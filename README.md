@@ -23,6 +23,14 @@ const ax = @cImport({
 });
 ```
 
+Run the tiny Zig smoke:
+
+```bash
+zig run examples/zig/hello.zig -I dist dist/axllm/axllm_c.cpp dist/axllm/axllm.cpp dist/axllm/mcp.cpp -lc++
+```
+
+It calls `axllm_c_schema_for_signature("question:string -> answer:string", ...)` and prints the generated schema.
+
 Direct Zig to C++ buys almost no speed for LLM workloads and adds C++ ABI/toolchain pain. The C ABI keeps the boundary boring.
 
 ## Updating
