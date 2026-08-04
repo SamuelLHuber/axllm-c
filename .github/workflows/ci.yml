@@ -23,9 +23,9 @@ jobs:
           sudo apt-get install -y cmake g++ curl libcurl4-openssl-dev libssl-dev
       - name: Lint workflow and scripts
         run: |
-          npm install -g actionlint
-          actionlint .github/workflows/*.yml
-          bash -n scripts/update-upstream.sh scripts/apply-overlays.sh scripts/verify.sh
+          curl -sSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash | bash -s -- latest /tmp
+          /tmp/actionlint .github/workflows/*.yml
+          bash -n scripts/*.sh
           node --check scripts/patch-ax-codegen.mjs
       - name: Verify overlay patching
         run: ./scripts/test-overlay.sh
