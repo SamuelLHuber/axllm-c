@@ -1,0 +1,761 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { AxJSRuntime, AxJSRuntimePermission } from './jsRuntime.js';
+
+// --- Mock browser globals ---
+const mockPostMessage = vi.fn();
+const mockTerminate = vi.fn();
+const mockWorkerInstance = {
+  postMessage: mockPostMessage,
+  terminate: mockTerminate,
+  onmessage: null as ((e: MessageEvent) => void) | null,
+};
+
+vi.stubGlobal(
+  'Worker',
+  vi.fn(() => mockWorkerInstance)
+);
+vi.stubGlobal('Blob', vi.fn());
+vi.stubGlobal('URL', {
+  createObjectURL: vi.fn(() => 'blob:mock'),
+  revokeObjectURL: vi.fn(),
+});
+
+const originalProcess = globalThis.process;
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  mockWorkerInstance.onmessage = null;
+  delete (globalThis as { Deno?: unknown }).Deno;
+  vi.stubGlobal('process', originalProcess);
+});
+
+// --- Tests ---
+
+describe('AxJSRuntimePermission', () => {
+  it('has expected string values', () => {
+    expect(AxJSRuntimePermission.NETWORK).toBe('network');
+    expect(AxJSRuntimePermission.STORAGE).toBe('storage');
+    expect(AxJSRuntimePermission.CODE_LOADING).toBe('code-loading');
+    expect(AxJSRuntimePermission.COMMUNICATION).toBe('communication');
+    expect(AxJSRuntimePermission.TIMING).toBe('timing');
+    expect(AxJSRuntimePermission.WORKERS).toBe('workers');
+    expect(AxJSRuntimePermission.FILESYSTEM).toBe('filesystem');
+    expect(AxJSRuntimePermission.CHILD_PROCESS).toBe('child-process');
+  });
+});
+
+describe('AxJSRuntime secure defaults', () => {
+  it('init message carries secure-by-default lockdown flags', () => {
+    const interp = new AxJSRuntime();
+    interp.createSession();
+
+    const initMsg = mockPostMessage.mock.calls[0]![0];
+    expect(initMsg.blockDynamicImport).toBe(true);
+    expect(initMsg.blockShadowRealm).toBe(true);
+    expect(initMsg.freezeIntrinsics).toBe(true);
+    expect(initMsg.lockWorkerIPC).toBe(true);
+    expect(initMsg.preventGlobalThisExtensions).toBe(false);
+    expect(initMsg.allowedModules).toEqual([]);
+  });
+
+  it('propagates explicit overrides into init message', () => {
+    const interp = new AxJSRuntime({
+      blockDynamicImport: false,
+      blockShadowRealm: false,
+      freezeIntrinsics: false,
+      lockWorkerIPC: false,
+      preventGlobalThisExtensions: true,
+      allowedModules: ['node:fs', 'node:path'],
+    });
+    interp.createSession();
+
+    const initMsg = mockPostMessage.mock.calls[0]![0];
+    expect(initMsg.blockDynamicImport).toBe(false);
+    expect(initMsg.blockShadowRealm).toBe(false);
+    expect(initMsg.freezeIntrinsics).toBe(false);
+    expect(initMsg.lockWorkerIPC).toBe(false);
+    expect(initMsg.preventGlobalThisExtensions).toBe(true);
+    expect(initMsg.allowedModules).toEqual(['node:fs', 'node:path']);
+  });
+
+  it('propagates new permissions (FILESYSTEM, CHILD_PROCESS)', () => {
+    const interp = new AxJSRuntime({
+      permissions: [
+        AxJSRuntimePermission.FILESYSTEM,
+        AxJSRuntimePermission.CHILD_PROCESS,
+      ],
+    });
+    interp.createSession();
+
+    const initMsg = mockPostMessage.mock.calls[0]![0];
+    expect(initMsg.permissions).toEqual(['filesystem', 'child-process']);
+  });
+});
+
+describe('AxJSRuntime', () => {
+  it('provides runtime usage instructions for RLM prompts', () => {
+    const interp = new AxJSRuntime();
+    const instructions = interp.getUsageInstructions();
+
+    expect(typeof instructions).toBe('string');
+    expect(instructions.length).toBeGreaterThan(0);
+    expect(instructions).toContain('State is session-scoped');
+    expect(instructions).toContain('globalThis');
+    expect(instructions).toContain('var');
+  });
+
+  it('sends empty permissions by default', () => {
+    const interp = new AxJSRuntime();
+    interp.createSession();
+
+    expect(mockPostMessage).toHaveBeenCalledOnce();
+    const initMsg = mockPostMessage.mock.calls[0]![0];
+    expect(initMsg.type).toBe('init');
+    expect(initMsg.permissions).toEqual([]);
+  });
+
+  it('sends custom permissions in init message', () => {
+    const interp = new AxJSRuntime({
+      permissions: [
+        AxJSRuntimePermission.NETWORK,
+        AxJSRuntimePermission.STORAGE,
+      ],
+    });
+    interp.createSession();
+
+    const initMsg = mockPostMessage.mock.calls[0]![0];
+    expect(initMsg.permissions).toEqual(['network', 'storage']);
+  });
+
+  it('uses stdout output mode by default', () => {
+    const interp = new AxJSRuntime();
+    interp.createSession();
+
+    const initMsg = mockPostMessage.mock.calls[0]![0];
+    expect(initMsg.outputMode).toBe('stdout');
+    expect(initMsg.captureConsole).toBe(true);
+  });
+
+  it('enables stdout capture mode when configured', () => {
+    const interp = new AxJSRuntime({ outputMode: 'stdout' });
+    interp.createSession();
+
+    const initMsg = mockPostMessage.mock.calls[0]![0];
+    expect(initMsg.outputMode).toBe('stdout');
+    expect(initMsg.captureConsole).toBe(true);
+  });
+
+  it('allows disabling console capture in stdout mode', () => {
+    const interp = new AxJSRuntime({
+      outputMode: 'stdout',
+      captureConsole: false,
+    });
+    interp.createSession();
+
+    const initMsg = mockPostMessage.mock.calls[0]![0];
+    expect(initMsg.outputMode).toBe('stdout');
+    expect(initMsg.captureConsole).toBe(false);
+  });
+
+  it('worker source contains _PERM_GLOBALS with expected globals', () => {
+    const interp = new AxJSRuntime();
+    interp.createSession();
+
+    // The Blob constructor receives the worker source as first argument
+    const BlobMock = vi.mocked(globalThis.Blob);
+    const blobArgs = BlobMock.mock.calls[0]![0] as string[];
+    const source = blobArgs[0]!;
+
+    // Verify the lockdown map exists with expected global names
+    const expectedGlobals = [
+      'fetch',
+      'XMLHttpRequest',
+      'WebSocket',
+      'EventSource',
+      'indexedDB',
+      'caches',
+      'importScripts',
+      'BroadcastChannel',
+      'performance',
+      'Worker',
+      'SharedWorker',
+    ];
+
+    expect(source).toContain('_PERM_GLOBALS');
+    for (const name of expectedGlobals) {
+      expect(source).toMatch(new RegExp(`['"]${name}['"]`));
+    }
+  });
+
+  it('worker source includes async trailing-expression auto-return helper', () => {
+    const interp = new AxJSRuntime();
+    interp.createSession();
+
+    const BlobMock = vi.mocked(globalThis.Blob);
+    const blobArgs = BlobMock.mock.calls[0]![0] as string[];
+    const source = blobArgs[0]!;
+
+    expect(source).toContain('const _injectAsyncAutoReturn = (code) =>');
+    expect(source).toContain('const _buildAsyncAutoReturnSource = (');
+    expect(source).toContain('const _canCompileAsyncSource = (source) =>');
+    expect(source).toContain('return (');
+  });
+
+  it('worker source bootstraps serialized runtime with config payload', () => {
+    const interp = new AxJSRuntime();
+    interp.createSession();
+
+    const BlobMock = vi.mocked(globalThis.Blob);
+    const blobArgs = BlobMock.mock.calls[0]![0] as string[];
+    const source = blobArgs[0]!;
+
+    expect(source).toContain('function axWorkerRuntime');
+    expect(source).toContain('"functionRefKey"');
+    expect(source).toContain('"maxErrorCauseDepth"');
+    expect(source.endsWith('\n')).toBe(true);
+  });
+
+  it('worker source rewrites top-level sync return snippets', () => {
+    const interp = new AxJSRuntime();
+    interp.createSession();
+
+    const BlobMock = vi.mocked(globalThis.Blob);
+    const blobArgs = BlobMock.mock.calls[0]![0] as string[];
+    const source = blobArgs[0]!;
+
+    expect(source).toContain(
+      'const _rewriteTopLevelReturnForSyncEval = (code) =>'
+    );
+    expect(source).toContain('_TOP_LEVEL_RETURN_ONLY');
+  });
+
+  it('worker source supports stdout capture and print hint output', () => {
+    const interp = new AxJSRuntime();
+    interp.createSession();
+
+    const BlobMock = vi.mocked(globalThis.Blob);
+    const blobArgs = BlobMock.mock.calls[0]![0] as string[];
+    const source = blobArgs[0]!;
+
+    expect(source).toContain('_OUTPUT_MODE_STDOUT');
+    expect(source).toContain('_scope.print = (...args) =>');
+  });
+
+  it('usage instructions mention output mode behavior', () => {
+    const stdoutMode = new AxJSRuntime().getUsageInstructions();
+    const returnMode = new AxJSRuntime({
+      outputMode: 'return',
+    }).getUsageInstructions();
+
+    expect(stdoutMode).toContain('console.log(...)');
+    expect(returnMode).toContain('return');
+  });
+
+  it('close() calls worker.terminate()', () => {
+    const interp = new AxJSRuntime();
+    const session = interp.createSession();
+
+    expect(mockTerminate).not.toHaveBeenCalled();
+    session.close();
+    expect(mockTerminate).toHaveBeenCalledOnce();
+  });
+
+  it('close() rejects pending executions', async () => {
+    const interp = new AxJSRuntime();
+    const session = interp.createSession();
+
+    const promise = session.execute('1+1');
+    session.close();
+
+    await expect(promise).rejects.toThrow('Worker terminated');
+  });
+
+  it('queues overlapping execute calls in FIFO order', async () => {
+    const interp = new AxJSRuntime();
+    const session = interp.createSession();
+
+    const first = session.execute('1+1');
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const second = session.execute('2+2');
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const executeCallsBeforeFirstResult = mockPostMessage.mock.calls.filter(
+      (call) => call[0]?.type === 'execute'
+    );
+    expect(executeCallsBeforeFirstResult).toHaveLength(1);
+    expect(executeCallsBeforeFirstResult[0]?.[0]).toMatchObject({
+      type: 'execute',
+      code: '1+1',
+    });
+
+    const firstExecuteMsg = executeCallsBeforeFirstResult[0]![0] as {
+      id: number;
+    };
+    mockWorkerInstance.onmessage?.({
+      data: { type: 'result', id: firstExecuteMsg.id, value: 2 },
+    } as MessageEvent);
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const executeCallsAfterFirstResult = mockPostMessage.mock.calls.filter(
+      (call) => call[0]?.type === 'execute'
+    );
+    expect(executeCallsAfterFirstResult).toHaveLength(2);
+    expect(executeCallsAfterFirstResult[1]?.[0]).toMatchObject({
+      type: 'execute',
+      code: '2+2',
+    });
+
+    const secondExecuteMsg = executeCallsAfterFirstResult[1]![0] as {
+      id: number;
+    };
+    mockWorkerInstance.onmessage?.({
+      data: { type: 'result', id: secondExecuteMsg.id, value: 4 },
+    } as MessageEvent);
+
+    await expect(first).resolves.toBe(2);
+    await expect(second).resolves.toBe(4);
+  });
+
+  it('queues patchGlobals behind an active execute', async () => {
+    const interp = new AxJSRuntime();
+    const session = interp.createSession();
+
+    const first = session.execute('1+1');
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const patch = session.patchGlobals({ query: 'updated' });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const patchCallsBeforeFirstResult = mockPostMessage.mock.calls.filter(
+      (call) => call[0]?.type === 'update-globals'
+    );
+    expect(patchCallsBeforeFirstResult).toHaveLength(0);
+
+    const executeCall = mockPostMessage.mock.calls.find(
+      (call) => call[0]?.type === 'execute'
+    );
+    const executeMsg = executeCall![0] as { id: number };
+    mockWorkerInstance.onmessage?.({
+      data: { type: 'result', id: executeMsg.id, value: 2 },
+    } as MessageEvent);
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const patchCall = mockPostMessage.mock.calls.find(
+      (call) => call[0]?.type === 'update-globals'
+    );
+    expect(patchCall?.[0]).toMatchObject({
+      type: 'update-globals',
+      globals: { query: 'updated' },
+    });
+
+    const patchMsg = patchCall![0] as { id: number };
+    mockWorkerInstance.onmessage?.({
+      data: { type: 'result', id: patchMsg.id, value: undefined },
+    } as MessageEvent);
+
+    await expect(first).resolves.toBe(2);
+    await expect(patch).resolves.toBeUndefined();
+  });
+
+  it('queues inspectGlobals behind an active execute and forwards reserved names', async () => {
+    const interp = new AxJSRuntime();
+    const session = interp.createSession();
+
+    const first = session.execute('1+1');
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const inspect = session.inspectGlobals!({
+      reservedNames: ['query'],
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const inspectCallsBeforeFirstResult = mockPostMessage.mock.calls.filter(
+      (call) => call[0]?.type === 'inspect-globals'
+    );
+    expect(inspectCallsBeforeFirstResult).toHaveLength(0);
+
+    const executeCall = mockPostMessage.mock.calls.find(
+      (call) => call[0]?.type === 'execute'
+    );
+    const executeMsg = executeCall![0] as { id: number };
+    mockWorkerInstance.onmessage?.({
+      data: { type: 'result', id: executeMsg.id, value: 2 },
+    } as MessageEvent);
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const inspectCall = mockPostMessage.mock.calls.find(
+      (call) => call[0]?.type === 'inspect-globals'
+    );
+    expect(inspectCall?.[0]).toMatchObject({
+      type: 'inspect-globals',
+      reservedNames: ['query'],
+    });
+
+    const inspectMsg = inspectCall![0] as { id: number };
+    mockWorkerInstance.onmessage?.({
+      data: {
+        type: 'result',
+        id: inspectMsg.id,
+        value: '{"version":1,"entries":[]}',
+      },
+    } as MessageEvent);
+
+    await expect(first).resolves.toBe(2);
+    await expect(inspect).resolves.toBe('{"version":1,"entries":[]}');
+  });
+
+  it('rejects queued inspectGlobals calls that are aborted before they start', async () => {
+    const interp = new AxJSRuntime();
+    const session = interp.createSession();
+    const controller = new AbortController();
+
+    const first = session.execute('1+1');
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const inspect = session.inspectGlobals!({ signal: controller.signal });
+    controller.abort('cancelled inspect');
+
+    await expect(inspect).rejects.toThrow('Aborted: cancelled inspect');
+
+    const inspectCallsBeforeFirstResult = mockPostMessage.mock.calls.filter(
+      (call) => call[0]?.type === 'inspect-globals'
+    );
+    expect(inspectCallsBeforeFirstResult).toHaveLength(0);
+
+    const executeCall = mockPostMessage.mock.calls.find(
+      (call) => call[0]?.type === 'execute'
+    );
+    const executeMsg = executeCall![0] as { id: number };
+    mockWorkerInstance.onmessage?.({
+      data: { type: 'result', id: executeMsg.id, value: 2 },
+    } as MessageEvent);
+
+    await expect(first).resolves.toBe(2);
+  });
+
+  it('rejects queued execute calls that are aborted before they start', async () => {
+    const interp = new AxJSRuntime();
+    const session = interp.createSession();
+    const controller = new AbortController();
+
+    const first = session.execute('1+1');
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const second = session.execute('2+2', { signal: controller.signal });
+    controller.abort('cancelled before start');
+
+    await expect(second).rejects.toThrow('Aborted: cancelled before start');
+
+    const executeCallsBeforeFirstResult = mockPostMessage.mock.calls.filter(
+      (call) => call[0]?.type === 'execute'
+    );
+    expect(executeCallsBeforeFirstResult).toHaveLength(1);
+    expect(executeCallsBeforeFirstResult[0]?.[0]).toMatchObject({
+      type: 'execute',
+      code: '1+1',
+    });
+
+    const firstExecuteMsg = executeCallsBeforeFirstResult[0]![0] as {
+      id: number;
+    };
+    mockWorkerInstance.onmessage?.({
+      data: { type: 'result', id: firstExecuteMsg.id, value: 2 },
+    } as MessageEvent);
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const executeCallsAfterFirstResult = mockPostMessage.mock.calls.filter(
+      (call) => call[0]?.type === 'execute'
+    );
+    expect(executeCallsAfterFirstResult).toHaveLength(1);
+
+    await expect(first).resolves.toBe(2);
+  });
+
+  it('blocks broader reserved runtime name shadowing before dispatching to the worker', async () => {
+    const interp = new AxJSRuntime();
+    const session = interp.createSession();
+
+    for (const code of [
+      'function inputs() {}',
+      'class inputs {}',
+      'inputs++',
+    ]) {
+      await expect(
+        session.execute(code, { reservedNames: ['inputs'] })
+      ).resolves.toContain(
+        "Cannot assign to, redeclare, or shadow reserved runtime variable 'inputs'"
+      );
+    }
+
+    const executeCalls = mockPostMessage.mock.calls.filter(
+      (call) => call[0]?.type === 'execute'
+    );
+    expect(executeCalls).toHaveLength(0);
+  });
+
+  it('result with legacy string error rejects with Error with that message', async () => {
+    const interp = new AxJSRuntime();
+    const session = interp.createSession();
+
+    const promise = session.execute('1+1');
+    await Promise.resolve();
+    const executeCall = mockPostMessage.mock.calls.find(
+      (call) => call[0]?.type === 'execute'
+    );
+    const executeMsg = executeCall![0] as { type: string; id: number };
+    mockWorkerInstance.onmessage?.({
+      data: { type: 'result', id: executeMsg.id, error: 'something wrong' },
+    } as MessageEvent);
+
+    const err = await promise.catch((x) => x);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toBe('something wrong');
+  });
+
+  it('result with structured error rejects with Error preserving name and message', async () => {
+    const interp = new AxJSRuntime();
+    const session = interp.createSession();
+
+    const promise = session.execute('1+1');
+    await Promise.resolve();
+    const executeCall = mockPostMessage.mock.calls.find(
+      (call) => call[0]?.type === 'execute'
+    );
+    const executeMsg = executeCall![0] as { type: string; id: number };
+    mockWorkerInstance.onmessage?.({
+      data: {
+        type: 'result',
+        id: executeMsg.id,
+        error: { name: 'TypeError', message: 'x is not a function' },
+      },
+    } as MessageEvent);
+
+    const err = await promise.catch((x) => x);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).name).toBe('TypeError');
+    expect((err as Error).message).toBe('x is not a function');
+  });
+
+  it('result with structured error including data rejects with data on error', async () => {
+    const interp = new AxJSRuntime();
+    const session = interp.createSession();
+
+    const promise = session.execute('1+1');
+    await Promise.resolve();
+    const executeCall = mockPostMessage.mock.calls.find(
+      (call) => call[0]?.type === 'execute'
+    );
+    const executeMsg = executeCall![0] as { type: string; id: number };
+    mockWorkerInstance.onmessage?.({
+      data: {
+        type: 'result',
+        id: executeMsg.id,
+        error: {
+          name: 'CustomError',
+          message: 'failed',
+          data: { code: 'E1', args: [1, 2] },
+        },
+      },
+    } as MessageEvent);
+
+    const err = await promise.catch((x) => x);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).name).toBe('CustomError');
+    expect((err as Error).message).toBe('failed');
+    expect((err as Error & { data?: unknown }).data).toEqual({
+      code: 'E1',
+      args: [1, 2],
+    });
+  });
+
+  it('result with structured error including cause rejects with cause chain', async () => {
+    const interp = new AxJSRuntime();
+    const session = interp.createSession();
+
+    const promise = session.execute('1+1');
+    await Promise.resolve();
+    const executeCall = mockPostMessage.mock.calls.find(
+      (call) => call[0]?.type === 'execute'
+    );
+    const executeMsg = executeCall![0] as { type: string; id: number };
+    mockWorkerInstance.onmessage?.({
+      data: {
+        type: 'result',
+        id: executeMsg.id,
+        error: {
+          name: 'WaitForUserActionError',
+          message: 'outer',
+          cause: { name: 'AgentError', message: 'inner' },
+        },
+      },
+    } as MessageEvent);
+
+    const err = await promise.catch((x) => x);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).name).toBe('WaitForUserActionError');
+    expect((err as Error).message).toBe('outer');
+    const cause = (err as Error & { cause?: Error }).cause;
+    expect(cause).toBeInstanceOf(Error);
+    expect(cause!.name).toBe('AgentError');
+    expect(cause!.message).toBe('inner');
+  });
+
+  it('toFunction() executes code and closes session', async () => {
+    const interp = new AxJSRuntime();
+    const fn = interp.toFunction();
+
+    const promise = fn.func({ code: '1+1' });
+
+    // execute is posted asynchronously after worker readiness
+    await Promise.resolve();
+    const executeCall = mockPostMessage.mock.calls.find(
+      (call) => call[0]?.type === 'execute'
+    );
+    expect(executeCall).toBeDefined();
+    const executeMsg = executeCall![0] as {
+      type: string;
+      id: number;
+    };
+    expect(executeMsg.type).toBe('execute');
+
+    mockWorkerInstance.onmessage?.({
+      data: { type: 'result', id: executeMsg.id, value: 2 },
+    } as MessageEvent);
+
+    await expect(promise).resolves.toBe(2);
+    expect(mockTerminate).toHaveBeenCalledOnce();
+  });
+
+  it('session is not permanently closed after timeout', async () => {
+    vi.useFakeTimers();
+
+    const interp = new AxJSRuntime({ timeout: 100 });
+    const session = interp.createSession();
+
+    // First execute: will time out
+    const timeoutPromise = session.execute('while(true){}');
+    await vi.advanceTimersByTimeAsync(0);
+    vi.advanceTimersByTime(101);
+    await expect(timeoutPromise).rejects.toThrow('Execution timed out');
+
+    // Second execute: should NOT throw "Session is closed"
+    // (ensureWorker will recreate a browser worker)
+    const secondPromise = session.execute('1+1');
+
+    // Flush microtasks so ensureWorker().then() runs and posts the execute message
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Simulate the worker returning a result for '1+1'
+    const executeMsg = mockPostMessage.mock.calls.find(
+      (call: unknown[]) =>
+        (call[0] as { type: string }).type === 'execute' &&
+        (call[0] as { code: string }).code === '1+1'
+    );
+    expect(executeMsg).toBeDefined();
+    const id = (executeMsg![0] as { id: number }).id;
+    mockWorkerInstance.onmessage?.({
+      data: { type: 'result', id, value: 2 },
+    } as MessageEvent);
+
+    await expect(secondPromise).resolves.toBe(2);
+
+    session.close();
+    vi.useRealTimers();
+  });
+
+  it('uses Bun Worker smol mode when running under Bun', () => {
+    vi.stubGlobal('process', {
+      env: {},
+      versions: { node: '24.3.0', bun: '1.3.5' },
+    });
+
+    const interp = new AxJSRuntime();
+    interp.createSession();
+
+    const WorkerMock = vi.mocked(
+      globalThis.Worker as unknown as ReturnType<typeof vi.fn>
+    );
+    const workerCtorCall = WorkerMock.mock.calls[0]!;
+
+    expect(workerCtorCall[1]).toEqual({ smol: true });
+  });
+
+  it('does not use Node Permission Model when running under Bun', () => {
+    vi.stubGlobal('process', {
+      env: {},
+      versions: { node: '18.19.0', bun: '1.3.5' },
+    });
+
+    const interp = new AxJSRuntime({ useNodePermissionModel: true });
+
+    expect(() => interp.createSession()).not.toThrow();
+
+    const WorkerMock = vi.mocked(
+      globalThis.Worker as unknown as ReturnType<typeof vi.fn>
+    );
+    const workerCtorCall = WorkerMock.mock.calls[0]!;
+
+    expect(workerCtorCall[1]).toEqual({ smol: true });
+  });
+
+  it('uses Deno module worker options when available', () => {
+    (globalThis as { Deno?: unknown }).Deno = { version: { deno: '2.6.3' } };
+
+    const interp = new AxJSRuntime({
+      permissions: [AxJSRuntimePermission.NETWORK],
+    });
+    interp.createSession();
+
+    const WorkerMock = vi.mocked(
+      globalThis.Worker as unknown as ReturnType<typeof vi.fn>
+    );
+    const workerCtorCall = WorkerMock.mock.calls[0]!;
+    const workerOptions = workerCtorCall[1] as Record<string, unknown>;
+
+    expect(workerOptions.type).toBe('module');
+    // With NETWORK granted and allowDenoRemoteImport: false (the secure
+    // default), the Deno permission map includes `import: false` so that
+    // granting fetch does not also enable `import('https://evil.com/…')`.
+    expect(workerOptions.deno).toEqual({
+      permissions: { net: true, import: false },
+    });
+  });
+
+  it('permits Deno remote imports when allowDenoRemoteImport: true', () => {
+    (globalThis as { Deno?: unknown }).Deno = { version: { deno: '2.6.3' } };
+
+    const interp = new AxJSRuntime({
+      permissions: [AxJSRuntimePermission.NETWORK],
+      allowDenoRemoteImport: true,
+    });
+    interp.createSession();
+
+    const WorkerMock = vi.mocked(
+      globalThis.Worker as unknown as ReturnType<typeof vi.fn>
+    );
+    const workerCtorCall = WorkerMock.mock.calls[0]!;
+    const workerOptions = workerCtorCall[1] as Record<string, unknown>;
+
+    expect(workerOptions.deno).toEqual({
+      permissions: { net: true },
+    });
+  });
+});

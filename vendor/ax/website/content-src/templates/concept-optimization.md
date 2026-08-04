@@ -1,0 +1,99 @@
+# Optimization
+
+Optimization means measuring a program and improving the parts that affect quality: instructions, demos, tool descriptions, templates, component maps, or saved optimizer artifacts.
+
+For TypeScript, use the top-level `optimize(...)` helper for normal AxGen and Flow tuning, and `agent.optimize(...)` for agent-specific tuning. Generated languages expose the AxIR-supported optimizer surface, usually around `AxGEPA` and artifact application.
+
+```{{fence}}
+{{optimizeCode}}
+```
+
+GEPA is useful when accuracy, cost, latency, brevity, tool-use quality, or policy quality are real tradeoffs. The output can be a Pareto frontier instead of one fake "best" prompt.
+
+{{< svg "pareto-frontier" "GEPA Pareto frontier" >}}
+
+## What You Provide
+
+- A program to tune.
+- Training examples with the same input/output shape as the signature.
+- A metric or judge that scores predictions.
+- Optional validation examples for holdout selection.
+- Student and teacher model settings where the language surface supports them.
+- A `maxMetricCalls` bound so the optimizer cannot spend without limit.
+
+```mermaid
+flowchart LR
+  A[Program] --> D[Optimizer]
+  B[Train examples] --> D
+  C[Metric or judge] --> D
+  E[Validation examples] --> D
+  D --> F[Optimized artifact]
+  D --> G[Pareto frontier]
+```
+
+## AxGen Example
+
+Use this for a single structured generator. Keep the metric deterministic when the expected output is easy to score.
+
+{{optimizeAxGenExample}}
+
+## Flow Example
+
+Flows expose multiple optimizable components. Use multi-objective metrics when a workflow must balance accuracy with brevity, cost, or latency.
+
+{{optimizeFlowExample}}
+
+## Agent Example
+
+Use `agent.optimize(...)` for tool-use, clarification, delegation, and final-response behavior. The normal path starts with task records containing `input`, `criteria`, and optional `expectedActions` or `forbiddenActions`.
+
+{{optimizeAgentExample}}
+
+## Verified Playbook Learning
+
+Failure-driven repair lives on the playbook, not on a separate method: the agent-bound playbook evolve method grows the agent's playbook from a task set. It runs the train tasks as a failure corpus, clusters the failures deterministically by error signature, mines each cluster for a grounded weakness (evidence quotes must literally appear in the failing runs' excerpts — fabricated diagnoses are discarded), and proposes one bounded playbook bullet per weakness. With `verify` (default on) a bullet is kept only when the train score improves by `minHeldInGain` AND the validation score does not drop by more than `epsilon` — rejected bullets roll back exactly. `verify: false` applies the mined lessons without the gate (trust-batch). The engine is an implementation detail hidden behind the method, exactly as `optimize(...)` hides its optimizer.
+
+Mining and judging need strong models; with weak teachers, weaknesses fail the grounding check and little is accepted. On small task sets, set `runsPerTask` to `2` or `3` so accept decisions compare averaged scores instead of trusting a single (possibly lucky) run per task. TypeScript and all five generated packages share the miner, grounding, budget, gate, and exact-rollback contract. Scoring remains host-shaped: TypeScript uses its metric, Python/Java/Go can accept a metric callback, and every generated port can use task scores plus the agent evaluation result.
+
+{{agentPlaybookEvolveExample}}
+
+Lineage: Self-Harness (mine weaknesses, validate edits), STOP (recursive improvement needs strong models), and the Darwin Gödel Machine (keep only what provably improves) — see the [Research Map](/research/).
+
+### optimize() vs the playbook
+
+| Use | When |
+| --- | --- |
+| `agent.optimize(...)` | Maximize a metric over a labeled dataset by tuning instructions and demos |
+| The `playbook` option / `agent.playbook().update(...)` | Accumulate reusable lessons continuously (trust) — automatically from each run's failures |
+| `agent.playbook().evolve(dataset)` | Grow the playbook from a task set, keeping only verified, rollback-safe lessons |
+
+## Metrics And Judges
+
+| Scoring path | Use when |
+| --- | --- |
+| Deterministic scalar metric | The expected answer or action is clear |
+| Multi-objective metric | You need visible tradeoffs such as accuracy vs brevity |
+| Plain typed `AxGen` judge | Non-agent qualitative scoring needs an LLM |
+| Built-in `agent.optimize(...)` judge | Agent behavior needs holistic review |
+
+Normalize scores to `0..1` when possible. Keep objective names stable across calls.
+
+## Bootstrap And GEPA Together
+
+Bootstrap demos are useful for small starter sets because they seed the model with concrete successful examples before GEPA mutates instructions/components. TypeScript `optimize(...)` composes the practical bootstrap-plus-GEPA path. Generated languages expose the optimizer primitives supported by their AxIR contract.
+
+## Artifacts
+
+Optimization output is model-adjacent configuration. Save it, version it, record the examples and metrics used, and apply it through the program or agent API rather than manually patching instructions.
+
+{{optimizeArtifactExample}}
+
+## Budget Discipline
+
+- Always set `maxMetricCalls` in docs and examples.
+- Use distinct validation examples when selecting a best candidate.
+- Start with small `numTrials` and scale once the metric is stable.
+- For trees, inspect optimized component keys so you know what changed.
+- Persist artifacts only after a held-out or smoke run proves they help.
+
+See [{{optimizeName}} GEPA]({{langRoot}}/subsystems/optimize/) and [optimize() API]({{langRoot}}/api/optimize/).

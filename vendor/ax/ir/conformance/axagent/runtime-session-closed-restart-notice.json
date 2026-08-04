@@ -1,0 +1,76 @@
+{
+  "close_runtime_session": true,
+  "context_values": {
+    "question": "restart"
+  },
+  "expected_action_log_subset": [
+    {
+      "action": "create_session"
+    },
+    {
+      "action": "restart",
+      "reason": "session_closed"
+    },
+    {
+      "action": "create_session"
+    },
+    {
+      "kind": "final"
+    },
+    {
+      "action": "close_session"
+    }
+  ],
+  "expected_closed_session_count": 1,
+  "expected_result_subset": {
+    "completion_payload": {
+      "args": [
+        {
+          "answer": "after restart"
+        }
+      ],
+      "type": "final"
+    },
+    "kind": "final"
+  },
+  "expected_session_count": 2,
+  "expected_trace_event_kinds": [
+    "runtime_lifecycle",
+    "runtime_lifecycle",
+    "runtime_lifecycle",
+    "runtime_execute",
+    "final",
+    "runtime_lifecycle"
+  ],
+  "kind": "agent_runtime_session",
+  "name": "runtime-session-closed-restart-notice",
+  "operation": "steps",
+  "runtime_script": [
+    {
+      "expected_code": "final({ answer: \"after restart\" })",
+      "result": {
+        "error": "session closed",
+        "error_category": "session_closed",
+        "is_error": true,
+        "kind": "error"
+      }
+    },
+    {
+      "expected_code": "final({ answer: \"after restart\" })",
+      "result": {
+        "args": [
+          {
+            "answer": "after restart"
+          }
+        ],
+        "type": "final"
+      }
+    }
+  ],
+  "signature": "question:string -> answer:string",
+  "steps": [
+    {
+      "code": "final({ answer: \"after restart\" })"
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "expected_error_contains": "session_id mismatch",
+  "kind": "agent_runtime_protocol",
+  "mode": "session_mismatch",
+  "name": "runtime-protocol-session-mismatch",
+  "operation": "session_mismatch"
+}

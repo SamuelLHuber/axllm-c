@@ -1,0 +1,62 @@
+{
+  "expected_output": {
+    "apiKeyQuery": "key",
+    "auth": "api_key_query",
+    "defaultEmbedModel": "gemini-embedding-2",
+    "defaultModel": "gemini-2.5-flash",
+    "features": {
+      "caching": {
+        "supported": true,
+        "types": ["persistent"]
+      },
+      "media": {
+        "audio": {
+          "output": {
+            "supported": true
+          },
+          "supported": true
+        },
+        "files": {
+          "supported": true,
+          "upload_method": "cloud"
+        },
+        "images": {
+          "supported": true
+        }
+      },
+      "thinking": true
+    },
+    "id": "google-gemini",
+    "name": "GoogleGeminiAI",
+    "operations": {
+      "chat": {
+        "body": "json",
+        "method": "POST",
+        "path": "/models/{model}:generateContent",
+        "stream": false
+      },
+      "embed": {
+        "body": "json",
+        "method": "POST",
+        "path": "/models/{model}:batchEmbedContents",
+        "stream": false
+      },
+      "realtime_audio": {
+        "body": "events",
+        "grammar": "gemini_live_bidi",
+        "method": "WS",
+        "path": "/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent",
+        "stream": true
+      },
+      "stream_chat": {
+        "body": "json",
+        "method": "POST",
+        "path": "/models/{model}:streamGenerateContent?alt=sse",
+        "stream": true
+      }
+    }
+  },
+  "kind": "ai_provider_descriptor",
+  "name": "gemini-provider-descriptor",
+  "provider": "google-gemini"
+}

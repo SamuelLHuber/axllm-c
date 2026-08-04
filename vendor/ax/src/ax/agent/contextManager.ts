@@ -1,0 +1,2101 @@
+/**
+ * Semantic Context Management for the AxAgent RLM loop.
+ *
+ * Manages the action log by evaluating step importance via hindsight heuristics,
+ * generating compact tombstones for resolved errors, and pruning low-value entries
+ * to maximize context window utility.
+ */
+
+import type { AxAIService } from '../ai/types.js';
+import { AxGen } from '../dsp/generate.js';
+import { f } from '../dsp/sig.js';
+import type { AxProgramForwardOptions } from '../dsp/types.js';
+import {
+  extractTopLevelDeclaredNames,
+  extractTopLevelDurableWriteTargets,
+  stripJsStringsAndComments,
+} from '../util/jsAnalysis.js';
+import type {
+  AxAgentContextStage,
+  AxAgentOnContextEvent,
+} from './contextEvents.js';
+import { emitContextEvent } from './contextEvents.js';
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export type ActionLogTag =
+  | 'error'
+  | 'dead-end'
+  | 'foundational'
+  | 'pivot'
+  | 'superseded';
+
+export type ActionLogStepKind =
+  | 'explore'
+  | 'transform'
+  | 'query'
+  | 'finalize'
+  | 'error';
+
+export type ActionReplayMode = 'full' | 'distill' | 'compact' | 'omit';
+
+export type ActionLogHygieneMode =
+  | 'none'
+  | 'pressure'
+  | 'proactive'
+  | 'aggressive';
+
+export type ActionLogCompactionMode = 'distill' | 'compact';
+
+export type ActionLogCompactionReason =
+  | 'structured_output'
+  | 'superseded'
+  | 'pressure'
+  | 'proactive'
+  | 'lean';
+
+export type ActionLogCompaction = {
+  turn: number;
+  mode: ActionLogCompactionMode;
+  reason: ActionLogCompactionReason;
+  originalChars: number;
+  renderedChars: number;
+};
+
+export type ActionLogFunctionCall = {
+  qualifiedName: string;
+  name?: string;
+  arguments?: unknown;
+  result?: unknown;
+  error?: string;
+};
+
+export type ActionLogEntry = {
+  turn: number;
+  code: string;
+  output: string;
+  tags: ActionLogTag[];
+  summary?: string;
+  producedVars?: string[];
+  referencedVars?: string[];
+  stateDelta?: string;
+  stepKind?: ActionLogStepKind;
+  replayMode?: ActionReplayMode;
+  /** 0-5 importance score set by hindsight evaluation. */
+  rank?: number;
+  /** Compact summary replacing full code+output when rendered. */
+  tombstone?: string;
+  /** @internal Pending tombstone generation. */
+  _tombstonePromise?: Promise<string>;
+  /** @internal Direct qualified callable usages like `db.search(...)`. */
+  _directQualifiedCalls?: readonly string[];
+  /** @internal Runtime-recorded function calls made during this turn. */
+  _functionCalls?: readonly ActionLogFunctionCall[];
+  /** @internal Durable runtime values written during this turn. */
+  _durableWrites?: readonly string[];
+  /** @internal Runtime values read during this turn. */
+  _durableReads?: readonly string[];
+  /** @internal Retry hazards inferred from errors in this turn. */
+  _failureHazards?: readonly string[];
+};
+
+/** Resolved config passed to `manageContext`. */
+export type ContextManagementEffectiveConfig = {
+  errorPruning: boolean;
+  hindsightEvaluation: boolean;
+  tombstoning:
+    | boolean
+    | Omit<AxProgramForwardOptions<string>, 'functions'>
+    | undefined;
+  pruneRank: number;
+  rankPruneGraceTurns: number;
+  actionReplay: 'full' | 'adaptive' | 'minimal' | 'checkpointed';
+  recentFullActions: number;
+  contextHygiene?: {
+    defaultMode: ActionLogHygieneMode;
+    pressureMode?: ActionLogHygieneMode;
+  };
+  stateSummary: { enabled: boolean; maxEntries?: number; maxChars?: number };
+  stateInspection: { enabled: boolean; contextThreshold?: number };
+  checkpoints: {
+    enabled: boolean;
+    triggerChars?: number;
+    summarizerOptions?: Omit<AxProgramForwardOptions<string>, 'functions'>;
+  };
+};
+
+export type ActionLogBuildPolicy = {
+  actionReplay?: 'full' | 'adaptive' | 'minimal' | 'checkpointed';
+  recentFullActions?: number;
+  restoreNotice?: string;
+  delegatedContextSummary?: string;
+  checkpointSummary?: string;
+  checkpointTurns?: readonly number[];
+  hygieneMode?: ActionLogHygieneMode;
+  hygieneGraceTurns?: number;
+};
+
+export type CheckpointSummaryState = {
+  fingerprint: string;
+  summary: string;
+  turns: number[];
+};
+
+export type ActionLogReplayPlan = {
+  promptFacingEntries: ActionLogEntry[];
+  checkpointEntries: ActionLogEntry[];
+  historyText: string;
+  historyChars: number;
+  compactions: ActionLogCompaction[];
+};
+
+export type RuntimeStateSnapshotEntry = {
+  name: string;
+  type: string;
+  ctor?: string;
+  size?: string;
+  preview?: string;
+  restorable?: boolean;
+};
+
+export type RuntimeStateSnapshot = {
+  version: 1;
+  entries: RuntimeStateSnapshotEntry[];
+};
+
+export type RuntimeStateVariableProvenance = {
+  createdTurn: number;
+  lastReadTurn?: number;
+  stepKind?: ActionLogStepKind;
+  source?: string;
+  code?: string;
+};
+
+// ---------------------------------------------------------------------------
+// Heuristic helpers (exported for testing)
+// ---------------------------------------------------------------------------
+
+/**
+ * Extracts a rough error signature from output text.
+ * Uses the first `XxxError: message` line for comparison.
+ */
+export function extractErrorSignature(output: string): string {
+  const match = output.match(/^(\w+Error:\s*.{0,60})/m);
+  return match?.[1] ?? output.slice(0, 80);
+}
+
+/**
+ * Extracts variable names declared via `var`, `let`, or `const`.
+ */
+export function extractDeclaredVariables(code: string): string[] {
+  return extractTopLevelDeclaredNames(code);
+}
+
+export function extractDurableWriteTargets(code: string): string[] {
+  return extractTopLevelDurableWriteTargets(code);
+}
+
+const JS_KEYWORDS = new Set([
+  'var',
+  'let',
+  'const',
+  'function',
+  'return',
+  'if',
+  'else',
+  'for',
+  'while',
+  'do',
+  'switch',
+  'case',
+  'break',
+  'continue',
+  'try',
+  'catch',
+  'finally',
+  'throw',
+  'new',
+  'delete',
+  'typeof',
+  'void',
+  'in',
+  'of',
+  'instanceof',
+  'this',
+  'class',
+  'extends',
+  'super',
+  'import',
+  'export',
+  'default',
+  'from',
+  'as',
+  'async',
+  'await',
+  'yield',
+  'true',
+  'false',
+  'null',
+  'undefined',
+  'console',
+  'log',
+]);
+
+/**
+ * Extracts all identifiers referenced in code (approximate).
+ * Filters out JavaScript keywords.
+ */
+export function extractReferencedIdentifiers(code: string): Set<string> {
+  const sanitized = stripJsStringsAndComments(code);
+  const identRegex = /\b([a-zA-Z_$][a-zA-Z0-9_$]*)\b/g;
+  const ids = new Set<string>();
+  let match: RegExpExecArray | null = identRegex.exec(sanitized);
+  while (match !== null) {
+    if (match[1] && !JS_KEYWORDS.has(match[1])) {
+      ids.add(match[1]);
+    }
+    match = identRegex.exec(sanitized);
+  }
+  return ids;
+}
+
+/**
+ * Extracts identifiers that are read from earlier runtime state.
+ * Current-turn top-level declarations are excluded so replacements like
+ * `const data = ...` do not look like reads of a prior `data`.
+ */
+export function extractReadIdentifiers(code: string): Set<string> {
+  const reads = extractReferencedIdentifiers(code);
+  for (const declared of extractDeclaredVariables(code)) {
+    reads.delete(declared);
+  }
+  return reads;
+}
+
+const HINDSIGHT_TAGS = new Set<ActionLogTag>([
+  'dead-end',
+  'foundational',
+  'pivot',
+  'superseded',
+]);
+
+function truncateInline(text: string, maxChars = 120): string {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, maxChars - 3)}...`;
+}
+
+function formatCompactList(
+  values: readonly string[],
+  options?: Readonly<{ maxItems?: number; maxItemChars?: number }>
+): string {
+  const maxItems = options?.maxItems ?? 8;
+  const maxItemChars = options?.maxItemChars ?? 48;
+  const shown = values
+    .slice(0, maxItems)
+    .map((value) => truncateInline(value, maxItemChars));
+  if (values.length > shown.length) {
+    shown.push('...');
+  }
+  return shown.join(', ');
+}
+
+function hasCompletionSignal(code: string): boolean {
+  return /\b(final|askClarification)\s*\(/.test(code);
+}
+
+function uniqueNonEmpty(values: readonly (string | undefined)[]): string[] {
+  return [
+    ...new Set(
+      values
+        .filter((value): value is string => typeof value === 'string')
+        .map((value) => value.trim())
+        .filter(Boolean)
+    ),
+  ];
+}
+
+function inferStepKind(entry: Readonly<ActionLogEntry>): ActionLogStepKind {
+  if (entry.tags.includes('error')) return 'error';
+  if (hasCompletionSignal(entry.code)) return 'finalize';
+  if (/\b(llmQuery|discover)\s*\(/.test(entry.code)) {
+    return 'query';
+  }
+  if ((entry.producedVars?.length ?? 0) > 0) return 'transform';
+  return 'explore';
+}
+
+function buildStateDelta(entry: Readonly<ActionLogEntry>): string {
+  const producedVars = entry._durableWrites ?? entry.producedVars ?? [];
+  const readVars = entry._durableReads ?? [
+    ...extractReadIdentifiers(entry.code),
+  ];
+  const callables = getQualifiedCallableUsages(entry);
+
+  if (entry.tags.includes('error')) {
+    const failure = getFailureHazards(entry)[0];
+    return [
+      'Runtime error; no durable runtime state update',
+      callables.length > 0 ? `callables: ${callables.join(', ')}` : undefined,
+      failure ? `failure: ${failure}` : undefined,
+    ]
+      .filter((part): part is string => Boolean(part))
+      .join('; ');
+  }
+
+  const details = [
+    producedVars.length > 0
+      ? `Updated live runtime values: ${producedVars.join(', ')}`
+      : undefined,
+    readVars.length > 0 ? `read: ${formatCompactList(readVars)}` : undefined,
+    callables.length > 0 ? `callables: ${callables.join(', ')}` : undefined,
+  ].filter((part): part is string => Boolean(part));
+
+  if (details.length > 0) {
+    return details.join('; ');
+  }
+
+  switch (entry.stepKind) {
+    case 'query':
+      return 'Gathered external or semantic evidence without creating durable runtime values';
+    case 'finalize':
+      return 'Prepared completion payload for the responder';
+    case 'error':
+      return 'Did not produce a durable runtime state update';
+    default:
+      return 'Inspected runtime state without creating durable runtime values';
+  }
+}
+
+function buildEntrySummary(entry: Readonly<ActionLogEntry>): string {
+  if (entry.tombstone) {
+    return entry.tombstone;
+  }
+
+  const label =
+    entry.stepKind === 'error'
+      ? 'Error step'
+      : entry.stepKind === 'query'
+        ? 'Query step'
+        : entry.stepKind === 'transform'
+          ? 'Transform step'
+          : entry.stepKind === 'finalize'
+            ? 'Finalize step'
+            : 'Explore step';
+  const observation = truncateInline(entry.output || '(no output)');
+  const stateDelta = entry.stateDelta ?? 'No durable runtime state update';
+
+  return `[SUMMARY]: ${label}. ${stateDelta}. Result: ${observation}.`;
+}
+
+function clearHindsightEvaluation(entry: ActionLogEntry): void {
+  entry.rank = undefined;
+  entry.tags = entry.tags.filter((tag) => !HINDSIGHT_TAGS.has(tag));
+}
+
+function ensureEntryMetadata(entry: ActionLogEntry): void {
+  if (!entry.producedVars) {
+    entry.producedVars = extractDurableWriteTargets(entry.code);
+  }
+  if (!entry.referencedVars) {
+    entry.referencedVars = [...extractReferencedIdentifiers(entry.code)];
+  }
+  if (!entry.stepKind) {
+    entry.stepKind = inferStepKind(entry);
+  }
+  if (!entry._durableWrites) {
+    entry._durableWrites = [...(entry.producedVars ?? [])];
+  }
+  if (!entry._durableReads) {
+    entry._durableReads = [...extractReadIdentifiers(entry.code)];
+  }
+  if (entry.tags.includes('error') && !entry._failureHazards) {
+    entry._failureHazards = [extractErrorSignature(entry.output)].filter(
+      Boolean
+    );
+  }
+  if (!entry.stateDelta) {
+    entry.stateDelta = buildStateDelta(entry);
+  }
+  if (!entry.summary) {
+    entry.summary = buildEntrySummary(entry);
+  }
+}
+
+function extractDirectQualifiedCallableUsages(code: string): string[] {
+  const sanitized = stripJsStringsAndComments(code);
+  const usages = new Set<string>();
+  const callPattern =
+    /\b([a-zA-Z_$][a-zA-Z0-9_$]*)\.([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(/g;
+  let match = callPattern.exec(sanitized);
+
+  while (match) {
+    const namespace = match[1];
+    const name = match[2];
+    if (namespace && name) {
+      usages.add(`${namespace}.${name}`);
+    }
+    match = callPattern.exec(sanitized);
+  }
+
+  return [...usages];
+}
+
+function ensureDiscoveryMetadata(entry: ActionLogEntry): void {
+  if (!entry._directQualifiedCalls) {
+    entry._directQualifiedCalls = extractDirectQualifiedCallableUsages(
+      entry.code
+    );
+  }
+}
+
+export function getQualifiedCallableUsages(
+  entry: Readonly<ActionLogEntry>
+): string[] {
+  if (entry._functionCalls) {
+    return uniqueNonEmpty(
+      entry._functionCalls.map((call) => call.qualifiedName)
+    );
+  }
+
+  ensureDiscoveryMetadata(entry as ActionLogEntry);
+  return uniqueNonEmpty(entry._directQualifiedCalls ?? []);
+}
+
+function getFailureHazards(entry: Readonly<ActionLogEntry>): string[] {
+  if (entry._failureHazards) {
+    return uniqueNonEmpty(entry._failureHazards);
+  }
+  if (!entry.tags.includes('error')) {
+    return [];
+  }
+  return uniqueNonEmpty([extractErrorSignature(entry.output)]);
+}
+
+function getPrimaryActionSource(entry: ActionLogEntry): string | undefined {
+  return getQualifiedCallableUsages(entry)[0];
+}
+
+export function buildRuntimeStateProvenance(
+  entries: readonly ActionLogEntry[]
+): Map<string, RuntimeStateVariableProvenance> {
+  const provenance = new Map<string, RuntimeStateVariableProvenance>();
+
+  for (const entry of entries) {
+    const mutableEntry = entry as ActionLogEntry;
+    ensureEntryMetadata(mutableEntry);
+    const source = getPrimaryActionSource(mutableEntry);
+
+    for (const name of mutableEntry.producedVars ?? []) {
+      provenance.set(name, {
+        createdTurn: mutableEntry.turn,
+        stepKind: mutableEntry.stepKind,
+        source,
+        code: mutableEntry.code,
+      });
+    }
+
+    const readRefs = extractReadIdentifiers(mutableEntry.code);
+    for (const name of readRefs) {
+      const current = provenance.get(name);
+      if (!current) {
+        continue;
+      }
+
+      current.lastReadTurn = Math.max(
+        current.lastReadTurn ?? current.createdTurn,
+        mutableEntry.turn
+      );
+    }
+  }
+
+  return provenance;
+}
+
+export function getPromptFacingActionLogEntries(
+  entries: readonly ActionLogEntry[]
+): ActionLogEntry[] {
+  return [...entries];
+}
+
+function extractTestOutputSummary(output: string): string | undefined {
+  const counts = new Map<string, number>();
+  const countRegex =
+    /\b(\d+)\s+(passed|failed|failures?|errors?|skipped|xfailed|xpassed)\b/gi;
+  let match = countRegex.exec(output);
+  while (match) {
+    const count = Number.parseInt(match[1]!, 10);
+    const label = match[2]!.toLowerCase().replace(/s$/, '');
+    counts.set(label, (counts.get(label) ?? 0) + count);
+    match = countRegex.exec(output);
+  }
+
+  if (counts.size === 0) {
+    return undefined;
+  }
+
+  const lines = output.split('\n');
+  const failingTests = uniqueNonEmpty(
+    lines
+      .map((line) => {
+        const trimmed = line.trim();
+        return (
+          trimmed.match(/^FAILED\s+([^\s]+)/)?.[1] ??
+          trimmed.match(/^FAIL\s+([^\s]+)/)?.[1] ??
+          trimmed.match(/^([^\s]+::[^\s]+)\s+(?:FAILED|FAIL)\b/)?.[1]
+        );
+      })
+      .filter((line): line is string => Boolean(line))
+  ).slice(0, 6);
+  const errorLines = uniqueNonEmpty(
+    lines
+      .map((line) => line.trim())
+      .filter((line) =>
+        /\b(?:AssertionError|Error:|Expected|Received|Traceback)\b/.test(line)
+      )
+      .map((line) => truncateInline(line, 180))
+  ).slice(0, 4);
+
+  const orderedLabels = [
+    'passed',
+    'failed',
+    'failure',
+    'error',
+    'skipped',
+    'xfailed',
+    'xpassed',
+  ];
+  const summary = orderedLabels
+    .filter((label) => counts.has(label))
+    .map((label) => `${counts.get(label)} ${label}`)
+    .join(', ');
+  const parts = [`[DISTILLED:test-output]: ${summary}`];
+  if (failingTests.length > 0) {
+    parts.push(`Failures: ${failingTests.join(', ')}`);
+  }
+  if (errorLines.length > 0) {
+    parts.push(`Error details: ${errorLines.join(' | ')}`);
+  }
+  return parts.join('\n');
+}
+
+function extractDiffSummary(output: string): string | undefined {
+  const lines = output.split('\n');
+  const looksLikeDiff = lines.some(
+    (line) =>
+      line.startsWith('diff --git ') ||
+      line.startsWith('@@ ') ||
+      line.startsWith('+++ b/')
+  );
+  if (!looksLikeDiff) {
+    return undefined;
+  }
+
+  const files = uniqueNonEmpty(
+    lines
+      .map((line) => {
+        const diffMatch = line.match(/^diff --git a\/(.+?) b\/(.+)$/);
+        if (diffMatch) return diffMatch[2];
+        return line.match(/^\+\+\+ b\/(.+)$/)?.[1];
+      })
+      .filter((file): file is string => Boolean(file))
+  ).slice(0, 8);
+  const additions = lines.filter(
+    (line) => line.startsWith('+') && !line.startsWith('+++')
+  ).length;
+  const deletions = lines.filter(
+    (line) => line.startsWith('-') && !line.startsWith('---')
+  ).length;
+  const hunks = lines.filter((line) => line.startsWith('@@ ')).length;
+  const changedFiles = files.length > 0 ? files.join(', ') : 'unknown files';
+  return `[DISTILLED:diff]: ${files.length || 'unknown'} file(s), +${additions}/-${deletions}, ${hunks} hunk(s)\nFiles: ${changedFiles}`;
+}
+
+function extractTraceSummary(output: string): string | undefined {
+  const lines = output.split('\n').map((line) => line.trim());
+  const hasTrace =
+    /\b\w+Error:/.test(output) ||
+    /^Traceback \(most recent call last\):/m.test(output) ||
+    lines.some(
+      (line) =>
+        /^at\s+.+:\d+:\d+/.test(line) || /^File ".+", line \d+/.test(line)
+    );
+  if (!hasTrace) {
+    return undefined;
+  }
+
+  const signature = extractErrorSignature(output);
+  const frames = uniqueNonEmpty(
+    lines
+      .filter(
+        (line) =>
+          /^at\s+.+:\d+:\d+/.test(line) || /^File ".+", line \d+/.test(line)
+      )
+      .map((line) => truncateInline(line, 180))
+  );
+  const keptFrames =
+    frames.length > 4
+      ? [...frames.slice(0, 3), frames[frames.length - 1]!]
+      : frames;
+  return [
+    `[DISTILLED:trace]: ${truncateInline(signature, 160)}`,
+    keptFrames.length > 0 ? `Frames: ${keptFrames.join(' | ')}` : undefined,
+  ]
+    .filter((part): part is string => Boolean(part))
+    .join('\n');
+}
+
+function summarizeJsonShape(value: unknown): string {
+  if (Array.isArray(value)) {
+    const firstObject = value.find(
+      (item): item is Record<string, unknown> =>
+        Boolean(item) && typeof item === 'object' && !Array.isArray(item)
+    );
+    const keys = firstObject ? Object.keys(firstObject).slice(0, 8) : [];
+    return `array(${value.length})${keys.length > 0 ? ` object keys: ${keys.join(', ')}` : ''}`;
+  }
+
+  if (value && typeof value === 'object') {
+    const keys = Object.keys(value as Record<string, unknown>).slice(0, 12);
+    return `object keys: ${keys.join(', ') || 'none'}`;
+  }
+
+  return typeof value;
+}
+
+function extractJsonSummary(output: string): string | undefined {
+  const trimmed = output.trim();
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) {
+    return undefined;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return undefined;
+  }
+
+  const shouldDistill =
+    trimmed.length > 220 ||
+    (Array.isArray(parsed) && parsed.length > 4) ||
+    (!!parsed &&
+      typeof parsed === 'object' &&
+      !Array.isArray(parsed) &&
+      Object.keys(parsed as Record<string, unknown>).length > 8);
+  if (!shouldDistill) {
+    return undefined;
+  }
+
+  const previewValue = Array.isArray(parsed)
+    ? parsed.slice(0, 2)
+    : Object.fromEntries(
+        Object.entries(parsed as Record<string, unknown>).slice(0, 6)
+      );
+  return `[DISTILLED:json]: ${summarizeJsonShape(parsed)}\nPreview: ${truncateInline(
+    JSON.stringify(previewValue),
+    180
+  )}`;
+}
+
+export function distillStructuredActionOutput(
+  output: string
+): string | undefined {
+  return (
+    extractTestOutputSummary(output) ??
+    extractDiffSummary(output) ??
+    extractTraceSummary(output) ??
+    extractJsonSummary(output)
+  );
+}
+
+function hasUserConstraintSignal(entry: Readonly<ActionLogEntry>): boolean {
+  return /\b(?:user|constraint|preference|prefer|must|should|only|never|exact|format|deadline|success criteria)\b/i.test(
+    `${entry.code}\n${entry.output}`
+  );
+}
+
+function getCompactionReason(
+  entry: Readonly<ActionLogEntry>,
+  hygieneMode: ActionLogHygieneMode
+): ActionLogCompactionReason {
+  if (entry.tags.includes('superseded')) return 'superseded';
+  if (hygieneMode === 'pressure') return 'pressure';
+  if (hygieneMode === 'aggressive') return 'lean';
+  return 'proactive';
+}
+
+function buildFutureReferenceSets(
+  entries: readonly ActionLogEntry[]
+): Array<Set<string>> {
+  const futureRefs: Array<Set<string>> = Array.from(
+    { length: entries.length },
+    () => new Set<string>()
+  );
+  const seen = new Set<string>();
+
+  for (let i = entries.length - 1; i >= 0; i--) {
+    futureRefs[i] = new Set(seen);
+    for (const ref of entries[i]?.referencedVars ?? []) {
+      seen.add(ref);
+    }
+  }
+
+  return futureRefs;
+}
+
+function assignReplayModes(
+  entries: readonly ActionLogEntry[],
+  policy: Readonly<ActionLogBuildPolicy>
+): void {
+  const actionReplay = policy.actionReplay ?? 'full';
+  const recentFullActions = Math.max(policy.recentFullActions ?? 1, 0);
+  const hygieneMode = policy.hygieneMode ?? 'none';
+  const hygieneGraceTurns = Math.max(policy.hygieneGraceTurns ?? 0, 0);
+  const checkpointReplayActive =
+    actionReplay === 'checkpointed' &&
+    ((policy.checkpointTurns?.length ?? 0) > 0 ||
+      Boolean(policy.checkpointSummary));
+
+  for (const entry of entries) {
+    ensureEntryMetadata(entry);
+  }
+
+  const futureRefs = buildFutureReferenceSets(entries);
+  const recentStart = Math.max(entries.length - recentFullActions, 0);
+  const latestTurn = entries.at(-1)?.turn ?? 0;
+
+  entries.forEach((entry, index) => {
+    if (entry.tombstone) {
+      entry.replayMode = 'full';
+      return;
+    }
+
+    if (actionReplay === 'full') {
+      entry.replayMode = 'full';
+      return;
+    }
+
+    if (
+      actionReplay === 'checkpointed' &&
+      !checkpointReplayActive &&
+      hygieneMode === 'none'
+    ) {
+      entry.replayMode = 'full';
+      return;
+    }
+
+    const keepRecent = index >= recentStart;
+    const unresolvedError = entry.tags.includes('error');
+    const policyViolation = entry.output.startsWith('[POLICY]');
+    const finalizationPayload = entry.stepKind === 'finalize';
+    const userConstraintSignal = hasUserConstraintSignal(entry);
+    const inProactiveGraceWindow =
+      hygieneMode === 'proactive' &&
+      hygieneGraceTurns > 0 &&
+      latestTurn - entry.turn < hygieneGraceTurns;
+    const laterReferences = futureRefs[index] ?? new Set<string>();
+    const producedVars = entry.producedVars ?? [];
+    const referencedLater = producedVars.some((name) =>
+      laterReferences.has(name)
+    );
+
+    if (
+      keepRecent ||
+      unresolvedError ||
+      policyViolation ||
+      finalizationPayload ||
+      userConstraintSignal ||
+      referencedLater ||
+      inProactiveGraceWindow
+    ) {
+      entry.replayMode = 'full';
+      return;
+    }
+
+    if (hygieneMode !== 'none') {
+      const distillation = distillStructuredActionOutput(entry.output);
+      if (distillation) {
+        entry.replayMode = 'distill';
+        return;
+      }
+
+      if (
+        entry.tags.includes('superseded') ||
+        (hygieneMode === 'aggressive' && entry.output.length > 400) ||
+        (hygieneMode === 'pressure' && entry.output.length > 1200)
+      ) {
+        entry.replayMode = 'compact';
+        return;
+      }
+    }
+
+    if (actionReplay === 'checkpointed' && !checkpointReplayActive) {
+      entry.replayMode = 'full';
+      return;
+    }
+
+    entry.replayMode = 'omit';
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Hindsight Evaluation
+// ---------------------------------------------------------------------------
+
+/**
+ * Heuristic-based importance scoring for an action log entry.
+ * Evaluates entry `prev` given the following entry `curr`.
+ *
+ * | prev    | curr                        | Tag          | Rank |
+ * |---------|-----------------------------|--------------|------|
+ * | error   | success                     | dead-end     | 0    |
+ * | error   | error (same signature)      | dead-end     | 0    |
+ * | error   | error (different signature) | pivot        | 3    |
+ * | success | success (references prev)   | foundational | 5    |
+ * | success | success (no reference)      | superseded   | 1    |
+ * | success | error                       | (keep as-is) | —    |
+ */
+export function evaluateHindsight(
+  prev: ActionLogEntry,
+  curr: ActionLogEntry
+): void {
+  ensureEntryMetadata(prev);
+  ensureEntryMetadata(curr);
+  clearHindsightEvaluation(prev);
+
+  const prevIsError = prev.tags.includes('error');
+  const currIsError = curr.tags.includes('error');
+
+  if (prevIsError && !currIsError) {
+    // Dead-end: previous errored, current succeeded
+    prev.rank = 0;
+    addTag(prev, 'dead-end');
+    return;
+  }
+
+  if (prevIsError && currIsError) {
+    // Compare error signatures to distinguish pivot from repeated dead-end
+    const prevSig = extractErrorSignature(prev.output);
+    const currSig = extractErrorSignature(curr.output);
+    if (prevSig !== currSig) {
+      prev.rank = 3;
+      addTag(prev, 'pivot');
+    } else {
+      prev.rank = 0;
+      addTag(prev, 'dead-end');
+    }
+    return;
+  }
+
+  if (!prevIsError && !currIsError) {
+    // Both succeeded — check if curr clearly builds on prev.
+    const prevVars = prev.producedVars ?? extractDeclaredVariables(prev.code);
+    if (
+      prevVars.length === 0 ||
+      prev.stepKind === 'explore' ||
+      prev.stepKind === 'query'
+    ) {
+      return;
+    }
+
+    const currRefs = extractReadIdentifiers(curr.code);
+    const overlap = prevVars.filter((v) => currRefs.has(v));
+
+    if (overlap.length > 0) {
+      prev.rank = 5;
+      addTag(prev, 'foundational');
+      return;
+    }
+
+    if (prev.stepKind === 'transform') {
+      prev.rank = 1;
+      addTag(prev, 'superseded');
+    }
+    return;
+  }
+
+  // prevIsError = false, currIsError = true: unusual regression — keep prev as-is
+}
+
+function addTag(entry: ActionLogEntry, tag: ActionLogTag): void {
+  if (!entry.tags.includes(tag)) {
+    entry.tags.push(tag);
+  }
+}
+
+function buildDeterministicResolvedErrorTombstone(
+  errorEntry: Readonly<ActionLogEntry>,
+  resolutionEntry: Readonly<ActionLogEntry>
+): string {
+  const informativeLine =
+    errorEntry.output
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .find((line) => /\b\w+Error:/.test(line) && !line.startsWith('[')) ??
+    errorEntry.output
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(
+        (line) =>
+          Boolean(line) && !line.startsWith('[') && !line.startsWith('...')
+      )
+      .at(-1) ??
+    extractErrorSignature(errorEntry.output);
+  const signature = truncateInline(informativeLine, 96);
+  return `[TOMBSTONE]: Resolved ${signature} in turn ${resolutionEntry.turn}.`;
+}
+
+function isDeterministicResolvedErrorTombstone(text: string): boolean {
+  return text.startsWith('[TOMBSTONE]: Resolved ');
+}
+
+// ---------------------------------------------------------------------------
+// Tombstone Generation
+// ---------------------------------------------------------------------------
+
+type InternalSummaryForwardOptions = Omit<
+  AxProgramForwardOptions<any>,
+  'functions'
+>;
+
+const TOMBSTONE_SUMMARIZER_DESCRIPTION = `You are an internal AxAgent tombstone summarizer.
+
+Write the output field \`tombstone\` as exactly one concise line.
+- Start with \`[TOMBSTONE]:\`
+- Summarize the resolved error and the successful fix.
+- Mention one failed approach to avoid when possible.
+- Do not include code fences, bullet points, or extra prose.
+- Keep it roughly 20-40 tokens.`;
+
+const CHECKPOINT_SUMMARIZER_DESCRIPTION = `You are an internal AxAgent trajectory summarizer.
+
+You are given the OLDER trajectory entries (the journey of attempts, errors, and fixes).
+Recent working code state is preserved separately and is NOT included here.
+Your job is to compress this execution history into a concise ledger.
+
+Write the output field \`checkpointSummary\` as plain text with exactly these labels in this order:
+Objective:
+Current state and artifacts:
+Exact callables and formats:
+Evidence:
+User constraints and preferences:
+Failures to avoid:
+Next step:
+
+Rules:
+- Compress the execution trajectory aggressively — only keep what is needed to avoid repeating mistakes and to understand the path taken.
+- Distinguish confirmed execution facts from inferred conclusions.
+- Preserve current state, artifacts, and durable values needed to resume the task.
+- Preserve exact qualified function names, module names, ids, field names, enum literals, date/time strings, literals, and query formats when they matter.
+- Put those exact details under \`Exact callables and formats:\` when possible.
+- Put user-provided constraints, preferences, requested output shape, deadlines, paths, ids, and success criteria under \`User constraints and preferences:\`.
+- Keep enough evidence to avoid repeating invalid callable names, invalid query formats, rejected literals, or wrong assumptions.
+- Use \`Failures to avoid:\` for exact retry hazards. Use \`none\` if there are no important failure patterns in the provided turns.
+- Do not restate raw code or quote large outputs.
+- Use "none" when a section has nothing worth preserving.
+- Be concise and factual.`;
+
+function sanitizeInternalSummaryOptions(
+  options: Readonly<InternalSummaryForwardOptions> | undefined
+): Omit<InternalSummaryForwardOptions, 'mem' | 'description' | 'maxSteps'> {
+  const {
+    mem: _mem,
+    description: _description,
+    maxSteps: _maxSteps,
+    ...rest
+  } = options ?? {};
+
+  return Object.fromEntries(
+    Object.entries(rest).filter(([, value]) => value !== undefined)
+  ) as Omit<InternalSummaryForwardOptions, 'mem' | 'description' | 'maxSteps'>;
+}
+
+function buildInternalSummaryProgramOptions(
+  description: string,
+  traceLabel: string,
+  options: Readonly<InternalSummaryForwardOptions> | undefined
+): InternalSummaryForwardOptions {
+  const sanitized = sanitizeInternalSummaryOptions(options);
+
+  return {
+    ...sanitized,
+    description,
+    traceLabel: sanitized.traceLabel ?? traceLabel,
+    maxSteps: 1,
+  };
+}
+
+function buildInternalSummaryCallOptions(
+  options: Readonly<InternalSummaryForwardOptions> | undefined,
+  defaults: Readonly<InternalSummaryForwardOptions> | undefined = undefined
+): InternalSummaryForwardOptions {
+  return {
+    ...sanitizeInternalSummaryOptions(defaults),
+    ...sanitizeInternalSummaryOptions(options),
+    maxSteps: 1,
+  };
+}
+
+/**
+ * Generates a tombstone summary for a resolved error entry.
+ * Uses an internal single-step AxGen program and falls back on any failure.
+ */
+export async function generateTombstoneAsync(
+  ai: AxAIService,
+  summarizerOptions:
+    | Omit<AxProgramForwardOptions<string>, 'functions'>
+    | undefined,
+  requestForwardOptions: Readonly<InternalSummaryForwardOptions> | undefined,
+  errorEntry: Readonly<ActionLogEntry>,
+  resolutionEntry: Readonly<ActionLogEntry>
+): Promise<string> {
+  const summarizer = new AxGen<
+    {
+      errorCode: string;
+      errorOutput: string;
+      resolutionCode: string;
+    },
+    { tombstone: string }
+  >(
+    f()
+      .input('errorCode', f.string())
+      .input('errorOutput', f.string())
+      .input('resolutionCode', f.string())
+      .output('tombstone', f.string())
+      .build(),
+    {
+      ...buildInternalSummaryProgramOptions(
+        TOMBSTONE_SUMMARIZER_DESCRIPTION,
+        'ax-agent-tombstone-summary',
+        summarizerOptions
+      ),
+    }
+  );
+
+  try {
+    const result = await summarizer.forward(
+      ai,
+      {
+        errorCode: errorEntry.code.slice(0, 500),
+        errorOutput: errorEntry.output.slice(0, 300),
+        resolutionCode: resolutionEntry.code.slice(0, 500),
+      },
+      buildInternalSummaryCallOptions(requestForwardOptions)
+    );
+    const text =
+      typeof result.tombstone === 'string'
+        ? result.tombstone.trim()
+        : String(result.tombstone).trim();
+    return (
+      text ||
+      buildDeterministicResolvedErrorTombstone(errorEntry, resolutionEntry)
+    );
+  } catch {
+    return buildDeterministicResolvedErrorTombstone(
+      errorEntry,
+      resolutionEntry
+    );
+  }
+}
+
+/** Maximum chars to preserve per code block in working state. */
+const WORKING_STATE_CODE_CAP = 2000;
+/** Maximum chars to preserve per output block in working state. */
+const WORKING_STATE_OUTPUT_CAP = 800;
+/** Number of recent non-error entries to keep as verbatim working state. */
+const WORKING_STATE_ENTRY_COUNT = 2;
+
+/**
+ * Split checkpoint entries into two groups:
+ * - **working**: last N non-error, non-tombstoned entries (preserved verbatim)
+ * - **trajectory**: everything else (compressed by the LLM)
+ */
+/** @internal Exported for testing only. */
+export function splitCheckpointEntries(entries: readonly ActionLogEntry[]): {
+  working: ActionLogEntry[];
+  trajectory: ActionLogEntry[];
+} {
+  const working: ActionLogEntry[] = [];
+
+  // Walk backwards, collect last N non-error entries as working state
+  for (
+    let i = entries.length - 1;
+    i >= 0 && working.length < WORKING_STATE_ENTRY_COUNT;
+    i--
+  ) {
+    const e = entries[i]!;
+    if (!e.tags.includes('error') && !e.tombstone) {
+      working.unshift(e);
+    }
+  }
+
+  const workingTurns = new Set(working.map((e) => e.turn));
+  const trajectory: ActionLogEntry[] = [];
+  for (const e of entries) {
+    if (!workingTurns.has(e.turn)) trajectory.push(e);
+  }
+
+  return { working, trajectory };
+}
+
+/**
+ * Deterministically extract verbatim working code state from recent entries.
+ * This bypasses the LLM entirely to guarantee no lossy compression of the
+ * code the agent is currently working with.
+ */
+/** @internal Exported for testing only. */
+export function extractWorkingCodeState(
+  entries: readonly ActionLogEntry[]
+): string {
+  if (entries.length === 0) return '';
+
+  const blocks = entries.map((entry) => {
+    ensureEntryMetadata(entry as ActionLogEntry);
+    ensureDiscoveryMetadata(entry as ActionLogEntry);
+
+    const code = entry.code
+      ? entry.code.length > WORKING_STATE_CODE_CAP
+        ? `${entry.code.slice(0, WORKING_STATE_CODE_CAP)}\n// ... (truncated)`
+        : entry.code
+      : '(no code)';
+    const output = entry.output
+      ? truncateInline(entry.output, WORKING_STATE_OUTPUT_CAP)
+      : '(no output)';
+    const directCallables =
+      getQualifiedCallableUsages(entry).join(', ') || 'none';
+
+    const lines = [
+      `Code:\n${code}`,
+      `Produced: ${(entry.producedVars ?? []).join(', ') || 'none'}`,
+      `Read: ${
+        entry._durableReads && entry._durableReads.length > 0
+          ? formatCompactList(entry._durableReads)
+          : 'none'
+      }`,
+      `Direct callables: ${directCallables}`,
+      `State delta: ${entry.stateDelta ?? 'none'}`,
+      `Output: ${output}`,
+    ];
+    return lines.join('\n');
+  });
+
+  return `=== Working Code State (verbatim) ===\n${blocks.join('\n\n')}`;
+}
+
+/**
+ * Serialize trajectory entries (older entries) with aggressive compression.
+ * These are sent to the LLM for summarization.
+ */
+/** @internal Exported for testing only. */
+export function serializeTrajectoryEntries(
+  entries: readonly ActionLogEntry[]
+): string {
+  return entries
+    .map((entry) => {
+      // Tombstoned entries are already compact
+      if (entry.tombstone) {
+        return `Turn: ${entry.turn}\n${entry.tombstone}`;
+      }
+
+      ensureEntryMetadata(entry as ActionLogEntry);
+      const directCallables =
+        getQualifiedCallableUsages(entry).join(', ') || 'none';
+      const failureCues =
+        getFailureHazards(entry)
+          .map((hazard) => truncateInline(hazard, 160))
+          .join(' | ') || 'none';
+
+      return [
+        `Turn: ${entry.turn}`,
+        `Step kind: ${entry.stepKind ?? 'explore'}`,
+        `Durable values written: ${(entry.producedVars ?? []).join(', ') || 'none'}`,
+        `Runtime values read: ${
+          entry._durableReads && entry._durableReads.length > 0
+            ? formatCompactList(entry._durableReads)
+            : 'none'
+        }`,
+        `Direct callables: ${directCallables}`,
+        `State delta: ${entry.stateDelta ?? 'none'}`,
+        `Observed result: ${truncateInline(entry.output || '(no output)', 200)}`,
+        `Failure cues: ${failureCues}`,
+        `Code excerpt: ${truncateInline(entry.code || '(no code)', 180)}`,
+      ].join('\n');
+    })
+    .join('\n\n');
+}
+
+/**
+ * Legacy full serialization — used only for backward-compatible contexts
+ * where the split approach is not applicable.
+ */
+function _serializeCheckpointEntries(
+  entries: readonly ActionLogEntry[]
+): string {
+  return entries
+    .map((entry) => {
+      ensureEntryMetadata(entry);
+      const directCallables =
+        getQualifiedCallableUsages(entry).join(', ') || 'none';
+      const failureCues =
+        getFailureHazards(entry)
+          .map((hazard) => truncateInline(hazard, 200))
+          .join(' | ') || 'none';
+
+      return [
+        `Turn: ${entry.turn}`,
+        `Step kind: ${entry.stepKind ?? 'explore'}`,
+        `Referenced inputs: ${(entry.referencedVars ?? []).join(', ') || 'none'}`,
+        `Durable values written: ${(entry.producedVars ?? []).join(', ') || 'none'}`,
+        `Direct callables: ${directCallables}`,
+        `State delta: ${entry.stateDelta ?? 'none'}`,
+        `Observed result: ${truncateInline(entry.output || '(no output)', 360)}`,
+        `Failure cues: ${failureCues}`,
+        `Code excerpt: ${truncateInline(entry.code || '(no code)', 360)}`,
+      ].join('\n');
+    })
+    .join('\n\n');
+}
+
+/**
+ * Deterministic fallback for trajectory summarization (no LLM).
+ */
+function buildFallbackTrajectorySummary(
+  entries: readonly ActionLogEntry[]
+): string {
+  if (entries.length === 0) return '';
+
+  const objectives = new Set<string>();
+  const exactCallablesAndFormats: string[] = [];
+  const evidence: string[] = [];
+  const currentStateAndArtifacts: string[] = [];
+  const userConstraintsAndPreferences: string[] = [];
+  const failuresToAvoid: string[] = [];
+  let nextStep = 'Continue from the latest live runtime state.';
+
+  for (const entry of entries) {
+    ensureEntryMetadata(entry);
+    objectives.add(entry.stepKind ?? 'explore');
+    const directCallables = getQualifiedCallableUsages(entry);
+    if (directCallables.length > 0) {
+      exactCallablesAndFormats.push(
+        `Turn ${entry.turn}: ${directCallables.join(', ')} via ${truncateInline(entry.code || '(no code)', 140)}`
+      );
+    } else if (/\bdiscover\s*\(/.test(entry.code)) {
+      exactCallablesAndFormats.push(
+        `Turn ${entry.turn}: ${truncateInline(entry.code || '(no code)', 140)}`
+      );
+    }
+    if (entry.stateDelta && entry.stateDelta !== 'none') {
+      currentStateAndArtifacts.push(`Turn ${entry.turn}: ${entry.stateDelta}`);
+    }
+    const constraintMatches = [
+      ...`${entry.code}\n${entry.output}`.matchAll(
+        /\b(?:must|should|prefer|only|never|exact|format|deadline|path|id)\b[^.\n]{0,120}/gi
+      ),
+    ].map((match) => truncateInline(match[0], 140));
+    for (const match of constraintMatches.slice(0, 2)) {
+      userConstraintsAndPreferences.push(`Turn ${entry.turn}: ${match}`);
+    }
+    const observation = truncateInline(entry.output || '(no output)', 200);
+    evidence.push(`Turn ${entry.turn}: ${observation}`);
+    for (const hazard of getFailureHazards(entry)) {
+      failuresToAvoid.push(
+        `Turn ${entry.turn}: ${truncateInline(hazard, 160)}`
+      );
+    }
+    nextStep =
+      entry.stepKind === 'finalize'
+        ? 'Complete the responder handoff.'
+        : 'Continue from the latest live runtime state.';
+  }
+
+  return [
+    `Objective: ${[...objectives].join(', ') || 'none'}`,
+    `Current state and artifacts: ${currentStateAndArtifacts.join(' | ') || 'Continue from liveRuntimeState and recent full action replay.'}`,
+    `Exact callables and formats: ${exactCallablesAndFormats.join(' | ') || 'none'}`,
+    `Evidence: ${evidence.join(' | ') || 'none'}`,
+    `User constraints and preferences: ${userConstraintsAndPreferences.join(' | ') || 'none'}`,
+    `Failures to avoid: ${failuresToAvoid.join(' | ') || 'none'}`,
+    `Next step: ${nextStep}`,
+  ].join('\n');
+}
+
+const CHECKPOINT_SECTION_LABELS = [
+  'Objective',
+  'Current state and artifacts',
+  'Exact callables and formats',
+  'Evidence',
+  'User constraints and preferences',
+  'Failures to avoid',
+  'Next step',
+] as const;
+
+type CheckpointSectionLabel = (typeof CHECKPOINT_SECTION_LABELS)[number];
+
+function isEmptySectionValue(value: string | undefined): boolean {
+  return !value || value.trim().length === 0 || value.trim() === 'none';
+}
+
+function normalizeSectionValue(value: string | undefined): string {
+  const trimmed = value?.replace(/\s+/g, ' ').trim() ?? '';
+  return trimmed.length > 0 ? trimmed : 'none';
+}
+
+function parseCheckpointSections(
+  summary: string
+): Record<CheckpointSectionLabel, string> {
+  const sections = Object.fromEntries(
+    CHECKPOINT_SECTION_LABELS.map((label) => [label, ''])
+  ) as Record<CheckpointSectionLabel, string>;
+  let currentLabel: CheckpointSectionLabel | undefined;
+  const labelSet = new Set<string>(CHECKPOINT_SECTION_LABELS);
+  const normalized = summary.replace(/^Checkpoint Summary:\s*/i, '').trim();
+
+  for (const rawLine of normalized.split('\n')) {
+    const line = rawLine.trim();
+    if (!line) {
+      continue;
+    }
+    const match = line.match(/^([^:]+):\s*(.*)$/);
+    if (match && labelSet.has(match[1]!.trim())) {
+      currentLabel = match[1]!.trim() as CheckpointSectionLabel;
+      sections[currentLabel] = [sections[currentLabel], match[2] ?? '']
+        .filter(Boolean)
+        .join(' ')
+        .trim();
+      continue;
+    }
+    if (currentLabel) {
+      sections[currentLabel] = [sections[currentLabel], line]
+        .filter(Boolean)
+        .join(' ')
+        .trim();
+    } else {
+      sections.Evidence = [sections.Evidence, line]
+        .filter(Boolean)
+        .join(' ')
+        .trim();
+    }
+  }
+
+  return sections;
+}
+
+function mergeSectionValue(
+  primary: string | undefined,
+  deterministic: string | undefined
+): string {
+  if (isEmptySectionValue(primary)) {
+    return normalizeSectionValue(deterministic);
+  }
+  if (isEmptySectionValue(deterministic)) {
+    return normalizeSectionValue(primary);
+  }
+
+  const normalizedPrimary = normalizeSectionValue(primary);
+  const normalizedDeterministic = normalizeSectionValue(deterministic);
+  if (normalizedPrimary.includes(normalizedDeterministic)) {
+    return normalizedPrimary;
+  }
+  return `${normalizedPrimary} | ${normalizedDeterministic}`;
+}
+
+export function buildCheckpointSupersessionNotes(
+  checkpointEntries: readonly ActionLogEntry[],
+  allEntries: readonly ActionLogEntry[]
+): string[] {
+  const notes: string[] = [];
+  const checkpointTurns = new Set(checkpointEntries.map((entry) => entry.turn));
+
+  for (const checkpointEntry of checkpointEntries) {
+    ensureEntryMetadata(checkpointEntry as ActionLogEntry);
+    for (const name of checkpointEntry.producedVars ?? []) {
+      const overwriter = allEntries.find((entry) => {
+        if (
+          entry.turn <= checkpointEntry.turn ||
+          checkpointTurns.has(entry.turn) ||
+          entry.tags.includes('error')
+        ) {
+          return false;
+        }
+        ensureEntryMetadata(entry as ActionLogEntry);
+        return (entry.producedVars ?? []).includes(name);
+      });
+      if (overwriter) {
+        notes.push(
+          `${name} from checkpoint turn ${checkpointEntry.turn} was overwritten by turn ${overwriter.turn}; prefer liveRuntimeState and recent full replay for ${name}.`
+        );
+      }
+    }
+  }
+
+  return uniqueNonEmpty(notes);
+}
+
+export function mergeCheckpointSummaryWithDeterministicFacts(
+  summary: string,
+  entries: readonly ActionLogEntry[],
+  supersessionNotes: readonly string[] = []
+): string {
+  const modelSections = parseCheckpointSections(summary);
+  const deterministicSections = parseCheckpointSections(
+    buildFallbackTrajectorySummary(entries)
+  );
+  const merged = Object.fromEntries(
+    CHECKPOINT_SECTION_LABELS.map((label) => [
+      label,
+      mergeSectionValue(modelSections[label], deterministicSections[label]),
+    ])
+  ) as Record<CheckpointSectionLabel, string>;
+
+  if (supersessionNotes.length > 0) {
+    const notes = supersessionNotes.join(' | ');
+    merged['Current state and artifacts'] = mergeSectionValue(
+      merged['Current state and artifacts'],
+      notes
+    );
+    merged['Next step'] = mergeSectionValue(
+      merged['Next step'],
+      'Prefer liveRuntimeState and recent full action replay for overwritten values.'
+    );
+  }
+
+  return CHECKPOINT_SECTION_LABELS.map(
+    (label) => `${label}: ${normalizeSectionValue(merged[label])}`
+  ).join('\n');
+}
+
+/**
+ * Legacy fallback used when the full entry set is provided without splitting.
+ * Kept for backward-compatible code paths.
+ */
+function _buildFallbackCheckpointSummary(
+  entries: readonly ActionLogEntry[]
+): string {
+  const { working, trajectory } = splitCheckpointEntries(entries);
+  const workingBlock = extractWorkingCodeState(working);
+  const trajectoryBlock = buildFallbackTrajectorySummary(trajectory);
+  return [workingBlock, trajectoryBlock].filter(Boolean).join('\n\n');
+}
+
+/**
+ * Generates a checkpoint summary using hybrid state separation:
+ * 1. Working code state (last N non-error entries) is extracted deterministically —
+ *    preserved verbatim, never passed through the LLM.
+ * 2. Trajectory (older entries) is compressed by the LLM into a concise execution ledger.
+ * 3. The final summary concatenates both parts.
+ */
+export async function generateCheckpointSummaryAsync(
+  ai: AxAIService,
+  summarizerOptions:
+    | Omit<AxProgramForwardOptions<string>, 'functions'>
+    | undefined,
+  requestForwardOptions: Readonly<InternalSummaryForwardOptions> | undefined,
+  entries: readonly ActionLogEntry[],
+  options?: Readonly<{
+    allEntries?: readonly ActionLogEntry[];
+    supersessionNotes?: readonly string[];
+  }>
+): Promise<string> {
+  const { working, trajectory } = splitCheckpointEntries(entries);
+  const workingCodeBlock = extractWorkingCodeState(working);
+  const supersessionNotes =
+    options?.supersessionNotes ??
+    buildCheckpointSupersessionNotes(entries, options?.allEntries ?? entries);
+
+  let trajectorySummary: string;
+  if (trajectory.length > 0) {
+    const summarizer = new AxGen<
+      { turns: string },
+      { checkpointSummary: string }
+    >(
+      f()
+        .input('turns', f.string())
+        .output('checkpointSummary', f.string())
+        .build(),
+      {
+        ...buildInternalSummaryProgramOptions(
+          CHECKPOINT_SUMMARIZER_DESCRIPTION,
+          'ax-agent-checkpoint-summary',
+          summarizerOptions
+        ),
+      }
+    );
+
+    try {
+      const result = await summarizer.forward(
+        ai,
+        { turns: serializeTrajectoryEntries(trajectory) },
+        buildInternalSummaryCallOptions(
+          requestForwardOptions,
+          summarizerOptions
+        )
+      );
+      const text =
+        typeof result.checkpointSummary === 'string'
+          ? result.checkpointSummary.trim()
+          : String(result.checkpointSummary).trim();
+      trajectorySummary = mergeCheckpointSummaryWithDeterministicFacts(
+        text || buildFallbackTrajectorySummary(trajectory),
+        trajectory,
+        supersessionNotes
+      );
+    } catch {
+      trajectorySummary = mergeCheckpointSummaryWithDeterministicFacts(
+        buildFallbackTrajectorySummary(trajectory),
+        trajectory,
+        supersessionNotes
+      );
+    }
+  } else {
+    trajectorySummary =
+      supersessionNotes.length > 0
+        ? mergeCheckpointSummaryWithDeterministicFacts(
+            '',
+            [],
+            supersessionNotes
+          )
+        : '';
+  }
+
+  return [workingCodeBlock, trajectorySummary].filter(Boolean).join('\n\n');
+}
+
+// ---------------------------------------------------------------------------
+// manageContext — main orchestration
+// ---------------------------------------------------------------------------
+
+/**
+ * Manages the action log after a new entry is pushed.
+ *
+ * Four phases run in order:
+ * 1. Hindsight evaluation (tag + rank the previous entry)
+ * 2. Tombstone generation (fire async for resolved errors)
+ * 3. Error pruning (remove error entries, respecting tombstones)
+ * 4. Rank-based pruning (remove low-rank entries)
+ *
+ * Mutates `entries` in-place.
+ */
+export async function manageContext(
+  entries: ActionLogEntry[],
+  newIndex: number,
+  config: Readonly<ContextManagementEffectiveConfig>,
+  ai?: AxAIService,
+  requestForwardOptions?: Readonly<InternalSummaryForwardOptions>,
+  contextEvents?: Readonly<{
+    stage: AxAgentContextStage;
+    onContextEvent?: AxAgentOnContextEvent;
+  }>
+): Promise<void> {
+  const newEntry = entries[newIndex];
+  if (!newEntry) return;
+
+  ensureEntryMetadata(newEntry);
+
+  const newEntryIsError = newEntry.tags.includes('error');
+
+  // --- Phase 1: Hindsight evaluation of the PREVIOUS entry ---
+  if (config.hindsightEvaluation && entries.length >= 2) {
+    const prev = entries[entries.length - 2]!;
+    evaluateHindsight(prev, newEntry);
+  }
+
+  // --- Phase 2: Tombstone generation for resolved errors ---
+  if (config.errorPruning || config.tombstoning) {
+    for (const entry of entries) {
+      if (!entry.tags.includes('error')) {
+        continue;
+      }
+
+      const idx = entries.indexOf(entry);
+      const next = entries[idx + 1];
+      if (!next || next.tags.includes('error')) {
+        continue;
+      }
+
+      if (config.errorPruning && !entry.tombstone) {
+        entry.tombstone = buildDeterministicResolvedErrorTombstone(entry, next);
+        await emitContextEvent(contextEvents?.onContextEvent, {
+          kind: 'tombstone_created',
+          stage: contextEvents?.stage ?? 'executor',
+          turn: entry.turn,
+          resolvedByTurn: next.turn,
+          source: 'deterministic',
+          summaryChars: entry.tombstone.length,
+        });
+      }
+
+      const shouldGenerateModelTombstone =
+        Boolean(config.tombstoning) &&
+        Boolean(ai) &&
+        !entry._tombstonePromise &&
+        (!entry.tombstone ||
+          isDeterministicResolvedErrorTombstone(entry.tombstone));
+      if (!shouldGenerateModelTombstone || !ai) {
+        continue;
+      }
+
+      const forwardOptions =
+        typeof config.tombstoning === 'object' ? config.tombstoning : undefined;
+      entry._tombstonePromise = generateTombstoneAsync(
+        ai,
+        forwardOptions,
+        requestForwardOptions,
+        entry,
+        next
+      );
+      entry._tombstonePromise
+        .then((ts) => {
+          entry.tombstone = ts;
+          void emitContextEvent(contextEvents?.onContextEvent, {
+            kind: 'tombstone_created',
+            stage: contextEvents?.stage ?? 'executor',
+            turn: entry.turn,
+            resolvedByTurn: next.turn,
+            source: 'model',
+            summaryChars: ts.length,
+          });
+        })
+        .catch(() => {
+          // Tombstone failure is non-fatal.
+        })
+        .finally(() => {
+          entry._tombstonePromise = undefined;
+        });
+    }
+  }
+
+  // --- Phase 3: Error pruning (respects tombstones) ---
+  if (config.errorPruning && !newEntryIsError) {
+    const pruned = entries.filter(
+      (e) =>
+        !e.tags.includes('error') || // not an error → keep
+        e.tombstone != null || // has tombstone → keep (compact)
+        e._tombstonePromise != null // pending tombstone → keep (will be compact)
+    );
+    entries.length = 0;
+    entries.push(...pruned);
+  }
+
+  // --- Phase 4: Rank-based pruning ---
+  if (config.hindsightEvaluation) {
+    const latestTurn = entries[entries.length - 1]?.turn ?? newEntry.turn;
+    const pruned = entries.filter(
+      (e, i) =>
+        i === entries.length - 1 || // always keep last entry
+        e.rank === undefined || // unscored → keep
+        (!e.tags.includes('error') &&
+          latestTurn - e.turn < config.rankPruneGraceTurns) || // keep successful entries for a short grace window
+        e.rank >= config.pruneRank || // above threshold → keep
+        e.tombstone != null || // tombstoned → keep (already compact)
+        e._tombstonePromise != null // pending tombstone → keep
+    );
+    entries.length = 0;
+    entries.push(...pruned);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Action log serialization
+// ---------------------------------------------------------------------------
+
+/**
+ * Serializes action log entries into a string for the actor prompt.
+ *
+ * Tombstoned entries render as compact one-liners.
+ * Normal entries render with full code blocks.
+ */
+export function buildActionLog(entries: readonly ActionLogEntry[]): string {
+  return buildActionLogWithPolicy(entries, {});
+}
+
+function renderFullActionReplayEntry(entry: Readonly<ActionLogEntry>): string {
+  return `\`\`\`javascript\n${entry.code}\n\`\`\`\nResult:\n${entry.output}`;
+}
+
+function buildCompactActionReplayEntry(
+  entry: Readonly<ActionLogEntry>,
+  hygieneMode: ActionLogHygieneMode
+): string {
+  ensureEntryMetadata(entry as ActionLogEntry);
+  const reason = getCompactionReason(entry, hygieneMode);
+  const callables = getQualifiedCallableUsages(entry).join(', ') || 'none';
+  const result =
+    distillStructuredActionOutput(entry.output) ??
+    truncateInline(entry.output || '(no output)', 180);
+  return [
+    `[COMPACT:${reason}]: Turn ${entry.turn}. ${entry.stepKind ?? 'explore'} step.`,
+    `State: ${entry.stateDelta ?? 'No durable runtime state update'}.`,
+    `Callables: ${callables}.`,
+    `Result: ${result}.`,
+  ].join(' ');
+}
+
+function renderActionReplayEntry(
+  entry: Readonly<ActionLogEntry>,
+  checkpointTurns: ReadonlySet<number>,
+  hygieneMode: ActionLogHygieneMode
+): { text: string; compaction?: ActionLogCompaction } {
+  if (
+    checkpointTurns.has(entry.turn) &&
+    !entry.tags.includes('error') &&
+    entry.replayMode !== 'full'
+  ) {
+    return { text: '' };
+  }
+
+  if (entry.tombstone) {
+    return { text: entry.tombstone };
+  }
+
+  const fullText = renderFullActionReplayEntry(entry);
+  switch (entry.replayMode) {
+    case 'distill': {
+      const distilled = distillStructuredActionOutput(entry.output);
+      if (!distilled) {
+        return { text: fullText };
+      }
+      const text = `\`\`\`javascript\n${entry.code}\n\`\`\`\nResult:\n${distilled}`;
+      if (text.length >= fullText.length) {
+        return { text: fullText };
+      }
+      return {
+        text,
+        compaction: {
+          turn: entry.turn,
+          mode: 'distill',
+          reason: 'structured_output',
+          originalChars: fullText.length,
+          renderedChars: text.length,
+        },
+      };
+    }
+    case 'compact': {
+      const text = buildCompactActionReplayEntry(entry, hygieneMode);
+      if (text.length >= fullText.length) {
+        return { text: fullText };
+      }
+      return {
+        text,
+        compaction: {
+          turn: entry.turn,
+          mode: 'compact',
+          reason: getCompactionReason(entry, hygieneMode),
+          originalChars: fullText.length,
+          renderedChars: text.length,
+        },
+      };
+    }
+    case 'omit':
+      ensureEntryMetadata(entry as ActionLogEntry);
+      return { text: entry.summary ?? buildEntrySummary(entry) };
+    default:
+      return { text: fullText };
+  }
+}
+
+export function buildActionLogReplayPlan(
+  entries: readonly ActionLogEntry[],
+  policy: Readonly<ActionLogBuildPolicy>
+): ActionLogReplayPlan {
+  const promptFacingEntries = getPromptFacingActionLogEntries(entries);
+
+  if (promptFacingEntries.length === 0) {
+    return {
+      promptFacingEntries,
+      checkpointEntries: [],
+      historyText: '',
+      historyChars: 0,
+      compactions: [],
+    };
+  }
+
+  assignReplayModes(promptFacingEntries, policy);
+
+  const checkpointEntries = promptFacingEntries.filter(
+    (entry) => !entry.tags.includes('error') && entry.replayMode !== 'full'
+  );
+  const checkpointTurns = new Set(policy.checkpointTurns ?? []);
+  const renderedEntries = promptFacingEntries
+    .map((entry) =>
+      renderActionReplayEntry(
+        entry,
+        checkpointTurns,
+        policy.hygieneMode ?? 'none'
+      )
+    )
+    .filter((entry) => Boolean(entry.text));
+  const historyText = renderedEntries.map((entry) => entry.text).join('\n\n');
+  const compactions = renderedEntries
+    .map((entry) => entry.compaction)
+    .filter((entry): entry is ActionLogCompaction => Boolean(entry));
+
+  return {
+    promptFacingEntries,
+    checkpointEntries,
+    historyText,
+    historyChars: historyText.length,
+    compactions,
+  };
+}
+
+export function buildActionLogWithPolicy(
+  entries: readonly ActionLogEntry[],
+  policy: Readonly<ActionLogBuildPolicy>
+): string {
+  const replayPlan = buildActionLogReplayPlan(entries, policy);
+
+  if (
+    replayPlan.promptFacingEntries.length === 0 &&
+    !policy.delegatedContextSummary &&
+    !policy.checkpointSummary
+  ) {
+    return '';
+  }
+
+  const parts: string[] = [];
+  if (policy.restoreNotice) {
+    parts.push(policy.restoreNotice);
+  }
+  if (policy.delegatedContextSummary) {
+    parts.push(
+      `Delegated Context (runtime-only — explore with code):\n${policy.delegatedContextSummary}`
+    );
+  }
+  if (replayPlan.historyText) {
+    parts.push(replayPlan.historyText);
+  }
+  if (policy.checkpointSummary) {
+    parts.push(`Checkpoint Summary:\n${policy.checkpointSummary}`);
+  }
+
+  return parts.join('\n\n');
+}
+
+/**
+ * Split of the action log into stable (cache-friendly) and mutating pieces.
+ *
+ * - `summary` contains only pieces that are stable across a turn boundary:
+ *   restoreNotice, delegatedContextSummary, and checkpointSummary. These
+ *   change rarely (usually only at compaction), so they can safely carry a
+ *   prompt-cache breakpoint in a dedicated input field.
+ * - `history` contains the recent replay text, which changes every turn and
+ *   therefore must not be part of the cached prefix.
+ */
+export type ActionLogParts = {
+  summary: string;
+  history: string;
+  compactions: ActionLogCompaction[];
+};
+
+export function buildActionLogParts(
+  entries: readonly ActionLogEntry[],
+  policy: Readonly<ActionLogBuildPolicy>
+): ActionLogParts {
+  const replayPlan = buildActionLogReplayPlan(entries, policy);
+
+  const summaryParts: string[] = [];
+  if (policy.restoreNotice) {
+    summaryParts.push(policy.restoreNotice);
+  }
+  if (policy.delegatedContextSummary) {
+    summaryParts.push(
+      `Delegated Context (runtime-only — explore with code):\n${policy.delegatedContextSummary}`
+    );
+  }
+  if (policy.checkpointSummary) {
+    summaryParts.push(`Checkpoint Summary:\n${policy.checkpointSummary}`);
+  }
+
+  return {
+    summary: summaryParts.join('\n\n'),
+    history: replayPlan.historyText,
+    compactions: replayPlan.compactions,
+  };
+}
+
+export function buildActionEvidenceSummary(
+  entries: readonly ActionLogEntry[],
+  options?: Readonly<{
+    stateSummary?: string;
+    checkpointSummary?: string;
+    checkpointTurns?: readonly number[];
+  }>
+): string {
+  const promptFacingEntries = getPromptFacingActionLogEntries(entries);
+  const checkpointTurns = new Set(options?.checkpointTurns ?? []);
+  const summaries = promptFacingEntries
+    .map((entry) => {
+      if (checkpointTurns.has(entry.turn) && !entry.tags.includes('error')) {
+        return '';
+      }
+      ensureEntryMetadata(entry);
+      const detail =
+        entry.tombstone ?? entry.summary ?? buildEntrySummary(entry);
+      return `- Action ${entry.turn}: ${detail}`;
+    })
+    .filter(Boolean)
+    .join('\n');
+
+  const parts = ['Actor stopped without calling final(...). Evidence summary:'];
+  if (options?.checkpointSummary) {
+    parts.push(`Checkpoint summary:\n${options.checkpointSummary}`);
+  }
+  if (summaries) {
+    parts.push(summaries);
+  } else if (!options?.checkpointSummary) {
+    parts.push('- No actions were taken.');
+  }
+  if (options?.stateSummary) {
+    parts.push(`Current runtime state:\n${options.stateSummary}`);
+  }
+  return parts.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Runtime state inspection
+// ---------------------------------------------------------------------------
+
+/**
+ * Builds JavaScript code that introspects `globalThis` in the worker session.
+ * The code enumerates all user-defined variables, reporting their name, type,
+ * size, and a truncated preview.
+ */
+export function buildInspectRuntimeCode(
+  reservedNames: readonly string[],
+  baselineNames: readonly string[] = []
+): string {
+  const skipList = [...reservedNames, ...baselineNames]
+    .map((n) => `'${n}'`)
+    .join(',');
+  return `(() => {
+  const skip = new Set([${skipList}]);
+  const truncate = (text, maxChars) =>
+    text.length <= maxChars ? text : text.slice(0, maxChars - 3) + '...';
+  const previewAtom = (value) => {
+    if (value === null) return 'null';
+    if (value === undefined) return 'undefined';
+    const valueType = typeof value;
+    if (valueType === 'string') return JSON.stringify(truncate(value, 40));
+    if (valueType === 'number' || valueType === 'boolean' || valueType === 'bigint') {
+      return String(value);
+    }
+    if (valueType === 'symbol') return String(value);
+    if (valueType === 'function') {
+      return '[function ' + (value.name || 'anonymous') + ']';
+    }
+    if (Array.isArray(value)) return '[array(' + value.length + ')]';
+    if (value instanceof Date) {
+      return Number.isFinite(value.getTime()) ? value.toISOString() : String(value);
+    }
+    if (value instanceof Error) {
+      return (value.name || 'Error') + ': ' + (value.message || '');
+    }
+    if (value instanceof Map) return '[map(' + value.size + ')]';
+    if (value instanceof Set) return '[set(' + value.size + ')]';
+    const ctorName =
+      value && value.constructor && typeof value.constructor.name === 'string'
+        ? value.constructor.name
+        : '';
+    return ctorName && ctorName !== 'Object' ? '[' + ctorName + ']' : '[object]';
+  };
+  const previewValue = (value, type, ctor) => {
+    if (type === 'array') {
+      const items = value.slice(0, 3).map((item) => previewAtom(item));
+      return '[' + items.join(', ') + (value.length > 3 ? ', ...' : '') + ']';
+    }
+    if (type === 'map') {
+      const items = Array.from(value.entries())
+        .slice(0, 3)
+        .map(([key, item]) => previewAtom(key) + ' => ' + previewAtom(item));
+      return 'Map(' + value.size + ') {' + items.join(', ') + (value.size > 3 ? ', ...' : '') + '}';
+    }
+    if (type === 'set') {
+      const items = Array.from(value.values())
+        .slice(0, 5)
+        .map((item) => previewAtom(item));
+      return 'Set(' + value.size + ') {' + items.join(', ') + (value.size > 5 ? ', ...' : '') + '}';
+    }
+    if (type === 'date') return previewAtom(value);
+    if (type === 'error') return previewAtom(value);
+    if (type === 'function') return previewAtom(value);
+    if (type === 'object') {
+      const keys = Object.keys(value);
+      const shown = keys.slice(0, 4);
+      const prefix = ctor && ctor !== 'Object' ? ctor + ' ' : '';
+      return prefix + '{' + shown.join(', ') + (keys.length > shown.length ? ', ...' : '') + '}';
+    }
+    return previewAtom(value);
+  };
+  const describeSize = (value, type) => {
+    if (type === 'string') return value.length + ' chars';
+    if (type === 'array') return value.length + ' items';
+    if (type === 'map' || type === 'set') return value.size + ' items';
+    if (type === 'object') return Object.keys(value).length + ' keys';
+    return undefined;
+  };
+  const describeType = (value) => {
+    if (value === null) return { type: 'null' };
+    if (Array.isArray(value)) return { type: 'array', ctor: 'Array' };
+    if (value instanceof Map) return { type: 'map', ctor: 'Map' };
+    if (value instanceof Set) return { type: 'set', ctor: 'Set' };
+    if (value instanceof Date) return { type: 'date', ctor: 'Date' };
+    if (value instanceof Error) {
+      return {
+        type: 'error',
+        ctor:
+          typeof value.name === 'string' && value.name.trim()
+            ? value.name
+            : 'Error',
+      };
+    }
+    const type = typeof value;
+    if (type !== 'object') return { type };
+    const ctor =
+      value && value.constructor && typeof value.constructor.name === 'string'
+        ? value.constructor.name
+        : undefined;
+    return { type: 'object', ctor };
+  };
+  const entries = Object.getOwnPropertyNames(globalThis)
+    .filter((name) => !skip.has(name) && !name.startsWith('_'))
+    .sort()
+    .flatMap((name) => {
+      try {
+        const descriptor = Object.getOwnPropertyDescriptor(globalThis, name);
+        if (!descriptor) return [];
+        if (
+          'get' in descriptor &&
+          typeof descriptor.get === 'function' &&
+          !('value' in descriptor)
+        ) {
+          return [{ name, type: 'accessor', preview: '[getter omitted]' }];
+        }
+        const value = 'value' in descriptor ? descriptor.value : globalThis[name];
+        const meta = describeType(value);
+        const size = describeSize(value, meta.type);
+        const preview = previewValue(value, meta.type, meta.ctor);
+        return [
+          {
+            name,
+            type: meta.type,
+            ...(meta.ctor ? { ctor: meta.ctor } : {}),
+            ...(size ? { size } : {}),
+            ...(preview ? { preview: truncate(preview, 96) } : {}),
+          },
+        ];
+      } catch {
+        return [{ name, type: 'unknown', preview: '[unavailable]' }];
+      }
+    });
+  return JSON.stringify({ version: 1, entries });
+})()`;
+}
+
+export function buildInspectRuntimeBaselineCode(): string {
+  return `(() => JSON.stringify(Object.getOwnPropertyNames(globalThis).sort()))()`;
+}

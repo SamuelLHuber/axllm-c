@@ -1,0 +1,1953 @@
+module @ax.optimize version "0.1" {
+  dialect @ax.optimize version "0.1"
+
+  op ax.optimize.component @optimization_component {
+    attr core_kind = "func"
+    attr emit_module = "agent"
+    attr private = true
+    type signature = "(id:string, owner:string, kind:string, current:json, description:string, constraints:list<string>, depends_on:list<string>, preserve:bool, format:string, validation:json) -> json"
+    body @entry(%id: string, %owner: string, %kind: string, %current: json, %description: string, %constraints: json, %depends_on: json, %preserve: bool, %format: string, %validation: json) {
+      %out = core.map
+      core.set %out["id"] = %id
+      core.set %out["owner"] = %owner
+      core.set %out["kind"] = %kind
+      core.set %out["current"] = %current
+      core.set %out["description"] = %description
+      core.set %out["constraints"] = %constraints
+      core.set %out["dependsOn"] = %depends_on
+      core.set %out["preserve"] = %preserve
+      core.set %out["format"] = %format
+      core.set %out["validation"] = %validation
+      core.return %out
+    }
+  }
+
+  op ax.optimize.artifact @optimized_artifact {
+    attr core_kind = "func"
+    attr emit_module = "agent"
+    attr private = true
+    type signature = "(optimizer_name:string, optimizer_version:string, component_map:json, metadata:json) -> json"
+    body @entry(%optimizer_name: string, %optimizer_version: string, %component_map: json, %metadata: json) {
+      %empty_map = core.map
+      %out = core.map
+      core.set %out["artifactVersion"] = "axir-optimized-artifact-v1"
+      core.set %out["optimizerName"] = %optimizer_name
+      core.set %out["optimizerVersion"] = %optimizer_version
+      core.set %out["componentMap"] = %component_map
+      %meta = core.let %metadata
+      %meta_missing = core.call intrinsic.is_none(%metadata)
+      core.if %meta_missing {
+        %meta = core.let %empty_map
+      }
+      core.set %out["metadata"] = %meta
+      %provenance = core.get %meta["provenance"] default %empty_map
+      %evidence = core.get %meta["evidence"] default %empty_map
+      core.set %out["provenance"] = %provenance
+      core.set %out["evidence"] = %evidence
+      core.return %out
+    }
+  }
+
+  op ax.optimize.semantic @validate_optimization_component_value {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(component:json, value:json) -> bool throws"
+    body @entry(%component: json, %value: json) {
+      %current = core.get %component["current"] default null
+      %current_is_string = core.type_is %current type "string"
+      core.if %current_is_string {
+        %value_is_string = core.type_is %value type "string"
+        %bad_string = core.call intrinsic.not(%value_is_string)
+        core.if %bad_string {
+          %id = core.get %component["id"] default ""
+          %message = core.call intrinsic.string.format("invalid optimized component value for {}", %id)
+          %error = core.call intrinsic.error.runtime(%message)
+          core.raise %error
+        }
+      }
+      %current_is_object = core.type_is %current type "object"
+      core.if %current_is_object {
+        %value_is_object = core.type_is %value type "object"
+        %bad_object = core.call intrinsic.not(%value_is_object)
+        core.if %bad_object {
+          %id_object = core.get %component["id"] default ""
+          %message_object = core.call intrinsic.string.format("invalid optimized component value for {}", %id_object)
+          %error_object = core.call intrinsic.error.runtime(%message_object)
+          core.raise %error_object
+        }
+      }
+      %current_is_list = core.type_is %current type "list"
+      core.if %current_is_list {
+        %value_is_list = core.type_is %value type "list"
+        %bad_list = core.call intrinsic.not(%value_is_list)
+        core.if %bad_list {
+          %id_list = core.get %component["id"] default ""
+          %message_list = core.call intrinsic.string.format("invalid optimized component value for {}", %id_list)
+          %error_list = core.call intrinsic.error.runtime(%message_list)
+          core.raise %error_list
+        }
+      }
+      %current_is_number = core.type_is %current type "number"
+      core.if %current_is_number {
+        %value_is_number = core.type_is %value type "number"
+        %bad_number = core.call intrinsic.not(%value_is_number)
+        core.if %bad_number {
+          %id_number = core.get %component["id"] default ""
+          %message_number = core.call intrinsic.string.format("invalid optimized component value for {}", %id_number)
+          %error_number = core.call intrinsic.error.runtime(%message_number)
+          core.raise %error_number
+        }
+      }
+      %current_is_boolean = core.type_is %current type "boolean"
+      core.if %current_is_boolean {
+        %value_is_boolean = core.type_is %value type "boolean"
+        %bad_boolean = core.call intrinsic.not(%value_is_boolean)
+        core.if %bad_boolean {
+          %id_boolean = core.get %component["id"] default ""
+          %message_boolean = core.call intrinsic.string.format("invalid optimized component value for {}", %id_boolean)
+          %error_boolean = core.call intrinsic.error.runtime(%message_boolean)
+          core.raise %error_boolean
+        }
+      }
+      %format = core.get %component["format"] default ""
+      %is_snake = core.call intrinsic.eq(%format, "snake_case")
+      core.if %is_snake {
+        %snake_ok = core.regex_match %value pattern "^[a-z][a-z0-9_]{0,31}$"
+        %bad_snake = core.call intrinsic.not(%snake_ok)
+        core.if %bad_snake {
+          %error_snake = core.call intrinsic.error.runtime("invalid optimized function name")
+          core.raise %error_snake
+        }
+      }
+      core.return true
+    }
+  }
+
+  op ax.optimize.semantic @validate_optimization_component_map {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(components:list<json>, component_map:json) -> bool throws"
+    body @entry(%components: json, %component_map: json) {
+      %known = core.list
+      %component_by_id = core.map
+      core.for %component in %components {
+        %id = core.get %component["id"] default ""
+        core.append %known, %id
+        core.set %component_by_id[%id] = %component
+      }
+      %keys = core.call intrinsic.map.keys(%component_map)
+      core.for %id in %keys {
+        %ok = core.call intrinsic.contains(%known, %id)
+        %bad = core.call intrinsic.not(%ok)
+        core.if %bad {
+          %message = core.call intrinsic.string.format("unknown optimized component id: {}", %id)
+          %error = core.call intrinsic.error.runtime(%message)
+          core.raise %error
+        }
+        %component = core.get %component_by_id[%id]
+        %value = core.get %component_map[%id]
+        core.call @validate_optimization_component_value(%component, %value)
+      }
+      core.return true
+    }
+  }
+
+  op ax.optimize.semantic @validate_optimized_artifact_provenance {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(artifact:json, components:list<json>) -> bool throws"
+    body @entry(%artifact: json, %components: json) {
+      %empty_map = core.map
+      %provenance = core.get %artifact["provenance"] default %empty_map
+      %owners = core.get %provenance["componentOwners"] default %empty_map
+      %owners_is_object = core.type_is %owners type "object"
+      %bad_owners = core.call intrinsic.not(%owners_is_object)
+      core.if %bad_owners {
+        %owners_error = core.call intrinsic.error.runtime("optimized artifact provenance componentOwners must be an object")
+        core.raise %owners_error
+      }
+      core.for %component in %components {
+        %id = core.get %component["id"] default ""
+        %expected_owner = core.get %owners[%id] default null
+        %has_expected_owner = core.call intrinsic.is_not_none(%expected_owner)
+        core.if %has_expected_owner {
+          %actual_owner = core.get %component["owner"] default ""
+          %owner_ok = core.call intrinsic.eq(%expected_owner, %actual_owner)
+          %stale_owner = core.call intrinsic.not(%owner_ok)
+          core.if %stale_owner {
+            %message = core.call intrinsic.string.format("stale optimized component owner: {}", %id)
+            %error = core.call intrinsic.error.runtime(%message)
+            core.raise %error
+          }
+        }
+      }
+      core.return true
+    }
+  }
+
+  op ax.optimize.semantic @validate_optimized_artifact {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(artifact:json, components:list<json>) -> json throws"
+    body @entry(%artifact: json, %components: json) {
+      %is_object = core.type_is %artifact type "object"
+      %not_object = core.call intrinsic.not(%is_object)
+      core.if %not_object {
+        %error = core.call intrinsic.error.runtime("optimized artifact must be an object")
+        core.raise %error
+      }
+      %version = core.get %artifact["artifactVersion"] default ""
+      %version_ok = core.call intrinsic.eq(%version, "axir-optimized-artifact-v1")
+      %bad_version = core.call intrinsic.not(%version_ok)
+      core.if %bad_version {
+        %error_version = core.call intrinsic.error.runtime("unsupported optimized artifact version")
+        core.raise %error_version
+      }
+      %optimizer_name = core.get %artifact["optimizerName"] default ""
+      %name_is_string = core.type_is %optimizer_name type "string"
+      %name_empty = core.call intrinsic.eq(%optimizer_name, "")
+      %bad_name_type = core.call intrinsic.not(%name_is_string)
+      %bad_name = core.call intrinsic.or(%bad_name_type, %name_empty)
+      core.if %bad_name {
+        %name_error = core.call intrinsic.error.runtime("optimized artifact optimizerName must be a non-empty string")
+        core.raise %name_error
+      }
+      %optimizer_version = core.get %artifact["optimizerVersion"] default ""
+      %version_is_string = core.type_is %optimizer_version type "string"
+      %optimizer_version_empty = core.call intrinsic.eq(%optimizer_version, "")
+      %bad_optimizer_version_type = core.call intrinsic.not(%version_is_string)
+      %bad_optimizer_version = core.call intrinsic.or(%bad_optimizer_version_type, %optimizer_version_empty)
+      core.if %bad_optimizer_version {
+        %optimizer_version_error = core.call intrinsic.error.runtime("optimized artifact optimizerVersion must be a non-empty string")
+        core.raise %optimizer_version_error
+      }
+      %empty_map = core.map
+      %component_map = core.get %artifact["componentMap"] default %empty_map
+      %component_map_is_object = core.type_is %component_map type "object"
+      %bad_component_map = core.call intrinsic.not(%component_map_is_object)
+      core.if %bad_component_map {
+        %error_map = core.call intrinsic.error.runtime("optimized artifact componentMap must be an object")
+        core.raise %error_map
+      }
+      %metadata = core.get %artifact["metadata"] default null
+      %metadata_is_object = core.type_is %metadata type "object"
+      %bad_metadata = core.call intrinsic.not(%metadata_is_object)
+      core.if %bad_metadata {
+        %metadata_error = core.call intrinsic.error.runtime("optimized artifact metadata must be an object")
+        core.raise %metadata_error
+      }
+      %provenance = core.get %artifact["provenance"] default null
+      %provenance_is_object = core.type_is %provenance type "object"
+      %bad_provenance = core.call intrinsic.not(%provenance_is_object)
+      core.if %bad_provenance {
+        %provenance_error = core.call intrinsic.error.runtime("optimized artifact provenance must be an object")
+        core.raise %provenance_error
+      }
+      %evidence = core.get %artifact["evidence"] default null
+      %evidence_is_object = core.type_is %evidence type "object"
+      %bad_evidence = core.call intrinsic.not(%evidence_is_object)
+      core.if %bad_evidence {
+        %evidence_error = core.call intrinsic.error.runtime("optimized artifact evidence must be an object")
+        core.raise %evidence_error
+      }
+      core.call @validate_optimization_component_map(%components, %component_map)
+      core.call @validate_optimized_artifact_provenance(%artifact, %components)
+      core.return %artifact
+    }
+  }
+
+  op ax.optimize.semantic @serialize_optimized_artifact {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(artifact:json) -> string"
+    body @entry(%artifact: json) {
+      %text = core.call intrinsic.json.stringify(%artifact)
+      core.return %text
+    }
+  }
+
+  op ax.optimize.semantic @deserialize_optimized_artifact {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(text:string, components:list<json>) -> json throws"
+    body @entry(%text: string, %components: json) {
+      %artifact = core.call intrinsic.json.parse(%text)
+      %validated = core.call @validate_optimized_artifact(%artifact, %components)
+      core.return %validated
+    }
+  }
+
+  op ax.optimize.semantic @optimization_changed_components {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(components:list<json>, component_map:json) -> list<json>"
+    body @entry(%components: json, %component_map: json) {
+      %changes = core.list
+      core.for %component in %components {
+        %id = core.get %component["id"] default ""
+        %current = core.get %component["current"]
+        %next = core.get %component_map[%id] default %current
+        %same = core.call intrinsic.eq(%current, %next)
+        %changed = core.call intrinsic.not(%same)
+        core.if %changed {
+          %entry = core.map
+          core.set %entry["id"] = %id
+          core.set %entry["current"] = %current
+          core.set %entry["next"] = %next
+          core.append %changes, %entry
+        }
+      }
+      core.return %changes
+    }
+  }
+
+  op ax.optimize.semantic @optimization_component_current_map {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(components:list<json>) -> json"
+    body @entry(%components: json) {
+      %out = core.map
+      core.for %component in %components {
+        %id = core.get %component["id"] default ""
+        %current = core.get %component["current"]
+        core.set %out[%id] = %current
+      }
+      core.return %out
+    }
+  }
+
+  op ax.optimize.semantic @normalize_optimization_dataset {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(dataset:json) -> json"
+    body @entry(%dataset: json) {
+      %empty_list = core.list
+      %is_object = core.type_is %dataset type "object"
+      core.if %is_object {
+        %train = core.get %dataset["train"] default %empty_list
+        %validation = core.get %dataset["validation"] default %empty_list
+        %out_obj = core.map
+        core.set %out_obj["train"] = %train
+        core.set %out_obj["validation"] = %validation
+        core.return %out_obj
+      }
+      %out_list = core.map
+      core.set %out_list["train"] = %dataset
+      core.set %out_list["validation"] = %empty_list
+      core.return %out_list
+    }
+  }
+
+  op ax.optimize.semantic @normalize_optimization_metric_scores {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(raw:json) -> json"
+    body @entry(%raw: json) {
+      %is_number = core.type_is %raw type "number"
+      core.if %is_number {
+        %out_number = core.map
+        core.set %out_number["score"] = %raw
+        core.return %out_number
+      }
+      %is_object = core.type_is %raw type "object"
+      core.if %is_object {
+        core.return %raw
+      }
+      %out_zero = core.map
+      core.set %out_zero["score"] = 0
+      core.return %out_zero
+    }
+  }
+
+  op ax.optimize.semantic @scalarize_optimization_scores {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(scores:json, options:json) -> f64"
+    body @entry(%scores: json, %options: json) {
+      %metric_key = core.get %options["paretoMetricKey"] default ""
+      %has_metric = core.call intrinsic.ne(%metric_key, "")
+      core.if %has_metric {
+        %picked = core.get %scores[%metric_key] default 0
+        core.return %picked
+      }
+      %values = core.call intrinsic.map.values(%scores)
+      %sum = core.let 0
+      %count = core.let 0
+      core.for %value in %values {
+        %sum_next = core.call intrinsic.add(%sum, %value)
+        %count_next = core.call intrinsic.add(%count, 1)
+        %sum = core.let %sum_next
+        %count = core.let %count_next
+      }
+      %empty = core.call intrinsic.eq(%count, 0)
+      core.if %empty {
+        core.return 0
+      }
+      %avg = core.call intrinsic.div(%sum, %count)
+      core.return %avg
+    }
+  }
+
+  op ax.optimize.semantic @optimization_action_name_matches {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(expected:string, call:json) -> bool"
+    body @entry(%expected: string, %call: json) {
+      %qualified = core.get %call["qualifiedName"] default ""
+      %name = core.get %call["name"] default ""
+      %qualified_match = core.call intrinsic.eq(%qualified, %expected)
+      %name_match = core.call intrinsic.eq(%name, %expected)
+      %dot_expected = core.call intrinsic.add(".", %expected)
+      %suffix_match = core.call intrinsic.string.ends_with(%qualified, %dot_expected)
+      %direct_match = core.call intrinsic.or(%qualified_match, %name_match)
+      %any_match = core.call intrinsic.or(%direct_match, %suffix_match)
+      core.return %any_match
+    }
+  }
+
+  op ax.optimize.semantic @adjust_optimization_score_for_actions {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(score:f64, task:json, prediction:json) -> f64"
+    body @entry(%score: json, %task: json, %prediction: json) {
+      %empty_list = core.list
+      %function_calls = core.get %prediction["functionCalls"] default %empty_list
+      %expected_actions = core.get %task["expectedActions"] default %empty_list
+      %forbidden_actions = core.get %task["forbiddenActions"] default %empty_list
+      %adjusted = core.let %score
+      %expected_count = core.call intrinsic.len(%expected_actions)
+      %has_expected = core.call intrinsic.gt(%expected_count, 0)
+      core.if %has_expected {
+        %matched = core.let 0
+        core.for %expected in %expected_actions {
+          %found = core.let false
+          core.for %call in %function_calls {
+            %call_matches = core.call @optimization_action_name_matches(%expected, %call)
+            core.if %call_matches {
+              %found = core.let true
+            }
+          }
+          core.if %found {
+            %matched_next = core.call intrinsic.add(%matched, 1)
+            %matched = core.let %matched_next
+          }
+        }
+        %ratio = core.call intrinsic.div(%matched, %expected_count)
+        %half_ratio = core.call intrinsic.mul(0.5, %ratio)
+        %factor = core.call intrinsic.add(0.5, %half_ratio)
+        %adjusted_next = core.call intrinsic.mul(%adjusted, %factor)
+        %adjusted = core.let %adjusted_next
+      }
+      core.for %forbidden in %forbidden_actions {
+        %bad_found = core.let false
+        core.for %call in %function_calls {
+          %bad_match = core.call @optimization_action_name_matches(%forbidden, %call)
+          core.if %bad_match {
+            %bad_found = core.let true
+          }
+        }
+        core.if %bad_found {
+          %penalized = core.call intrinsic.mul(%adjusted, 0.2)
+          %adjusted = core.let %penalized
+        }
+      }
+      core.return %adjusted
+    }
+  }
+
+  op ax.optimize.semantic @map_optimization_judge_quality_to_score {
+    attr core_kind = "func"
+    attr emit_module = "agent"
+    attr private = true
+    type signature = "(quality:string) -> f64"
+    body @entry(%quality: string) {
+      %normalized = core.call intrinsic.string.lower(%quality)
+      %is_excellent = core.call intrinsic.eq(%normalized, "excellent")
+      core.if %is_excellent {
+        core.return 1
+      }
+      %is_good = core.call intrinsic.eq(%normalized, "good")
+      core.if %is_good {
+        core.return 0.8
+      }
+      %is_acceptable = core.call intrinsic.eq(%normalized, "acceptable")
+      core.if %is_acceptable {
+        core.return 0.5
+      }
+      %is_poor = core.call intrinsic.eq(%normalized, "poor")
+      core.if %is_poor {
+        core.return 0.2
+      }
+      %is_unacceptable = core.call intrinsic.eq(%normalized, "unacceptable")
+      core.if %is_unacceptable {
+        core.return 0
+      }
+      core.return 0.5
+    }
+  }
+
+  op ax.optimize.semantic @build_optimization_judge_payload {
+    attr core_kind = "func"
+    attr emit_module = "agent"
+    attr private = true
+    type signature = "(task:json, prediction:json, criteria:string) -> json"
+    body @entry(%task: json, %prediction: json, %criteria: string) {
+      %empty_list = core.list
+      %out = core.map
+      %task_input = core.get %task["input"] default %task
+      core.set %out["taskInput"] = %task_input
+      %task_criteria = core.get %task["criteria"] default %criteria
+      core.set %out["criteria"] = %task_criteria
+      %expected_output = core.get %task["expectedOutput"]
+      core.set %out["expectedOutput"] = %expected_output
+      %expected_actions = core.get %task["expectedActions"] default %empty_list
+      core.set %out["expectedActions"] = %expected_actions
+      %forbidden_actions = core.get %task["forbiddenActions"] default %empty_list
+      core.set %out["forbiddenActions"] = %forbidden_actions
+      %metadata = core.get %task["metadata"]
+      core.set %out["metadata"] = %metadata
+      %completion_type = core.get %prediction["completionType"] default "error"
+      core.set %out["completionType"] = %completion_type
+      %clarification = core.get %prediction["clarification"]
+      core.set %out["clarification"] = %clarification
+      %final_output = core.get %prediction["output"] default %prediction
+      core.set %out["finalOutput"] = %final_output
+      %guidance_log = core.get %prediction["guidanceLog"] default ""
+      core.set %out["guidanceLog"] = %guidance_log
+      %action_log = core.get %prediction["actionLog"] default %empty_list
+      core.set %out["actionLog"] = %action_log
+      %function_calls = core.get %prediction["functionCalls"] default %empty_list
+      core.set %out["functionCalls"] = %function_calls
+      %tool_errors = core.get %prediction["toolErrors"] default %empty_list
+      core.set %out["toolErrors"] = %tool_errors
+      %turn_count = core.get %prediction["turnCount"] default 0
+      core.set %out["turnCount"] = %turn_count
+      %usage = core.get %prediction["usage"] default %empty_list
+      core.set %out["usage"] = %usage
+      %trace = core.get %prediction["trace"]
+      core.set %out["trace"] = %trace
+      %empty_failure_signals = core.list
+      %failure_signals = core.get %prediction["failureSignals"] default %empty_failure_signals
+      core.set %out["failureSignals"] = %failure_signals
+      core.return %out
+    }
+  }
+
+  op ax.optimize.semantic @build_optimization_eval_row {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(task:json, prediction:json, scores:json, scalar:f64, trace:json, error:json) -> json"
+    body @entry(%task: json, %prediction: json, %scores: json, %scalar: json, %trace: json, %error: json) {
+      %out = core.map
+      core.set %out["input"] = %task
+      core.set %out["prediction"] = %prediction
+      core.set %out["scores"] = %scores
+      core.set %out["scalar"] = %scalar
+      core.set %out["trace"] = %trace
+      %has_error = core.call intrinsic.is_not_none(%error)
+      core.if %has_error {
+        core.set %out["error"] = %error
+      }
+      core.return %out
+    }
+  }
+
+  op ax.optimize.semantic @build_optimization_eval_result {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(rows:list<json>, candidate_map:json, phase:string) -> json"
+    body @entry(%rows: json, %candidate_map: json, %phase: string) {
+      %sum = core.let 0
+      %count = core.let 0
+      core.for %row in %rows {
+        %scalar = core.get %row["scalar"] default 0
+        %sum_next = core.call intrinsic.add(%sum, %scalar)
+        %count_next = core.call intrinsic.add(%count, 1)
+        %sum = core.let %sum_next
+        %count = core.let %count_next
+      }
+      %avg = core.let 0
+      %has_rows = core.call intrinsic.gt(%count, 0)
+      core.if %has_rows {
+        %avg_next = core.call intrinsic.div(%sum, %count)
+        %avg = core.let %avg_next
+      }
+      %out = core.map
+      core.set %out["phase"] = %phase
+      core.set %out["candidateMap"] = %candidate_map
+      core.set %out["rows"] = %rows
+      core.set %out["sum"] = %sum
+      core.set %out["avg"] = %avg
+      core.set %out["count"] = %count
+      core.return %out
+    }
+  }
+
+  op ax.optimize.semantic @filter_optimization_components {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(components:list<json>, target:json) -> list<json> throws"
+    body @entry(%components: json, %target: json) {
+      %out = core.list
+      %is_list = core.type_is %target type "list"
+      %is_all = core.call intrinsic.eq(%target, "all")
+      %is_actor = core.call intrinsic.eq(%target, "actor")
+      %is_responder = core.call intrinsic.eq(%target, "responder")
+      %is_flow = core.call intrinsic.eq(%target, "flow")
+      core.for %component in %components {
+        %id = core.get %component["id"] default ""
+        %kind = core.get %component["kind"] default ""
+        %include = core.let false
+        core.if %is_all {
+          %include = core.let true
+        }
+        core.if %is_list {
+          %listed = core.call intrinsic.contains(%target, %id)
+          core.if %listed {
+            %include = core.let true
+          }
+        }
+        core.if %is_actor {
+          %actor_match = core.call intrinsic.string.ends_with(%id, ".actor")
+          %actor_component_match = core.call intrinsic.contains(%id, ".actor::")
+          %actor_any_match = core.call intrinsic.or(%actor_match, %actor_component_match)
+          %stage_instruction_match = core.call intrinsic.eq(%id, "root::instruction")
+          %actor_any_match = core.call intrinsic.or(%actor_any_match, %stage_instruction_match)
+          core.if %actor_any_match {
+            %include = core.let true
+          }
+        }
+        core.if %is_responder {
+          %responder_match = core.call intrinsic.string.ends_with(%id, ".responder")
+          %responder_component_match = core.call intrinsic.contains(%id, ".responder::")
+          %responder_any_match = core.call intrinsic.or(%responder_match, %responder_component_match)
+          core.if %responder_any_match {
+            %include = core.let true
+          }
+        }
+        core.if %is_flow {
+          %flow_component = core.call intrinsic.eq(%kind, "flow-graph")
+          core.if %flow_component {
+            %include = core.let true
+          }
+        }
+        %explicit_match = core.call intrinsic.eq(%target, %id)
+        core.if %explicit_match {
+          %include = core.let true
+        }
+        core.if %include {
+          core.append %out, %component
+        }
+      }
+      %count = core.call intrinsic.len(%out)
+      %empty = core.call intrinsic.eq(%count, 0)
+      core.if %empty {
+        %message = core.call intrinsic.string.format("no optimizable components match target: {}", %target)
+        %error = core.call intrinsic.error.runtime(%message)
+        core.raise %error
+      }
+      core.return %out
+    }
+  }
+
+  op ax.optimize.semantic @build_optimizer_request {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(program_kind:string, components:list<json>, dataset:list<json>, options:json, trace:json) -> json"
+    body @entry(%program_kind: string, %components: json, %dataset: json, %options: json, %trace: json) {
+      %out = core.map
+      core.set %out["contractVersion"] = "axir-optimize-contract-v1"
+      core.set %out["programKind"] = %program_kind
+      core.set %out["components"] = %components
+      core.set %out["dataset"] = %dataset
+      core.set %out["options"] = %options
+      core.set %out["trace"] = %trace
+      %evaluator = core.map
+      %methods = core.list
+      core.append %methods, "evaluate"
+      core.set %evaluator["available"] = true
+      core.set %evaluator["contractVersion"] = "axir-optimizer-evaluator-v1"
+      core.set %evaluator["evidenceContractVersion"] = "axir-optimizer-evidence-v1"
+      core.set %evaluator["methods"] = %methods
+      core.set %out["evaluator"] = %evaluator
+      core.return %out
+    }
+  }
+
+  op ax.optimize.semantic @prepare_optimizer_run {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(program_kind:string, components:list<json>, dataset:json, options:json, trace:json, evaluator_available:bool) -> json throws"
+    body @entry(%program_kind: string, %components: json, %dataset: json, %options: json, %trace: json, %evaluator_available: bool) {
+      %empty_map = core.map
+      %opts_missing = core.call intrinsic.is_none(%options)
+      %opts = core.let %options
+      core.if %opts_missing {
+        %opts = core.let %empty_map
+      }
+      %normalized = core.call @normalize_optimization_dataset(%dataset)
+      %target = core.get %opts["target"] default "all"
+      %selected = core.call @filter_optimization_components(%components, %target)
+      %request_options = core.call intrinsic.map.merge(%empty_map, %opts)
+      core.call intrinsic.map.delete(%request_options, "client")
+      core.call intrinsic.map.delete(%request_options, "ai")
+      core.call intrinsic.map.delete(%request_options, "engine")
+      core.call intrinsic.map.delete(%request_options, "optimizer")
+      %request = core.call @build_optimizer_request(%program_kind, %selected, %normalized, %request_options, %trace)
+      %evaluator = core.get %request["evaluator"]
+      core.set %evaluator["available"] = %evaluator_available
+      core.set %request["evaluator"] = %evaluator
+      %out = core.map
+      core.set %out["components"] = %components
+      core.set %out["selectedComponents"] = %selected
+      core.set %out["dataset"] = %normalized
+      core.set %out["options"] = %request_options
+      core.set %out["request"] = %request
+      core.return %out
+    }
+  }
+
+  op ax.optimize.semantic @normalize_optimizer_engine_response {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(response:json, engine_name:string, engine_version:string, components:list<json>) -> json throws"
+    body @entry(%response: json, %engine_name: string, %engine_version: string, %components: json) {
+      %response_is_object = core.type_is %response type "object"
+      %bad_response = core.call intrinsic.not(%response_is_object)
+      core.if %bad_response {
+        %error = core.call intrinsic.error.runtime("optimizer engine must return an optimized artifact")
+        core.raise %error
+      }
+      %empty_map = core.map
+      %has_artifact = core.call intrinsic.map.contains(%response, "artifact")
+      %artifact_source = core.let %response
+      core.if %has_artifact {
+        %artifact_value = core.get %response["artifact"]
+        %artifact_source = core.let %artifact_value
+      }
+      %artifact = core.call intrinsic.map.merge(%empty_map, %artifact_source)
+      %artifact_is_object = core.type_is %artifact type "object"
+      %bad_artifact = core.call intrinsic.not(%artifact_is_object)
+      core.if %bad_artifact {
+        %artifact_error = core.call intrinsic.error.runtime("optimizer engine must return an optimized artifact")
+        core.raise %artifact_error
+      }
+      %version = core.get %artifact["artifactVersion"] default null
+      %missing_version = core.call intrinsic.is_none(%version)
+      core.if %missing_version {
+        core.set %artifact["artifactVersion"] = "axir-optimized-artifact-v1"
+      }
+      %name = core.get %artifact["optimizerName"] default null
+      %missing_name = core.call intrinsic.is_none(%name)
+      core.if %missing_name {
+        core.set %artifact["optimizerName"] = %engine_name
+      }
+      %engine_ver = core.get %artifact["optimizerVersion"] default null
+      %missing_engine_ver = core.call intrinsic.is_none(%engine_ver)
+      core.if %missing_engine_ver {
+        core.set %artifact["optimizerVersion"] = %engine_version
+      }
+      %component_map = core.get %artifact["componentMap"] default null
+      %missing_component_map = core.call intrinsic.is_none(%component_map)
+      core.if %missing_component_map {
+        %snake_map = core.get %artifact["component_map"] default %empty_map
+        core.set %artifact["componentMap"] = %snake_map
+      }
+      %metadata = core.get %artifact["metadata"] default null
+      %missing_metadata = core.call intrinsic.is_none(%metadata)
+      core.if %missing_metadata {
+        %default_metadata = core.map
+        core.set %artifact["metadata"] = %default_metadata
+      }
+      %metadata_final = core.get %artifact["metadata"]
+      %provenance = core.get %artifact["provenance"] default null
+      %missing_provenance = core.call intrinsic.is_none(%provenance)
+      core.if %missing_provenance {
+        %empty_provenance = core.map
+        %metadata_provenance = core.get %metadata_final["provenance"] default %empty_provenance
+        core.set %artifact["provenance"] = %metadata_provenance
+      }
+      %evidence = core.get %artifact["evidence"] default null
+      %missing_evidence = core.call intrinsic.is_none(%evidence)
+      core.if %missing_evidence {
+        %empty_evidence = core.map
+        %metadata_evidence = core.get %metadata_final["evidence"] default %empty_evidence
+        core.set %artifact["evidence"] = %metadata_evidence
+      }
+      %validated = core.call @validate_optimized_artifact(%artifact, %components)
+      %map = core.get %validated["componentMap"]
+      %changed = core.call @optimization_changed_components(%components, %map)
+      core.set %validated["changedComponents"] = %changed
+      core.return %validated
+    }
+  }
+
+  op ax.optimize.semantic @build_optimizer_evidence_batch {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(eval_result:json, components:list<json>) -> json"
+    body @entry(%eval_result: json, %components: json) {
+      %empty_list = core.list
+      %empty_map = core.map
+      %rows = core.get %eval_result["rows"] default %empty_list
+      %outputs = core.list
+      %scores = core.list
+      %score_vectors = core.list
+      %trajectories = core.list
+      core.for %row in %rows {
+        %prediction = core.get %row["prediction"] default %empty_map
+        %output = core.get %prediction["output"] default %prediction
+        core.append %outputs, %output
+        %scalar = core.get %row["scalar"] default 0
+        core.append %scores, %scalar
+        %vector = core.get %row["scores"] default %empty_map
+        core.append %score_vectors, %vector
+        %trajectory = core.map
+        %trace = core.get %row["trace"]
+        core.set %trajectory["trace"] = %trace
+        core.set %trajectory["output"] = %output
+        %row_error = core.get %row["error"] default null
+        %prediction_error = core.get %prediction["error"] default %row_error
+        %has_error = core.call intrinsic.is_not_none(%prediction_error)
+        core.if %has_error {
+          core.set %trajectory["error"] = %prediction_error
+        }
+        core.append %trajectories, %trajectory
+      }
+      %reflective = core.map
+      core.for %component in %components {
+        %id = core.get %component["id"] default ""
+        %items = core.list
+        core.for %row in %rows {
+          %entry = core.map
+          %prediction = core.get %row["prediction"] default %empty_map
+          %output = core.get %prediction["output"] default %prediction
+          %scalar = core.get %row["scalar"] default 0
+          %trace = core.get %row["trace"]
+          core.set %entry["score"] = %scalar
+          core.set %entry["output"] = %output
+          core.set %entry["trace"] = %trace
+          %error = core.get %row["error"] default null
+          %has_error = core.call intrinsic.is_not_none(%error)
+          core.if %has_error {
+            core.set %entry["error"] = %error
+          }
+          core.append %items, %entry
+        }
+        core.set %reflective[%id] = %items
+      }
+      %out = core.map
+      core.set %out["contractVersion"] = "axir-optimizer-evidence-v1"
+      %candidate_map = core.get %eval_result["candidateMap"] default %empty_map
+      core.set %out["candidateMap"] = %candidate_map
+      core.set %out["outputs"] = %outputs
+      core.set %out["scores"] = %scores
+      core.set %out["scoreVectors"] = %score_vectors
+      core.set %out["trajectories"] = %trajectories
+      %avg = core.get %eval_result["avg"] default 0
+      %sum = core.get %eval_result["sum"] default 0
+      %count = core.get %eval_result["count"] default 0
+      core.set %out["avg"] = %avg
+      core.set %out["sum"] = %sum
+      core.set %out["count"] = %count
+      core.set %out["reflectiveDataset"] = %reflective
+      core.return %out
+    }
+  }
+
+  op ax.optimize.semantic @build_agent_eval_prediction {
+    attr core_kind = "func"
+    attr emit_module = "agent"
+    attr private = true
+    type signature = "(output:json, action_log:list<json>, usage:json, trace:json) -> json"
+    body @entry(%output: json, %action_log: json, %usage: json, %trace: json) {
+      %out = core.map
+      core.set %out["completionType"] = "final"
+      core.set %out["output"] = %output
+      core.set %out["finalOutput"] = %output
+      core.set %out["actionLog"] = %action_log
+      core.set %out["usage"] = %usage
+      core.set %out["trace"] = %trace
+      %empty_list = core.list
+      %failure_signals = core.get %trace["failure_signals"] default %empty_list
+      core.set %out["failureSignals"] = %failure_signals
+      core.set %out["functionCalls"] = %empty_list
+      core.set %out["toolErrors"] = %empty_list
+      core.set %out["turnCount"] = 0
+      core.return %out
+    }
+  }
+
+  op ax.optimize.semantic @ace_estimate_token_count {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(text:string) -> i64"
+    body @entry(%text: string) {
+      %len = core.call intrinsic.len(%text)
+      %tokens = core.let 0
+      %remaining = core.let %len
+      core.loop {
+        %done = core.call intrinsic.lte(%remaining, 0)
+        core.if %done {
+          core.break
+        }
+        %tokens_next = core.call intrinsic.add(%tokens, 1)
+        %tokens = core.let %tokens_next
+        %remaining_next = core.call intrinsic.add(%remaining, -4)
+        %remaining = core.let %remaining_next
+      }
+      core.return %tokens
+    }
+  }
+
+  op ax.optimize.semantic @ace_recompute_playbook_stats {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(playbook:json) -> json"
+    body @entry(%playbook: json) {
+      %empty_map = core.map
+      %sections = core.get %playbook["sections"] default %empty_map
+      %bullet_count = core.let 0
+      %helpful_count = core.let 0
+      %harmful_count = core.let 0
+      %token_estimate = core.let 0
+      %section_lists = core.call intrinsic.map.values(%sections)
+      core.for %bullets in %section_lists {
+        core.for %bullet in %bullets {
+          %bullet_count_next = core.call intrinsic.add(%bullet_count, 1)
+          %bullet_count = core.let %bullet_count_next
+          %helpful = core.get %bullet["helpfulCount"] default 0
+          %harmful = core.get %bullet["harmfulCount"] default 0
+          %helpful_count_next = core.call intrinsic.add(%helpful_count, %helpful)
+          %helpful_count = core.let %helpful_count_next
+          %harmful_count_next = core.call intrinsic.add(%harmful_count, %harmful)
+          %harmful_count = core.let %harmful_count_next
+          %content = core.get %bullet["content"] default ""
+          %bullet_tokens = core.call @ace_estimate_token_count(%content)
+          %token_estimate_next = core.call intrinsic.add(%token_estimate, %bullet_tokens)
+          %token_estimate = core.let %token_estimate_next
+        }
+      }
+      %stats = core.map
+      core.set %stats["bulletCount"] = %bullet_count
+      core.set %stats["helpfulCount"] = %helpful_count
+      core.set %stats["harmfulCount"] = %harmful_count
+      core.set %stats["tokenEstimate"] = %token_estimate
+      core.set %playbook["stats"] = %stats
+      core.return %playbook
+    }
+  }
+
+  op ax.optimize.semantic @ace_empty_playbook {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(description:json, now:string) -> json"
+    body @entry(%description: json, %now: string) {
+      %out = core.map
+      core.set %out["version"] = 1
+      %sections = core.map
+      core.set %out["sections"] = %sections
+      %stats = core.map
+      core.set %stats["bulletCount"] = 0
+      core.set %stats["helpfulCount"] = 0
+      core.set %stats["harmfulCount"] = 0
+      core.set %stats["tokenEstimate"] = 0
+      core.set %out["stats"] = %stats
+      core.set %out["updatedAt"] = %now
+      %has_description = core.call intrinsic.truthy(%description)
+      core.if %has_description {
+        core.set %out["description"] = %description
+      }
+      core.return %out
+    }
+  }
+
+  op ax.optimize.semantic @ace_render_playbook {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(playbook:json) -> string"
+    body @entry(%playbook: json) {
+      %empty_map = core.map
+      %empty_list = core.list
+      %description = core.get %playbook["description"] default null
+      %has_description = core.call intrinsic.truthy(%description)
+      %sections = core.get %playbook["sections"] default %empty_map
+      %section_names = core.call intrinsic.map.keys(%sections)
+      %bullet_count = core.let 0
+      core.for %section_name in %section_names {
+        %section_bullets = core.get %sections[%section_name] default %empty_list
+        %section_count = core.call intrinsic.len(%section_bullets)
+        %next_bullet_count = core.call intrinsic.add(%bullet_count, %section_count)
+        %bullet_count = core.let %next_bullet_count
+      }
+      %has_bullets = core.call intrinsic.gt(%bullet_count, 0)
+      %no_bullets = core.call intrinsic.not(%has_bullets)
+      %no_description = core.call intrinsic.not(%has_description)
+      %empty_playbook = core.call intrinsic.and(%no_bullets, %no_description)
+      core.if %empty_playbook {
+        core.return ""
+      }
+      %header = core.let "## Context Playbook\n"
+      core.if %has_description {
+        %trimmed_description = core.string_trim %description
+        %header_with_description = core.call intrinsic.string.format("## Context Playbook\n{}\n", %trimmed_description)
+        %header = core.let %header_with_description
+      }
+      %section_blocks = core.list
+      core.for %section_name in %section_names {
+        %bullets = core.get %sections[%section_name] default null
+        %bullet_lines = core.list
+        core.for %bullet in %bullets {
+          %id = core.get %bullet["id"] default ""
+          %content = core.get %bullet["content"] default ""
+          %line = core.call intrinsic.string.format("- [{}] {}", %id, %content)
+          core.append %bullet_lines, %line
+        }
+        %body = core.string_join %bullet_lines sep "\n"
+        %has_body = core.call intrinsic.ne(%body, "")
+        %block = core.let ""
+        core.if %has_body {
+          %block_with_body = core.call intrinsic.string.format("### {}\n{}", %section_name, %body)
+          %block = core.let %block_with_body
+        } else {
+          %block_empty = core.call intrinsic.string.format("### {}\n_(empty)_", %section_name)
+          %block = core.let %block_empty
+        }
+        core.append %section_blocks, %block
+      }
+      %joined_sections = core.string_join %section_blocks sep "\n\n"
+      %combined = core.call intrinsic.string.format("{}\n{}", %header, %joined_sections)
+      %result = core.string_trim %combined
+      core.return %result
+    }
+  }
+
+  op ax.optimize.semantic @ace_update_bullet_feedback {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(playbook:json, bullet_id:string, tag:string, now:string) -> json"
+    body @entry(%playbook: json, %bullet_id: string, %tag: string, %now: string) {
+      %empty_map = core.map
+      %sections = core.get %playbook["sections"] default %empty_map
+      %section_names = core.call intrinsic.map.keys(%sections)
+      %found = core.let false
+      core.for %section_name in %section_names {
+        %already_found = core.let %found
+        core.if %already_found {
+        } else {
+          %bullets = core.get %sections[%section_name] default null
+          core.for %bullet in %bullets {
+            %current_id = core.get %bullet["id"] default ""
+            %match = core.call intrinsic.eq(%bullet_id, %current_id)
+            %still_open = core.call intrinsic.not(%found)
+            core.if %match {
+              core.if %still_open {
+                %is_helpful = core.call intrinsic.eq(%tag, "helpful")
+                core.if %is_helpful {
+                  %helpful = core.get %bullet["helpfulCount"] default 0
+                  %helpful_next = core.call intrinsic.add(%helpful, 1)
+                  core.set %bullet["helpfulCount"] = %helpful_next
+                }
+                %is_harmful = core.call intrinsic.eq(%tag, "harmful")
+                core.if %is_harmful {
+                  %harmful = core.get %bullet["harmfulCount"] default 0
+                  %harmful_next = core.call intrinsic.add(%harmful, 1)
+                  core.set %bullet["harmfulCount"] = %harmful_next
+                }
+                core.set %bullet["updatedAt"] = %now
+                %found = core.let true
+              }
+            }
+          }
+        }
+      }
+      %did_find = core.let %found
+      core.if %did_find {
+        %updated = core.call @ace_recompute_playbook_stats(%playbook)
+        core.return %updated
+      }
+      core.return %playbook
+    }
+  }
+
+  op ax.optimize.semantic @ace_dedupe_playbook {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(playbook:json) -> json"
+    body @entry(%playbook: json) {
+      %empty_map = core.map
+      %sections = core.get %playbook["sections"] default %empty_map
+      %section_names = core.call intrinsic.map.keys(%sections)
+      core.for %section_name in %section_names {
+        %bullets = core.get %sections[%section_name] default null
+        %seen = core.map
+        %unique = core.list
+        core.for %bullet in %bullets {
+          %content = core.get %bullet["content"] default ""
+          %trimmed = core.string_trim %content
+          %key = core.call intrinsic.string.lower(%trimmed)
+          %has_existing = core.call intrinsic.map.contains(%seen, %key)
+          core.if %has_existing {
+            %existing = core.get %seen[%key]
+            %existing_helpful = core.get %existing["helpfulCount"] default 0
+            %bullet_helpful = core.get %bullet["helpfulCount"] default 0
+            %merged_helpful = core.call intrinsic.add(%existing_helpful, %bullet_helpful)
+            core.set %existing["helpfulCount"] = %merged_helpful
+            %existing_harmful = core.get %existing["harmfulCount"] default 0
+            %bullet_harmful = core.get %bullet["harmfulCount"] default 0
+            %merged_harmful = core.call intrinsic.add(%existing_harmful, %bullet_harmful)
+            core.set %existing["harmfulCount"] = %merged_harmful
+            %bullet_updated_at = core.get %bullet["updatedAt"] default ""
+            core.set %existing["updatedAt"] = %bullet_updated_at
+          } else {
+            core.set %seen[%key] = %bullet
+            core.append %unique, %bullet
+          }
+        }
+        core.set %sections[%section_name] = %unique
+      }
+      core.set %playbook["sections"] = %sections
+      %recomputed = core.call @ace_recompute_playbook_stats(%playbook)
+      core.return %recomputed
+    }
+  }
+
+  op ax.optimize.semantic @ace_prune_section_for_addition {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(section:list<json>, protected_ids:list<string>) -> json"
+    body @entry(%section: json, %protected_ids: json) {
+      %candidate_index = core.let -1
+      %candidate_net = core.let 0
+      %candidate_helpful = core.let 0
+      %candidate_recency = core.let 0
+      %index = core.let 0
+      core.for %bullet in %section {
+        %id = core.get %bullet["id"] default ""
+        %is_protected = core.call intrinsic.contains(%protected_ids, %id)
+        %not_protected = core.call intrinsic.not(%is_protected)
+        core.if %not_protected {
+          %helpful = core.get %bullet["helpfulCount"] default 0
+          %harmful = core.get %bullet["harmfulCount"] default 0
+          %harmful_weighted = core.call intrinsic.mul(%harmful, 2)
+          %negative_harmful = core.call intrinsic.mul(%harmful_weighted, -1)
+          %net_score = core.call intrinsic.add(%helpful, %negative_harmful)
+          %created_at = core.get %bullet["createdAt"] default ""
+          %recency = core.get %bullet["updatedAt"] default %created_at
+          %no_candidate = core.call intrinsic.lt(%candidate_index, 0)
+          core.if %no_candidate {
+            %candidate_index = core.let %index
+            %candidate_net = core.let %net_score
+            %candidate_helpful = core.let %helpful
+            %candidate_recency = core.let %recency
+          } else {
+            %net_lower = core.call intrinsic.lt(%net_score, %candidate_net)
+            %net_equal = core.call intrinsic.eq(%net_score, %candidate_net)
+            %helpful_lower = core.call intrinsic.lt(%helpful, %candidate_helpful)
+            %helpful_equal = core.call intrinsic.eq(%helpful, %candidate_helpful)
+            %recency_lower = core.call intrinsic.lt(%recency, %candidate_recency)
+            %is_worse = core.let %net_lower
+            core.if %net_equal {
+              core.if %helpful_lower {
+                %is_worse = core.let true
+              }
+              core.if %helpful_equal {
+                core.if %recency_lower {
+                  %is_worse = core.let true
+                }
+              }
+            }
+            core.if %is_worse {
+              %candidate_index = core.let %index
+              %candidate_net = core.let %net_score
+              %candidate_helpful = core.let %helpful
+              %candidate_recency = core.let %recency
+            }
+          }
+        }
+        %index_next = core.call intrinsic.add(%index, 1)
+        %index = core.let %index_next
+      }
+      %out = core.map
+      %has_candidate = core.call intrinsic.gte(%candidate_index, 0)
+      %new_section = core.list
+      core.if %has_candidate {
+        %pruned = core.call intrinsic.none()
+        %cursor = core.let 0
+        core.for %bullet in %section {
+          %is_target = core.call intrinsic.eq(%cursor, %candidate_index)
+          core.if %is_target {
+            %pruned = core.let %bullet
+          } else {
+            core.append %new_section, %bullet
+          }
+          %cursor_next = core.call intrinsic.add(%cursor, 1)
+          %cursor = core.let %cursor_next
+        }
+        core.set %out["pruned"] = %pruned
+        core.set %out["section"] = %new_section
+        core.return %out
+      }
+      %null_pruned = core.call intrinsic.none()
+      core.set %out["pruned"] = %null_pruned
+      core.set %out["section"] = %section
+      core.return %out
+    }
+  }
+
+  op ax.optimize.semantic @ace_apply_curator_operations {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(playbook:json, operations:list<json>, options:json, now:string) -> json"
+    body @entry(%playbook: json, %operations: json, %options: json, %now: string) {
+      %empty_map = core.map
+      %empty_list = core.list
+      %opts = core.let %options
+      %opts_missing = core.call intrinsic.is_none(%options)
+      core.if %opts_missing {
+        %opts = core.let %empty_map
+      }
+      %allow_dynamic = core.get %opts["allowDynamicSections"] default true
+      %enable_auto_prune = core.get %opts["enableAutoPrune"] default false
+      %has_max = core.call intrinsic.map.contains(%opts, "maxSectionSize")
+      %max_section_size = core.get %opts["maxSectionSize"] default 0
+      %protected_ids = core.get %opts["protectedBulletIds"] default %empty_list
+      %updated_bullets = core.list
+      %auto_removed = core.list
+      %sections = core.get %playbook["sections"] default %empty_map
+      %operation_index = core.let 0
+      core.for %op in %operations {
+        %section_name = core.get %op["section"] default ""
+        %has_section_name = core.call intrinsic.ne(%section_name, "")
+        core.if %has_section_name {
+          %section_exists = core.call intrinsic.map.contains(%sections, %section_name)
+          %missing_section = core.call intrinsic.not(%section_exists)
+          core.if %missing_section {
+            core.if %allow_dynamic {
+              %new_section_list = core.list
+              core.set %sections[%section_name] = %new_section_list
+            }
+          }
+          %section_now_exists = core.call intrinsic.map.contains(%sections, %section_name)
+          core.if %section_now_exists {
+            %section = core.get %sections[%section_name]
+            %op_type = core.get %op["type"] default ""
+            %is_add = core.call intrinsic.eq(%op_type, "ADD")
+            core.if %is_add {
+              %raw_content = core.get %op["content"] default ""
+              %content = core.string_trim %raw_content
+              %has_content = core.call intrinsic.ne(%content, "")
+              core.if %has_content {
+                %section_len = core.call intrinsic.len(%section)
+                %at_capacity_raw = core.call intrinsic.gte(%section_len, %max_section_size)
+                %at_capacity = core.let false
+                core.if %has_max {
+                  core.if %at_capacity_raw {
+                    %at_capacity = core.let true
+                  }
+                }
+                %proceed = core.let true
+                core.if %at_capacity {
+                  core.if %enable_auto_prune {
+                    %prune_result = core.call @ace_prune_section_for_addition(%section, %protected_ids)
+                    %pruned = core.get %prune_result["pruned"] default null
+                    %has_pruned = core.call intrinsic.is_not_none(%pruned)
+                    core.if %has_pruned {
+                      %pruned_section = core.get %prune_result["section"]
+                      %section = core.let %pruned_section
+                      core.set %sections[%section_name] = %section
+                      %pruned_id = core.get %pruned["id"] default ""
+                      core.append %updated_bullets, %pruned_id
+                      %removal = core.map
+                      core.set %removal["type"] = "REMOVE"
+                      core.set %removal["section"] = %section_name
+                      core.set %removal["bulletId"] = %pruned_id
+                      %pruned_metadata = core.get %pruned["metadata"] default %empty_map
+                      %removal_metadata = core.call intrinsic.map.merge(%empty_map, %pruned_metadata)
+                      core.set %removal_metadata["autoPruned"] = true
+                      core.set %removal_metadata["removedAt"] = %now
+                      core.set %removal["metadata"] = %removal_metadata
+                      core.append %auto_removed, %removal
+                    } else {
+                      %proceed = core.let false
+                    }
+                  } else {
+                    %proceed = core.let false
+                  }
+                }
+                core.if %proceed {
+                  %op_bullet_id = core.get %op["bulletId"] default null
+                  %has_bullet_id = core.call intrinsic.is_not_none(%op_bullet_id)
+                  %bullet_id = core.let %op_bullet_id
+                  %missing_bullet_id = core.call intrinsic.not(%has_bullet_id)
+                  core.if %missing_bullet_id {
+                    %bullet_id_prefix = core.call intrinsic.string.format("{}-{}-{}", %section_name, %now, %section_len)
+                    %bullet_id = core.call intrinsic.string.format("{}-{}", %bullet_id_prefix, %operation_index)
+                  }
+                  %bullet = core.map
+                  core.set %bullet["id"] = %bullet_id
+                  core.set %bullet["section"] = %section_name
+                  core.set %bullet["content"] = %content
+                  core.set %bullet["helpfulCount"] = 0
+                  core.set %bullet["harmfulCount"] = 0
+                  core.set %bullet["createdAt"] = %now
+                  core.set %bullet["updatedAt"] = %now
+                  %op_metadata = core.get %op["metadata"] default null
+                  %has_metadata = core.call intrinsic.is_not_none(%op_metadata)
+                  core.if %has_metadata {
+                    %bullet_metadata = core.call intrinsic.map.merge(%empty_map, %op_metadata)
+                    core.set %bullet["metadata"] = %bullet_metadata
+                  }
+                  core.append %section, %bullet
+                  core.set %sections[%section_name] = %section
+                  core.append %updated_bullets, %bullet_id
+                }
+              }
+            }
+            %is_update = core.call intrinsic.eq(%op_type, "UPDATE")
+            core.if %is_update {
+              %target_id = core.get %op["bulletId"] default null
+              core.for %bullet in %section {
+                %candidate_bullet_id = core.get %bullet["id"] default ""
+                %bullet_match = core.call intrinsic.eq(%candidate_bullet_id, %target_id)
+                core.if %bullet_match {
+                  %op_content = core.get %op["content"] default null
+                  %content_is_string = core.type_is %op_content type "string"
+                  core.if %content_is_string {
+                    core.set %bullet["content"] = %op_content
+                  }
+                  core.set %bullet["updatedAt"] = %now
+                  %op_metadata_update = core.get %op["metadata"] default null
+                  %has_metadata_update = core.call intrinsic.is_not_none(%op_metadata_update)
+                  core.if %has_metadata_update {
+                    %existing_metadata = core.get %bullet["metadata"] default %empty_map
+                    %merged_metadata = core.call intrinsic.map.merge(%existing_metadata, %op_metadata_update)
+                    core.set %bullet["metadata"] = %merged_metadata
+                  }
+                  %bullet_id_update = core.get %bullet["id"] default ""
+                  core.append %updated_bullets, %bullet_id_update
+                }
+              }
+            }
+            %is_remove = core.call intrinsic.eq(%op_type, "REMOVE")
+            core.if %is_remove {
+              %remove_id = core.get %op["bulletId"] default null
+              %kept = core.list
+              %none_value = core.call intrinsic.none()
+              %removed_id = core.let %none_value
+              core.for %bullet in %section {
+                %remove_candidate_id = core.get %bullet["id"] default ""
+                %bullet_remove_match = core.call intrinsic.eq(%remove_candidate_id, %remove_id)
+                core.if %bullet_remove_match {
+                  %removed_id = core.let %remove_candidate_id
+                } else {
+                  core.append %kept, %bullet
+                }
+              }
+              core.set %sections[%section_name] = %kept
+              %did_remove = core.call intrinsic.is_not_none(%removed_id)
+              core.if %did_remove {
+                core.append %updated_bullets, %removed_id
+              }
+            }
+          }
+        }
+        %next_operation_index = core.call intrinsic.add(%operation_index, 1)
+        %operation_index = core.let %next_operation_index
+      }
+      core.set %playbook["sections"] = %sections
+      %recomputed = core.call @ace_recompute_playbook_stats(%playbook)
+      core.set %recomputed["updatedAt"] = %now
+      %out = core.map
+      core.set %out["playbook"] = %recomputed
+      core.set %out["updatedBulletIds"] = %updated_bullets
+      core.set %out["autoRemoved"] = %auto_removed
+      core.return %out
+    }
+  }
+
+  op ax.optimize.semantic @ace_is_noop_acknowledgment {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(content:string) -> bool"
+    body @entry(%content: string) {
+      %lowered = core.call intrinsic.string.lower(%content)
+      %c = core.string_trim %lowered
+      %is_noop = core.let false
+      %empty = core.call intrinsic.eq(%c, "")
+      %nonempty = core.call intrinsic.not(%empty)
+      core.if %nonempty {
+        %markers = core.list
+        core.append %markers, "no-op"
+        core.append %markers, "noop"
+        core.for %marker in %markers {
+          %marker_hit = core.call intrinsic.string.starts_with(%c, %marker)
+          core.if %marker_hit {
+            %is_noop = core.let true
+          }
+        }
+        %subjects = core.list
+        core.append %subjects, "no update"
+        core.append %subjects, "no updates"
+        core.append %subjects, "no change"
+        core.append %subjects, "no changes"
+        core.append %subjects, "no modification"
+        core.append %subjects, "no modifications"
+        core.append %subjects, "no edit"
+        core.append %subjects, "no edits"
+        core.append %subjects, "no revision"
+        core.append %subjects, "no revisions"
+        core.append %subjects, "no action"
+        core.append %subjects, "no adjustment"
+        core.append %subjects, "no adjustments"
+        core.append %subjects, "no new"
+        core.append %subjects, "no additional"
+        core.append %subjects, "no further"
+        %has_subject = core.let false
+        core.for %subject in %subjects {
+          %subject_hit = core.call intrinsic.contains(%c, %subject)
+          core.if %subject_hit {
+            %has_subject = core.let true
+          }
+        }
+        core.if %has_subject {
+          %qualifiers = core.list
+          core.append %qualifiers, "needed"
+          core.append %qualifiers, "required"
+          core.append %qualifiers, "necessary"
+          core.append %qualifiers, "warranted"
+          core.for %qualifier in %qualifiers {
+            %qualifier_hit = core.call intrinsic.contains(%c, %qualifier)
+            core.if %qualifier_hit {
+              %is_noop = core.let true
+            }
+          }
+        }
+        %phrases = core.list
+        core.append %phrases, "nothing to add"
+        core.append %phrases, "nothing to change"
+        core.append %phrases, "nothing to update"
+        core.append %phrases, "nothing to modify"
+        core.append %phrases, "nothing to revise"
+        core.append %phrases, "nothing needs"
+        core.append %phrases, "nothing further"
+        core.for %phrase in %phrases {
+          %phrase_hit = core.call intrinsic.contains(%c, %phrase)
+          core.if %phrase_hit {
+            %is_noop = core.let true
+          }
+        }
+        %keep_prefixes = core.list
+        core.append %keep_prefixes, "keep the existing"
+        core.append %keep_prefixes, "leave the existing"
+        core.append %keep_prefixes, "retain the existing"
+        core.append %keep_prefixes, "preserve the existing"
+        %has_keep_prefix = core.let false
+        core.for %keep_prefix in %keep_prefixes {
+          %keep_hit = core.call intrinsic.string.starts_with(%c, %keep_prefix)
+          core.if %keep_hit {
+            %has_keep_prefix = core.let true
+          }
+        }
+        core.if %has_keep_prefix {
+          %stasis_list = core.list
+          core.append %stasis_list, "unchanged"
+          core.append %stasis_list, "as is"
+          core.append %stasis_list, "as-is"
+          core.append %stasis_list, "intact"
+          core.append %stasis_list, "in place"
+          core.for %stasis in %stasis_list {
+            %stasis_hit = core.call intrinsic.contains(%c, %stasis)
+            core.if %stasis_hit {
+              %is_noop = core.let true
+            }
+          }
+        }
+        %remains_list = core.list
+        core.append %remains_list, "remains correct"
+        core.append %remains_list, "remains unchanged"
+        core.append %remains_list, "remains the same"
+        core.append %remains_list, "remains valid"
+        core.append %remains_list, "remains accurate"
+        core.append %remains_list, "already correct"
+        %has_remains = core.let false
+        core.for %remains in %remains_list {
+          %remains_hit = core.call intrinsic.contains(%c, %remains)
+          core.if %remains_hit {
+            %has_remains = core.let true
+          }
+        }
+        core.if %has_remains {
+          %referents = core.list
+          core.append %referents, "existing"
+          core.append %referents, "current"
+          core.append %referents, "rule"
+          core.append %referents, "guideline"
+          core.append %referents, "guidance"
+          core.append %referents, "playbook"
+          core.append %referents, "bullet"
+          core.append %referents, "entry"
+          core.for %referent in %referents {
+            %referent_hit = core.call intrinsic.contains(%c, %referent)
+            core.if %referent_hit {
+              %is_noop = core.let true
+            }
+          }
+        }
+      }
+      core.return %is_noop
+    }
+  }
+
+  op ax.optimize.semantic @ace_normalize_curator_operations {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(operations:json) -> list<json>"
+    body @entry(%operations: json) {
+      %empty_list = core.list
+      %has_operations = core.call intrinsic.is_not_none(%operations)
+      %missing = core.call intrinsic.not(%has_operations)
+      core.if %missing {
+        core.return %empty_list
+      }
+      %is_list = core.type_is %operations type "list"
+      core.if %is_list {
+        %normalized = core.list
+        %seen = core.map
+        core.for %entry in %operations {
+          %is_object = core.type_is %entry type "object"
+          core.if %is_object {
+            %type_raw = core.get %entry["type"] default "ADD"
+            %type_is_string = core.type_is %type_raw type "string"
+            %type_lower = core.let "add"
+            core.if %type_is_string {
+              %lowered = core.call intrinsic.string.lower(%type_raw)
+              %type_lower = core.let %lowered
+            }
+            %is_update = core.call intrinsic.eq(%type_lower, "update")
+            %is_remove = core.call intrinsic.eq(%type_lower, "remove")
+            %type = core.let "ADD"
+            core.if %is_update {
+              %type = core.let "UPDATE"
+            }
+            core.if %is_remove {
+              %type = core.let "REMOVE"
+            }
+            %section_raw = core.get %entry["section"] default "Guidelines"
+            %section_is_string = core.type_is %section_raw type "string"
+            %section = core.let "Guidelines"
+            core.if %section_is_string {
+              %section_trimmed = core.string_trim %section_raw
+              %section_nonempty = core.call intrinsic.ne(%section_trimmed, "")
+              core.if %section_nonempty {
+                %section = core.let %section_trimmed
+              }
+            }
+            %content_raw = core.get %entry["content"] default ""
+            %content_is_string = core.type_is %content_raw type "string"
+            %content = core.let ""
+            core.if %content_is_string {
+              %content_trimmed = core.string_trim %content_raw
+              %content = core.let %content_trimmed
+            }
+            %not_remove = core.call intrinsic.ne(%type, "REMOVE")
+            %content_empty = core.call intrinsic.eq(%content, "")
+            %keep = core.let true
+            core.if %not_remove {
+              core.if %content_empty {
+                %keep = core.let false
+              }
+            }
+            %is_add_type = core.call intrinsic.eq(%type, "ADD")
+            core.if %is_add_type {
+              %is_noop = core.call @ace_is_noop_acknowledgment(%content)
+              core.if %is_noop {
+                %keep = core.let false
+              }
+            }
+            core.if %keep {
+              %bullet_id_raw = core.get %entry["bulletId"] default null
+              %has_bullet_id_field = core.call intrinsic.is_not_none(%bullet_id_raw)
+              %bullet_id_source = core.let %bullet_id_raw
+              core.if %has_bullet_id_field {
+              } else {
+                %id_field = core.get %entry["id"] default null
+                %bullet_id_source = core.let %id_field
+              }
+              %bullet_id_is_string = core.type_is %bullet_id_source type "string"
+              %none_value = core.call intrinsic.none()
+              %bullet_id = core.let %none_value
+              core.if %bullet_id_is_string {
+                %bullet_id_trimmed = core.string_trim %bullet_id_source
+                %bullet_id_nonempty = core.call intrinsic.ne(%bullet_id_trimmed, "")
+                core.if %bullet_id_nonempty {
+                  %bullet_id = core.let %bullet_id_trimmed
+                }
+              }
+              %bullet_id_key = core.let ""
+              %has_bullet_id = core.call intrinsic.is_not_none(%bullet_id)
+              core.if %has_bullet_id {
+                %bullet_id_key = core.let %bullet_id
+              }
+              %key_a = core.call intrinsic.string.format("{}:{}", %type, %section)
+              %key_b = core.call intrinsic.string.format("{}:{}", %content, %bullet_id_key)
+              %key = core.call intrinsic.string.format("{}:{}", %key_a, %key_b)
+              %already_seen = core.call intrinsic.map.contains(%seen, %key)
+              %fresh = core.call intrinsic.not(%already_seen)
+              core.if %fresh {
+                core.set %seen[%key] = true
+                %normalized_entry = core.map
+                core.set %normalized_entry["type"] = %type
+                core.set %normalized_entry["section"] = %section
+                core.if %not_remove {
+                  core.set %normalized_entry["content"] = %content
+                }
+                core.if %has_bullet_id {
+                  core.set %normalized_entry["bulletId"] = %bullet_id
+                }
+                %metadata_raw = core.get %entry["metadata"] default null
+                %metadata_is_object = core.type_is %metadata_raw type "object"
+                core.if %metadata_is_object {
+                  %empty_metadata = core.map
+                  %metadata_copy = core.call intrinsic.map.merge(%empty_metadata, %metadata_raw)
+                  core.set %normalized_entry["metadata"] = %metadata_copy
+                }
+                core.append %normalized, %normalized_entry
+              }
+            }
+          }
+        }
+        core.return %normalized
+      }
+      %is_string = core.type_is %operations type "string"
+      core.if %is_string {
+        %parsed = core.call intrinsic.json.parse(%operations)
+        %parsed_is_none = core.call intrinsic.is_none(%parsed)
+        core.if %parsed_is_none {
+          core.return %empty_list
+        }
+        %normalized_from_string = core.call @ace_normalize_curator_operations(%parsed)
+        core.return %normalized_from_string
+      }
+      %is_object = core.type_is %operations type "object"
+      core.if %is_object {
+        %inner = core.get %operations["operations"] default null
+        %has_inner = core.call intrinsic.is_not_none(%inner)
+        core.if %has_inner {
+          %normalized_from_object = core.call @ace_normalize_curator_operations(%inner)
+          core.return %normalized_from_object
+        }
+        core.return %empty_list
+      }
+      core.return %empty_list
+    }
+  }
+
+  op ax.optimize.semantic @ace_locate_bullet_section {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(playbook:json, bullet_id:string) -> json"
+    body @entry(%playbook: json, %bullet_id: string) {
+      %empty_map = core.map
+      %sections = core.get %playbook["sections"] default %empty_map
+      %section_names = core.call intrinsic.map.keys(%sections)
+      %none_value = core.call intrinsic.none()
+      %found = core.let %none_value
+      core.for %section_name in %section_names {
+        %already = core.call intrinsic.is_not_none(%found)
+        %still_open = core.call intrinsic.not(%already)
+        core.if %still_open {
+          %bullets = core.get %sections[%section_name] default null
+          core.for %bullet in %bullets {
+            %open = core.call intrinsic.is_none(%found)
+            core.if %open {
+              %current_id = core.get %bullet["id"] default ""
+              %match = core.call intrinsic.eq(%current_id, %bullet_id)
+              core.if %match {
+                %hit = core.map
+                core.set %hit["section"] = %section_name
+                core.set %hit["id"] = %current_id
+                %found = core.let %hit
+              }
+            }
+          }
+        }
+      }
+      core.return %found
+    }
+  }
+
+  op ax.optimize.semantic @ace_resolve_curator_operation_targets {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(operations:list<json>, playbook:json, reflection:json, generator_output:json) -> list<json>"
+    body @entry(%operations: json, %playbook: json, %reflection: json, %generator_output: json) {
+      %op_count = core.call intrinsic.len(%operations)
+      %is_empty = core.call intrinsic.eq(%op_count, 0)
+      core.if %is_empty {
+        core.return %operations
+      }
+      %used_ids = core.map
+      core.for %op in %operations {
+        %existing_bullet_id = core.get %op["bulletId"] default null
+        %has_existing = core.call intrinsic.is_not_none(%existing_bullet_id)
+        core.if %has_existing {
+          %existing_is_string = core.type_is %existing_bullet_id type "string"
+          core.if %existing_is_string {
+            core.set %used_ids[%existing_bullet_id] = true
+          }
+        }
+      }
+      %section_queues = core.map
+      %empty_list = core.list
+      %reflection_present = core.call intrinsic.is_not_none(%reflection)
+      core.if %reflection_present {
+        %bullet_tags = core.call @ace_normalize_reflection_bullet_tags(%reflection)
+        core.for %tag in %bullet_tags {
+          %tag_id = core.get %tag["id"] default null
+          %tag_value = core.get %tag["tag"] default null
+          %is_harmful = core.call intrinsic.eq(%tag_value, "harmful")
+          %already_used = core.call intrinsic.map.contains(%used_ids, %tag_id)
+          %not_used = core.call intrinsic.not(%already_used)
+          core.if %not_used {
+            %located = core.call @ace_locate_bullet_section(%playbook, %tag_id)
+            %located_found = core.call intrinsic.is_not_none(%located)
+            core.if %located_found {
+              %located_section = core.get %located["section"]
+              %located_id = core.get %located["id"]
+              %priority = core.let "primary"
+              core.if %is_harmful {
+                %priority = core.let "harmful"
+              }
+              %has_queue = core.call intrinsic.map.contains(%section_queues, %located_section)
+              %missing_queue = core.call intrinsic.not(%has_queue)
+              core.if %missing_queue {
+                %new_queue = core.map
+                %harmful_list = core.list
+                core.set %new_queue["harmful"] = %harmful_list
+                %primary_list = core.list
+                core.set %new_queue["primary"] = %primary_list
+                %generator_list = core.list
+                core.set %new_queue["generator"] = %generator_list
+                core.set %section_queues[%located_section] = %new_queue
+              }
+              %queue = core.get %section_queues[%located_section]
+              %priority_list = core.get %queue[%priority]
+              core.append %priority_list, %located_id
+              core.set %queue[%priority] = %priority_list
+              core.set %section_queues[%located_section] = %queue
+            }
+          }
+        }
+      }
+      %generator_present = core.call intrinsic.is_not_none(%generator_output)
+      core.if %generator_present {
+        %generator_bullet_ids = core.get %generator_output["bulletIds"] default %empty_list
+        core.for %bullet_id in %generator_bullet_ids {
+          %gen_id_is_string = core.type_is %bullet_id type "string"
+          core.if %gen_id_is_string {
+            %gen_already_used = core.call intrinsic.map.contains(%used_ids, %bullet_id)
+            %gen_not_used = core.call intrinsic.not(%gen_already_used)
+            core.if %gen_not_used {
+              %gen_located = core.call @ace_locate_bullet_section(%playbook, %bullet_id)
+              %gen_found = core.call intrinsic.is_not_none(%gen_located)
+              core.if %gen_found {
+                %gen_section = core.get %gen_located["section"]
+                %gen_located_id = core.get %gen_located["id"]
+                %gen_has_queue = core.call intrinsic.map.contains(%section_queues, %gen_section)
+                %gen_missing_queue = core.call intrinsic.not(%gen_has_queue)
+                core.if %gen_missing_queue {
+                  %gen_new_queue = core.map
+                  %gen_harmful = core.list
+                  core.set %gen_new_queue["harmful"] = %gen_harmful
+                  %gen_primary = core.list
+                  core.set %gen_new_queue["primary"] = %gen_primary
+                  %gen_generator = core.list
+                  core.set %gen_new_queue["generator"] = %gen_generator
+                  core.set %section_queues[%gen_section] = %gen_new_queue
+                }
+                %gen_queue = core.get %section_queues[%gen_section]
+                %gen_generator_list = core.get %gen_queue["generator"]
+                core.append %gen_generator_list, %gen_located_id
+                core.set %gen_queue["generator"] = %gen_generator_list
+                core.set %section_queues[%gen_section] = %gen_queue
+              }
+            }
+          }
+        }
+      }
+      %resolved = core.list
+      core.for %op in %operations {
+        %op_type = core.get %op["type"] default ""
+        %op_is_update = core.call intrinsic.eq(%op_type, "UPDATE")
+        %op_is_remove = core.call intrinsic.eq(%op_type, "REMOVE")
+        %needs_target = core.call intrinsic.or(%op_is_update, %op_is_remove)
+        %current_bullet_id = core.get %op["bulletId"] default null
+        %has_bullet_id = core.call intrinsic.is_not_none(%current_bullet_id)
+        %missing_bullet_id = core.call intrinsic.not(%has_bullet_id)
+        %empty_op = core.map
+        %resolved_op = core.call intrinsic.map.merge(%empty_op, %op)
+        core.if %needs_target {
+          core.if %missing_bullet_id {
+            %op_section = core.get %op["section"] default ""
+            %candidate = core.call @ace_dequeue_section_candidate(%section_queues, %op_section, %used_ids, %playbook)
+            %candidate_found = core.call intrinsic.is_not_none(%candidate)
+            core.if %candidate_found {
+              core.set %resolved_op["bulletId"] = %candidate
+              core.set %used_ids[%candidate] = true
+            }
+          }
+        }
+        %final_bullet_id = core.get %resolved_op["bulletId"] default null
+        %final_has_bullet_id = core.call intrinsic.is_not_none(%final_bullet_id)
+        %keep = core.let true
+        core.if %needs_target {
+          %keep = core.let %final_has_bullet_id
+        }
+        core.if %keep {
+          core.append %resolved, %resolved_op
+        }
+      }
+      core.return %resolved
+    }
+  }
+
+  op ax.optimize.semantic @ace_normalize_reflection_bullet_tags {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    tag "source:src/ax/dsp/optimizers/ace.ts#normalizeReflectionBulletTags"
+    type signature = "(reflection:json) -> list<json>"
+    body @entry(%reflection: json) {
+      %empty_list = core.list
+      %raw_bullet_tags = core.get %reflection["bulletTags"] default %empty_list
+      %candidates = core.list
+      %tags_is_list = core.type_is %raw_bullet_tags type "list"
+      core.if %tags_is_list {
+        %candidates = core.let %raw_bullet_tags
+      } else {
+        %tags_is_object = core.type_is %raw_bullet_tags type "object"
+        core.if %tags_is_object {
+          core.append %candidates, %raw_bullet_tags
+        }
+      }
+      %normalized = core.list
+      core.for %tag in %candidates {
+        %tag_is_object = core.type_is %tag type "object"
+        core.if %tag_is_object {
+          %tag_id = core.get %tag["id"] default null
+          %tag_id_is_string = core.type_is %tag_id type "string"
+          %tag_value = core.get %tag["tag"] default null
+          %tag_value_is_string = core.type_is %tag_value type "string"
+          %valid_tag_shape = core.call intrinsic.and(%tag_id_is_string, %tag_value_is_string)
+          core.if %valid_tag_shape {
+            core.append %normalized, %tag
+          }
+        }
+      }
+      core.return %normalized
+    }
+  }
+
+  op ax.optimize.semantic @ace_dequeue_section_candidate {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(section_queues:json, section:string, used_ids:json, playbook:json) -> json"
+    body @entry(%section_queues: json, %section: string, %used_ids: json, %playbook: json) {
+      %none_value = core.call intrinsic.none()
+      %picked = core.let %none_value
+      %has_queue = core.call intrinsic.map.contains(%section_queues, %section)
+      core.if %has_queue {
+        %queue = core.get %section_queues[%section]
+        %empty_list = core.list
+        %harmful_list = core.get %queue["harmful"] default %empty_list
+        core.for %candidate in %harmful_list {
+          %open = core.call intrinsic.is_none(%picked)
+          core.if %open {
+            %used = core.call intrinsic.map.contains(%used_ids, %candidate)
+            %not_used = core.call intrinsic.not(%used)
+            core.if %not_used {
+              %picked = core.let %candidate
+            }
+          }
+        }
+        %primary_list = core.get %queue["primary"] default %empty_list
+        core.for %candidate in %primary_list {
+          %open = core.call intrinsic.is_none(%picked)
+          core.if %open {
+            %used = core.call intrinsic.map.contains(%used_ids, %candidate)
+            %not_used = core.call intrinsic.not(%used)
+            core.if %not_used {
+              %picked = core.let %candidate
+            }
+          }
+        }
+        %generator_list = core.get %queue["generator"] default %empty_list
+        core.for %candidate in %generator_list {
+          %open = core.call intrinsic.is_none(%picked)
+          core.if %open {
+            %used = core.call intrinsic.map.contains(%used_ids, %candidate)
+            %not_used = core.call intrinsic.not(%used)
+            core.if %not_used {
+              %picked = core.let %candidate
+            }
+          }
+        }
+      }
+      %still_open = core.call intrinsic.is_none(%picked)
+      core.if %still_open {
+        %empty_map = core.map
+        %sections = core.get %playbook["sections"] default %empty_map
+        %fallback_bullets = core.get %sections[%section] default null
+        %fallback_present = core.call intrinsic.is_not_none(%fallback_bullets)
+        core.if %fallback_present {
+          core.for %bullet in %fallback_bullets {
+            %open = core.call intrinsic.is_none(%picked)
+            core.if %open {
+              %bullet_id = core.get %bullet["id"] default ""
+              %used = core.call intrinsic.map.contains(%used_ids, %bullet_id)
+              %not_used = core.call intrinsic.not(%used)
+              core.if %not_used {
+                %picked = core.let %bullet_id
+              }
+            }
+          }
+        }
+      }
+      core.return %picked
+    }
+  }
+}

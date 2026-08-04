@@ -1,0 +1,406 @@
+import { describe, expect, it } from 'vitest';
+import { AxMockAIService } from '../ai/mock/api.js';
+import type { AxChatResponse } from '../ai/types.js';
+import { AxAIServiceAbortedError } from '../util/apicall.js';
+import {
+  AX_HOST_SNIPPET_MARKER,
+  AX_INPUTS_PATCH_GLOBAL,
+} from './agentInternal/sharedSession.js';
+
+import { AxAgent } from './index.js';
+import type { AxCodeRuntime } from './rlm.js';
+
+const makeModelUsage = () => ({
+  ai: 'mock',
+  model: 'mock',
+  tokens: { promptTokens: 10, completionTokens: 5, totalTokens: 15 },
+});
+
+const createSimpleRuntime = (): AxCodeRuntime => ({
+  getUsageInstructions: () => '',
+  createSession(globals) {
+    return {
+      execute: async (code: string) => {
+        if (code.startsWith(AX_HOST_SNIPPET_MARKER)) return 'host-snippet';
+        if (globals?.final && code.includes('final(')) {
+          (globals.final as (...args: unknown[]) => void)('done');
+          return 'submitted';
+        }
+        return `executed: ${code}`;
+      },
+      // REPL-faithful: merge (phase-2 rebinding) + honor staged input merges.
+      patchGlobals: async (patch: Record<string, unknown>) => {
+        const { [AX_INPUTS_PATCH_GLOBAL]: staged, ...rest } = patch;
+        Object.assign(globals ?? {}, rest);
+        if (globals && staged && typeof staged === 'object') {
+          globals.inputs = Object.assign(
+            (globals.inputs as Record<string, unknown>) ?? {},
+            staged
+          );
+        }
+      },
+      close: () => {},
+    };
+  },
+});
+
+describe('AxAgent.stop()', () => {
+  it('throws when stop() is called during Actor loop execution', async () => {
+    let actorCallCount = 0;
+
+    const ai = new AxMockAIService({
+      features: { functions: false, streaming: false },
+      chatResponse: async (req): Promise<AxChatResponse> => {
+        const systemPrompt = String(req.chatPrompt[0]?.content ?? '');
+
+        if (systemPrompt.includes('You (`executor`)')) {
+          actorCallCount++;
+          // Always return code (never final()) so the loop continues
+          return {
+            results: [
+              {
+                index: 0,
+                content: `Javascript Code: "step ${actorCallCount}"`,
+                finishReason: 'stop',
+              },
+            ],
+            modelUsage: makeModelUsage(),
+          };
+        }
+
+        // Responder
+        return {
+          results: [
+            {
+              index: 0,
+              content: 'Answer: done',
+              finishReason: 'stop',
+            },
+          ],
+          modelUsage: makeModelUsage(),
+        };
+      },
+    });
+
+    let stopCalled = false;
+    const runtime: AxCodeRuntime = {
+      getUsageInstructions: () => '',
+      createSession() {
+        return {
+          execute: async () => {
+            if (!stopCalled) {
+              stopCalled = true;
+              myAgent.stop();
+            }
+            return 'executed';
+          },
+          // REPL-faithful: merge (phase-2 rebinding) + honor staged input merges.
+          patchGlobals: async (patch: Record<string, unknown>) => {
+            const { [AX_INPUTS_PATCH_GLOBAL]: staged, ...rest } = patch;
+            Object.assign(globals ?? {}, rest);
+            if (globals && staged && typeof staged === 'object') {
+              globals.inputs = Object.assign(
+                (globals.inputs as Record<string, unknown>) ?? {},
+                staged
+              );
+            }
+          },
+          close: () => {},
+        };
+      },
+    };
+
+    const myAgent = new AxAgent(
+      {
+        signature: 'userQuery:string -> answer:string',
+      },
+      {
+        maxSteps: 10,
+        contextFields: [],
+        runtime,
+        maxTurns: 5,
+      }
+    );
+
+    await expect(myAgent.forward(ai, { userQuery: 'test' })).rejects.toThrow();
+  });
+
+  it('throws when external abort signal is triggered', async () => {
+    const controller = new AbortController();
+    let actorCallCount = 0;
+
+    const ai = new AxMockAIService({
+      features: { functions: false, streaming: false },
+      chatResponse: async (req): Promise<AxChatResponse> => {
+        const systemPrompt = String(req.chatPrompt[0]?.content ?? '');
+
+        if (systemPrompt.includes('You (`executor`)')) {
+          actorCallCount++;
+          if (actorCallCount === 1) {
+            controller.abort('external abort');
+          }
+          return {
+            results: [
+              {
+                index: 0,
+                content: 'Javascript Code: "step"',
+                finishReason: 'stop',
+              },
+            ],
+            modelUsage: makeModelUsage(),
+          };
+        }
+
+        return {
+          results: [
+            {
+              index: 0,
+              content: 'Answer: done',
+              finishReason: 'stop',
+            },
+          ],
+          modelUsage: makeModelUsage(),
+        };
+      },
+    });
+
+    const myAgent = new AxAgent(
+      {
+        signature: 'userQuery:string -> answer:string',
+      },
+      {
+        maxSteps: 10,
+        contextFields: [],
+        runtime: createSimpleRuntime(),
+        maxTurns: 5,
+      }
+    );
+
+    await expect(
+      myAgent.forward(
+        ai,
+        { userQuery: 'test' },
+        { abortSignal: controller.signal }
+      )
+    ).rejects.toThrow();
+  });
+
+  it('throws when stop() is called before forward()', async () => {
+    const ai = new AxMockAIService({
+      features: { functions: false, streaming: false },
+    });
+
+    const myAgent = new AxAgent(
+      {
+        signature: 'userQuery:string -> answer:string',
+      },
+      {
+        maxSteps: 10,
+        contextFields: [],
+        runtime: createSimpleRuntime(),
+        maxTurns: 5,
+      }
+    );
+
+    // Call stop before forward
+    myAgent.stop();
+
+    await expect(myAgent.forward(ai, { userQuery: 'test' })).rejects.toThrow();
+  });
+
+  it('propagates abortSignal through the Actor loop', async () => {
+    let runtimeReceivedAbort = false;
+    const controller = new AbortController();
+
+    const ai = new AxMockAIService({
+      features: { functions: false, streaming: false },
+      chatResponse: async (req): Promise<AxChatResponse> => {
+        const systemPrompt = String(req.chatPrompt[0]?.content ?? '');
+
+        if (systemPrompt.includes('You (`executor`)')) {
+          return {
+            results: [
+              {
+                index: 0,
+                content: 'Javascript Code: "check abort"',
+                finishReason: 'stop',
+              },
+            ],
+            modelUsage: makeModelUsage(),
+          };
+        }
+
+        return {
+          results: [
+            {
+              index: 0,
+              content: 'Answer: done',
+              finishReason: 'stop',
+            },
+          ],
+          modelUsage: makeModelUsage(),
+        };
+      },
+    });
+
+    const runtime: AxCodeRuntime = {
+      getUsageInstructions: () => '',
+      createSession() {
+        return {
+          execute: async (_code: string, opts?: { signal?: AbortSignal }) => {
+            if (opts?.signal) {
+              runtimeReceivedAbort = true;
+            }
+            // Abort after first execution to trigger abort path
+            controller.abort('test abort');
+            return 'executed';
+          },
+          // REPL-faithful: merge (phase-2 rebinding) + honor staged input merges.
+          patchGlobals: async (patch: Record<string, unknown>) => {
+            const { [AX_INPUTS_PATCH_GLOBAL]: staged, ...rest } = patch;
+            Object.assign(globals ?? {}, rest);
+            if (globals && staged && typeof staged === 'object') {
+              globals.inputs = Object.assign(
+                (globals.inputs as Record<string, unknown>) ?? {},
+                staged
+              );
+            }
+          },
+          close: () => {},
+        };
+      },
+    };
+
+    const myAgent = new AxAgent(
+      {
+        signature: 'userQuery:string -> answer:string',
+      },
+      {
+        maxSteps: 5,
+        contextFields: [],
+        runtime,
+        maxTurns: 3,
+      }
+    );
+
+    await myAgent
+      .forward(ai, { userQuery: 'test' }, { abortSignal: controller.signal })
+      .catch(() => {
+        /* expected to throw due to abort */
+      });
+
+    // The runtime should have received the signal
+    expect(runtimeReceivedAbort).toBe(true);
+  });
+
+  it('aborts when stop() is called during forward execution', async () => {
+    const ai = new AxMockAIService({
+      features: { functions: false, streaming: false },
+      chatResponse: async (): Promise<AxChatResponse> => {
+        // Slow response to allow stop to be called
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        return {
+          results: [
+            {
+              index: 0,
+              content: 'Javascript Code: "step"',
+              finishReason: 'stop',
+            },
+          ],
+          modelUsage: makeModelUsage(),
+        };
+      },
+    });
+
+    const myAgent = new AxAgent(
+      {
+        signature: 'userQuery:string -> answer:string',
+      },
+      {
+        contextFields: [],
+        runtime: createSimpleRuntime(),
+        maxTurns: 5,
+      }
+    );
+
+    const pending = myAgent.forward(ai, { userQuery: 'test' });
+
+    // Let the forward start, then stop
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    myAgent.stop();
+
+    await expect(pending).rejects.toBeInstanceOf(AxAIServiceAbortedError);
+  });
+
+  it('coordinator stop() aborts both ctxAgent and taskAgent concurrently in Case A', async () => {
+    const stubFunction = {
+      name: 'stubFn',
+      description: 'A stub function for testing',
+      parameters: {
+        type: 'object' as const,
+        properties: { input: { type: 'string' as const } },
+        required: [] as string[],
+      },
+      func: async () => 'stub result',
+    };
+
+    // The ctx actor AI is slow — this gives us a window to call stop()
+    const ai = new AxMockAIService({
+      features: { functions: false, streaming: false },
+      chatResponse: async (req): Promise<AxChatResponse> => {
+        const systemPrompt = String(req.chatPrompt[0]?.content ?? '');
+
+        if (systemPrompt.includes('You (`distiller`)')) {
+          // Deliberately slow so stop() wins the race
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          return {
+            results: [
+              {
+                index: 0,
+                content: 'Javascript Code: final("distilled", {})',
+                finishReason: 'stop',
+              },
+            ],
+            modelUsage: makeModelUsage(),
+          };
+        }
+
+        return {
+          results: [
+            {
+              index: 0,
+              content: 'Javascript Code: final("done", {"answer":"ok"})',
+              finishReason: 'stop',
+            },
+          ],
+          modelUsage: makeModelUsage(),
+        };
+      },
+    });
+
+    // Case A: contextFields + function → coordinator creates both ctxAgent and taskAgent
+    const myAgent = new AxAgent(
+      {
+        signature: 'docText:string, query:string -> answer:string',
+      },
+      {
+        contextFields: ['docText'],
+        functions: [stubFunction],
+        runtime: createSimpleRuntime(),
+        maxTurns: 5,
+      }
+    );
+
+    const pending = myAgent.forward(ai, {
+      docText: 'some document',
+      query: 'test',
+    });
+
+    // Let the ctx stage start its slow AI call, then abort
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    myAgent.stop();
+
+    // The forward() must reject — coordinator fans out stop() to both internal agents
+    await expect(pending).rejects.toThrow();
+  });
+});

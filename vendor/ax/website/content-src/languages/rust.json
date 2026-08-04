@@ -1,0 +1,457 @@
+{
+  "id": "rust",
+  "label": "Rust",
+  "shortLabel": "Rust",
+  "fence": "rust",
+  "packageName": "axllm",
+  "install": ["cargo add axllm"],
+  "exampleRoot": "packages/rust/examples",
+  "academy": {
+    "unitExamples": {
+      "dspy": "src/examples/rust/generation/structured_generation.rs",
+      "models-signatures": "src/examples/rust/generation/structured_generation.rs",
+      "axgen": "src/examples/rust/generation/basic_generation.rs",
+      "axflow": "src/examples/rust/flows/branch_flow.rs",
+      "axagent": "src/examples/rust/short-agents/tools_agent.rs",
+      "rlm": "src/examples/rust/long-agents/incident_log_forensics.rs",
+      "peek-context": "src/examples/rust/long-agents/codebase_peek_map.rs",
+      "optimization": "src/examples/rust/optimization/axgen_optimization.rs",
+      "mcp": "src/examples/rust/mcp/native_mcp_tools.rs",
+      "notifications": "src/examples/rust/mcp/resource_wake_agent.rs",
+      "production": "src/examples/rust/long-agents/smart_defaults_agent.rs"
+    },
+    "capstoneExample": "src/examples/rust/mcp/task_resume_flow.rs",
+    "exerciseAnswers": {
+      "signature-semantic-contract": ["s"],
+      "ai-providers-models": ["ai"],
+      "fluent-fields-validation": ["f", "FieldType"],
+      "typed-tools": ["tool"],
+      "optimize-gen-flow": ["AxGEPA"]
+    },
+    "snippets": {
+      "flow": [
+        "let mermaid = r#\"flowchart TD",
+        "  %%ax classify: request:string -> route:class \"support, sales\"",
+        "  classify{route}\"#;",
+        "let program = flow(mermaid);",
+        "println!(\"{}\", program);"
+      ],
+      "rlm": [
+        "let investigator = agent_with_options(signature, json!({",
+        "    \"contextFields\": [\"logs\"],",
+        "    \"contextPolicy\": {\"preset\": \"lean\", \"budget\": \"balanced\"},",
+        "    \"runtime\": {\"language\": \"JavaScript\"},",
+        "}))?.with_runtime(Box::new(QuickJsCodeRuntime::new()))?;"
+      ],
+      "contextMap": [
+        "let analyst = agent_with_options(signature, json!({",
+        "    \"contextFields\": [\"codebase\"],",
+        "    \"contextPolicy\": {\"preset\": \"adaptive\", \"budget\": \"balanced\"},",
+        "    \"contextMap\": {\"maxChars\": 1800, \"infiniteEvolve\": false, \"evolveSteps\": 1},",
+        "}))?.with_runtime(Box::new(QuickJsCodeRuntime::new()))?;"
+      ],
+      "memorySkills": [
+        "let assistant = agent_with_options(signature, json!({",
+        "    \"memoriesCatalog\": memories,",
+        "    \"skillsCatalog\": skills,",
+        "}))?;"
+      ]
+    }
+  },
+  "apiKind": "axir",
+  "optimizeName": "AxGEPA",
+  "optimizeIntro": "Use the generated `AxGEPA` optimizer surface for portable GEPA tuning. TypeScript also exposes the convenience `optimize()` helper; generated packages currently keep the optimizer explicit.",
+  "apiReference": "/rust/api/reference/",
+  "apiSections": {
+    "ai": ["AxAI"],
+    "ax": ["AxGen", "Tools"],
+    "s": ["Signatures"],
+    "agent": ["Agents And RLM", "Runtime Profiles", "MCP"],
+    "flow": ["Flow"],
+    "optimize": ["Optimizers"]
+  },
+  "snippets": {
+    "ai": {
+      "balancer": {
+        "sourcePath": "src/examples/rust/generation/adaptive_balancer.rs",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "let store = Arc::new(AxInMemoryBalancerStatsStore::new());",
+          "let strategy = AxBalancerAdaptiveStrategy::new(6000.0, 0.02)",
+          "    .with_namespace(\"support-v1\").with_store(store)",
+          "    .with_route_key(stable_route_key).with_slice(workflow_slice)",
+          "    .on_routing_event(analytics_hook);",
+          "let balancer = AxBalancer::from_clients(",
+          "    services, AxBalancerOptions { strategy: Some(strategy), ..Default::default() })?;"
+        ]
+      },
+      "audio": [
+        "// Realtime audio over WebSocket — cargo add axllm --features realtime",
+        "let client = ai(\"openai-responses\", json!({\"model\": \"gpt-realtime-2\"}))?;",
+        "let request = json!({\"model\": \"gpt-realtime-2\", \"chat_prompt\": [{\"role\": \"user\", \"content\": \"Say hello.\"}], \"audio\": {\"output\": {\"voice\": \"alloy\"}}});",
+        "let response = client.realtime_chat(request, None)?;  // one merged turn: transcript + base64 PCM audio",
+        "// Realtime models also route transparently through chat(); chat() accepts input_audio parts; transcribe()/speak() do batch STT/TTS."
+      ]
+    },
+    "quickStart": [
+      "use axllm::{ai, ax};",
+      "use serde_json::json;",
+      "",
+      "let llm = ai(\"openai\", json!({\"apiKey\": std::env::var(\"OPENAI_API_KEY\")?}))?;",
+      "let classify = ax(\"review:string -> sentiment:class \\\"positive, negative, neutral\\\"\")?;"
+    ],
+    "dspy": [
+      "let qa = ax(\"question:string -> answer:string, confidence:number\")?;"
+    ],
+    "signature": [
+      "let sig = s(\"email:string -> priority:class \\\"high, normal, low\\\"\")?;"
+    ],
+    "ax": ["let answer = ax(\"question:string -> answer:string\")?;"],
+    "flow": [
+      "let mermaid = r#\"flowchart TD",
+      "  %%ax research: topicText:string -> factList:string[]",
+      "  %%ax audience: topicText:string -> audienceAngle:string",
+      "  %%ax join: factList:string[], audienceAngle:string -> briefText:string",
+      "  research & audience --> join\"#;",
+      "let program = flow(mermaid);",
+      "println!(\"{}\", program);"
+    ],
+    "agent": ["let helper = agent(\"question:string -> answer:string\")?;"],
+    "llm": [
+      "let client = ai(\"openai\", json!({\"apiKey\": std::env::var(\"OPENAI_API_KEY\")?}))?;"
+    ],
+    "telemetry": {
+      "sourcePath": "src/examples/rust/generation/usage_observer.rs",
+      "code": [
+        "set_usage_observer(Some(Arc::new(move |event| {",
+        "    usage_queue.lock().unwrap().push(event);",
+        "})));",
+        "client.chat_with_options(request, json!({",
+        "    \"usageContext\": {\"tenantId\": tenant_id, \"userId\": user_id, \"requestId\": request_id}",
+        "}))?;"
+      ],
+      "verified": true,
+      "requiresCredentials": true
+    },
+    "optimize": [
+      "let engine = AxGEPA::new(reflection_client, json!({}));",
+      "let result = engine.optimize(request, evaluator);"
+    ],
+    "playbook": [
+      "let mut pb = axllm::playbook(program, student, None, json!({}));",
+      "pb.evolve(&examples, &metric, json!({}));  // grow a playbook offline from examples",
+      "let rendered = pb.render();                // the playbook is now applied to the program",
+      "let state = pb.to_json();                  // persist; restore later with playbook(...).load(state)"
+    ]
+  },
+  "snippetGroups": {
+    "signatures": {
+      "string": {
+        "sourcePath": "src/examples/rust/generation/basic_generation.rs",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "let mut program = ax(\"question:string -> answer:string\")?;",
+          "let output = program.forward(&mut client, json!({\"question\": \"What is Ax?\"}))?;"
+        ]
+      },
+      "fluent": {
+        "sourcePath": "src/examples/rust/generation/signature-constraints.rs",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "let signature = f()",
+          "    .input(\"requestText\", request_type)",
+          "    .input(\"contactEmail\", email_type)",
+          "    .output(\"partySize\", party_type)",
+          "    .output(\"bookingCode\", code_type)",
+          "    .build();"
+        ]
+      },
+      "validation": {
+        "sourcePath": "src/examples/rust/generation/signature-constraints.rs",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "let mut party_type = FieldType::number();",
+          "party_type.minimum = Some(1.0);",
+          "party_type.maximum = Some(12.0);",
+          "let mut code_type = FieldType::string();",
+          "code_type.pattern = Some(r\"^[A-Z]{3}-\\d{4}$\".to_string());"
+        ]
+      },
+      "hybrid": {
+        "sourcePath": "src/examples/rust/generation/signature-constraints.rs",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "let mut program = ax(\"requestText:string -> partySize:number, bookingCode:string\")?;",
+          "program.signature = signature;",
+          "let output = program.forward(&mut client, inputs)?;"
+        ]
+      }
+    },
+    "flow": {
+      "branch": {
+        "sourcePath": "src/examples/rust/flows/branch_flow.rs",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "let classifier = ax(\"request:string -> route:class \\\"support, sales, engineering\\\"\")?;",
+          "let responder = ax(\"request:string, route:string -> response:string\")?;",
+          "let mut program = flow(\"examples.branchFlow\")",
+          "    .execute_with_options(\"classifier\", classifier, &json!({\"reads\": [\"request\"], \"writes\": [\"classifierResult\", \"route\"]}))",
+          "    .execute_with_options(\"responder\", responder, &json!({\"reads\": [\"request\", \"route\"], \"writes\": [\"responderResult\", \"response\"]}))",
+          "    .returns(json!({\"route\": \"route\", \"response\": \"response\"}));"
+        ]
+      },
+      "parallel": {
+        "sourcePath": "src/examples/rust/flows/parallel-flow.rs",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "let mut program = flow(\"examples.parallelFlow\")",
+          "    .execute_with_options(\"research\", research, &json!({\"reads\": [\"topicText\"], \"writes\": [\"researchResult\", \"factList\"]}))",
+          "    .execute_with_options(\"audience\", audience, &json!({\"reads\": [\"topicText\"], \"writes\": [\"audienceResult\", \"audienceAngle\"]}))",
+          "    .execute_with_options(\"join\", join, &json!({\"reads\": [\"factList\", \"audienceAngle\"], \"writes\": [\"joinResult\", \"briefText\"]}))",
+          "    .returns(json!({\"briefText\": \"briefText\"}));"
+        ]
+      },
+      "refine": {
+        "sourcePath": "src/examples/rust/flows/refine-flow.rs",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "let mut program = flow(\"examples.refineFlow\")",
+          "    .execute_with_options(\"draft\", draft, &json!({\"reads\": [\"topicText\"], \"writes\": [\"draftResult\", \"draftText\"]}))",
+          "    .execute_with_options(\"critique\", critique, &json!({\"reads\": [\"draftText\"], \"writes\": [\"critiqueResult\", \"critiqueText\"]}))",
+          "    .execute_with_options(\"revise\", revise, &json!({\"reads\": [\"draftText\", \"critiqueText\"], \"writes\": [\"reviseResult\", \"revisedText\"]}))",
+          "    .returns(json!({\"revisedText\": \"revisedText\"}));"
+        ]
+      }
+    },
+    "agents": {
+      "playbookEvolve": {
+        "sourcePath": "src/examples/rust/optimization/agent_playbook_evolve.rs",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "let evolution = playbook.evolve_agent(",
+          "    &mut assistant, &mut client, &dataset,",
+          "    &json!({\"verify\": true, \"maxProposals\": 1}),",
+          ")?;"
+        ]
+      }
+    },
+    "tools": {
+      "basic": [
+        "use axllm::{tool, FieldType};",
+        "",
+        "let search = tool(\"search\")",
+        "  .description(\"Search docs\")",
+        "  .arg(\"query\", FieldType::string())",
+        "  .handler(|args| Ok(json!([\"hit\"])));"
+      ],
+      "standardSchema": [
+        "// TypeScript owns the zod/valibot/arktype Standard Schema adapters.",
+        "// Generated packages expose the same Ax concept as JSON-schema-compatible tool descriptors.",
+        "let lookup = tool(\"lookupProduct\")",
+        "  .description(\"Look up product inventory\")",
+        "  .arg(\"productName\", FieldType::string())",
+        "  .handler(|_args| Ok(json!({\"price\": 79.99, \"inStock\": true})));"
+      ],
+      "namespaces": [
+        "let policy = tool(\"findPolicy\")",
+        "  .description(\"Find policies\")",
+        "  .arg(\"topic\", FieldType::string())",
+        "  .handler(|args| Ok(json!([format!(\"policy: {}\", args[\"topic\"])])));",
+        "// Group related tools under domain namespaces where the package surface supports it.",
+        "// Runtime calls should read like kb.findPolicy(...) or billing.lookupInvoice(...)."
+      ],
+      "ax": [
+        "let mut answer = axllm::ax(\"question:string -> answer:string\")?.with_tool(search);",
+        "let out = answer.forward(",
+        "  &mut llm,",
+        "  json!({\"question\": \"Can this customer get a refund?\"})",
+        ")?;"
+      ],
+      "agentFlat": [
+        "let mut assistant = axllm::agent(\"message:string -> reply:string\")?;",
+        "assistant.program.tools.push(search);"
+      ],
+      "agentGroups": [
+        "// Generated package discovery metadata follows the AxAgentFunctionGroup shape where supported.",
+        "let group = json!({",
+        "  \"namespace\": \"kb\",",
+        "  \"title\": \"Knowledge Base\",",
+        "  \"selectionCriteria\": \"Use for policy or documentation lookup.\",",
+        "  \"functions\": [\"search\"]",
+        "});"
+      ]
+    },
+    "mcp": {
+      "era": {
+        "sourcePath": "src/examples/rust/mcp/native_mcp_tools.rs",
+        "illustrative": true,
+        "notes": [
+          "Generated Rust supports automatic dual-era classification and modern discovery."
+        ],
+        "code": [
+          "let mcp = Arc::new(Mutex::new(AxMCPClient::new(",
+          "        Box::new(transport),",
+          "        json!({\"namespace\":\"inventory\"}),",
+          ")));",
+          "let catalog = mcp.lock().unwrap().inspect_catalog(false)?;"
+        ]
+      },
+      "mrtrElicitation": {
+        "illustrative": true,
+        "notes": [
+          "The setter installs a real host callback before initialization; sampling remains unsupported."
+        ],
+        "code": [
+          "let mut client = AxMCPClient::new(transport, json!({",
+          "    \"era\": \"modern\",",
+          "    \"roots\": [{ \"uri\": \"file:///workspace\" }],",
+          "}));",
+          "client.set_elicitation_handler(|params, context| {",
+          "    Ok(json!({",
+          "        \"action\": \"accept\",",
+          "        \"content\": { \"confirmed\": true },",
+          "    }))",
+          "});",
+          "let result = client.call_tool(\"mrtr_one_round\", json!({}))?;"
+        ]
+      },
+      "native": {
+        "sourcePath": "src/examples/rust/mcp/native_mcp_tools.rs",
+        "code": [
+          "let transport = AxMCPStreamableHTTPTransport::new(endpoint, json!({}))?;",
+          "let mcp = Arc::new(Mutex::new(AxMCPClient::new(",
+          "    Box::new(transport),",
+          "    json!({\"namespace\":\"inventory\"}),",
+          ")));",
+          "let context = AxExecutionContext::new(vec![mcp.clone()], vec![])?;",
+          "let catalog = mcp.lock().unwrap().inspect_catalog(false)?;",
+          "println!(\"MCP catalog: {} tools, {} resources, {} templates\",",
+          "    catalog.tools.len(), catalog.resources.len(),",
+          "    catalog.resource_templates.len());",
+          "let mut program = ax(\"request:string -> answer:string\")?.with_execution_context(context)?;",
+          "let mut llm = OpenAICompatibleClient::new(key, \"gpt-5.4-mini\");",
+          "println!(\"{}\", program.forward(",
+          "    &mut llm, json!({\"request\":\"Reindex inventory.\"}),",
+          ")?);",
+          "mcp.lock().unwrap().close()?;"
+        ]
+      },
+      "resourceWake": {
+        "code": [
+          "let route = AxEventRoute {",
+          "    id: \"resource-wake\".into(),",
+          "    action: \"wake\".into(),",
+          "    r#match: json!({\"types\":[\"mcp.resource.updated\"]}),",
+          "    target_id: Some(\"inventory-agent\".into()),",
+          "    require_authenticated: true,",
+          "    ordering: \"strict\".into(), debounce_ms: 0, instance_key: None,",
+          "};",
+          "let mut runtime = AxEventRuntime::new(vec![route], json!({}))?;",
+          "runtime.register_target(target);",
+          "runtime.start()?;",
+          "let runtime = Arc::new(Mutex::new(runtime));",
+          "let mut source = AxMCPEventSource::with_policy(",
+          "    client.clone(), runtime.clone(), \"inventory\",",
+          "    \"tenant:demo\", \"authenticated\",",
+          "    AxMCPResourceSubscriptionPolicy::All,",
+          ");",
+          "source.start()?;",
+          "source.poll(); // Drain protocol callbacks on the host thread."
+        ]
+      },
+      "taskResume": {
+        "code": [
+          "let task = client.lock().unwrap()",
+          "    .call_tool(\"start_reindex\", json!({\"scope\":\"all\"}))?;",
+          "let task_id = task[\"task\"][\"taskId\"].as_str().unwrap().to_string();",
+          "target.wait_for = vec![json!({",
+          "    \"kind\":\"mcp.task\", \"value\":\"taskKey\",",
+          "    \"metadata\":{\"taskId\":task_id},",
+          "})];",
+          "runtime.register_target(target);",
+          "runtime.start()?;",
+          "runtime.publish(start_event, \"tenant:demo\", \"authenticated\")?;",
+          "let runtime = Arc::new(Mutex::new(runtime));",
+          "let mut source = AxMCPEventSource::new(",
+          "    client.clone(), runtime.clone(), \"inventory\",",
+          "    \"tenant:demo\", \"authenticated\", vec![],",
+          ");",
+          "source.start()?;",
+          "source.poll(); // Terminal task status resumes the owner."
+        ]
+      }
+    },
+    "event": {
+      "wake": {
+        "code": [
+          "let mut target = AxEventTarget::new(\"inventory-agent\", invoke_agent);",
+          "target.map_input = Some(Arc::new(|event, _|",
+          "    Ok(json!({\"uri\": event.data[\"uri\"]}))",
+          "));",
+          "let route = AxEventRoute {",
+          "    id: \"resource-wake\".into(), action: \"wake\".into(),",
+          "    r#match: json!({\"types\":[\"mcp.resource.updated\"]}),",
+          "    target_id: Some(\"inventory-agent\".into()),",
+          "    require_authenticated: true, ordering: \"strict\".into(),",
+          "    debounce_ms: 0, instance_key: None,",
+          "};",
+          "let mut runtime = AxEventRuntime::new(vec![route], json!({}))?;",
+          "runtime.register_target(target);",
+          "runtime.start()?;"
+        ]
+      },
+      "resume": {
+        "code": [
+          "let mut target = AxEventTarget::new(\"reindex-flow\", invoke_flow);",
+          "target.wait_for = vec![json!({",
+          "    \"kind\":\"mcp.task\", \"value\":\"taskKey\",",
+          "    \"metadata\":{\"taskId\":task_id},",
+          "})];",
+          "target.map_input = Some(Arc::new(|event, continuation| Ok(json!({",
+          "    \"taskId\": continuation",
+          "        .map(|value| value.metadata[\"taskId\"].clone())",
+          "        .unwrap_or_else(|| event.data[\"taskId\"].clone()),",
+          "}))));",
+          "let routes = vec![",
+          "    route(\"task-start\", \"wake\", \"app.task.started\", \"reindex-flow\"),",
+          "    route(\"task-resume\", \"resume\", \"mcp.task.status\", \"reindex-flow\"),",
+          "];",
+          "let mut runtime = AxEventRuntime::new(routes, json!({}))?;",
+          "runtime.register_target(target);",
+          "runtime.start()?;"
+        ]
+      },
+      "ucp": {
+        "code": [
+          "fn handle_ucp_webhook(request: Request) -> AxResult<()> {",
+          "    // Verify signer profile, RFC 9421 signature, digest, freshness,",
+          "    // key rotation, and replay state before publishing.",
+          "    let order = verify_ucp_request(request)?;",
+          "    let identity = lookup_buyer_identity(&order.checkout_id)?;",
+          "    runtime.lock().unwrap().publish(",
+          "        AxEventEnvelope {",
+          "            specversion: \"1.0\".into(),",
+          "            id: order.id, source: \"ucp://orders\".into(),",
+          "            r#type: \"ucp.order.fulfilled\".into(),",
+          "            subject: Some(order.checkout_id),",
+          "            data: order.data,",
+          "            extensions: serde_json::Map::new(), correlation: vec![],",
+          "        },",
+          "        &identity, \"authenticated\",",
+          "    )?;",
+          "    Ok(())",
+          "}"
+        ]
+      }
+    }
+  }
+}

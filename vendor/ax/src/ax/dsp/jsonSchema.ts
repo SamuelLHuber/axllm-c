@@ -1,0 +1,489 @@
+import type { AxFunctionJSONSchema } from '../ai/types.js';
+import type { AxField } from './sig.js';
+
+type ToJsonSchemaOptions = {
+  /**
+   * Native structured-output providers often reject flexible JSON unions. When
+   * enabled, json and unshaped object fields are represented as JSON strings.
+   */
+  flexibleJsonFieldsAsString?: boolean;
+  /**
+   * Native structured-output APIs require every object property to be listed in
+   * `required`; optional fields are represented as nullable unions instead.
+   */
+  strictStructuredOutputs?: boolean;
+};
+
+/**
+ * Enhances field description with validation constraint information
+ * so the LLM understands the requirements
+ */
+function enhanceDescriptionWithValidation(
+  baseDescription: string | undefined,
+  type?: AxField['type']
+): string | undefined {
+  if (!type) return baseDescription;
+
+  const constraints: string[] = [];
+
+  // Email format
+  if (type.format === 'email') {
+    constraints.push('Must be a valid email address format');
+  }
+
+  // URL format
+  if (type.format === 'uri' || type.format === 'url' || type.name === 'url') {
+    constraints.push('Must be a valid URL format');
+  }
+
+  // String length constraints
+  if (
+    type.name === 'string' ||
+    type.name === 'code' ||
+    type.name === 'url' ||
+    type.name === 'date' ||
+    type.name === 'dateRange' ||
+    type.name === 'datetime' ||
+    type.name === 'datetimeRange'
+  ) {
+    if (type.minLength !== undefined && type.maxLength !== undefined) {
+      constraints.push(
+        `Minimum length: ${type.minLength} characters, maximum length: ${type.maxLength} characters`
+      );
+    } else if (type.minLength !== undefined) {
+      constraints.push(`Minimum length: ${type.minLength} characters`);
+    } else if (type.maxLength !== undefined) {
+      constraints.push(`Maximum length: ${type.maxLength} characters`);
+    }
+  }
+
+  // Number range constraints
+  if (type.name === 'number') {
+    if (type.minimum !== undefined && type.maximum !== undefined) {
+      constraints.push(
+        `Minimum value: ${type.minimum}, maximum value: ${type.maximum}`
+      );
+    } else if (type.minimum !== undefined) {
+      constraints.push(`Minimum value: ${type.minimum}`);
+    } else if (type.maximum !== undefined) {
+      constraints.push(`Maximum value: ${type.maximum}`);
+    }
+  }
+
+  // Regex pattern - patternDescription is required
+  if (type.pattern !== undefined) {
+    if (!type.patternDescription) {
+      throw new Error(
+        `Field with pattern '${type.pattern}' must include a patternDescription to explain the pattern to the LLM`
+      );
+    }
+    constraints.push(type.patternDescription);
+  }
+
+  // Date/DateTime format hints
+  if (type.name === 'date') {
+    constraints.push('Format: YYYY-MM-DD');
+  }
+  if (type.name === 'dateRange') {
+    constraints.push(
+      'Format: JSON object with start and end dates, or YYYY-MM-DD/YYYY-MM-DD'
+    );
+  }
+  if (type.name === 'datetime') {
+    constraints.push('Format: ISO 8601 date-time');
+  }
+  if (type.name === 'datetimeRange') {
+    constraints.push(
+      'Format: JSON object with start and end ISO 8601 date-times, or ISO interval start/end'
+    );
+  }
+
+  // Combine base description with constraints
+  if (constraints.length === 0) {
+    return baseDescription;
+  }
+
+  const constraintText = constraints.join('. ');
+
+  if (!baseDescription || baseDescription.trim().length === 0) {
+    return constraintText;
+  }
+
+  // Ensure base description ends with period
+  const normalizedBase = baseDescription.trim().endsWith('.')
+    ? baseDescription.trim()
+    : `${baseDescription.trim()}.`;
+
+  return `${normalizedBase} ${constraintText}`;
+}
+
+function appendJsonStringDescription(
+  baseDescription: string | undefined
+): string {
+  const jsonStringHint =
+    'Return this field as a JSON-encoded string that can be parsed with JSON.parse.';
+
+  if (!baseDescription || baseDescription.trim().length === 0) {
+    return jsonStringHint;
+  }
+
+  const normalizedBase = baseDescription.trim().endsWith('.')
+    ? baseDescription.trim()
+    : `${baseDescription.trim()}.`;
+
+  return `${normalizedBase} ${jsonStringHint}`;
+}
+
+function appendAudioScriptDescription(
+  baseDescription: string | undefined
+): string {
+  const audioHint =
+    'Return plain text to synthesize as speech; do not return audio bytes or JSON audio objects.';
+
+  if (!baseDescription || baseDescription.trim().length === 0) {
+    return audioHint;
+  }
+
+  const normalizedBase = baseDescription.trim().endsWith('.')
+    ? baseDescription.trim()
+    : `${baseDescription.trim()}.`;
+
+  return `${normalizedBase} ${audioHint}`;
+}
+
+function shouldEncodeFlexibleJsonAsString(
+  type: AxField['type'] | undefined,
+  options?: ToJsonSchemaOptions
+): boolean {
+  return (
+    options?.flexibleJsonFieldsAsString === true &&
+    (type?.name === 'json' || (type?.name === 'object' && !type.fields))
+  );
+}
+
+function shouldRequireField(
+  field: Pick<AxField, 'isOptional'>,
+  options?: ToJsonSchemaOptions
+): boolean {
+  return options?.strictStructuredOutputs === true || !field.isOptional;
+}
+
+function addNullToSchemaType(schema: any): void {
+  if (schema.type === undefined) {
+    return;
+  }
+
+  if (Array.isArray(schema.type)) {
+    if (!schema.type.includes('null')) {
+      schema.type = [...schema.type, 'null'];
+    }
+  } else {
+    schema.type = [schema.type, 'null'];
+  }
+
+  if (Array.isArray(schema.enum) && !schema.enum.includes(null)) {
+    schema.enum = [...schema.enum, null];
+  }
+}
+
+export function toJsonSchema(
+  fields: Readonly<AxField[]> | Readonly<AxField>,
+  schemaTitle: string = 'Schema',
+  options?: ToJsonSchemaOptions
+): AxFunctionJSONSchema {
+  // Handle single field case (for recursive calls or single output)
+  if ('name' in fields && 'type' in fields) {
+    return fieldToSchema(fields as AxField, false, options);
+  }
+
+  // Handle array of fields (root object)
+  const properties: Record<string, any> = {};
+  const required: string[] = [];
+
+  for (const field of fields as AxField[]) {
+    if (field.isInternal) continue;
+
+    const schema = fieldToSchema(field, false, options);
+    properties[field.name] = schema;
+
+    if (shouldRequireField(field, options)) {
+      required.push(field.name);
+    }
+  }
+
+  return {
+    type: 'object',
+    title: schemaTitle,
+    properties,
+    required,
+    additionalProperties: false,
+  };
+}
+
+function fieldToSchema(
+  field: Readonly<AxField>,
+  isNested = false,
+  options?: ToJsonSchemaOptions
+): any {
+  const type = field.type;
+
+  // Enhance description with validation constraints
+  const description = enhanceDescriptionWithValidation(field.description, type);
+
+  // Validate that media types are not used in nested objects
+  if (
+    isNested &&
+    type?.name &&
+    (type.name === 'image' || type.name === 'audio' || type.name === 'file')
+  ) {
+    throw new Error(
+      `Media type '${type.name}' is not allowed in nested object fields. ` +
+        `Media types (image, audio, file) can only be used as top-level fields. ` +
+        `Field: ${field.name}`
+    );
+  }
+
+  const schema: any = {};
+
+  if (description) {
+    schema.description = description;
+  }
+
+  if (type?.isArray) {
+    schema.type = 'array';
+    if (type.fields) {
+      // Array of objects
+      schema.items = {
+        type: 'object',
+        properties: {},
+        required: [],
+        additionalProperties: false,
+      };
+      if (type.description) {
+        schema.items.description = type.description;
+      }
+      for (const [key, fieldType] of Object.entries(type.fields)) {
+        const nestedField: AxField = {
+          name: key,
+          description: fieldType.description,
+          type: {
+            name: fieldType.type,
+            isArray: fieldType.isArray,
+            options: fieldType.options ? [...fieldType.options] : undefined,
+            fields: fieldType.fields,
+            minLength: fieldType.minLength,
+            maxLength: fieldType.maxLength,
+            minimum: fieldType.minimum,
+            maximum: fieldType.maximum,
+            pattern: fieldType.pattern,
+            patternDescription: fieldType.patternDescription,
+            format: fieldType.format,
+          },
+          isOptional: fieldType.isOptional,
+          isInternal: fieldType.isInternal,
+        };
+        schema.items.properties[key] = fieldToSchema(
+          nestedField,
+          true,
+          options
+        );
+        if (shouldRequireField(fieldType, options)) {
+          schema.items.required.push(key);
+        }
+      }
+    } else if (type.name === 'class' && type.options) {
+      schema.items = {
+        type: 'string',
+        enum: type.options,
+      };
+    } else {
+      // Array of primitives
+      // Enhance description for array items
+      const itemDescription = enhanceDescriptionWithValidation(
+        type.description || field.description,
+        type
+      );
+
+      schema.items = {
+        type: shouldEncodeFlexibleJsonAsString(type, options)
+          ? 'string'
+          : mapAxTypeToJsonSchemaType(type.name),
+      };
+
+      if (shouldEncodeFlexibleJsonAsString(type, options)) {
+        schema.items.description = appendJsonStringDescription(itemDescription);
+      } else if (itemDescription) {
+        schema.items.description = itemDescription;
+      }
+
+      // Add constraints to array items
+      if (
+        type.name === 'string' ||
+        type.name === 'code' ||
+        type.name === 'url' ||
+        type.name === 'date' ||
+        type.name === 'dateRange' ||
+        type.name === 'datetime' ||
+        type.name === 'datetimeRange'
+      ) {
+        if (type.minLength !== undefined) {
+          schema.items.minLength = type.minLength;
+        }
+        if (type.maxLength !== undefined) {
+          schema.items.maxLength = type.maxLength;
+        }
+        if (type.pattern !== undefined) {
+          schema.items.pattern = type.pattern;
+        }
+        if (type.format !== undefined) {
+          schema.items.format = type.format;
+        }
+      } else if (type.name === 'number') {
+        if (type.minimum !== undefined) {
+          schema.items.minimum = type.minimum;
+        }
+        if (type.maximum !== undefined) {
+          schema.items.maximum = type.maximum;
+        }
+      }
+    }
+  } else if (type?.name === 'object' && type.fields) {
+    schema.type = 'object';
+    schema.properties = {};
+    schema.required = [];
+    schema.additionalProperties = false;
+
+    for (const [key, fieldType] of Object.entries(type.fields)) {
+      const nestedField: AxField = {
+        name: key,
+        description: fieldType.description,
+        type: {
+          name: fieldType.type,
+          isArray: fieldType.isArray,
+          options: fieldType.options ? [...fieldType.options] : undefined,
+          fields: fieldType.fields,
+          minLength: fieldType.minLength,
+          maxLength: fieldType.maxLength,
+          minimum: fieldType.minimum,
+          maximum: fieldType.maximum,
+          pattern: fieldType.pattern,
+          patternDescription: fieldType.patternDescription,
+          format: fieldType.format,
+        },
+        isOptional: fieldType.isOptional,
+        isInternal: fieldType.isInternal,
+      };
+      schema.properties[key] = fieldToSchema(nestedField, true, options);
+      if (shouldRequireField(fieldType, options)) {
+        schema.required.push(key);
+      }
+    }
+  } else if (type?.name === 'class' && type.options) {
+    schema.type = 'string';
+    schema.enum = type.options;
+  } else {
+    schema.type = shouldEncodeFlexibleJsonAsString(type, options)
+      ? 'string'
+      : mapAxTypeToJsonSchemaType(type?.name ?? 'string');
+
+    if (shouldEncodeFlexibleJsonAsString(type, options)) {
+      schema.description = appendJsonStringDescription(schema.description);
+    }
+    if (type?.name === 'audio') {
+      schema.description = appendAudioScriptDescription(schema.description);
+    }
+
+    // Add constraints based on field type
+    if (
+      type?.name === 'string' ||
+      type?.name === 'code' ||
+      type?.name === 'url' ||
+      type?.name === 'date' ||
+      type?.name === 'dateRange' ||
+      type?.name === 'datetime' ||
+      type?.name === 'datetimeRange'
+    ) {
+      if (type.minLength !== undefined) {
+        schema.minLength = type.minLength;
+      }
+      if (type.maxLength !== undefined) {
+        schema.maxLength = type.maxLength;
+      }
+      if (type.pattern !== undefined) {
+        schema.pattern = type.pattern;
+      }
+      if (type.format !== undefined) {
+        schema.format = type.format;
+      }
+      // Add default format hints for special types
+      if (type.name === 'url' && !type.format) {
+        schema.format = 'uri';
+      }
+      if (type.name === 'date' && !type.format) {
+        schema.format = 'date';
+      }
+      if (type.name === 'datetime' && !type.format) {
+        schema.format = 'date-time';
+      }
+    } else if (type?.name === 'number') {
+      if (type.minimum !== undefined) {
+        schema.minimum = type.minimum;
+      }
+      if (type.maximum !== undefined) {
+        schema.maximum = type.maximum;
+      }
+    }
+  }
+
+  if (field.isOptional && options?.strictStructuredOutputs === true) {
+    addNullToSchemaType(schema);
+  }
+
+  return schema;
+}
+
+function mapAxTypeToJsonSchemaType(axType: string): string | string[] {
+  switch (axType) {
+    case 'string':
+    case 'code':
+    case 'url':
+    case 'date':
+    case 'datetime':
+    case 'dateRange':
+    case 'datetimeRange':
+    case 'image':
+    case 'audio':
+    case 'file':
+      return 'string';
+    case 'number':
+      return 'number';
+    case 'boolean':
+      return 'boolean';
+    case 'json':
+    case 'object':
+      return ['object', 'array', 'string', 'number', 'boolean', 'null'];
+    default:
+      return 'string';
+  }
+}
+
+export function validateJSONSchema(schema: any): void {
+  if (!schema || typeof schema !== 'object') {
+    throw new Error('Schema must be an object');
+  }
+
+  if (schema.type === 'array') {
+    if (!schema.items) {
+      throw new Error(
+        'Array schema is missing an "items" definition (required by JSON Schema and all LLM providers for function tools)'
+      );
+    }
+    validateJSONSchema(schema.items);
+  } else if (schema.type === 'object') {
+    if (schema.properties) {
+      for (const prop of Object.values(schema.properties)) {
+        validateJSONSchema(prop);
+      }
+    }
+  }
+}

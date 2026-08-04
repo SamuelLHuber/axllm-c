@@ -1,0 +1,32 @@
+export const axSpanAttributes = {
+  LLM_SYSTEM: 'gen_ai.system',
+  LLM_OPERATION_NAME: 'gen_ai.operation.name',
+  LLM_REQUEST_MODEL: 'gen_ai.request.model',
+  LLM_REQUEST_MAX_TOKENS: 'gen_ai.request.max_tokens',
+  LLM_REQUEST_TEMPERATURE: 'gen_ai.request.temperature',
+  LLM_REQUEST_TOP_K: 'gen_ai.request.top_k',
+  LLM_REQUEST_FREQUENCY_PENALTY: 'gen_ai.request.frequency_penalty',
+  LLM_REQUEST_PRESENCE_PENALTY: 'gen_ai.request.presence_penalty',
+  LLM_REQUEST_STOP_SEQUENCES: 'gen_ai.request.stop_sequences',
+  LLM_REQUEST_LLM_IS_STREAMING: 'gen_ai.request.llm_is_streaming',
+  LLM_REQUEST_TOP_P: 'gen_ai.request.top_p',
+  LLM_RESPONSE_ID: 'gen_ai.response.id',
+  LLM_RESPONSE_MODEL: 'gen_ai.response.model',
+  LLM_CONVERSATION_ID: 'gen_ai.conversation.id',
+  LLM_USAGE_INPUT_TOKENS: 'gen_ai.usage.input_tokens',
+  LLM_USAGE_OUTPUT_TOKENS: 'gen_ai.usage.output_tokens',
+  LLM_USAGE_TOTAL_TOKENS: 'gen_ai.usage.total_tokens',
+  LLM_USAGE_THOUGHTS_TOKENS: 'gen_ai.usage.thoughts_tokens',
+  AX_SESSION_ID: 'ax.session.id',
+  AX_PROVIDER_REQUEST_ID: 'ax.provider.request_id',
+  AX_PROVIDER_SESSION_ID: 'ax.provider.session_id',
+} as const;
+
+export const axSpanEvents = {
+  GEN_AI_USER_MESSAGE: 'gen_ai.user.message',
+  GEN_AI_SYSTEM_MESSAGE: 'gen_ai.system.message',
+  GEN_AI_ASSISTANT_MESSAGE: 'gen_ai.assistant.message',
+  GEN_AI_TOOL_MESSAGE: 'gen_ai.tool.message',
+  GEN_AI_CHOICE: 'gen_ai.choice',
+  GEN_AI_USAGE: 'gen_ai.usage',
+} as const;

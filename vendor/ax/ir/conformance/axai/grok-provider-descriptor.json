@@ -1,0 +1,50 @@
+{
+  "expected_output": {
+    "baseUrl": "https://api.x.ai/v1",
+    "defaultModel": "grok-4.3",
+    "features": {
+      "media": {
+        "audio": {
+          "output": {
+            "supported": true
+          },
+          "realtime": true,
+          "supported": true
+        },
+        "images": {
+          "supported": true
+        },
+        "urls": {
+          "web_search": true
+        }
+      },
+      "thinking": true
+    },
+    "id": "grok",
+    "name": "Grok",
+    "operations": {
+      "chat": {
+        "body": "json",
+        "method": "POST",
+        "path": "/chat/completions",
+        "stream": false
+      },
+      "realtime_audio": {
+        "body": "events",
+        "grammar": "openai_realtime_compatible",
+        "method": "WS",
+        "path": "/realtime",
+        "stream": true
+      },
+      "stream_chat": {
+        "body": "json",
+        "method": "POST",
+        "path": "/chat/completions",
+        "stream": true
+      }
+    }
+  },
+  "kind": "ai_provider_descriptor",
+  "name": "grok-provider-descriptor",
+  "provider": "grok"
+}

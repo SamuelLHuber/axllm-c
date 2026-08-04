@@ -1,0 +1,19 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "website",
+      "runtimeExecutable": "hugo",
+      "runtimeArgs": ["server", "--source", "website", "--port", "1414"],
+      "port": 1414,
+      "autoPort": false
+    },
+    {
+      "name": "website-static",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "http.server", "1415", "-d", "website/public"],
+      "port": 1415,
+      "autoPort": false
+    }
+  ]
+}

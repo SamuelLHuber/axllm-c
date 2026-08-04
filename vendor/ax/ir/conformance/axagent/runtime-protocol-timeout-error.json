@@ -1,0 +1,12 @@
+{
+  "execute_code": "timeout()",
+  "expected_execute_subset": {
+    "error": "fixture timeout",
+    "error_category": "timeout",
+    "is_error": true,
+    "kind": "error"
+  },
+  "kind": "agent_runtime_protocol",
+  "name": "runtime-protocol-timeout-error",
+  "operation": "execute_error"
+}

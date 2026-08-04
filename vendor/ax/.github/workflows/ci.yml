@@ -1,0 +1,447 @@
+name: Build and Test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  AXIR_BIN_CACHE: /tmp/axir-bin-cache
+  GOCACHE: /tmp/go-build
+  GOMODCACHE: /tmp/go-mod
+  CARGO_TARGET_DIR: /tmp/axir-cargo-target
+  AXIR_CARGO_OFFLINE_FIRST: '1'
+  HUGO_VERSION: '0.162.0'
+
+jobs:
+  changes:
+    name: Detect CI Scope
+    runs-on: ubuntu-latest
+    outputs:
+      axir: ${{ steps.scope.outputs.run_axir }}
+      core: ${{ steps.scope.outputs.run_core }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22.x'
+      - name: Detect CI scope
+        id: scope
+        run: node scripts/ci-scope.mjs --base "$DIFF_BASE" --head HEAD --github-output "$GITHUB_OUTPUT"
+        env:
+          DIFF_BASE: ${{ github.event_name == 'push' && github.event.before || github.event.pull_request.base.sha }}
+
+  build:
+    name: Build
+    needs: changes
+    if: needs.changes.outputs.core == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22.x'
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Build packages
+        run: npm run build
+
+  repo-checks:
+    name: Repo Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22.x'
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Check AxIR backlog coverage for portable TypeScript changes
+        # On push events origin/main already equals HEAD, so diff against the
+        # pre-push tip; the script falls back safely when it is unreachable.
+        run: npm run axir:backlog:check -- --base "$DIFF_BASE" --head HEAD
+        env:
+          DIFF_BASE: ${{ github.event_name == 'push' && github.event.before || 'origin/main' }}
+      - name: Validate AxIR backlog ledger and docs
+        run: npm run axir:backlog:validate
+      - name: Test AxIR maintenance tools
+        run: npm run test:axir:tools
+      - name: Check AxIR behavioral-parity ledger
+        run: npm run axir:gate:ledger
+      - name: Check complete AxAgent semantic parity
+        run: npm run axir:semantic-parity
+      - name: Check AxIR anti-facade examples
+        run: npm run axir:gate:anti-facade
+      - name: Check AxIR RLM prompt sync (TS .md vs IR json)
+        run: npm run axir:gate:prompt-sync
+      - name: Check formatting
+        run: npm run test:format
+      - name: Lint
+        run: npm run test:lint
+      - name: Check spelling
+        run: npm run test:spelling
+
+  workspace-tests:
+    name: Workspace Tests
+    needs: changes
+    if: needs.changes.outputs.core == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22.x'
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Run workspace tests
+        run: npm run test:tests
+
+  generated-examples:
+    name: Generated Examples
+    needs: changes
+    if: needs.changes.outputs.axir == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22.x'
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.23.x'
+          cache: false
+      - name: Cache AxIR Go outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.AXIR_BIN_CACHE }}
+            ${{ env.GOCACHE }}
+            ${{ env.GOMODCACHE }}
+          key: ${{ runner.os }}-axir-go-${{ hashFiles('tools/axir/go.mod', 'tools/axir/**/*.go') }}
+          restore-keys: |
+            ${{ runner.os }}-axir-go-
+      - name: Cache Cargo outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            ${{ env.CARGO_TARGET_DIR }}
+          key: ${{ runner.os }}-cargo-generated-${{ hashFiles('packages/rust/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-generated-
+            ${{ runner.os }}-cargo-
+      - name: Install C++ QuickJS runtime
+        run: sudo apt-get update && sudo apt-get install --yes libquickjs
+      - name: Install dependencies
+        run: npm ci
+      - name: Run generated examples
+        run: npm run test:examples:generated
+        env:
+          AXIR_QUICKJS_CFLAGS: '-I/usr/include/quickjs'
+          AXIR_QUICKJS_LDFLAGS: '/usr/lib/quickjs/libquickjs.a -lm -ldl -pthread'
+      - name: AxIR perturbation gate (expected-mutation, all targets)
+        run: npm run axir:perturb:check
+      - name: AxIR anti-hardcode gate (model-response mutation, all targets)
+        run: npm run axir:gate:response-perturb
+        env:
+          AXIR_PERTURB_ALL: "1"
+
+  axir-packages:
+    name: AxIR Package Freshness
+    needs: changes
+    if: needs.changes.outputs.axir == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22.x'
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.23.x'
+          cache: false
+      - name: Cache AxIR Go outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.AXIR_BIN_CACHE }}
+            ${{ env.GOCACHE }}
+            ${{ env.GOMODCACHE }}
+          key: ${{ runner.os }}-axir-go-${{ hashFiles('tools/axir/go.mod', 'tools/axir/**/*.go') }}
+          restore-keys: |
+            ${{ runner.os }}-axir-go-
+      - name: Install dependencies
+        run: npm ci
+      - name: Check complete AxAgent semantic parity
+        run: npm run axir:semantic-parity
+      - name: Check generated package freshness
+        run: npm run axir:check-packages
+
+  website:
+    name: Documentation Website
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22.x'
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install Hugo
+        run: |
+          curl -sL "https://github.com/gohugoio/hugo/releases/download/v${HUGO_VERSION}/hugo_${HUGO_VERSION}_linux-amd64.tar.gz" -o /tmp/hugo.tar.gz
+          tar -C /tmp -xzf /tmp/hugo.tar.gz hugo
+          sudo mv /tmp/hugo /usr/local/bin/hugo
+          hugo version
+      - name: Install dependencies
+        run: npm ci
+      - name: Check documentation website
+        run: npm run website:check
+
+  axir-verify:
+    name: AxIR Verify (${{ matrix.target }})
+    needs: changes
+    if: needs.changes.outputs.axir == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [python, java, cpp, go, rust]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22.x'
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Setup Python
+        if: matrix.target == 'python'
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+      - name: Setup Java
+        if: matrix.target == 'java'
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.23.x'
+          cache: false
+      - name: Cache AxIR Go outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.AXIR_BIN_CACHE }}
+            ${{ env.GOCACHE }}
+            ${{ env.GOMODCACHE }}
+          key: ${{ runner.os }}-axir-go-${{ hashFiles('tools/axir/go.mod', 'tools/axir/**/*.go') }}
+          restore-keys: |
+            ${{ runner.os }}-axir-go-
+      - name: Cache Cargo outputs
+        if: matrix.target == 'rust'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            ${{ env.CARGO_TARGET_DIR }}
+          key: ${{ runner.os }}-cargo-verify-${{ hashFiles('packages/rust/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-verify-
+            ${{ runner.os }}-cargo-
+      - name: Install dependencies
+        run: npm ci
+      - name: Verify AxIR ${{ matrix.target }} package
+        run: npm run axir:verify:release -- --targets ${{ matrix.target }}
+
+  axir-agent-antidote:
+    # Real-engine antidote (see docs/AXIR_GATES.md). Runs the WHOLE ir/conformance/axagent-real
+    # suite, so BOTH RLM actor stages are genuinely executed by a real embedded engine: the executor
+    # (agent-runtime-real-javascript-final) AND the distiller (agent-runtime-real-distiller-code,
+    # which a one-shot distiller that demands a completion cannot pass -- the bug a live model surfaced
+    # that scripted fixtures + the executor-only antidote missed). The recorded transcript supplies the
+    # model turns, but the completion MUST be produced by the engine run -- a hollow agent that
+    # fabricates a completion payload cannot pass. Go uses the bundled goja engine; Python the optional
+    # quickjs wheel (axllm[runtime-quickjs]); Rust the rquickjs feature; Java the pure-JVM quickjs4j
+    # engine from Maven Central. cpp is verified locally (all five real engines pass) -- it needs a
+    # native libquickjs: g++ -std=c++17 -DAX_CONFORMANCE_QUICKJS -I packages/cpp -I <quickjs-include>
+    # packages/cpp/conformance.cpp packages/cpp/axllm/axllm.cpp packages/cpp/axllm/mcp.cpp
+    # packages/cpp/axllm/runtime/quickjs/quickjs_runtime.cpp -L <quickjs-lib> -lquickjs (see
+    # docs/AXIR_GATES.md). TestRLMStagesSymmetric + TestRealEngineFixturesRunCode (go test) statically
+    # guard that every actor stage has a code signature + runtime loop and that these fixtures run code,
+    # not a hand-fed completion.
+    name: AxIR Agent Real-Engine Antidote
+    needs: changes
+    if: needs.changes.outputs.axir == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.23.x'
+          cache: false
+      - name: Go in-process engine antidote (goja, bundled)
+        run: cd packages/go && go run ./conformance ../../ir/conformance/axagent-real
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+      - name: Python in-process engine antidote (axllm[runtime-quickjs])
+        run: |
+          pip install quickjs
+          PYTHONPATH=packages/python python -m axllm.conformance ir/conformance/axagent-real
+      - name: Cache Cargo outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            ${{ env.CARGO_TARGET_DIR }}
+          key: ${{ runner.os }}-cargo-antidote-${{ hashFiles('packages/rust/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      - name: Build Rust antidote binary
+        run: |
+          for attempt in 1 2 3; do
+            if cargo build --manifest-path packages/rust/Cargo.toml --features runtime-quickjs --bin axllm-conformance; then
+              exit 0
+            fi
+            if [ "$attempt" = "3" ]; then
+              exit 1
+            fi
+            sleep $((attempt * 15))
+          done
+      - name: Rust in-process engine antidote (rquickjs)
+        run: cargo run --offline --manifest-path packages/rust/Cargo.toml --features runtime-quickjs --bin axllm-conformance -- ir/conformance/axagent-real
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Java in-process engine antidote (quickjs4j/Chicory)
+        # quickjs4j is a pure-JVM WASM engine, so the only setup is fetching it (+ deps) from
+        # Maven Central, compiling the package against it, and running -- no native toolchain.
+        run: |
+          cat > /tmp/qjs4j-pom.xml <<'EOF'
+          <project xmlns="http://maven.apache.org/POM/4.0.0">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>tmp</groupId><artifactId>fetch</artifactId><version>1</version><packaging>pom</packaging>
+            <dependencies><dependency>
+              <groupId>io.roastedroot</groupId><artifactId>quickjs4j</artifactId><version>0.0.18</version>
+            </dependency></dependencies>
+          </project>
+          EOF
+          mvn -q -f /tmp/qjs4j-pom.xml dependency:copy-dependencies -DoutputDirectory=/tmp/qjs4j-libs
+          CP=$(ls /tmp/qjs4j-libs/*.jar | tr '\n' ':')
+          find packages/java/dev -name '*.java' > /tmp/java-sources.txt
+          javac -cp "$CP" -d /tmp/java-classes @/tmp/java-sources.txt
+          java -cp "/tmp/java-classes:$CP" dev.axllm.ax.Conformance ir/conformance/axagent-real
+
+  ci-summary:
+    name: CI Summary
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - changes
+      - build
+      - repo-checks
+      - workspace-tests
+      - generated-examples
+      - axir-packages
+      - website
+      - axir-verify
+      - axir-agent-antidote
+    steps:
+      - name: Check all CI shards
+        run: |
+          core_scope="${{ needs.changes.outputs.core }}"
+          axir_scope="${{ needs.changes.outputs.axir }}"
+          for scope in "$core_scope" "$axir_scope"; do
+            case "$scope" in
+              true|false) ;;
+              *)
+                echo "Invalid or missing CI scope output: '$scope'"
+                exit 1
+                ;;
+            esac
+          done
+
+          for result in \
+            "${{ needs.changes.result }}" \
+            "${{ needs.repo-checks.result }}" \
+            "${{ needs.website.result }}"; do
+            if [ "$result" != "success" ]; then
+              echo "Required CI shard failed or was skipped: $result"
+              exit 1
+            fi
+          done
+
+          if [ "$core_scope" = "true" ]; then
+            expected=success
+          else
+            expected=skipped
+          fi
+
+          for result in \
+            "${{ needs.build.result }}" \
+            "${{ needs.workspace-tests.result }}"; do
+            if [ "$result" != "$expected" ]; then
+              echo "Core CI shard result $result, expected $expected"
+              exit 1
+            fi
+          done
+
+          if [ "$axir_scope" = "true" ]; then
+            expected=success
+          else
+            expected=skipped
+          fi
+
+          for result in \
+            "${{ needs.generated-examples.result }}" \
+            "${{ needs.axir-packages.result }}" \
+            "${{ needs.axir-verify.result }}" \
+            "${{ needs.axir-agent-antidote.result }}"; do
+            if [ "$result" != "$expected" ]; then
+              echo "AxIR CI shard result $result, expected $expected"
+              exit 1
+            fi
+          done

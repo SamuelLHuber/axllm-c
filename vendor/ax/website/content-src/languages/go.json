@@ -1,0 +1,462 @@
+{
+  "id": "go",
+  "label": "Go",
+  "shortLabel": "Go",
+  "fence": "go",
+  "packageName": "github.com/ax-llm/ax/packages/go",
+  "install": ["go get github.com/ax-llm/ax/packages/go"],
+  "exampleRoot": "packages/go/examples",
+  "academy": {
+    "unitExamples": {
+      "dspy": "src/examples/go/generation/structured_generation.go",
+      "models-signatures": "src/examples/go/generation/structured_generation.go",
+      "axgen": "src/examples/go/generation/basic_generation.go",
+      "axflow": "src/examples/go/flows/branch_flow.go",
+      "axagent": "src/examples/go/short-agents/tools_agent.go",
+      "rlm": "src/examples/go/long-agents/incident_log_forensics.go",
+      "peek-context": "src/examples/go/long-agents/codebase_peek_map.go",
+      "optimization": "src/examples/go/optimization/axgen_optimization.go",
+      "mcp": "src/examples/go/mcp/native_mcp_tools.go",
+      "notifications": "src/examples/go/mcp/resource_wake_agent.go",
+      "production": "src/examples/go/long-agents/smart_defaults_agent.go"
+    },
+    "capstoneExample": "src/examples/go/mcp/task_resume_flow.go",
+    "exerciseAnswers": {
+      "signature-semantic-contract": ["S"],
+      "ai-providers-models": ["NewAI"],
+      "fluent-fields-validation": ["FieldType"],
+      "typed-tools": ["Fn"],
+      "optimize-gen-flow": ["NewGEPA"]
+    },
+    "snippets": {
+      "flow": [
+        "mermaid := `flowchart TD",
+        "  %%ax classify: request:string -> route:class \"support, sales\"",
+        "  classify{route}`",
+        "program := axllm.NewFlow(mermaid)",
+        "fmt.Println(program.String())"
+      ],
+      "rlm": [
+        "investigator := axllm.NewAgent(signature, map[string]axllm.Value{",
+        "    \"contextFields\": axllm.Array(\"logs\"),",
+        "    \"contextPolicy\": axllm.Object(\"preset\", \"lean\", \"budget\", \"balanced\"),",
+        "    \"runtime\": axllm.Object(\"language\", \"JavaScript\"),",
+        "})"
+      ],
+      "contextMap": [
+        "analyst := axllm.NewAgent(signature, map[string]axllm.Value{",
+        "    \"contextFields\": axllm.Array(\"codebase\"),",
+        "    \"contextPolicy\": axllm.Object(\"preset\", \"adaptive\", \"budget\", \"balanced\"),",
+        "    \"contextMap\": axllm.Object(\"maxChars\", 1800, \"infiniteEvolve\", false, \"evolveSteps\", 1),",
+        "})"
+      ],
+      "memorySkills": [
+        "assistant := axllm.NewAgent(signature, map[string]axllm.Value{",
+        "    \"memoriesCatalog\": memories,",
+        "    \"skillsCatalog\": skills,",
+        "})"
+      ]
+    }
+  },
+  "apiKind": "axir",
+  "optimizeName": "AxGEPA",
+  "optimizeIntro": "Use the generated `AxGEPA` optimizer surface for portable GEPA tuning. TypeScript also exposes the convenience `optimize()` helper; generated packages currently keep the optimizer explicit.",
+  "apiReference": "/go/api/reference/",
+  "apiSections": {
+    "ai": ["AxAI"],
+    "ax": ["AxGen", "Tools"],
+    "s": ["Signatures"],
+    "agent": ["Agents And RLM", "Runtime Profiles", "MCP"],
+    "flow": ["Flow"],
+    "optimize": ["Optimizers"]
+  },
+  "snippets": {
+    "ai": {
+      "balancer": {
+        "sourcePath": "src/examples/go/generation/adaptive_balancer.go",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "store := ax.NewAxInMemoryBalancerStatsStore()",
+          "strategy := &ax.AxBalancerAdaptiveStrategy{",
+          "    DeadlineMs: 6000, BadOutcomeCost: 0.02, Namespace: \"support-v1\",",
+          "    StatsStore: store, RouteKey: stableRouteKey, Slice: workflowSlice,",
+          "    OnRoutingEvent: analyticsHook,",
+          "}",
+          "balancer, _ := ax.NewAxBalancerWithOptions(services, ax.AxBalancerOptions{Strategy: strategy})"
+        ]
+      },
+      "audio": [
+        "// Realtime audio over WebSocket — needs Go 1.23+",
+        "client := ax.NewOpenAIResponsesClient(map[string]ax.Value{\"model\": \"gpt-realtime-2\", \"api_key\": os.Getenv(\"OPENAI_APIKEY\")})",
+        "request := map[string]ax.Value{\"model\": \"gpt-realtime-2\", \"chat_prompt\": ax.Array(ax.Object(\"role\", \"user\", \"content\", \"Say hello.\")), \"audio\": ax.Object(\"output\", ax.Object(\"voice\", \"alloy\"))}",
+        "final, _ := client.RealtimeChat(context.Background(), request, nil, nil)  // one merged turn: transcript + base64 PCM audio",
+        "// Realtime models also route transparently through Chat(); Chat() accepts input_audio parts; Transcribe()/Speak() do batch STT/TTS."
+      ]
+    },
+    "quickStart": [
+      "import axllm \"github.com/ax-llm/ax/packages/go\"",
+      "",
+      "client := axllm.NewAI(\"openai\", map[string]axllm.Value{\"apiKey\": os.Getenv(\"OPENAI_API_KEY\")})",
+      "classify := axllm.NewAx(\"review:string -> sentiment:class \\\"positive, negative, neutral\\\"\", nil)"
+    ],
+    "dspy": [
+      "qa := axllm.NewAx(\"question:string -> answer:string, confidence:number\", nil)"
+    ],
+    "signature": [
+      "sig := axllm.S(\"email:string -> priority:class \\\"high, normal, low\\\"\")"
+    ],
+    "ax": ["answer := axllm.NewAx(\"question:string -> answer:string\", nil)"],
+    "flow": [
+      "mermaid := `flowchart TD",
+      "  %%ax research: topicText:string -> factList:string[]",
+      "  %%ax audience: topicText:string -> audienceAngle:string",
+      "  %%ax join: factList:string[], audienceAngle:string -> briefText:string",
+      "  research & audience --> join`",
+      "program := axllm.NewFlow(mermaid)",
+      "fmt.Println(program.String())"
+    ],
+    "agent": [
+      "helper := axllm.NewAgent(\"question:string -> answer:string\", nil)"
+    ],
+    "llm": [
+      "client := axllm.NewAI(\"openai\", map[string]axllm.Value{\"apiKey\": os.Getenv(\"OPENAI_API_KEY\")})"
+    ],
+    "telemetry": {
+      "sourcePath": "src/examples/go/generation/usage_observer.go",
+      "code": [
+        "axllm.SetUsageObserver(func(event axllm.AxUsageEvent) {",
+        "    usageQueue <- event",
+        "})",
+        "_, err := client.Chat(ctx, request, axllm.Object(",
+        "    \"usageContext\", axllm.Object(\"tenantId\", tenantID, \"userId\", userID, \"requestId\", requestID),",
+        "))"
+      ],
+      "verified": true,
+      "requiresCredentials": true
+    },
+    "optimize": [
+      "engine := axllm.NewAxGEPA(reflectionClient, nil)",
+      "result := engine.Optimize(request, evaluator)"
+    ],
+    "playbook": [
+      "pb := axllm.Playbook(program, map[string]axllm.Value{\"studentAI\": studentAI})",
+      "pb.Evolve(ctx, examples, metric, nil)   // grow a playbook offline from examples",
+      "pb.Update(ctx, map[string]axllm.Value{\"example\": ex, \"prediction\": pred, \"feedback\": \"...\"})",
+      "pb.ApplyTo(program)"
+    ]
+  },
+  "snippetGroups": {
+    "signatures": {
+      "string": {
+        "sourcePath": "src/examples/go/generation/basic_generation.go",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "program := ax.NewAx(\"question:string -> answer:string\", nil)",
+          "output, err := program.Forward(ctx, client, map[string]ax.Value{\"question\": \"What is Ax?\"}, nil)"
+        ]
+      },
+      "fluent": {
+        "sourcePath": "src/examples/go/generation/signature-constraints.go",
+        "verified": true,
+        "requiresCredentials": true,
+        "notes": [
+          "Go exposes the generated native signature records directly."
+        ],
+        "code": [
+          "signature := ax.AxSignature{",
+          "  Inputs: []ax.Field{{",
+          "    Name: \"requestText\",",
+          "    Type: ax.FieldType{Name: \"string\", MinLength: 10, MaxLength: 500},",
+          "  }},",
+          "}"
+        ]
+      },
+      "validation": {
+        "sourcePath": "src/examples/go/generation/signature-constraints.go",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "party := ax.FieldType{Name: \"number\", Minimum: 1, Maximum: 12}",
+          "code := ax.FieldType{",
+          "  Name: \"string\", Pattern: `^[A-Z]{3}-\\d{4}$`,",
+          "  PatternDescription: \"Must look like ABC-1234\",",
+          "}"
+        ]
+      },
+      "hybrid": {
+        "sourcePath": "src/examples/go/generation/signature-constraints.go",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "program := ax.NewAx(\"requestText:string -> partySize:number, bookingCode:string\", nil)",
+          "program.Signature = signature",
+          "output, err := program.Forward(ctx, client, inputs, nil)"
+        ]
+      }
+    },
+    "flow": {
+      "branch": {
+        "sourcePath": "src/examples/go/flows/branch_flow.go",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "classifier := ax.NewAx(\"request:string -> route:class \\\"support, sales, engineering\\\"\", nil)",
+          "responder := ax.NewAx(\"request:string, route:string -> response:string\", nil)",
+          "program := ax.NewFlow(map[string]ax.Value{\"id\": \"examples.branchFlow\"}).",
+          "  Execute(\"classifier\", classifier, map[string]ax.Value{\"reads\": ax.Array(\"request\"), \"writes\": ax.Array(\"classifierResult\", \"route\")}).",
+          "  Execute(\"responder\", responder, map[string]ax.Value{\"reads\": ax.Array(\"request\", \"route\"), \"writes\": ax.Array(\"responderResult\", \"response\")}).",
+          "  Returns(map[string]ax.Value{\"route\": \"route\", \"response\": \"response\"})"
+        ]
+      },
+      "parallel": {
+        "sourcePath": "src/examples/go/flows/parallel-flow.go",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "program := ax.NewFlow(map[string]ax.Value{\"id\": \"examples.parallelFlow\"}).",
+          "  Execute(\"research\", research, map[string]ax.Value{\"reads\": ax.Array(\"topicText\"), \"writes\": ax.Array(\"researchResult\", \"factList\")}).",
+          "  Execute(\"audience\", audience, map[string]ax.Value{\"reads\": ax.Array(\"topicText\"), \"writes\": ax.Array(\"audienceResult\", \"audienceAngle\")}).",
+          "  Execute(\"join\", join, map[string]ax.Value{\"reads\": ax.Array(\"factList\", \"audienceAngle\"), \"writes\": ax.Array(\"joinResult\", \"briefText\")}).",
+          "  Returns(map[string]ax.Value{\"briefText\": \"briefText\"})"
+        ]
+      },
+      "refine": {
+        "sourcePath": "src/examples/go/flows/refine-flow.go",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "program := ax.NewFlow(map[string]ax.Value{\"id\": \"examples.refineFlow\"}).",
+          "  Execute(\"draft\", draft, map[string]ax.Value{\"reads\": ax.Array(\"topicText\"), \"writes\": ax.Array(\"draftResult\", \"draftText\")}).",
+          "  Execute(\"critique\", critique, map[string]ax.Value{\"reads\": ax.Array(\"draftText\"), \"writes\": ax.Array(\"critiqueResult\", \"critiqueText\")}).",
+          "  Execute(\"revise\", revise, map[string]ax.Value{\"reads\": ax.Array(\"draftText\", \"critiqueText\"), \"writes\": ax.Array(\"reviseResult\", \"revisedText\")}).",
+          "  Returns(map[string]ax.Value{\"revisedText\": \"revisedText\"})"
+        ]
+      }
+    },
+    "agents": {
+      "playbookEvolve": {
+        "sourcePath": "src/examples/go/optimization/agent_playbook_evolve.go",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "evolution, err := assistant.GetPlaybook().EvolveAgent(",
+          "    ctx, dataset,",
+          "    map[string]ax.Value{\"verify\": true, \"maxProposals\": 1, \"runtime\": runtime},",
+          ")"
+        ]
+      }
+    },
+    "tools": {
+      "basic": {
+        "sourcePath": "packages/go/examples/axgen_scripted_client_tool/main.go",
+        "notes": [
+          "Shortened from the checked-in scripted-client tool example."
+        ],
+        "code": [
+          "search := axllm.Fn(\"search\").WithHandler(func(args map[string]axllm.Value) (axllm.Value, error) {",
+          "  return axllm.Object(\"title\", \"Ax docs\"), nil",
+          "})"
+        ]
+      },
+      "standardSchema": [
+        "// TypeScript owns the zod/valibot/arktype Standard Schema adapters.",
+        "// Generated packages expose the same Ax concept as JSON-schema-compatible tool descriptors.",
+        "lookup := axllm.Fn(\"lookupProduct\").WithHandler(func(args map[string]axllm.Value) (axllm.Value, error) {",
+        "  return axllm.Object(\"price\", 79.99, \"inStock\", true), nil",
+        "})"
+      ],
+      "namespaces": [
+        "policy := axllm.Fn(\"findPolicy\").WithHandler(policyHandler)",
+        "// Group related tools under domain namespaces where the package surface supports it.",
+        "// Runtime calls should read like kb.findPolicy(...) or billing.lookupInvoice(...)."
+      ],
+      "ax": [
+        "answer := axllm.NewAx(\"question:string -> answer:string\", nil)",
+        "answer.Functions = []axllm.Tool{search}",
+        "out, err := answer.Forward(context.Background(), client, map[string]axllm.Value{",
+        "  \"question\": \"Can this customer get a refund?\",",
+        "}, nil)"
+      ],
+      "agentFlat": [
+        "assistant := axllm.NewAgent(\"message:string -> reply:string\", map[string]axllm.Value{",
+        "  \"functions\": axllm.Array(search),",
+        "  \"contextFields\": []axllm.Value{},",
+        "})"
+      ],
+      "agentGroups": [
+        "assistant := axllm.NewAgent(\"message:string -> reply:string\", map[string]axllm.Value{",
+        "  \"functionDiscovery\": true,",
+        "  \"functions\": []axllm.Value{map[string]axllm.Value{",
+        "    \"namespace\": \"kb\",",
+        "    \"title\": \"Knowledge Base\",",
+        "    \"selectionCriteria\": \"Use for policy or documentation lookup.\",",
+        "    \"functions\": axllm.Array(search),",
+        "  }},",
+        "})"
+      ]
+    },
+    "mcp": {
+      "era": {
+        "sourcePath": "src/examples/go/mcp/native_mcp_tools.go",
+        "illustrative": true,
+        "notes": [
+          "Generated Go supports automatic dual-era classification and modern discovery."
+        ],
+        "code": [
+          "mcp := ax.NewAxMCPClient(transport, map[string]ax.Value{\"namespace\": \"inventory\"})",
+          "catalog, err := mcp.InspectCatalog(false)"
+        ]
+      },
+      "mrtrElicitation": {
+        "illustrative": true,
+        "notes": [
+          "The callback is advertised only for modern MCP; sampling remains unsupported."
+        ],
+        "code": [
+          "elicitation := func(params, context map[string]ax.Value) (map[string]ax.Value, error) {",
+          "    return map[string]ax.Value{",
+          "        \"action\": \"accept\",",
+          "        \"content\": map[string]ax.Value{\"confirmed\": true},",
+          "    }, nil",
+          "}",
+          "client := ax.NewAxMCPClient(transport, map[string]ax.Value{",
+          "    \"era\": \"modern\",",
+          "    \"roots\": ax.Array(map[string]ax.Value{\"uri\": \"file:///workspace\"}),",
+          "    \"elicitation\": elicitation,",
+          "})",
+          "result, err := client.CallTool(\"mrtr_one_round\", map[string]ax.Value{})"
+        ]
+      },
+      "native": {
+        "sourcePath": "src/examples/go/mcp/native_mcp_tools.go",
+        "code": [
+          "transport, err := ax.NewAxMCPStreamableHTTPTransport(endpoint, nil)",
+          "if err != nil { panic(err) }",
+          "mcp := ax.NewAxMCPClient(transport, map[string]ax.Value{\"namespace\": \"inventory\"})",
+          "defer func() { _ = mcp.Close() }()",
+          "catalog, err := mcp.InspectCatalog(false)",
+          "if err != nil { panic(err) }",
+          "fmt.Printf(\"MCP catalog: %d tools, %d resources, %d templates\\n\",",
+          "    len(catalog.Tools), len(catalog.Resources), len(catalog.ResourceTemplates))",
+          "program := ax.NewAx(\"request:string -> answer:string\", map[string]ax.Value{\"mcp\": mcp})",
+          "llm := ax.NewOpenAICompatibleClient(map[string]ax.Value{",
+          "    \"api_key\": key, \"model\": \"gpt-5.4-mini\",",
+          "})",
+          "output, err := program.Forward(context.Background(), llm,",
+          "    map[string]ax.Value{\"request\": \"Reindex inventory.\"}, nil)",
+          "if err != nil { panic(err) }",
+          "fmt.Println(output)"
+        ]
+      },
+      "resourceWake": {
+        "code": [
+          "source := ax.NewAxMCPEventSourceWithPolicy(client, \"inventory\", \"tenant:demo\", \"authenticated\", ax.AxMCPSubscribeAll())",
+          "routes := []ax.AxEventRoute{{",
+          "    ID: \"resource-wake\", Action: \"wake\",",
+          "    TargetID: \"inventory-agent\", RequireAuthenticated: true,",
+          "    Match: map[string]ax.Value{\"types\": ax.Array(\"mcp.resource.updated\")},",
+          "}}",
+          "runtime, err := ax.NewAxEventRuntime(routes, nil)",
+          "if err != nil { panic(err) }",
+          "runtime.RegisterTarget(ax.AxEventTarget{",
+          "    ID: \"inventory-agent\", RetrySafety: \"idempotent\",",
+          "    MapInput: func(event ax.AxEventEnvelope, _ *ax.AxEventContinuation) (ax.Value, error) {",
+          "        return map[string]ax.Value{\"uri\": event.Data.(map[string]ax.Value)[\"uri\"]}, nil",
+          "    },",
+          "    Invoke: invokeAgent,",
+          "})",
+          "runtime.AddSource(source)",
+          "if err := runtime.Start(); err != nil { panic(err) }"
+        ]
+      },
+      "taskResume": {
+        "code": [
+          "taskResult, err := client.CallTool(\"start_reindex\", map[string]ax.Value{\"scope\": \"all\"})",
+          "if err != nil { panic(err) }",
+          "taskID := taskResult[\"task\"].(map[string]ax.Value)[\"taskId\"].(string)",
+          "target.WaitFor = []map[string]ax.Value{{",
+          "    \"kind\": \"mcp.task\", \"value\": \"taskKey\",",
+          "    \"metadata\": map[string]ax.Value{\"taskId\": taskID},",
+          "}}",
+          "runtime.RegisterTarget(target)",
+          "runtime.AddSource(started)",
+          "runtime.AddSource(mcp)",
+          "if err := runtime.Start(); err != nil { panic(err) }",
+          "err = started.Publish(ax.AxEventEnvelope{",
+          "    SpecVersion: \"1.0\", ID: \"task-start\", Source: \"app://tasks\",",
+          "    Type: \"app.task.started\",",
+          "    Data: map[string]ax.Value{",
+          "        \"taskId\": taskID, \"taskKey\": \"inventory:\" + taskID,",
+          "    },",
+          "})",
+          "if err != nil { panic(err) }"
+        ]
+      }
+    },
+    "event": {
+      "wake": {
+        "code": [
+          "source := ax.NewAxMCPEventSourceWithPolicy(",
+          "    client, \"inventory\", \"tenant:demo\", \"authenticated\",",
+          "    ax.AxMCPSubscribeAll(),",
+          ")",
+          "runtime, err := ax.NewAxEventRuntime([]ax.AxEventRoute{{",
+          "    ID: \"resource-wake\", Action: \"wake\",",
+          "    TargetID: \"inventory-agent\", RequireAuthenticated: true,",
+          "    Match: map[string]ax.Value{\"types\": ax.Array(\"mcp.resource.updated\")},",
+          "}}, nil)",
+          "if err != nil { panic(err) }",
+          "runtime.RegisterTarget(ax.AxEventTarget{",
+          "    ID: \"inventory-agent\",",
+          "    MapInput: func(event ax.AxEventEnvelope, _ *ax.AxEventContinuation) (ax.Value, error) {",
+          "        return map[string]ax.Value{\"uri\": event.Data.(map[string]ax.Value)[\"uri\"]}, nil",
+          "    },",
+          "    Invoke: invokeAgent,",
+          "})",
+          "runtime.AddSource(source)",
+          "if err := runtime.Start(); err != nil { panic(err) }"
+        ]
+      },
+      "resume": {
+        "code": [
+          "target := ax.AxEventTarget{",
+          "    ID: \"reindex-flow\", RetrySafety: \"idempotent\",",
+          "    WaitFor: []map[string]ax.Value{{",
+          "        \"kind\": \"mcp.task\", \"value\": \"taskKey\",",
+          "        \"metadata\": map[string]ax.Value{\"taskId\": taskID},",
+          "    }},",
+          "    MapInput: func(event ax.AxEventEnvelope, continuation *ax.AxEventContinuation) (ax.Value, error) {",
+          "        if continuation != nil {",
+          "            return map[string]ax.Value{\"taskId\": continuation.Metadata[\"taskId\"]}, nil",
+          "        }",
+          "        return map[string]ax.Value{\"taskId\": event.Data.(map[string]ax.Value)[\"taskId\"]}, nil",
+          "    },",
+          "    Invoke: invokeFlow,",
+          "}",
+          "routes := []ax.AxEventRoute{",
+          "    {ID: \"task-start\", Action: \"wake\", TargetID: \"reindex-flow\", Match: map[string]ax.Value{\"types\": ax.Array(\"app.task.started\")}},",
+          "    {ID: \"task-resume\", Action: \"resume\", TargetID: \"reindex-flow\", Match: map[string]ax.Value{\"types\": ax.Array(\"mcp.task.status\")}},",
+          "}"
+        ]
+      },
+      "ucp": {
+        "code": [
+          "func handleUCPWebhook(request *http.Request) error {",
+          "    // Verify signer profile, RFC 9421 signature, digest, freshness,",
+          "    // key rotation, and replay state before publishing.",
+          "    order, err := verifyUCPRequest(request)",
+          "    if err != nil { return err }",
+          "    identityScope := lookupBuyerIdentity(order.CheckoutID)",
+          "    _, err = runtime.Publish(ax.AxEventEnvelope{",
+          "        SpecVersion: \"1.0\", ID: order.ID, Source: \"ucp://orders\",",
+          "        Type: \"ucp.order.fulfilled\", Data: order.Data,",
+          "    }, identityScope, \"authenticated\")",
+          "    return err",
+          "}"
+        ]
+      }
+    }
+  }
+}

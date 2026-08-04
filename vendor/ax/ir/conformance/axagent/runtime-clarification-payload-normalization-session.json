@@ -1,0 +1,43 @@
+{
+  "code": "askClarification({ question: \"Which city?\" })",
+  "context_values": {
+    "question": "book it"
+  },
+  "expected_result_subset": {
+    "completion_payload": {
+      "args": [
+        {
+          "question": "Which city?"
+        }
+      ],
+      "type": "askClarification"
+    },
+    "kind": "askClarification"
+  },
+  "expected_trace_event_kinds": [
+    "runtime_lifecycle",
+    "runtime_execute",
+    "clarification",
+    "runtime_lifecycle"
+  ],
+  "kind": "agent_runtime_session",
+  "name": "runtime-clarification-payload-normalization-session",
+  "operation": "test",
+  "replay_trace": true,
+  "runtime_script": [
+    {
+      "expected_code": "askClarification({ question: \"Which city?\" })",
+      "result": {
+        "completion_payload": {
+          "args": [
+            {
+              "question": "Which city?"
+            }
+          ],
+          "type": "askClarification"
+        }
+      }
+    }
+  ],
+  "signature": "question:string -> answer:string"
+}

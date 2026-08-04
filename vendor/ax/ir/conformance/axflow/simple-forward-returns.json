@@ -1,0 +1,142 @@
+{
+  "kind": "flow",
+  "name": "simple-forward-returns",
+  "program_id": "qa.flow",
+  "source": {
+    "tsDerived": true,
+    "extractor": "tools/axir/extractors/flow-goldens.ts",
+    "reference": [
+      "src/ax/flow/flow.ts",
+      "src/ax/flow/steps.ts",
+      "src/ax/flow/executor.ts",
+      "src/ax/flow/executionPlanner.ts",
+      "src/ax/flow/mermaid.ts",
+      "src/ax/flow/dependencyAnalyzer.ts",
+      "src/ax/dsp/program.ts"
+    ],
+    "name": "simple-forward-returns",
+    "observed": {
+      "output": {
+        "answer": "Paris"
+      },
+      "plan": {
+        "totalSteps": 2,
+        "parallelGroups": 2,
+        "maxParallelism": 1,
+        "steps": [
+          {
+            "name": "qa",
+            "kind": "execute",
+            "reads": ["question"],
+            "writes": ["qaResult"],
+            "barrier": false,
+            "stepIndex": 0
+          },
+          {
+            "name": "returns",
+            "kind": "returns",
+            "reads": [],
+            "writes": [],
+            "barrier": true,
+            "stepIndex": 1
+          }
+        ],
+        "groups": [
+          {
+            "level": 0,
+            "steps": [
+              {
+                "name": "qa",
+                "kind": "execute",
+                "reads": ["question"],
+                "writes": ["qaResult"],
+                "barrier": false,
+                "stepIndex": 0
+              }
+            ]
+          },
+          {
+            "level": 1,
+            "steps": [
+              {
+                "name": "returns",
+                "kind": "returns",
+                "reads": [],
+                "writes": [],
+                "barrier": true,
+                "stepIndex": 1
+              }
+            ]
+          }
+        ]
+      },
+      "chatLogNames": ["qa"],
+      "usageCount": 1,
+      "traceCount": 1
+    }
+  },
+  "input": {
+    "question": "Capital of France?"
+  },
+  "steps": [
+    {
+      "kind": "execute",
+      "name": "qa",
+      "signature": "question:string -> answer:string",
+      "options": {
+        "reads": ["question"],
+        "writes": ["qaResult"],
+        "isBarrier": false
+      }
+    }
+  ],
+  "returns": {
+    "answer": "answer"
+  },
+  "responses": [
+    {
+      "content": "{\"answer\":\"Paris\"}",
+      "usage": {
+        "prompt_tokens": 1,
+        "completion_tokens": 2,
+        "total_tokens": 3
+      }
+    }
+  ],
+  "expected_output": {
+    "answer": "Paris"
+  },
+  "expected_request_count": 1,
+  "expected_chat_log_subset": [
+    {
+      "name": "qa"
+    }
+  ],
+  "expected_trace_kinds": [
+    "flow_start",
+    "flow_step",
+    "flow_child_trace",
+    "flow_done"
+  ],
+  "expected_trace_subset": [
+    {
+      "kind": "flow_child_trace",
+      "name": "qa"
+    }
+  ],
+  "expected_usage_subset": {
+    "qa": [
+      {
+        "prompt_tokens": 1,
+        "completion_tokens": 2,
+        "total_tokens": 3
+      }
+    ]
+  },
+  "expected_components_subset": [
+    {
+      "id": "qa.flow::graph-plan",
+      "kind": "flow-graph"
+    }
+  ]
+}

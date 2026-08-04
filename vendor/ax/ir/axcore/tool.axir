@@ -1,0 +1,71 @@
+module @ax.tool version "0.1" {
+  dialect @ax.tool version "0.1"
+
+  op ax.tool.record @Tool {
+    attr core_kind = "record"
+    attr public = true
+    tag "src/ax/dsp/functions.ts"
+    type fields = "name:string,description:string,parameters:AxFunctionJSONSchema,handler:HostFunction,returns?:list<Field>"
+  }
+
+  op ax.tool.record @ToolBuilder {
+    attr core_kind = "record"
+    tag "src/ax/dsp/sig.ts"
+    type fields = "name:string,args:list<Field>,returns:list<Field>"
+  }
+
+  op ax.tool.interface @HostFunction {
+    attr core_kind = "interface"
+    type call = "(json) -> json throws"
+  }
+
+  op ax.tool.semantic @execute_tool_call {
+    attr core_kind = "func"
+    attr effect = "throws"
+    attr emit_module = "gen"
+    attr private = true
+    ref validate = @validate_fields
+    tag "native-tool-call"
+    type signature = "(list<Tool>, json) -> json throws"
+    body @entry(%functions: list<Tool>, %call: json) {
+      %fn_call = core.get %call["function"]
+      %direct_name = core.get %call["name"]
+      %name = core.get %fn_call["name"] default %direct_name
+      %direct_params = core.get %call["params"]
+      %params = core.get %fn_call["params"] default %direct_params
+      %missing_params = core.call intrinsic.is_none(%params)
+      core.if %missing_params {
+        %argument_params = core.get %call["arguments"]
+        %params = core.let %argument_params
+      }
+      %params_is_string = core.type_is %params type "string"
+      core.if %params_is_string {
+        %parsed_params = core.call intrinsic.json.parse(%params)
+        %params = core.let %parsed_params
+      }
+      %params_still_missing = core.call intrinsic.is_none(%params)
+      core.if %params_still_missing {
+        %empty_params = core.map
+        %params = core.let %empty_params
+      }
+      core.for %fn in %functions {
+        %fn_name = core.get %fn["name"]
+        %matches = core.call intrinsic.eq(%fn_name, %name)
+        core.if %matches {
+          %result = core.call intrinsic.tool.invoke(%fn, %params)
+          core.return %result
+        }
+      }
+      %available_names = core.list
+      core.for %fn in %functions {
+        %available_name = core.get %fn["name"]
+        core.append %available_names, %available_name
+      }
+      %available_joined = core.call intrinsic.string.join(", ", %available_names)
+      %available = core.call intrinsic.string.default_if_empty(%available_joined, "(none)")
+      %message = core.call intrinsic.string.format("Function not found: {}. Available functions: {}. Call one of these exact function names.", %name, %available)
+      %error = core.call intrinsic.error.validation(%message)
+      core.raise %error
+    }
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "name": "mcp roots/list server request",
+  "kind": "mcp",
+  "operation": "roots_notifications",
+  "client_options": {
+    "era": "legacy",
+    "roots": [
+      {
+        "uri": "file:///workspace",
+        "name": "workspace"
+      }
+    ]
+  },
+  "responses": [
+    {
+      "method": "initialize",
+      "result": {
+        "protocolVersion": "2025-11-25",
+        "capabilities": {},
+        "serverInfo": {
+          "name": "scripted-mcp",
+          "version": "1.0.0"
+        }
+      }
+    }
+  ],
+  "expected_roots_response": {
+    "result": {
+      "roots": [
+        {
+          "uri": "file:///workspace",
+          "name": "workspace"
+        }
+      ]
+    }
+  }
+}

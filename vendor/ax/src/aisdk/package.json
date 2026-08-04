@@ -1,0 +1,51 @@
+{
+  "name": "@ax-llm/ax-ai-sdk-provider",
+  "version": "23.0.9",
+  "type": "module",
+  "description": "Ax AI SDK Provider for the Vercel AI SDK",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ax-llm/ax.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "Apache-2.0",
+  "keywords": [],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "tsup --watch",
+    "build": "tsup",
+    "clean": "rm -rf dist",
+    "test": "run-s test:*",
+    "test:type-check": "tsc --noEmit",
+    "test:unit": "vitest run",
+    "test:lint": "biome lint .",
+    "test:format": "biome format .",
+    "fix": "run-s fix:*",
+    "fix:lint": "biome lint --write .",
+    "fix:format": "biome format --write .",
+    "coverage": "vitest run --coverage",
+    "tsx": "node --env-file=.env --import=tsx",
+    "release": "release-it",
+    "publish": "npm run build && cd dist && npm publish",
+    "postbuild": "node ../../scripts/postbuild.js"
+  },
+  "dependencies": {
+    "@ai-sdk/provider": "^4.0.0",
+    "@ai-sdk/provider-utils": "^5.0.0",
+    "@ax-llm/ax": "23.0.9",
+    "ai": "^7.0.2",
+    "zod": "^3.25.76"
+  },
+  "bugs": {
+    "url": "https://github.com/@ax-llm/ax/issues"
+  },
+  "homepage": "https://github.com/ax-llm/ax#readme",
+  "author": "Vikram <https://twitter.com/dosco>",
+  "devDependencies": {
+    "@types/react": "^19.0.5"
+  }
+}

@@ -1,0 +1,441 @@
+{
+  "id": "java",
+  "label": "Java",
+  "shortLabel": "Java",
+  "fence": "java",
+  "packageName": "dev.axllm:ax",
+  "install": [
+    "// Gradle (build.gradle):",
+    "implementation 'dev.axllm:ax:22.0.4'",
+    "// Maven (pom.xml):",
+    "<dependency>",
+    "  <groupId>dev.axllm</groupId>",
+    "  <artifactId>ax</artifactId>",
+    "  <version>22.0.4</version>",
+    "</dependency>"
+  ],
+  "exampleRoot": "packages/java/examples",
+  "academy": {
+    "unitExamples": {
+      "dspy": "src/examples/java/generation/StructuredGenerationExample.java",
+      "models-signatures": "src/examples/java/generation/StructuredGenerationExample.java",
+      "axgen": "src/examples/java/generation/BasicGenerationExample.java",
+      "axflow": "src/examples/java/flows/BranchFlowExample.java",
+      "axagent": "src/examples/java/short-agents/ToolsAgentExample.java",
+      "rlm": "src/examples/java/long-agents/IncidentLogForensicsExample.java",
+      "peek-context": "src/examples/java/long-agents/CodebasePeekMapExample.java",
+      "optimization": "src/examples/java/optimization/AxgenOptimizationExample.java",
+      "mcp": "src/examples/java/mcp/NativeMCPToolsExample.java",
+      "notifications": "src/examples/java/mcp/ResourceWakeAgentExample.java",
+      "production": "src/examples/java/long-agents/SmartDefaultsAgentExample.java"
+    },
+    "capstoneExample": "src/examples/java/mcp/TaskResumeFlowExample.java",
+    "exerciseAnswers": {
+      "signature-semantic-contract": ["Ax.s", "s"],
+      "ai-providers-models": ["Ax.ai", "ai"],
+      "fluent-fields-validation": ["Ax.f", "f"],
+      "typed-tools": ["Ax.fn", "fn"],
+      "optimize-gen-flow": ["AxGEPA"]
+    },
+    "snippets": {
+      "flow": [
+        "String mermaid = \"flowchart TD\\n  %%ax classify: request:string -> route:class \\\"support, sales\\\"\\n  classify{route}\";",
+        "AxFlow program = Ax.flow(mermaid);",
+        "System.out.println(program);"
+      ],
+      "rlm": [
+        "AxAgent investigator = Ax.agent(signature, Map.of(",
+        "    \"contextFields\", List.of(\"logs\"),",
+        "    \"contextPolicy\", Map.of(\"preset\", \"lean\", \"budget\", \"balanced\"),",
+        "    \"runtime\", Map.of(\"language\", \"JavaScript\")));"
+      ],
+      "contextMap": [
+        "AxAgent analyst = Ax.agent(signature, Map.of(",
+        "    \"contextFields\", List.of(\"codebase\"),",
+        "    \"contextPolicy\", Map.of(\"preset\", \"adaptive\", \"budget\", \"balanced\"),",
+        "    \"contextMap\", Map.of(\"maxChars\", 1800, \"infiniteEvolve\", false, \"evolveSteps\", 1)));"
+      ],
+      "memorySkills": [
+        "AxAgent assistant = Ax.agent(signature, Map.of(",
+        "    \"memoriesCatalog\", memories,",
+        "    \"skillsCatalog\", skills));"
+      ]
+    }
+  },
+  "apiKind": "axir",
+  "optimizeName": "AxGEPA",
+  "optimizeIntro": "Use the generated `AxGEPA` optimizer surface for portable GEPA tuning. TypeScript also exposes the convenience `optimize()` helper; generated packages currently keep the optimizer explicit.",
+  "apiReference": "/java/api/reference/",
+  "apiSections": {
+    "ai": ["AxAI"],
+    "ax": ["AxGen", "Tools"],
+    "s": ["Signatures"],
+    "agent": ["Agents And RLM", "Runtime Profiles", "MCP"],
+    "flow": ["Flow"],
+    "optimize": ["Optimizers"]
+  },
+  "snippets": {
+    "ai": {
+      "balancer": {
+        "sourcePath": "src/examples/java/generation/AdaptiveBalancerExample.java",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "var store = new AxInMemoryBalancerStatsStore();",
+          "var strategy = new AxBalancerAdaptiveStrategy(6_000, 0.02)",
+          "    .namespace(\"support-v1\").statsStore(store)",
+          "    .routeKey((service, index) -> routeKeys.get(index))",
+          "    .slice(context -> workflowSlice(context))",
+          "    .onRoutingEvent(event -> analytics.record(event));",
+          "var balancer = new AxBalancer(services, new AxBalancerOptions().strategy(strategy));"
+        ]
+      },
+      "audio": [
+        "// Realtime audio over WebSocket — uses the JDK's built-in WebSocket (no extra dependency)",
+        "OpenAIResponsesClient client = new OpenAIResponsesClient(Map.of(\"model\", \"gpt-realtime-2\", \"api_key\", System.getenv(\"OPENAI_APIKEY\")));",
+        "Map<String, Object> request = Map.of(\"model\", \"gpt-realtime-2\", \"chat_prompt\", List.of(Map.of(\"role\", \"user\", \"content\", \"Say hello.\")), \"audio\", Map.of(\"output\", Map.of(\"voice\", \"alloy\")));",
+        "Map<String, Object> result = client.realtimeChat(request, null);  // one merged turn: transcript + base64 PCM audio",
+        "// Realtime models also route transparently through chat(); chat() accepts input_audio parts; transcribe()/speak() do batch STT/TTS."
+      ]
+    },
+    "quickStart": [
+      "import dev.axllm.ax.Ax;",
+      "",
+      "var llm = Ax.ai(\"openai\", Map.of(\"apiKey\", System.getenv(\"OPENAI_API_KEY\")));",
+      "var classify = Ax.ax(\"review:string -> sentiment:class \\\"positive, negative, neutral\\\"\");"
+    ],
+    "dspy": [
+      "var qa = Ax.ax(\"question:string -> answer:string, confidence:number\");"
+    ],
+    "signature": [
+      "var sig = Ax.s(\"email:string -> priority:class \\\"high, normal, low\\\"\");"
+    ],
+    "ax": ["var answer = Ax.ax(\"question:string -> answer:string\");"],
+    "flow": [
+      "String mermaid = \"flowchart TD\\n\" +",
+      "    \"  %%ax research: topicText:string -> factList:string[]\\n\" +",
+      "    \"  %%ax audience: topicText:string -> audienceAngle:string\\n\" +",
+      "    \"  %%ax join: factList:string[], audienceAngle:string -> briefText:string\\n\" +",
+      "    \"  research & audience --> join\";",
+      "AxFlow program = Ax.flow(mermaid);",
+      "System.out.println(program);"
+    ],
+    "agent": ["var helper = Ax.agent(\"question:string -> answer:string\");"],
+    "llm": [
+      "var client = Ax.ai(\"openai\", Map.of(\"apiKey\", System.getenv(\"OPENAI_API_KEY\")));"
+    ],
+    "telemetry": {
+      "sourcePath": "src/examples/java/generation/UsageObserverExample.java",
+      "code": [
+        "AxGlobals.setUsageObserver(usageQueue::add);",
+        "client.chat(",
+        "    request,",
+        "    Map.of(\"usageContext\", Map.of(",
+        "        \"tenantId\", tenantId, \"userId\", userId, \"requestId\", requestId)));"
+      ],
+      "verified": true,
+      "requiresCredentials": true
+    },
+    "optimize": [
+      "var engine = new AxGEPA(reflectionClient, Map.of());",
+      "var result = engine.optimize(request, evaluator);"
+    ],
+    "playbook": [
+      "AxPlaybook pb = Ax.playbook(program, Map.of(\"studentAI\", studentAI));",
+      "pb.evolve(examples, metric, Map.of());   // grow a playbook offline from examples",
+      "pb.update(Map.of(\"example\", ex, \"prediction\", pred, \"feedback\", \"...\"));",
+      "pb.applyTo(program);"
+    ]
+  },
+  "snippetGroups": {
+    "signatures": {
+      "string": {
+        "sourcePath": "src/examples/java/generation/BasicGenerationExample.java",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "AxGen program = Ax.ax(\"question:string -> answer:string\");",
+          "Map<String, Object> output = program.forward(client, Map.of(\"question\", \"What is Ax?\"));"
+        ]
+      },
+      "fluent": {
+        "sourcePath": "src/examples/java/generation/SignatureConstraintsExample.java",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "AxSignature signature = Ax.f().call()",
+          "    .input(\"requestText\", Ax.f().string(\"Booking request\").min(10).max(500))",
+          "    .input(\"contactEmail\", Ax.f().string(\"Contact email\").email())",
+          "    .output(\"partySize\", Ax.f().number(\"Guests\").min(1).max(12))",
+          "    .build();"
+        ]
+      },
+      "validation": {
+        "sourcePath": "src/examples/java/generation/SignatureConstraintsExample.java",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "AxSignature signature = Ax.f().call()",
+          "    .output(\"partySize\", Ax.f().number(\"Guests\").min(1).max(12))",
+          "    .output(\"bookingCode\", Ax.f().string().regex(\"^[A-Z]{3}-\\\\d{4}$\", \"ABC-1234\"))",
+          "    .build();"
+        ]
+      },
+      "hybrid": {
+        "sourcePath": "src/examples/java/generation/SignatureConstraintsExample.java",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "AxSignature signature = Ax.f().call()",
+          "    .input(\"requestText\", Ax.f().string().min(10))",
+          "    .output(\"partySize\", Ax.f().number().min(1))",
+          "    .build();",
+          "AxGen program = Ax.ax(signature);"
+        ]
+      }
+    },
+    "flow": {
+      "branch": {
+        "sourcePath": "src/examples/java/flows/BranchFlowExample.java",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "AxGen classifier = Ax.ax(\"request:string -> route:class \\\"support, sales, engineering\\\"\");",
+          "AxGen responder = Ax.ax(\"request:string, route:string -> response:string\");",
+          "AxFlow program = Ax.flow(Map.of(\"id\", \"examples.branchFlow\"))",
+          "    .execute(\"classifier\", classifier, Map.of(\"reads\", List.of(\"request\"), \"writes\", List.of(\"classifierResult\", \"route\")))",
+          "    .execute(\"responder\", responder, Map.of(\"reads\", List.of(\"request\", \"route\"), \"writes\", List.of(\"responderResult\", \"response\")))",
+          "    .returns(Map.of(\"route\", \"route\", \"response\", \"response\"));"
+        ]
+      },
+      "parallel": {
+        "sourcePath": "src/examples/java/flows/ParallelFlowExample.java",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "AxFlow program = Ax.flow(Map.of(\"id\", \"examples.parallelFlow\"))",
+          "    .execute(\"research\", research, Map.of(\"reads\", List.of(\"topicText\"), \"writes\", List.of(\"researchResult\", \"factList\")))",
+          "    .execute(\"audience\", audience, Map.of(\"reads\", List.of(\"topicText\"), \"writes\", List.of(\"audienceResult\", \"audienceAngle\")))",
+          "    .execute(\"join\", join, Map.of(\"reads\", List.of(\"factList\", \"audienceAngle\"), \"writes\", List.of(\"joinResult\", \"briefText\")))",
+          "    .returns(Map.of(\"briefText\", \"briefText\"));"
+        ]
+      },
+      "refine": {
+        "sourcePath": "src/examples/java/flows/RefineFlowExample.java",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "AxFlow program = Ax.flow(Map.of(\"id\", \"examples.refineFlow\"))",
+          "    .execute(\"draft\", draft, Map.of(\"reads\", List.of(\"topicText\"), \"writes\", List.of(\"draftResult\", \"draftText\")))",
+          "    .execute(\"critique\", critique, Map.of(\"reads\", List.of(\"draftText\"), \"writes\", List.of(\"critiqueResult\", \"critiqueText\")))",
+          "    .execute(\"revise\", revise, Map.of(\"reads\", List.of(\"draftText\", \"critiqueText\"), \"writes\", List.of(\"reviseResult\", \"revisedText\")))",
+          "    .returns(Map.of(\"revisedText\", \"revisedText\"));"
+        ]
+      }
+    },
+    "agents": {
+      "playbookEvolve": {
+        "sourcePath": "src/examples/java/optimization/AgentPlaybookEvolveExample.java",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "Map<String, Object> evolution = assistant.playbook(null).evolve(",
+          "    dataset,",
+          "    Map.of(\"verify\", true, \"maxProposals\", 1, \"runtime\", runtime));"
+        ]
+      }
+    },
+    "tools": {
+      "basic": [
+        "Tool search = Ax.fn(\"search\")",
+        "    .description(\"Search docs\")",
+        "    .arg(\"query\", Ax.f().string(\"Search query\"))",
+        "    .handler(args -> List.of(\"hit for \" + args.get(\"query\")))",
+        "    .build();"
+      ],
+      "standardSchema": [
+        "// TypeScript owns the zod/valibot/arktype Standard Schema adapters.",
+        "// Generated packages expose the same Ax concept as JSON-schema-compatible tool descriptors.",
+        "Tool lookup = Ax.fn(\"lookupProduct\")",
+        "    .description(\"Look up product inventory\")",
+        "    .arg(\"productName\", Ax.f().string(\"Exact product name\"))",
+        "    .build();"
+      ],
+      "namespaces": [
+        "Tool policy = Ax.fn(\"findPolicy\")",
+        "    .description(\"Find policies\")",
+        "    .arg(\"topic\", Ax.f().string())",
+        "    .handler(args -> List.of(\"policy: \" + args.get(\"topic\")))",
+        "    .build();",
+        "// Group related tools under domain namespaces where the package surface supports it.",
+        "// Runtime calls should read like kb.findPolicy(...) or billing.lookupInvoice(...)."
+      ],
+      "ax": [
+        "var answer = Ax.ax(\"question:string -> answer:string\");",
+        "var out = answer.forward(llm, Map.of(",
+        "    \"question\", \"Can this customer get a refund?\"",
+        "), Map.of(\"functions\", List.of(search)));"
+      ],
+      "agentFlat": [
+        "var assistant = Ax.agent(\"message:string -> reply:string\", Map.of(",
+        "    \"functions\", List.of(search),",
+        "    \"contextFields\", List.of()",
+        "));"
+      ],
+      "agentGroups": [
+        "var assistant = Ax.agent(\"message:string -> reply:string\", Map.of(",
+        "    \"functionDiscovery\", true,",
+        "    \"functions\", List.of(Map.of(",
+        "        \"namespace\", \"kb\",",
+        "        \"title\", \"Knowledge Base\",",
+        "        \"selectionCriteria\", \"Use for policy or documentation lookup.\",",
+        "        \"functions\", List.of(search)",
+        "    ))",
+        "));"
+      ]
+    },
+    "mcp": {
+      "era": {
+        "sourcePath": "src/examples/java/mcp/NativeMCPToolsExample.java",
+        "illustrative": true,
+        "notes": [
+          "Generated Java supports automatic dual-era classification and modern discovery."
+        ],
+        "code": [
+          "AxMCPClient mcp = new AxMCPClient(new AxMCPStreamableHTTPTransport(endpoint), Map.of(\"namespace\", \"inventory\"));",
+          "AxMCPClient.CatalogSnapshot catalog = mcp.inspectCatalog();"
+        ]
+      },
+      "mrtrElicitation": {
+        "illustrative": true,
+        "notes": [
+          "The BiFunction is advertised only for modern MCP; sampling remains unsupported."
+        ],
+        "code": [
+          "BiFunction<Map<String,Object>, Map<String,Object>, Map<String,Object>> elicitation =",
+          "    (params, context) -> Map.of(",
+          "        \"action\", \"accept\",",
+          "        \"content\", Map.of(\"confirmed\", true));",
+          "Map<String,Object> options = new LinkedHashMap<>();",
+          "options.put(\"era\", \"modern\");",
+          "options.put(\"roots\", List.of(Map.of(\"uri\", \"file:///workspace\")));",
+          "options.put(\"elicitation\", elicitation);",
+          "AxMCPClient client = new AxMCPClient(transport, options);",
+          "Map<String,Object> result = client.callTool(\"mrtr_one_round\", Map.of());"
+        ]
+      },
+      "native": {
+        "sourcePath": "src/examples/java/mcp/NativeMCPToolsExample.java",
+        "code": [
+          "AxMCPClient mcp = new AxMCPClient(new AxMCPStreamableHTTPTransport(endpoint), Map.of(\"namespace\", \"inventory\"));",
+          "AxGen program = new AxGen(Ax.s(\"request:string -> answer:string\"), Map.of(\"mcp\", mcp));",
+          "OpenAICompatibleClient llm = new OpenAICompatibleClient(Map.of(",
+          "    \"api_key\", key, \"model\", \"gpt-5.4-mini\"));",
+          "try {",
+          "  AxMCPClient.CatalogSnapshot catalog = mcp.inspectCatalog();",
+          "  System.out.println(Json.stringify(Map.of(",
+          "      \"tools\", catalog.tools().stream().map(tool -> tool.get(\"name\")).toList(),",
+          "      \"resources\", catalog.resources(),",
+          "      \"resourceTemplates\", catalog.resourceTemplates())));",
+          "  System.out.println(Json.stringify(program.forward(",
+          "      llm, Map.of(\"request\", \"Reindex inventory.\"))));",
+          "} finally {",
+          "  mcp.close();",
+          "}"
+        ]
+      },
+      "resourceWake": {
+        "code": [
+          "AxMCPEventSource source = new AxMCPEventSource(",
+          "    client, \"inventory\", \"tenant:demo\", \"authenticated\",",
+          "    AxMCPEventSource.all());",
+          "AxEventRuntime.Target target = new AxEventRuntime.Target(",
+          "    \"inventory-agent\", (input, context) -> agent.forward(",
+          "        llm, castMap(input), Map.of(\"runtime\", js)))",
+          "    .mapInput((event, continuation) -> Map.of(",
+          "        \"uri\", castMap(event.data()).get(\"uri\")))",
+          "    .retrySafety(\"idempotent\");",
+          "AxEventRuntime runtime = new AxEventRuntime(List.of(",
+          "    new AxEventRoute(\"resource-wake\", \"wake\",",
+          "        Map.of(\"types\", List.of(\"mcp.resource.updated\")),",
+          "        \"inventory-agent\", true, \"strict\", 0)))",
+          "    .registerTarget(target)",
+          "    .addSource(source);",
+          "runtime.start();"
+        ]
+      },
+      "taskResume": {
+        "code": [
+          "client.init();",
+          "String taskId = String.valueOf(castMap(",
+          "    client.callTool(\"start_reindex\", Map.of(\"scope\", \"all\"))",
+          "        .get(\"task\")).get(\"taskId\"));",
+          "AxEventRuntime.Target target = new AxEventRuntime.Target(",
+          "    \"reindex-flow\", invokeFlow)",
+          "    .mapInput((event, continuation) -> Map.of(\"taskId\",",
+          "        continuation == null ? castMap(event.data()).get(\"taskId\")",
+          "            : continuation.metadata.get(\"taskId\")))",
+          "    .waitFor(\"mcp.task\", \"taskKey\", Map.of(\"taskId\", taskId));",
+          "runtime.registerTarget(target);",
+          "runtime.start();",
+          "source.start(event -> runtime.publish(",
+          "    event, source.identityScope(), source.trust()));"
+        ]
+      }
+    },
+    "event": {
+      "wake": {
+        "code": [
+          "AxMCPEventSource source = new AxMCPEventSource(",
+          "    client, \"inventory\", \"tenant:demo\", \"authenticated\",",
+          "    AxMCPEventSource.all());",
+          "AxEventRuntime.Target target = new AxEventRuntime.Target(",
+          "    \"inventory-agent\", invokeAgent)",
+          "    .mapInput((event, continuation) -> Map.of(",
+          "        \"uri\", castMap(event.data()).get(\"uri\")));",
+          "AxEventRuntime runtime = new AxEventRuntime(List.of(",
+          "    new AxEventRoute(\"resource-wake\", \"wake\",",
+          "        Map.of(\"types\", List.of(\"mcp.resource.updated\")),",
+          "        \"inventory-agent\", true, \"strict\", 0)))",
+          "    .registerTarget(target)",
+          "    .addSource(source);",
+          "runtime.start();"
+        ]
+      },
+      "resume": {
+        "code": [
+          "AxEventRuntime.Target target = new AxEventRuntime.Target(",
+          "    \"reindex-flow\", invokeFlow)",
+          "    .mapInput((event, continuation) -> Map.of(\"taskId\",",
+          "        continuation == null ? castMap(event.data()).get(\"taskId\")",
+          "            : continuation.metadata.get(\"taskId\")))",
+          "    .waitFor(\"mcp.task\", \"taskKey\", Map.of(\"taskId\", taskId));",
+          "AxEventRuntime runtime = new AxEventRuntime(List.of(",
+          "    new AxEventRoute(\"task-start\", \"wake\",",
+          "        Map.of(\"types\", List.of(\"app.task.started\")),",
+          "        \"reindex-flow\", false, \"strict\", 0),",
+          "    new AxEventRoute(\"task-resume\", \"resume\",",
+          "        Map.of(\"types\", List.of(\"mcp.task.status\")),",
+          "        \"reindex-flow\", false, \"strict\", 0)))",
+          "    .registerTarget(target);",
+          "runtime.start();"
+        ]
+      },
+      "ucp": {
+        "code": [
+          "Response handleUCPWebhook(Request request) {",
+          "  // Verify signer profile, RFC 9421 signature, digest, freshness,",
+          "  // key rotation, and replay state before publishing.",
+          "  VerifiedOrder order = verifyUCPRequest(request);",
+          "  String identity = lookupBuyerIdentity(order.checkoutId());",
+          "  runtime.publish(",
+          "      new AxEventEnvelope(order.id(), \"ucp://orders\",",
+          "          \"ucp.order.fulfilled\", order.data()),",
+          "      identity, \"authenticated\");",
+          "  return new Response(202);",
+          "}"
+        ]
+      }
+    }
+  }
+}

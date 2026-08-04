@@ -1,0 +1,2695 @@
+export type AxWorkerRuntimeConfig = Readonly<{
+  functionRefKey: string;
+  maxErrorCauseDepth: number;
+}>;
+
+export function axWorkerRuntime(config: AxWorkerRuntimeConfig): void {
+  // ╔══════════════════════════════════════════════════════════════════════╗
+  // ║  IMPORTANT: SERIALIZED FUNCTION — READ BEFORE EDITING              ║
+  // ║                                                                    ║
+  // ║  This function is serialized via .toString() by getWorkerSource()  ║
+  // ║  in worker.ts and evaluated as a standalone script inside a Web    ║
+  // ║  Worker or Node worker_threads context.                            ║
+  // ║                                                                    ║
+  // ║  The serialized string has NO access to module-scope variables,    ║
+  // ║  imports, or bundler-injected helpers from the original bundle.    ║
+  // ║  Everything this function needs must live inside its own body.     ║
+  // ║                                                                    ║
+  // ║  Rules for code inside this function:                              ║
+  // ║                                                                    ║
+  // ║  1. NO IMPORTS — outer-scope modules/functions are NOT available   ║
+  // ║     in the worker. Everything must be self-contained.              ║
+  // ║                                                                    ║
+  // ║  2. NO BARE `require` — esbuild/tsup replaces bare `require`      ║
+  // ║     and `typeof require` with module-scope polyfill variables      ║
+  // ║     that don't exist in the serialized worker context.             ║
+  // ║     `globalThis['require']` is also NOT sufficient — esbuild      ║
+  // ║     sees through it. Use `new Function(...)` to obtain `require`   ║
+  // ║     (see _detectNodeParentPort for the correct pattern).           ║
+  // ║                                                                    ║
+  // ║  3. NO BARE `import()` — dynamic import() may also be rewritten   ║
+  // ║     by bundlers. If needed, use indirect eval to obtain it.        ║
+  // ║                                                                    ║
+  // ║  4. `typeof process` is SAFE — esbuild preserves this.            ║
+  // ║     `typeof self` and `typeof globalThis` are also safe.           ║
+  // ║                                                                    ║
+  // ║  5. BUNDLER HELPERS — esbuild may inject module-scope helpers      ║
+  // ║     like `__name()` into this function body during minification.   ║
+  // ║     These don't exist in the isolated worker context.              ║
+  // ║     getWorkerSource() in worker.ts detects them and prepends       ║
+  // ║     lightweight no-op polyfills. If you encounter a new            ║
+  // ║     ReferenceError in the built bundle (but not in vitest),        ║
+  // ║     it's likely a new bundler helper — add a polyfill in           ║
+  // ║     getWorkerSource() and a matching test.                         ║
+  // ║                                                                    ║
+  // ║  HOW TO DEBUG SERIALIZATION ISSUES:                                ║
+  // ║                                                                    ║
+  // ║  - vitest runs unminified TS source → bundler helpers are absent.  ║
+  // ║    Tests pass but the built bundle may still break at runtime.     ║
+  // ║  - To catch this: `npx tsup && node -e "..."` to evaluate         ║
+  // ║    getWorkerSource() output in a clean context.                    ║
+  // ║  - The "isolated sandbox" test in worker.runtime.test.ts runs      ║
+  // ║    getWorkerSource() in node:vm with no bundler helpers.           ║
+  // ║                                                                    ║
+  // ║  Tests in worker.runtime.test.ts validate these invariants.        ║
+  // ╚══════════════════════════════════════════════════════════════════════╝
+
+  type WorkerEvent = { data: unknown };
+  type NodeParentPort = {
+    postMessage: (message: unknown) => void;
+    on: (event: 'message', handler: (data: unknown) => void) => void;
+  };
+  type FnPending = {
+    resolve: (value: unknown) => void;
+    reject: (error: unknown) => void;
+  };
+  type SerializedError = {
+    name: string;
+    message: string;
+    stack?: string;
+    cause?: string | SerializedError;
+    data?: unknown;
+  };
+
+  const _scope = (typeof self !== 'undefined'
+    ? self
+    : globalThis) as unknown as {
+    [key: string]: unknown;
+    postMessage?: (message: unknown) => void;
+    onmessage?: ((event: WorkerEvent) => void) | null;
+    print?: (...args: unknown[]) => void;
+    console?: Record<string, unknown>;
+  };
+  let _inspectBaselineGlobalNames: string[] = [];
+  const _AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
+  const _FUNCTION_REF_KEY = config.functionRefKey;
+  const _OUTPUT_MODE_RETURN = 'return';
+  const _OUTPUT_MODE_STDOUT = 'stdout';
+  const _LAST_LINE_NON_EXPRESSION_START =
+    /^(if|for|while|switch|try|catch|finally|function|class|import|export|throw|return|var|let|const|break|continue|debugger)\b/;
+  const _TOP_LEVEL_RETURN_ONLY = /^\s*return\s+([^\n;]+?)\s*;?\s*$/;
+  const _PERM_GLOBALS = {
+    network: ['fetch', 'XMLHttpRequest', 'WebSocket', 'EventSource'],
+    storage: ['indexedDB', 'caches'],
+    'code-loading': ['importScripts'],
+    communication: ['BroadcastChannel'],
+    timing: ['performance'],
+    workers: ['Worker', 'SharedWorker'],
+  } as const;
+
+  // Shared loader captured BEFORE lockdown strips `process`/`require` from
+  // user scope. Used by both the parent-port detector and the vm detector,
+  // and later reused by the import callback to resolve allow-listed modules.
+  const _detectLoadBuiltin = (): ((id: string) => unknown) | undefined => {
+    let _loadBuiltin: ((id: string) => unknown) | undefined;
+
+    // Strategy 1: process.getBuiltinModule (Node 22.3+, works in ESM workers)
+    if (
+      typeof process !== 'undefined' &&
+      typeof (process as unknown as { getBuiltinModule?: unknown })
+        .getBuiltinModule === 'function'
+    ) {
+      const _getBuiltinModule = (
+        process as unknown as {
+          getBuiltinModule: (specifier: string) => unknown;
+        }
+      ).getBuiltinModule.bind(process);
+      _loadBuiltin = _getBuiltinModule;
+    }
+
+    // Strategy 2: new Function to get require (CJS workers, older Node).
+    // esbuild replaces both bare `require` AND `globalThis['require']` with
+    // module-scope polyfill variables that don't exist in the serialized
+    // worker context. `new Function()` is completely opaque to esbuild.
+    if (!_loadBuiltin) {
+      try {
+        _loadBuiltin = new Function(
+          'return typeof require==="function"?require:undefined'
+        )() as ((id: string) => unknown) | undefined;
+      } catch {
+        _loadBuiltin = undefined;
+      }
+    }
+
+    return _loadBuiltin;
+  };
+
+  const _loadBuiltin = _detectLoadBuiltin();
+  const _isBunLike =
+    typeof process !== 'undefined' &&
+    !!(process as unknown as { versions?: { bun?: string } }).versions?.bun;
+
+  const _detectNodeParentPort = (): {
+    isNodeWorker: boolean;
+    parentPort: NodeParentPort | null;
+  } => {
+    const isNodeLike =
+      !_isBunLike &&
+      typeof _loadBuiltin === 'function' &&
+      typeof process !== 'undefined' &&
+      !!process.versions?.node;
+
+    if (!isNodeLike) {
+      return { isNodeWorker: false, parentPort: null };
+    }
+
+    try {
+      const workerThreads = (_loadBuiltin as (id: string) => unknown)(
+        'node:worker_threads'
+      ) as {
+        parentPort?: NodeParentPort | null;
+      };
+      return {
+        isNodeWorker: true,
+        parentPort: workerThreads.parentPort ?? null,
+      };
+    } catch {
+      return { isNodeWorker: true, parentPort: null };
+    }
+  };
+
+  const { isNodeWorker: _isNodeWorker, parentPort: _nodeParentPort } =
+    _detectNodeParentPort();
+
+  // Detect node:vm for dynamic import interception. Same two-strategy pattern
+  // as _detectNodeParentPort. Must run BEFORE _applyNodeHostLockdown strips
+  // `process` / `require` from user scope.
+  const _detectNodeVm = (): { vm: unknown | null } => {
+    if (_isBunLike || typeof _loadBuiltin !== 'function') {
+      return { vm: null };
+    }
+    try {
+      return { vm: _loadBuiltin('node:vm') };
+    } catch {
+      return { vm: null };
+    }
+  };
+
+  const { vm: _vm } = _detectNodeVm();
+
+  // Module-level lockdown state; populated from the init message with secure
+  // defaults when fields are absent (stale pool workers still get the strong
+  // defaults). See plan §13-§15.
+  let _blockDynamicImport = true;
+  let _blockShadowRealm = true;
+  let _freezeIntrinsicsFlag = true;
+  let _lockWorkerIPC = true;
+  let _preventGlobalThisExtensions = false;
+  let _allowedModules: readonly string[] = [];
+  // Import callback built once at init time, reused by every execute and by
+  // the Function-constructor / eval shims.
+  let _cachedImportCallback: unknown;
+  // Hard-fail flag: set when blockDynamicImport is requested but node:vm is
+  // unavailable (non-Node runtime, or older Node without either detection
+  // strategy). First execute throws a clear error; we never silently downgrade.
+  let _dynamicImportBlockingUnavailable = false;
+
+  const _createMessageBridge = () => {
+    // Capture postMessage in closure BEFORE any lockdown can strip it, so the
+    // runtime keeps a working channel even after `_lockWorkerIPC` replaces
+    // `_scope.postMessage` with `undefined`. See plan §7.
+    const capturedPostMessage =
+      !_nodeParentPort && typeof _scope.postMessage === 'function'
+        ? (_scope.postMessage as (message: unknown) => void).bind(_scope)
+        : null;
+
+    if (!_nodeParentPort && !capturedPostMessage) {
+      throw new Error('Worker transport unavailable: no postMessage channel');
+    }
+
+    const send = (message: unknown): void => {
+      if (_nodeParentPort) {
+        _nodeParentPort.postMessage(message);
+        return;
+      }
+      (capturedPostMessage as (message: unknown) => void)(message);
+    };
+
+    const setOnMessage = (handler: (event: WorkerEvent) => void): void => {
+      if (_nodeParentPort) {
+        _nodeParentPort.on('message', (data) => handler({ data }));
+        return;
+      }
+      _scope.onmessage = handler;
+    };
+
+    return { send, setOnMessage };
+  };
+
+  const { send: _send, setOnMessage: _setOnMessage } = _createMessageBridge();
+
+  const _ensureTrailingNewline = (code: string): string => {
+    if (!code) {
+      return code;
+    }
+    return /\r?\n$/.test(code) ? code : `${code}\n`;
+  };
+
+  const _isCommentLikeLine = (line: string): boolean => {
+    const trimmed = line.trim();
+    return (
+      trimmed.startsWith('//') ||
+      trimmed.startsWith('/*') ||
+      trimmed.startsWith('*')
+    );
+  };
+
+  const _findLastMeaningfulLineIndex = (lines: string[]): number => {
+    let tail = lines.length - 1;
+    while (tail >= 0) {
+      const trimmed = lines[tail]!.trim();
+      if (trimmed && !_isCommentLikeLine(trimmed)) {
+        break;
+      }
+      tail -= 1;
+    }
+    return tail;
+  };
+
+  const _isNonExpressionCandidate = (expression: string): boolean => {
+    if (!expression) {
+      return true;
+    }
+
+    const firstMeaningfulLine = expression
+      .split('\n')
+      .find((line) => line.trim().length > 0)
+      ?.trim();
+
+    if (!firstMeaningfulLine) {
+      return true;
+    }
+
+    if (_LAST_LINE_NON_EXPRESSION_START.test(firstMeaningfulLine)) {
+      return true;
+    }
+
+    return (
+      (firstMeaningfulLine.startsWith('{') &&
+        !firstMeaningfulLine.startsWith('({')) ||
+      firstMeaningfulLine === '}' ||
+      firstMeaningfulLine === '};' ||
+      _isCommentLikeLine(firstMeaningfulLine)
+    );
+  };
+
+  const _rewriteSingleLineExpressionCandidate = (
+    baseHead: string,
+    rawCandidate: string
+  ): { head: string; expression: string } | null => {
+    let head = baseHead;
+    let expression = rawCandidate.trim().replace(/;\s*$/, '');
+
+    if (!expression) {
+      return null;
+    }
+
+    const lastSemi = expression.lastIndexOf(';');
+    if (lastSemi !== -1) {
+      const maybeExpression = expression.slice(lastSemi + 1).trim();
+      const prefixStatement = expression.slice(0, lastSemi).trim();
+      if (maybeExpression) {
+        if (
+          maybeExpression.startsWith('//') ||
+          maybeExpression.startsWith('/*')
+        ) {
+          if (prefixStatement) {
+            expression = prefixStatement;
+          }
+        } else {
+          if (prefixStatement) {
+            head = head
+              ? `${head}\n${prefixStatement};`
+              : `${prefixStatement};`;
+          }
+          expression = maybeExpression;
+        }
+      }
+    }
+
+    if (_isNonExpressionCandidate(expression)) {
+      return null;
+    }
+
+    return { head, expression };
+  };
+
+  const _buildAsyncAutoReturnSource = (
+    lines: string[],
+    start: number,
+    tail: number
+  ): string | null => {
+    const baseHead = lines.slice(0, start).join('\n');
+    const rawCandidate = lines
+      .slice(start, tail + 1)
+      .join('\n')
+      .trim();
+
+    if (!rawCandidate) {
+      return null;
+    }
+
+    if (!rawCandidate.includes('\n')) {
+      const singleLine = _rewriteSingleLineExpressionCandidate(
+        baseHead,
+        rawCandidate
+      );
+      if (!singleLine) {
+        return null;
+      }
+      return singleLine.head
+        ? `${singleLine.head}\nreturn (\n${singleLine.expression}\n);`
+        : `return (\n${singleLine.expression}\n);`;
+    }
+
+    if (_isNonExpressionCandidate(rawCandidate)) {
+      return null;
+    }
+
+    return baseHead
+      ? `${baseHead}\nreturn (\n${rawCandidate}\n);`
+      : `return (\n${rawCandidate}\n);`;
+  };
+
+  const _canCompileAsyncSource = (source: string): boolean => {
+    try {
+      void new _AsyncFunction(source);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const _injectAsyncAutoReturn = (code: string): string => {
+    const lines = code.split('\n');
+    const tail = _findLastMeaningfulLineIndex(lines);
+    if (tail < 0) {
+      return code;
+    }
+
+    // Try progressively larger trailing slices until we find a syntactically-valid
+    // expression we can wrap in `return (...)`.
+    const seenCandidateSources = new Set<string>();
+    for (let start = tail; start >= 0; start -= 1) {
+      const startLine = lines[start] ?? '';
+      if (!startLine.trim() || _isCommentLikeLine(startLine)) {
+        continue;
+      }
+
+      const candidateSource = _buildAsyncAutoReturnSource(lines, start, tail);
+      if (!candidateSource) {
+        continue;
+      }
+      if (seenCandidateSources.has(candidateSource)) {
+        continue;
+      }
+      seenCandidateSources.add(candidateSource);
+      if (_canCompileAsyncSource(candidateSource)) {
+        return candidateSource;
+      }
+    }
+
+    return code;
+  };
+
+  const _rewriteTopLevelReturnForSyncEval = (code: string): string => {
+    const match = _TOP_LEVEL_RETURN_ONLY.exec(code);
+    if (!match) {
+      return code;
+    }
+    const expression = (match[1] || '').trim();
+    return expression || code;
+  };
+
+  /**
+   * Extract top-level declared variable names from code.
+   *
+   * Character-by-character scanner that tracks brace/paren depth and skips
+   * strings, template literals, and comments. Only extracts names at depth 0.
+   *
+   * Returns an array of binding names (simple, destructured, rest, etc.).
+   * Errs on the side of NOT extracting (false negatives = safe).
+   */
+  const _extractTopLevelDeclaredNames = (code: string): string[] => {
+    const names: string[] = [];
+    const len = code.length;
+    let i = 0;
+    let braceDepth = 0;
+    let parenDepth = 0;
+
+    const isIdChar = (ch: string): boolean =>
+      (ch >= 'a' && ch <= 'z') ||
+      (ch >= 'A' && ch <= 'Z') ||
+      (ch >= '0' && ch <= '9') ||
+      ch === '_' ||
+      ch === '$';
+
+    // Skip a string literal (single, double, or template).
+    const skipString = (quote: string): void => {
+      i++; // skip opening quote
+      if (quote === '`') {
+        // Template literal: handle ${...} nesting
+        let tmplDepth = 0;
+        while (i < len) {
+          const ch = code[i]!;
+          if (ch === '\\') {
+            i += 2;
+            continue;
+          }
+          if (tmplDepth > 0) {
+            if (ch === '{') {
+              tmplDepth++;
+            } else if (ch === '}') {
+              tmplDepth--;
+            }
+            i++;
+            continue;
+          }
+          if (ch === '$' && i + 1 < len && code[i + 1] === '{') {
+            tmplDepth++;
+            i += 2;
+            continue;
+          }
+          if (ch === '`') {
+            i++;
+            return;
+          }
+          i++;
+        }
+      } else {
+        while (i < len) {
+          const ch = code[i]!;
+          if (ch === '\\') {
+            i += 2;
+            continue;
+          }
+          if (ch === quote) {
+            i++;
+            return;
+          }
+          i++;
+        }
+      }
+    };
+
+    // Skip a single-line comment (// to EOL).
+    const skipLineComment = (): void => {
+      i += 2; // skip //
+      while (i < len && code[i] !== '\n') {
+        i++;
+      }
+    };
+
+    // Skip a block comment (/* to */).
+    const skipBlockComment = (): void => {
+      i += 2; // skip /*
+      while (i < len) {
+        if (code[i] === '*' && i + 1 < len && code[i + 1] === '/') {
+          i += 2;
+          return;
+        }
+        i++;
+      }
+    };
+
+    // Read a word (identifier) at position i.
+    const readWord = (): string => {
+      const start = i;
+      while (i < len && isIdChar(code[i]!)) {
+        i++;
+      }
+      return code.slice(start, i);
+    };
+
+    // Skip whitespace and comments, return true if any was skipped.
+    const skipWS = (): boolean => {
+      const start = i;
+      while (i < len) {
+        const ch = code[i]!;
+        if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r') {
+          i++;
+          continue;
+        }
+        if (ch === '/' && i + 1 < len) {
+          if (code[i + 1] === '/') {
+            skipLineComment();
+            continue;
+          }
+          if (code[i + 1] === '*') {
+            skipBlockComment();
+            continue;
+          }
+        }
+        break;
+      }
+      return i > start;
+    };
+
+    // Extract names from a destructuring pattern (after the opening { or [).
+    const extractDestructuredNames = (close: string): void => {
+      let depth = 1;
+      while (i < len && depth > 0) {
+        skipWS();
+        if (i >= len) return;
+        const ch = code[i]!;
+        if (ch === close) {
+          depth--;
+          i++;
+          continue;
+        }
+        if (ch === '{' || ch === '[') {
+          // Nested destructuring
+          const nestedClose = ch === '{' ? '}' : ']';
+          i++;
+          depth++;
+          // Continue scanning — we'll hit the nested close
+          // But we need to track which close matches which open.
+          // Simplified: recurse
+          i--; // back up to re-read
+          depth--; // undo
+          i++; // skip the open brace/bracket
+          extractDestructuredNames(nestedClose);
+          continue;
+        }
+        if (
+          ch === '.' &&
+          i + 2 < len &&
+          code[i + 1] === '.' &&
+          code[i + 2] === '.'
+        ) {
+          // Rest element: ...name
+          i += 3;
+          skipWS();
+          if (i < len && isIdChar(code[i]!)) {
+            const name = readWord();
+            if (name) names.push(name);
+          }
+          continue;
+        }
+        if (ch === ',') {
+          i++;
+          continue;
+        }
+        if (ch === '=') {
+          // Default value — skip the expression
+          i++;
+          let eqDepth = 0;
+          while (i < len) {
+            const ec = code[i]!;
+            if (ec === "'" || ec === '"' || ec === '`') {
+              skipString(ec);
+              continue;
+            }
+            if (ec === '(' || ec === '[' || ec === '{') {
+              eqDepth++;
+              i++;
+              continue;
+            }
+            if (ec === ')' || ec === ']' || ec === '}') {
+              if (eqDepth > 0) {
+                eqDepth--;
+                i++;
+                continue;
+              }
+              // This is the outer close — don't consume it
+              break;
+            }
+            if (ec === ',' && eqDepth === 0) {
+              break;
+            }
+            i++;
+          }
+          continue;
+        }
+        if (isIdChar(ch)) {
+          const word = readWord();
+          skipWS();
+          if (i < len && code[i] === ':') {
+            // Property rename: `{ a: renamed }` or `{ a: { nested } }`
+            i++; // skip colon
+            skipWS();
+            if (i < len) {
+              const nc = code[i]!;
+              if (nc === '{' || nc === '[') {
+                const nestedClose = nc === '{' ? '}' : ']';
+                i++;
+                extractDestructuredNames(nestedClose);
+              } else if (isIdChar(nc)) {
+                const renamed = readWord();
+                if (renamed) names.push(renamed);
+              }
+            }
+          } else {
+            // Simple binding name
+            if (word) names.push(word);
+          }
+          continue;
+        }
+        // Unknown character — skip it
+        i++;
+      }
+    };
+
+    // After extracting a binding name or destructuring pattern,
+    // skip to the next comma (for another binding) or end of statement.
+    // Returns true if a comma was found (more bindings to come), false otherwise.
+    const skipToCommaOrEnd = (): boolean => {
+      let depth = 0;
+      while (i < len) {
+        const ch = code[i]!;
+        if (ch === "'" || ch === '"' || ch === '`') {
+          skipString(ch);
+          continue;
+        }
+        if (ch === '/' && i + 1 < len) {
+          if (code[i + 1] === '/') {
+            skipLineComment();
+            continue;
+          }
+          if (code[i + 1] === '*') {
+            skipBlockComment();
+            continue;
+          }
+        }
+        if (ch === '(' || ch === '[' || ch === '{') {
+          depth++;
+          i++;
+          continue;
+        }
+        if (ch === ')' || ch === ']' || ch === '}') {
+          if (depth > 0) {
+            depth--;
+            i++;
+            continue;
+          }
+          // End of surrounding scope — stop
+          return false;
+        }
+        if (ch === ',' && depth === 0) {
+          i++; // skip comma
+          return true; // more bindings follow
+        }
+        if (ch === ';' && depth === 0) {
+          i++;
+          return false; // statement ended
+        }
+        if (ch === '\n' && depth === 0) {
+          // Could be end of statement (ASI)
+          // Peek ahead: if next non-ws token isn't a comma, treat as end
+          const savedI = i;
+          i++;
+          skipWS();
+          if (i < len && code[i] === ',') {
+            i++; // skip comma, continue to next binding
+            return true;
+          }
+          // Not a comma — revert and end
+          i = savedI;
+          return false;
+        }
+        i++;
+      }
+      return false;
+    };
+
+    // Extract binding names after `var`/`let`/`const` keyword.
+    // Handles: simple names, object destructuring, array destructuring,
+    // and comma-separated bindings.
+    const extractBindings = (): void => {
+      while (i < len) {
+        skipWS();
+        if (i >= len) return;
+        const ch = code[i]!;
+
+        if (ch === '{') {
+          i++;
+          extractDestructuredNames('}');
+          if (!skipToCommaOrEnd()) return;
+          continue;
+        }
+        if (ch === '[') {
+          i++;
+          extractDestructuredNames(']');
+          if (!skipToCommaOrEnd()) return;
+          continue;
+        }
+        if (isIdChar(ch)) {
+          const name = readWord();
+          if (name) names.push(name);
+          if (!skipToCommaOrEnd()) return;
+          continue;
+        }
+        // Something unexpected — bail out
+        return;
+      }
+    };
+
+    // Check if position is at a statement boundary (start of code or preceded by
+    // a newline, semicolon, or opening brace — ignoring whitespace/comments).
+    const isStatementBoundary = (pos: number): boolean => {
+      if (pos === 0) return true;
+      let j = pos - 1;
+      while (j >= 0) {
+        const ch = code[j]!;
+        if (ch === ' ' || ch === '\t' || ch === '\r') {
+          j--;
+          continue;
+        }
+        return ch === '\n' || ch === ';' || ch === '{' || ch === '}';
+      }
+      return true; // reached start
+    };
+
+    while (i < len) {
+      const ch = code[i]!;
+
+      // Skip strings
+      if (ch === "'" || ch === '"' || ch === '`') {
+        skipString(ch);
+        continue;
+      }
+
+      // Skip comments
+      if (ch === '/' && i + 1 < len) {
+        if (code[i + 1] === '/') {
+          skipLineComment();
+          continue;
+        }
+        if (code[i + 1] === '*') {
+          skipBlockComment();
+          continue;
+        }
+      }
+
+      // Track brace and paren depth
+      if (ch === '{') {
+        braceDepth++;
+        i++;
+        continue;
+      }
+      if (ch === '}') {
+        braceDepth--;
+        i++;
+        continue;
+      }
+      if (ch === '(') {
+        parenDepth++;
+        i++;
+        continue;
+      }
+      if (ch === ')') {
+        parenDepth--;
+        i++;
+        continue;
+      }
+
+      // Only extract at top level
+      if (braceDepth === 0 && parenDepth === 0 && isIdChar(ch)) {
+        const wordStart = i;
+        const word = readWord();
+        if (
+          (word === 'var' || word === 'let' || word === 'const') &&
+          i < len &&
+          (code[i] === ' ' || code[i] === '\t' || code[i] === '\n') &&
+          isStatementBoundary(wordStart)
+        ) {
+          extractBindings();
+          continue;
+        }
+        // Not a declaration keyword — skip
+        continue;
+      }
+
+      i++;
+    }
+
+    // Deduplicate while preserving order
+    const seen = new Set<string>();
+    const unique: string[] = [];
+    for (const n of names) {
+      if (!seen.has(n)) {
+        seen.add(n);
+        unique.push(n);
+      }
+    }
+    return unique;
+  };
+
+  /**
+   * Build a persistence suffix that assigns declared names to globalThis.
+   * Wrapped in try/catch so failures are silent (fail-open to current behavior).
+   */
+  const _buildPersistenceSuffix = (declNames: string[]): string => {
+    if (declNames.length === 0) return '';
+    const assignments = declNames
+      .map((n) => `try { globalThis[${JSON.stringify(n)}] = ${n}; } catch {}`)
+      .join(' ');
+    return `\n${assignments} void 0;`;
+  };
+
+  const _formatOutputArg = (value: unknown): string => {
+    if (typeof value === 'string') {
+      return value;
+    }
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch {
+      return String(value);
+    }
+  };
+
+  const _captureConsoleMethod = (
+    methodName: string,
+    output: string[]
+  ): (() => void) => {
+    const consoleObject =
+      _scope.console && typeof _scope.console === 'object'
+        ? _scope.console
+        : null;
+    const existingMethod = consoleObject?.[methodName];
+    const original =
+      typeof existingMethod === 'function'
+        ? (...args: unknown[]) =>
+            (existingMethod as (...args: unknown[]) => unknown).apply(
+              consoleObject,
+              args
+            )
+        : null;
+
+    const wrapped = (...args: unknown[]) => {
+      output.push(args.map(_formatOutputArg).join(' '));
+    };
+
+    if (!_scope.console || typeof _scope.console !== 'object') {
+      _scope.console = {};
+    }
+    (_scope.console as Record<string, unknown>)[methodName] = wrapped;
+
+    return () => {
+      if (!_scope.console || typeof _scope.console !== 'object') {
+        return;
+      }
+      if (original) {
+        (_scope.console as Record<string, unknown>)[methodName] = original;
+        return;
+      }
+      try {
+        delete (_scope.console as Record<string, unknown>)[methodName];
+      } catch {
+        (_scope.console as Record<string, unknown>)[methodName] = undefined;
+      }
+    };
+  };
+
+  const _captureConsoleMethods = (output: string[]): Array<() => void> => {
+    const restoreFns: Array<() => void> = [];
+    if (_captureConsole) {
+      restoreFns.push(_captureConsoleMethod('log', output));
+      restoreFns.push(_captureConsoleMethod('info', output));
+      restoreFns.push(_captureConsoleMethod('warn', output));
+      restoreFns.push(_captureConsoleMethod('error', output));
+    }
+    return restoreFns;
+  };
+
+  const _setupOutputCapture = (): {
+    output: string[];
+    cleanup: () => void;
+  } => {
+    const output: string[] = [];
+    const restoreFns = _captureConsoleMethods(output);
+    const previousPrint = _scope.print;
+
+    if (_outputMode === _OUTPUT_MODE_STDOUT) {
+      _scope.print = (...args: unknown[]) => {
+        output.push(args.map(_formatOutputArg).join(' '));
+      };
+    }
+
+    const cleanupOutputCapture = () => {
+      for (const restore of restoreFns) {
+        try {
+          restore();
+        } catch {
+          // Best-effort cleanup.
+        }
+      }
+
+      if (_outputMode === _OUTPUT_MODE_STDOUT) {
+        if (previousPrint === undefined) {
+          try {
+            delete _scope.print;
+          } catch {
+            _scope.print = undefined;
+          }
+        } else {
+          _scope.print = previousPrint;
+        }
+      }
+    };
+
+    return {
+      output,
+      cleanup: cleanupOutputCapture,
+    };
+  };
+
+  const _lockdownGlobals = (names: readonly string[]): void => {
+    for (const name of names) {
+      try {
+        Object.defineProperty(_scope, name, {
+          value: undefined,
+          writable: false,
+          configurable: false,
+        });
+      } catch {
+        // Best-effort: some globals may already be non-configurable.
+      }
+    }
+  };
+
+  const _applyPermissionLockdown = (permissions: unknown): void => {
+    const granted = new Set(Array.isArray(permissions) ? permissions : []);
+    for (const [perm, names] of Object.entries(_PERM_GLOBALS)) {
+      if (!granted.has(perm)) {
+        _lockdownGlobals(names);
+      }
+    }
+  };
+
+  const _applyNodeHostLockdown = (
+    allowUnsafeNodeHostAccess: boolean | undefined
+  ): void => {
+    // Node runtime lockdown (safer default): hide process/require from generated code.
+    if (_isNodeWorker && !allowUnsafeNodeHostAccess) {
+      _lockdownGlobals(['process', 'require']);
+    }
+  };
+
+  // Node builtin module names without the `node:` prefix. Populated lazily
+  // (the first time the import callback runs). We do not seed from
+  // `module.builtinModules` at module top because the loader is optional and
+  // the list must be frozen for canonicalization regardless — better to
+  // derive it on first use, and fall back to a conservative set otherwise.
+  const _NODE_BUILTIN_NAMES: string[] = [
+    'assert',
+    'async_hooks',
+    'buffer',
+    'child_process',
+    'cluster',
+    'console',
+    'constants',
+    'crypto',
+    'dgram',
+    'diagnostics_channel',
+    'dns',
+    'domain',
+    'events',
+    'fs',
+    'fs/promises',
+    'http',
+    'http2',
+    'https',
+    'inspector',
+    'module',
+    'net',
+    'os',
+    'path',
+    'path/posix',
+    'path/win32',
+    'perf_hooks',
+    'process',
+    'punycode',
+    'querystring',
+    'readline',
+    'readline/promises',
+    'repl',
+    'stream',
+    'stream/consumers',
+    'stream/promises',
+    'stream/web',
+    'string_decoder',
+    'sys',
+    'test',
+    'timers',
+    'timers/promises',
+    'tls',
+    'trace_events',
+    'tty',
+    'url',
+    'util',
+    'util/types',
+    'v8',
+    'vm',
+    'wasi',
+    'worker_threads',
+    'zlib',
+  ];
+  const _NODE_BUILTINS: ReadonlySet<string> = new Set(_NODE_BUILTIN_NAMES);
+
+  type _Canonical =
+    | { kind: 'builtin'; name: string }
+    | { kind: 'userland'; name: string }
+    | { kind: 'url'; name: string };
+
+  const _canonicalizeSpecifier = (spec: string): _Canonical => {
+    const trimmed = String(spec);
+    if (trimmed.startsWith('node:')) {
+      return { kind: 'builtin', name: trimmed.slice(5) };
+    }
+    if (_NODE_BUILTINS.has(trimmed)) {
+      return { kind: 'builtin', name: trimmed };
+    }
+    if (/^(https?:|file:|\.\.?\/|\/)/.test(trimmed)) {
+      return { kind: 'url', name: trimmed };
+    }
+    return { kind: 'userland', name: trimmed };
+  };
+
+  const _buildAllowedSet = (
+    raw: readonly string[]
+  ): {
+    builtins: Set<string>;
+    userland: Set<string>;
+    urls: Set<string>;
+  } => {
+    const builtins = new Set<string>();
+    const userland = new Set<string>();
+    const urls = new Set<string>();
+    for (const entry of raw) {
+      const c = _canonicalizeSpecifier(entry);
+      if (c.kind === 'builtin') {
+        builtins.add(c.name);
+      } else if (c.kind === 'userland') {
+        if (_NODE_BUILTINS.has(c.name)) {
+          throw new Error(
+            `allowedModules entry '${entry}' is ambiguous: it matches a Node builtin. ` +
+              `Use 'node:${c.name}' to allow the builtin, or a different name for a userland package.`
+          );
+        }
+        userland.add(c.name);
+      } else {
+        urls.add(c.name);
+      }
+    }
+    return { builtins, userland, urls };
+  };
+
+  const _makeImportCallback = (): ((
+    specifier: string,
+    referrer: unknown
+  ) => Promise<unknown> | unknown) => {
+    // Canonicalize allowlist once at init time so every dispatch is a simple
+    // set lookup; throws immediately on ambiguous entries.
+    const allowed = _buildAllowedSet(_allowedModules ?? []);
+    return async (specifier: string, _referrer: unknown) => {
+      const c = _canonicalizeSpecifier(String(specifier));
+      if (c.kind === 'builtin' && allowed.builtins.has(c.name)) {
+        if (typeof _loadBuiltin !== 'function') {
+          throw new Error(
+            `Module '${specifier}' cannot be loaded: no module loader`
+          );
+        }
+        return _loadBuiltin(`node:${c.name}`);
+      }
+      if (c.kind === 'userland' && allowed.userland.has(c.name)) {
+        if (typeof _loadBuiltin !== 'function') {
+          throw new Error(
+            `Module '${specifier}' cannot be loaded: no module loader`
+          );
+        }
+        return _loadBuiltin(c.name);
+      }
+      if (c.kind === 'url' && allowed.urls.has(c.name)) {
+        throw new Error(
+          `URL-specifier imports are not yet supported in this sandbox: '${specifier}'`
+        );
+      }
+      throw new Error(
+        `dynamic import of '${specifier}' is not allowed in this sandbox`
+      );
+    };
+  };
+
+  const _installImportBlocker = (vm: unknown): void => {
+    const callback = _cachedImportCallback;
+    const runInThisContext = (
+      vm as {
+        runInThisContext: (code: string, opts?: unknown) => unknown;
+      }
+    ).runInThisContext;
+
+    // Captured native constructors. These are used strictly as
+    // parse-validators (SyntaxError oracles) before we string-template the
+    // wrapper. We never execute functions created by them directly.
+    const OriginalFunction = _scope.Function as FunctionConstructor;
+    const OriginalAsyncFunction = Object.getPrototypeOf(async () => {})
+      .constructor as FunctionConstructor;
+    const OriginalGeneratorFunction = Object.getPrototypeOf(function* () {})
+      .constructor as FunctionConstructor;
+    const OriginalAsyncGeneratorFunction = Object.getPrototypeOf(
+      async function* () {}
+    ).constructor as FunctionConstructor;
+
+    type _Kind = 'sync' | 'async' | 'gen' | 'asyncGen';
+    const VALIDATORS: Record<_Kind, FunctionConstructor> = {
+      sync: OriginalFunction,
+      async: OriginalAsyncFunction,
+      gen: OriginalGeneratorFunction,
+      asyncGen: OriginalAsyncGeneratorFunction,
+    };
+
+    const compileKind = (
+      kind: _Kind,
+      params: string[],
+      body: string
+    ): ((...args: unknown[]) => unknown) => {
+      // 1. Native parse-validation. Throws SyntaxError on any malformed
+      //    input — including parameter-name injection attempts. The
+      //    validator function is discarded; we only rely on its
+      //    SyntaxError behavior.
+      const Validator = VALIDATORS[kind];
+      (Validator as unknown as (...a: unknown[]) => unknown)(...params, body);
+
+      // 2. String-template the wrapper. Inputs are known well-formed.
+      const joinedParams = params.join(', ');
+      const wrapper =
+        kind === 'sync'
+          ? `(function anonymous(${joinedParams}) {\n${body}\n})`
+          : kind === 'async'
+            ? `(async function anonymous(${joinedParams}) {\n${body}\n})`
+            : kind === 'gen'
+              ? `(function* anonymous(${joinedParams}) {\n${body}\n})`
+              : `(async function* anonymous(${joinedParams}) {\n${body}\n})`;
+
+      // 3. Compile in the current realm with the dynamic-import blocker.
+      return runInThisContext(wrapper, {
+        importModuleDynamically: callback,
+      }) as (...a: unknown[]) => unknown;
+    };
+
+    const makeFunctionShim = (kind: _Kind) => {
+      return function (this: unknown, ...args: unknown[]) {
+        const body = args.length > 0 ? String(args[args.length - 1]) : '';
+        const params = args.slice(0, -1).map(String);
+        return compileKind(kind, params, body);
+      };
+    };
+
+    const SyncShim = makeFunctionShim('sync');
+    const AsyncShim = makeFunctionShim('async');
+    const GenShim = makeFunctionShim('gen');
+    const AsyncGenShim = makeFunctionShim('asyncGen');
+
+    try {
+      Object.defineProperty(_scope, 'Function', {
+        value: SyncShim,
+        writable: false,
+        configurable: false,
+      });
+    } catch {
+      // Best-effort: Function may already be locked.
+    }
+    try {
+      Object.defineProperty(OriginalFunction.prototype, 'constructor', {
+        value: SyncShim,
+        writable: false,
+        configurable: false,
+      });
+    } catch {
+      // Best-effort.
+    }
+    try {
+      Object.defineProperty(OriginalAsyncFunction.prototype, 'constructor', {
+        value: AsyncShim,
+        writable: false,
+        configurable: false,
+      });
+    } catch {
+      // Best-effort.
+    }
+    try {
+      Object.defineProperty(
+        OriginalGeneratorFunction.prototype,
+        'constructor',
+        {
+          value: GenShim,
+          writable: false,
+          configurable: false,
+        }
+      );
+    } catch {
+      // Best-effort.
+    }
+    try {
+      Object.defineProperty(
+        OriginalAsyncGeneratorFunction.prototype,
+        'constructor',
+        {
+          value: AsyncGenShim,
+          writable: false,
+          configurable: false,
+        }
+      );
+    } catch {
+      // Best-effort.
+    }
+
+    // eval: route through vm.runInThisContext. Eval takes a whole program
+    // string, not (params, body), so no wrapper templating is involved —
+    // runInThisContext is safe because the string is parsed as a complete
+    // program with no attacker-controlled wrapper around it.
+    const evalShim = (code: unknown) =>
+      runInThisContext(String(code), { importModuleDynamically: callback });
+    try {
+      Object.defineProperty(_scope, 'eval', {
+        value: evalShim,
+        writable: false,
+        configurable: false,
+      });
+    } catch {
+      // Best-effort.
+    }
+  };
+
+  const _freezeIntrinsics = (): void => {
+    // Pin Error.stackTraceLimit BEFORE freezing Error. Otherwise the frozen
+    // value could be whatever the host app previously set (possibly
+    // Infinity, triggering OOM on repeated errors).
+    try {
+      Object.defineProperty(Error, 'stackTraceLimit', {
+        value: 10,
+        writable: false,
+        configurable: false,
+      });
+    } catch {
+      // Best-effort.
+    }
+
+    const intrinsics: unknown[] = [
+      Object,
+      (Object as unknown as { prototype: unknown }).prototype,
+      Function,
+      (Function as unknown as { prototype: unknown }).prototype,
+      Array,
+      (Array as unknown as { prototype: unknown }).prototype,
+      Promise,
+      (Promise as unknown as { prototype: unknown }).prototype,
+      String,
+      (String as unknown as { prototype: unknown }).prototype,
+      Number,
+      (Number as unknown as { prototype: unknown }).prototype,
+      Boolean,
+      (Boolean as unknown as { prototype: unknown }).prototype,
+      Symbol,
+      (Symbol as unknown as { prototype: unknown }).prototype,
+      RegExp,
+      (RegExp as unknown as { prototype: unknown }).prototype,
+      Date,
+      (Date as unknown as { prototype: unknown }).prototype,
+      Map,
+      (Map as unknown as { prototype: unknown }).prototype,
+      Set,
+      (Set as unknown as { prototype: unknown }).prototype,
+      WeakMap,
+      (WeakMap as unknown as { prototype: unknown }).prototype,
+      WeakSet,
+      (WeakSet as unknown as { prototype: unknown }).prototype,
+      // Error constructors are frozen (blocks Error.prepareStackTrace
+      // attacks) but their .prototype is NOT frozen: instance code commonly
+      // does `err.name = 'CustomName'` / `err.message = '...'` which would
+      // silently fail if the prototype's `name`/`message` are non-writable.
+      Error,
+      TypeError,
+      RangeError,
+      SyntaxError,
+      ReferenceError,
+      EvalError,
+      URIError,
+      Reflect,
+      Math,
+      JSON,
+      ArrayBuffer,
+      (ArrayBuffer as unknown as { prototype: unknown }).prototype,
+      DataView,
+      (DataView as unknown as { prototype: unknown }).prototype,
+      Int8Array,
+      (Int8Array as unknown as { prototype: unknown }).prototype,
+      Uint8Array,
+      (Uint8Array as unknown as { prototype: unknown }).prototype,
+      Uint8ClampedArray,
+      (Uint8ClampedArray as unknown as { prototype: unknown }).prototype,
+      Int16Array,
+      (Int16Array as unknown as { prototype: unknown }).prototype,
+      Uint16Array,
+      (Uint16Array as unknown as { prototype: unknown }).prototype,
+      Int32Array,
+      (Int32Array as unknown as { prototype: unknown }).prototype,
+      Uint32Array,
+      (Uint32Array as unknown as { prototype: unknown }).prototype,
+      Float32Array,
+      (Float32Array as unknown as { prototype: unknown }).prototype,
+      Float64Array,
+      (Float64Array as unknown as { prototype: unknown }).prototype,
+    ];
+
+    // Optional intrinsics — guarded because older runtimes may lack them.
+    const optionalNames = [
+      'BigInt',
+      'BigInt64Array',
+      'BigUint64Array',
+      'SharedArrayBuffer',
+      'Atomics',
+      'Proxy',
+      'WeakRef',
+      'FinalizationRegistry',
+      'AggregateError',
+      'URL',
+      'URLSearchParams',
+      'Intl',
+    ];
+    // Error-family prototypes are not frozen (see note above on why).
+    const skipPrototypeFreeze = new Set(['AggregateError']);
+    for (const name of optionalNames) {
+      try {
+        const ctor = (_scope as Record<string, unknown>)[name];
+        if (ctor) {
+          intrinsics.push(ctor);
+          if (!skipPrototypeFreeze.has(name)) {
+            const proto = (ctor as { prototype?: unknown }).prototype;
+            if (proto) intrinsics.push(proto);
+          }
+        }
+      } catch {
+        // Best-effort.
+      }
+    }
+
+    // Iterator prototypes (reachable through standard collection iterators).
+    try {
+      intrinsics.push(Object.getPrototypeOf([][Symbol.iterator]()));
+    } catch {
+      // Best-effort.
+    }
+    try {
+      intrinsics.push(Object.getPrototypeOf(new Map()[Symbol.iterator]()));
+    } catch {
+      // Best-effort.
+    }
+    try {
+      intrinsics.push(Object.getPrototypeOf(new Set()[Symbol.iterator]()));
+    } catch {
+      // Best-effort.
+    }
+    try {
+      intrinsics.push(Object.getPrototypeOf(''[Symbol.iterator]()));
+    } catch {
+      // Best-effort.
+    }
+    try {
+      intrinsics.push(Object.getPrototypeOf(function* () {}).prototype);
+    } catch {
+      // Best-effort.
+    }
+    try {
+      intrinsics.push(Object.getPrototypeOf(async function* () {}).prototype);
+    } catch {
+      // Best-effort.
+    }
+
+    for (const target of intrinsics) {
+      if (!target) continue;
+      try {
+        Object.freeze(target);
+      } catch {
+        // Best-effort: some intrinsics may resist freezing.
+      }
+    }
+  };
+
+  const _MAX_ERROR_CAUSE_DEPTH = config.maxErrorCauseDepth;
+
+  const _serializeError = (
+    err: unknown,
+    depth: number = 0,
+    seen: Set<object> = new Set()
+  ): SerializedError => {
+    if (depth > _MAX_ERROR_CAUSE_DEPTH) {
+      return { name: 'Error', message: '[cause chain truncated]' };
+    }
+
+    if (err && typeof err === 'object') {
+      if (seen.has(err)) {
+        return { name: 'Error', message: '[circular]' };
+      }
+      seen.add(err);
+    }
+
+    const errObject = err as {
+      name?: unknown;
+      message?: unknown;
+      stack?: unknown;
+      cause?: unknown;
+      data?: unknown;
+    };
+
+    const name = errObject?.name != null ? String(errObject.name) : 'Error';
+    const message =
+      errObject?.message != null
+        ? String(errObject.message)
+        : _safeStringify(err);
+    const stack =
+      typeof errObject?.stack === 'string' ? errObject.stack : undefined;
+
+    let cause: SerializedError | undefined;
+    if (
+      typeof errObject?.cause !== 'undefined' &&
+      depth < _MAX_ERROR_CAUSE_DEPTH
+    ) {
+      try {
+        const sourceCause = errObject.cause;
+        if (
+          sourceCause instanceof Error ||
+          (sourceCause &&
+            typeof sourceCause === 'object' &&
+            ('message' in sourceCause || 'name' in sourceCause))
+        ) {
+          cause = _serializeError(sourceCause, depth + 1, seen);
+        } else {
+          cause = { name: 'Error', message: _safeStringify(sourceCause) };
+        }
+      } catch {
+        cause = { name: 'Error', message: _safeStringify(errObject.cause) };
+      }
+    }
+
+    const out: SerializedError = { name, message };
+    if (stack !== undefined) {
+      out.stack = stack;
+    }
+    if (cause !== undefined) {
+      out.cause = cause;
+    }
+    if (typeof errObject?.data !== 'undefined') {
+      try {
+        out.data =
+          typeof structuredClone === 'function'
+            ? structuredClone(errObject.data)
+            : errObject.data;
+      } catch {
+        // Non-cloneable error data is ignored.
+      }
+    }
+
+    return out;
+  };
+
+  const _deserializeError = (payload: unknown): Error => {
+    if (typeof payload === 'string') {
+      return new Error(payload);
+    }
+
+    if (!payload || typeof payload !== 'object') {
+      return new Error(String(payload));
+    }
+
+    const typedPayload = payload as {
+      name?: unknown;
+      message?: unknown;
+      stack?: unknown;
+      cause?: unknown;
+      data?: unknown;
+    };
+
+    const err = new Error(
+      typedPayload.message != null ? String(typedPayload.message) : ''
+    );
+    err.name = typedPayload.name != null ? String(typedPayload.name) : 'Error';
+
+    if (typeof typedPayload.stack === 'string') {
+      err.stack = typedPayload.stack;
+    }
+    if (typedPayload.cause !== undefined) {
+      (err as Error & { cause?: unknown }).cause = _deserializeError(
+        typedPayload.cause
+      );
+    }
+    if (typedPayload.data !== undefined) {
+      (err as Error & { data?: unknown }).data = typedPayload.data;
+    }
+
+    return err;
+  };
+
+  const _isCodeExecutionError = (err: unknown): boolean => {
+    const aggregateErrorCtor = (
+      globalThis as unknown as {
+        AggregateError?: new (...args: unknown[]) => Error;
+      }
+    ).AggregateError;
+    const isAggregateError =
+      typeof aggregateErrorCtor === 'function' &&
+      err instanceof aggregateErrorCtor;
+    return (
+      err instanceof SyntaxError ||
+      err instanceof TypeError ||
+      err instanceof RangeError ||
+      err instanceof ReferenceError ||
+      isAggregateError ||
+      err instanceof EvalError ||
+      err instanceof URIError
+    );
+  };
+
+  const _safeStringify = (value: unknown): string => {
+    if (value === null || value === undefined) {
+      return String(value);
+    }
+    if (typeof value !== 'object') {
+      return String(value);
+    }
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch {
+      return String(value);
+    }
+  };
+
+  const _formatCodeError = (
+    err: unknown,
+    code?: string,
+    lineOffset = 0
+  ): string => {
+    const typedErr = err as {
+      name?: unknown;
+      message?: unknown;
+      stack?: unknown;
+      cause?: unknown;
+      data?: unknown;
+    };
+    const name = typedErr?.name != null ? String(typedErr.name) : 'Error';
+    const message =
+      typedErr?.message != null
+        ? String(typedErr.message)
+        : _safeStringify(err);
+    const parts: string[] = [`${name}: ${message}`];
+
+    // Extract line/column from stack trace if available.
+    let errorLine: number | undefined;
+    if (typeof typedErr?.stack === 'string') {
+      const lineMatch = typedErr.stack.match(/<anonymous>:(\d+):(\d+)/);
+      if (lineMatch) {
+        // Adjust for wrapper preamble lines (e.g. AsyncFunction adds 2 lines).
+        errorLine = Math.max(1, Number(lineMatch[1]) - lineOffset);
+        parts.push(`  at line ${errorLine}, column ${lineMatch[2]}`);
+      }
+    }
+
+    // Include source code context around the error line (when known).
+    // When errorLine is unknown (e.g. SyntaxErrors from new Function/eval),
+    // skip the Source section — the code is already in the action log code block.
+    if (
+      code &&
+      errorLine !== undefined &&
+      errorLine >= 1 &&
+      errorLine <= code.split('\n').length
+    ) {
+      const lines = code.split('\n');
+      // Show a focused window: error line ± 1 line (clamped to bounds).
+      const start = Math.max(0, errorLine - 2);
+      const end = Math.min(lines.length, errorLine + 1);
+      const contextLines = lines.slice(start, end);
+      const numberedSrc = contextLines
+        .map((l, i) => `  ${String(start + i + 1).padStart(3)}| ${l}`)
+        .join('\n');
+      parts.push(`Source:\n${numberedSrc}`);
+    }
+
+    if (typedErr?.data !== undefined) {
+      parts.push(`Data: ${_safeStringify(typedErr.data)}`);
+    }
+    if (typedErr?.cause !== undefined) {
+      const _fmtCause = (cause: unknown, depth: number): string => {
+        if (depth > 4) return '[cause chain truncated]';
+        const c = cause as typeof typedErr;
+        const cName = c?.name != null ? String(c.name) : 'Error';
+        const cMsg =
+          c?.message != null ? String(c.message) : _safeStringify(cause);
+        const cParts: string[] = [`${cName}: ${cMsg}`];
+        if (c?.data !== undefined)
+          cParts.push(`Data: ${_safeStringify(c.data)}`);
+        if (c?.cause !== undefined)
+          cParts.push(`Caused by: ${_fmtCause(c.cause, depth + 1)}`);
+        return cParts.join('\n');
+      };
+      parts.push(`Caused by: ${_fmtCause(typedErr.cause, 1)}`);
+    }
+
+    return parts.join('\n');
+  };
+
+  // Pending function-call promises keyed by call ID.
+  const _fnPending = new Map<number, FnPending>();
+  let _fnCallId = 0;
+  let _outputMode = _OUTPUT_MODE_RETURN;
+  let _captureConsole = false;
+  const _detachedFnErrors: unknown[] = [];
+
+  const _isPlainObject = (value: unknown): value is Record<string, unknown> => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return false;
+    }
+    const proto = Object.getPrototypeOf(value);
+    return proto === Object.prototype || proto === null;
+  };
+
+  const _isNonEmptyString = (value: unknown): value is string =>
+    typeof value === 'string' && value.trim().length > 0;
+
+  const _validateClarificationChoice = (choice: unknown): void => {
+    if (_isNonEmptyString(choice)) {
+      return;
+    }
+
+    if (!_isPlainObject(choice)) {
+      throw new Error(
+        'askClarification() choice entries must be non-empty strings or objects with a non-empty label'
+      );
+    }
+
+    if (!_isNonEmptyString(choice.label)) {
+      throw new Error(
+        'askClarification() choice objects require a non-empty label'
+      );
+    }
+
+    if (choice.value !== undefined && !_isNonEmptyString(choice.value)) {
+      throw new Error(
+        'askClarification() choice object values must be non-empty strings'
+      );
+    }
+  };
+
+  const _createMultipleChoiceClarificationError = (detail?: string): Error => {
+    const suffix = detail ? ` ${detail}` : '';
+    return new Error(
+      'askClarification() with type "multiple_choice" must include at least two valid choices. Use a non-empty string question plus choices like ["Option A", "Option B"], or switch to "single_choice" / a plain question if there is only one option.' +
+        suffix
+    );
+  };
+
+  const _stripChoiceMetadata = (
+    payload: Record<string, unknown>,
+    options?: { dropType?: boolean }
+  ): Record<string, unknown> => {
+    const { choices: _choices, ...restWithType } = payload;
+
+    if (options?.dropType) {
+      const { type: _type, ...rest } = restWithType;
+      return {
+        ...rest,
+        question: payload.question,
+      };
+    }
+
+    return {
+      ...restWithType,
+      question: payload.question,
+    };
+  };
+
+  const _normalizeClarificationPayload = (payload: unknown): unknown => {
+    if (_isNonEmptyString(payload)) {
+      return payload;
+    }
+
+    if (!_isPlainObject(payload)) {
+      throw new Error(
+        'askClarification() requires a non-empty string or an object payload'
+      );
+    }
+
+    if (!_isNonEmptyString(payload.question)) {
+      throw new Error(
+        'askClarification() object payload requires a non-empty question'
+      );
+    }
+
+    const allowedTypes = new Set([
+      'text',
+      'number',
+      'date',
+      'single_choice',
+      'multiple_choice',
+    ]);
+    let normalizedType: string | undefined;
+    if (payload.type === undefined) {
+      normalizedType =
+        Array.isArray(payload.choices) && payload.choices.length > 0
+          ? 'single_choice'
+          : undefined;
+    } else {
+      if (typeof payload.type !== 'string' || !allowedTypes.has(payload.type)) {
+        throw new Error(
+          'askClarification() object payload type must be one of: text, number, date, single_choice, multiple_choice'
+        );
+      }
+      normalizedType = payload.type;
+    }
+
+    const wantsChoices =
+      normalizedType === 'single_choice' ||
+      normalizedType === 'multiple_choice';
+    const rawChoices = payload.choices;
+    let normalizedChoices: unknown[] | undefined;
+
+    if (rawChoices !== undefined) {
+      if (!Array.isArray(rawChoices) || rawChoices.length === 0) {
+        if (normalizedType === 'multiple_choice') {
+          throw _createMultipleChoiceClarificationError();
+        }
+
+        return _stripChoiceMetadata(payload, {
+          dropType: normalizedType === 'single_choice',
+        });
+      }
+
+      try {
+        normalizedChoices = rawChoices.map((choice) => {
+          _validateClarificationChoice(choice);
+          return choice;
+        });
+      } catch (error) {
+        if (normalizedType === 'multiple_choice') {
+          const detail =
+            error instanceof Error
+              ? `Fix the choices so each option is a non-empty string or an object with a non-empty label. ${error.message}`
+              : undefined;
+          throw _createMultipleChoiceClarificationError(detail);
+        }
+
+        return _stripChoiceMetadata(payload, {
+          dropType: normalizedType === 'single_choice',
+        });
+      }
+    } else if (wantsChoices) {
+      if (normalizedType === 'multiple_choice') {
+        throw _createMultipleChoiceClarificationError();
+      }
+
+      return _stripChoiceMetadata(payload, { dropType: true });
+    }
+
+    if (
+      normalizedType === 'multiple_choice' &&
+      (!normalizedChoices || normalizedChoices.length < 2)
+    ) {
+      throw _createMultipleChoiceClarificationError();
+    }
+
+    return {
+      ...payload,
+      question: payload.question,
+      ...(normalizedType ? { type: normalizedType } : {}),
+      ...(normalizedChoices ? { choices: normalizedChoices } : {}),
+    };
+  };
+
+  const _normalizeCompletionCall = (
+    name: string,
+    args: readonly unknown[]
+  ): unknown[] => {
+    if (name === 'final') {
+      if (args.length === 0) {
+        throw new Error('final() requires at least one argument');
+      }
+      return [...args];
+    }
+
+    if (name === 'askClarification') {
+      if (args.length !== 1) {
+        throw new Error('askClarification() requires exactly one argument');
+      }
+      return [_normalizeClarificationPayload(args[0])];
+    }
+
+    return [...args];
+  };
+
+  const _getCompletionCallType = (
+    name: string
+  ): 'final' | 'askClarification' | undefined => {
+    if (name === 'final' || name === 'askClarification') {
+      return name;
+    }
+
+    const refMatch = /^fn_\d+_(.+)$/.exec(name);
+    const refPath = refMatch?.[1];
+    if (refPath === 'final' || refPath === 'askClarification') {
+      return refPath;
+    }
+
+    return undefined;
+  };
+
+  const _createFnProxy =
+    (name: string) =>
+    (...args: unknown[]) => {
+      const completionType = _getCompletionCallType(name);
+      let normalizedArgs = args;
+      if (completionType) {
+        normalizedArgs = _normalizeCompletionCall(completionType, args);
+      }
+
+      const id = ++_fnCallId;
+      let observed = false;
+      const basePromise = new Promise((resolve, reject) => {
+        _fnPending.set(id, { resolve, reject });
+        try {
+          _send({ type: 'fn-call', id, name, args: normalizedArgs });
+        } catch (err) {
+          // Args contain a non-cloneable value (e.g. a Promise). Reject immediately.
+          _fnPending.delete(id);
+          reject(err);
+        }
+      });
+
+      const originalThen = basePromise.then.bind(basePromise);
+      const originalCatch = basePromise.catch.bind(basePromise);
+      const originalFinally = basePromise.finally.bind(basePromise);
+      const markObserved = () => {
+        observed = true;
+      };
+
+      const trackedPromise = new Proxy(basePromise, {
+        get(target, prop, receiver) {
+          if (prop === 'then') {
+            return (...thenArgs: Parameters<Promise<unknown>['then']>) => {
+              markObserved();
+              return originalThen(...thenArgs);
+            };
+          }
+
+          if (prop === 'catch') {
+            return (...catchArgs: Parameters<Promise<unknown>['catch']>) => {
+              markObserved();
+              return originalCatch(...catchArgs);
+            };
+          }
+
+          if (prop === 'finally') {
+            return (
+              ...finallyArgs: Parameters<Promise<unknown>['finally']>
+            ) => {
+              markObserved();
+              return originalFinally(...finallyArgs);
+            };
+          }
+
+          return Reflect.get(target, prop, receiver);
+        },
+      }) as Promise<unknown>;
+
+      void basePromise.catch((error) => {
+        if (!observed) {
+          _detachedFnErrors.push(error);
+        }
+      });
+
+      return trackedPromise;
+    };
+
+  const _waitForPendingFnCalls = async (): Promise<void> => {
+    for (let i = 0; i < 50 && _fnPending.size > 0; i += 1) {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    }
+  };
+
+  const _rehydrateFnRefs = (value: unknown): unknown => {
+    if (!value || typeof value !== 'object') {
+      return value;
+    }
+
+    if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i += 1) {
+        value[i] = _rehydrateFnRefs(value[i]);
+      }
+      return value;
+    }
+
+    const valueObject = value as Record<string, unknown>;
+    if (_FUNCTION_REF_KEY in valueObject) {
+      const ref = valueObject[_FUNCTION_REF_KEY];
+      if (typeof ref === 'string') {
+        return _createFnProxy(ref);
+      }
+      return undefined;
+    }
+
+    for (const [key, innerValue] of Object.entries(valueObject)) {
+      valueObject[key] = _rehydrateFnRefs(innerValue);
+    }
+
+    return value;
+  };
+
+  const _patchGlobals = (globals: Record<string, unknown>): void => {
+    for (const [key, rawValue] of Object.entries(globals)) {
+      const nextValue = _rehydrateFnRefs(rawValue);
+      const currentValue = _scope[key];
+
+      if (_isPlainObject(currentValue) && _isPlainObject(nextValue)) {
+        for (const existingKey of Object.keys(currentValue)) {
+          if (!Object.hasOwn(nextValue, existingKey)) {
+            delete currentValue[existingKey];
+          }
+        }
+        for (const [nextKey, nextEntryValue] of Object.entries(nextValue)) {
+          currentValue[nextKey] = nextEntryValue;
+        }
+        continue;
+      }
+
+      try {
+        _scope[key] = nextValue;
+      } catch {
+        // Property may be read-only (e.g., `location` in DedicatedWorkerGlobalScope).
+      }
+    }
+  };
+
+  const _setGlobalsAndFnProxies = (msg: Record<string, unknown>): void => {
+    if (msg.globals && typeof msg.globals === 'object') {
+      _patchGlobals(msg.globals as Record<string, unknown>);
+    }
+
+    // Backward compatibility: allow explicit top-level function proxies.
+    if (Array.isArray(msg.fnNames)) {
+      for (const name of msg.fnNames) {
+        if (typeof name === 'string') {
+          try {
+            _scope[name] = _createFnProxy(name);
+          } catch {
+            // Skip read-only globals that cannot accept a proxy.
+          }
+        }
+      }
+    }
+  };
+
+  const _executeAsyncSnippet = async (code: string) => {
+    const fallbackSource = _ensureTrailingNewline(code);
+
+    // Extract declarations from the ORIGINAL code (before auto-return transform).
+    let declNames: string[] = [];
+    try {
+      declNames = _extractTopLevelDeclaredNames(code);
+    } catch {
+      declNames = [];
+    }
+    const suffix = _buildPersistenceSuffix(declNames);
+
+    let transformedSource = fallbackSource;
+    try {
+      transformedSource = _injectAsyncAutoReturn(fallbackSource);
+    } catch {
+      transformedSource = fallbackSource;
+    }
+
+    // Inject persistence suffix.
+    let withPersistence = transformedSource;
+    if (suffix) {
+      // If auto-return injected a `return (`, insert persistence before it.
+      const returnIdx = transformedSource.lastIndexOf('\nreturn (');
+      if (returnIdx !== -1) {
+        withPersistence =
+          transformedSource.slice(0, returnIdx) +
+          suffix +
+          transformedSource.slice(returnIdx);
+      } else {
+        // No auto-return — append at end.
+        withPersistence = transformedSource + suffix;
+      }
+    }
+
+    const sourceToRun = _canCompileAsyncSource(withPersistence)
+      ? withPersistence
+      : _canCompileAsyncSource(transformedSource)
+        ? transformedSource
+        : fallbackSource;
+
+    if (_vm && _blockDynamicImport) {
+      const wrapped = `(async () => {\n${sourceToRun}\n})()`;
+      return await (
+        _vm as {
+          runInThisContext: (code: string, opts?: unknown) => unknown;
+        }
+      ).runInThisContext(wrapped, {
+        importModuleDynamically: _cachedImportCallback,
+      });
+    }
+    const fn = new _AsyncFunction(sourceToRun);
+    return await fn();
+  };
+
+  const _executeSyncSnippet = (code: string): unknown => {
+    const syncCode = _rewriteTopLevelReturnForSyncEval(code);
+
+    // Inject persistence for const/let/var declarations.
+    let declNames: string[] = [];
+    try {
+      declNames = _extractTopLevelDeclaredNames(code);
+    } catch {
+      declNames = [];
+    }
+    const suffix = _buildPersistenceSuffix(declNames);
+    const codeToRun = suffix ? syncCode + suffix : syncCode;
+
+    if (_vm && _blockDynamicImport) {
+      return (
+        _vm as {
+          runInThisContext: (code: string, opts?: unknown) => unknown;
+        }
+      ).runInThisContext(codeToRun, {
+        importModuleDynamically: _cachedImportCallback,
+      });
+    }
+
+    // Indirect eval executes in worker global scope.
+    // biome-ignore lint/security/noGlobalEval: intentional indirect eval for worker sandbox
+    // biome-ignore lint/complexity/noCommaOperator: (0, eval) is the standard indirect eval pattern
+    return (0, eval)(codeToRun);
+  };
+
+  const _toOutputValue = (result: unknown, output: string[]): unknown => {
+    if (_outputMode !== _OUTPUT_MODE_STDOUT) {
+      return result;
+    }
+
+    const stdout = output.join('\n').trim();
+    return stdout ? stdout : result;
+  };
+
+  const _truncateInspectText = (text: string, maxChars: number): string =>
+    text.length <= maxChars ? text : `${text.slice(0, maxChars - 3)}...`;
+
+  const _previewInspectAtom = (value: unknown): string => {
+    if (value === null) {
+      return 'null';
+    }
+    if (value === undefined) {
+      return 'undefined';
+    }
+
+    const valueType = typeof value;
+    if (typeof value === 'string') {
+      return JSON.stringify(_truncateInspectText(value, 40));
+    }
+    if (
+      valueType === 'number' ||
+      valueType === 'boolean' ||
+      valueType === 'bigint'
+    ) {
+      return String(value);
+    }
+    if (valueType === 'symbol') {
+      return String(value);
+    }
+    if (valueType === 'function') {
+      const fnName =
+        (value as { name?: unknown }).name &&
+        typeof (value as { name?: unknown }).name === 'string'
+          ? ((value as { name?: string }).name ?? '')
+          : '';
+      return `[function ${fnName || 'anonymous'}]`;
+    }
+    if (Array.isArray(value)) {
+      return `[array(${value.length})]`;
+    }
+    if (value instanceof Date) {
+      return Number.isFinite(value.getTime())
+        ? value.toISOString()
+        : String(value);
+    }
+    if (value instanceof Error) {
+      return `${value.name || 'Error'}: ${value.message || ''}`;
+    }
+    if (value instanceof Map) {
+      return `[map(${value.size})]`;
+    }
+    if (value instanceof Set) {
+      return `[set(${value.size})]`;
+    }
+
+    const ctorName =
+      value &&
+      typeof value === 'object' &&
+      'constructor' in value &&
+      value.constructor &&
+      typeof (value.constructor as { name?: unknown }).name === 'string'
+        ? ((value.constructor as { name: string }).name ?? '')
+        : '';
+    return ctorName && ctorName !== 'Object' ? `[${ctorName}]` : '[object]';
+  };
+
+  const _describeInspectType = (
+    value: unknown
+  ): { type: string; ctor?: string } => {
+    if (value === null) {
+      return { type: 'null' };
+    }
+    if (Array.isArray(value)) {
+      return { type: 'array', ctor: 'Array' };
+    }
+    if (value instanceof Map) {
+      return { type: 'map', ctor: 'Map' };
+    }
+    if (value instanceof Set) {
+      return { type: 'set', ctor: 'Set' };
+    }
+    if (value instanceof Date) {
+      return { type: 'date', ctor: 'Date' };
+    }
+    if (value instanceof Error) {
+      return {
+        type: 'error',
+        ctor:
+          typeof value.name === 'string' && value.name.trim()
+            ? value.name
+            : 'Error',
+      };
+    }
+
+    const valueType = typeof value;
+    if (valueType !== 'object') {
+      return { type: valueType };
+    }
+
+    const ctor =
+      value &&
+      typeof value === 'object' &&
+      'constructor' in value &&
+      value.constructor &&
+      typeof (value.constructor as { name?: unknown }).name === 'string'
+        ? ((value.constructor as { name: string }).name ?? undefined)
+        : undefined;
+    return { type: 'object', ctor };
+  };
+
+  const _describeInspectSize = (
+    value: unknown,
+    type: string
+  ): string | undefined => {
+    if (type === 'string') {
+      return `${(value as string).length} chars`;
+    }
+    if (type === 'array') {
+      return `${(value as unknown[]).length} items`;
+    }
+    if (type === 'map' || type === 'set') {
+      return `${(value as Map<unknown, unknown> | Set<unknown>).size} items`;
+    }
+    if (type === 'object' && value && typeof value === 'object') {
+      return `${Object.keys(value as Record<string, unknown>).length} keys`;
+    }
+    return undefined;
+  };
+
+  const _previewInspectValue = (
+    value: unknown,
+    type: string,
+    ctor?: string
+  ): string => {
+    if (type === 'array') {
+      const items = (value as unknown[])
+        .slice(0, 3)
+        .map((item) => _previewInspectAtom(item));
+      return (
+        '[' +
+        items.join(', ') +
+        ((value as unknown[]).length > 3 ? ', ...' : '') +
+        ']'
+      );
+    }
+    if (type === 'map') {
+      const mapValue = value as Map<unknown, unknown>;
+      const items = Array.from(mapValue.entries())
+        .slice(0, 3)
+        .map(
+          ([key, item]) =>
+            `${_previewInspectAtom(key)} => ${_previewInspectAtom(item)}`
+        );
+      return (
+        'Map(' +
+        mapValue.size +
+        ') {' +
+        items.join(', ') +
+        (mapValue.size > 3 ? ', ...' : '') +
+        '}'
+      );
+    }
+    if (type === 'set') {
+      const setValue = value as Set<unknown>;
+      const items = Array.from(setValue.values())
+        .slice(0, 5)
+        .map((item) => _previewInspectAtom(item));
+      return (
+        'Set(' +
+        setValue.size +
+        ') {' +
+        items.join(', ') +
+        (setValue.size > 5 ? ', ...' : '') +
+        '}'
+      );
+    }
+    if (type === 'date' || type === 'error' || type === 'function') {
+      return _previewInspectAtom(value);
+    }
+    if (type === 'object' && value && typeof value === 'object') {
+      const keys = Object.keys(value as Record<string, unknown>);
+      const shown = keys.slice(0, 4);
+      const prefix = ctor && ctor !== 'Object' ? `${ctor} ` : '';
+      return (
+        prefix +
+        '{' +
+        shown.join(', ') +
+        (keys.length > shown.length ? ', ...' : '') +
+        '}'
+      );
+    }
+    return _previewInspectAtom(value);
+  };
+
+  const _buildInspectGlobalsSnapshot = (
+    reservedNames?: readonly string[]
+  ): string => {
+    const skip = new Set([
+      ..._inspectBaselineGlobalNames,
+      ...(reservedNames ?? []),
+    ]);
+    const entries = Object.getOwnPropertyNames(_scope)
+      .filter((name) => !skip.has(name) && !name.startsWith('_'))
+      .sort()
+      .flatMap((name) => {
+        try {
+          const descriptor = Object.getOwnPropertyDescriptor(_scope, name);
+          if (!descriptor) {
+            return [];
+          }
+          if (
+            'get' in descriptor &&
+            typeof descriptor.get === 'function' &&
+            !('value' in descriptor)
+          ) {
+            return [{ name, type: 'accessor', preview: '[getter omitted]' }];
+          }
+
+          const value = 'value' in descriptor ? descriptor.value : _scope[name];
+          const meta = _describeInspectType(value);
+          const size = _describeInspectSize(value, meta.type);
+          const preview = _previewInspectValue(value, meta.type, meta.ctor);
+
+          return [
+            {
+              name,
+              type: meta.type,
+              ...(meta.ctor ? { ctor: meta.ctor } : {}),
+              ...(size ? { size } : {}),
+              ...(preview
+                ? { preview: _truncateInspectText(preview, 96) }
+                : {}),
+            },
+          ];
+        } catch {
+          return [{ name, type: 'unknown', preview: '[unavailable]' }];
+        }
+      });
+
+    return JSON.stringify({ version: 1, entries });
+  };
+
+  const _canStructuredCloneValue = (value: unknown): boolean => {
+    if (typeof structuredClone === 'function') {
+      try {
+        structuredClone(value);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    try {
+      JSON.stringify(value);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const _buildStructuredGlobalsSnapshot = (
+    reservedNames?: readonly string[]
+  ) => {
+    const skip = new Set([
+      ..._inspectBaselineGlobalNames,
+      ...(reservedNames ?? []),
+    ]);
+    const bindings: Record<string, unknown> = {};
+    const entries = Object.getOwnPropertyNames(_scope)
+      .filter((name) => !skip.has(name) && !name.startsWith('_'))
+      .sort()
+      .flatMap((name) => {
+        try {
+          const descriptor = Object.getOwnPropertyDescriptor(_scope, name);
+          if (!descriptor) {
+            return [];
+          }
+          if (
+            'get' in descriptor &&
+            typeof descriptor.get === 'function' &&
+            !('value' in descriptor)
+          ) {
+            return [
+              {
+                name,
+                type: 'accessor',
+                preview: '[getter omitted]',
+                restorable: false,
+              },
+            ];
+          }
+
+          const value = 'value' in descriptor ? descriptor.value : _scope[name];
+          const meta = _describeInspectType(value);
+          const size = _describeInspectSize(value, meta.type);
+          const preview = _previewInspectValue(value, meta.type, meta.ctor);
+          const restorable = _canStructuredCloneValue(value);
+
+          if (restorable) {
+            bindings[name] =
+              typeof structuredClone === 'function'
+                ? structuredClone(value)
+                : value;
+          }
+
+          return [
+            {
+              name,
+              type: meta.type,
+              ...(meta.ctor ? { ctor: meta.ctor } : {}),
+              ...(size ? { size } : {}),
+              ...(preview
+                ? { preview: _truncateInspectText(preview, 96) }
+                : {}),
+              restorable,
+            },
+          ];
+        } catch {
+          return [
+            {
+              name,
+              type: 'unknown',
+              preview: '[unavailable]',
+              restorable: false,
+            },
+          ];
+        }
+      });
+
+    return { version: 1 as const, entries, bindings };
+  };
+
+  _setOnMessage(async (event) => {
+    const msg = event.data as Record<string, unknown>;
+
+    if (!msg || typeof msg !== 'object' || typeof msg.type !== 'string') {
+      return;
+    }
+
+    if (msg.type === 'init') {
+      _outputMode =
+        msg.outputMode === _OUTPUT_MODE_STDOUT
+          ? _OUTPUT_MODE_STDOUT
+          : _OUTPUT_MODE_RETURN;
+      _captureConsole =
+        msg.captureConsole !== undefined
+          ? Boolean(msg.captureConsole)
+          : _outputMode === _OUTPUT_MODE_STDOUT;
+      const allowUnsafeNodeHostAccess = msg.allowUnsafeNodeHostAccess === true;
+
+      // Read new lockdown fields; absent fields fall back to the *secure*
+      // default so stale workers still get strong protections.
+      _blockDynamicImport =
+        msg.blockDynamicImport === undefined
+          ? true
+          : Boolean(msg.blockDynamicImport);
+      _blockShadowRealm =
+        msg.blockShadowRealm === undefined
+          ? true
+          : Boolean(msg.blockShadowRealm);
+      _freezeIntrinsicsFlag =
+        msg.freezeIntrinsics === undefined
+          ? true
+          : Boolean(msg.freezeIntrinsics);
+      _lockWorkerIPC =
+        msg.lockWorkerIPC === undefined ? true : Boolean(msg.lockWorkerIPC);
+      _preventGlobalThisExtensions =
+        msg.preventGlobalThisExtensions === undefined
+          ? false
+          : Boolean(msg.preventGlobalThisExtensions);
+      _allowedModules = Array.isArray(msg.allowedModules)
+        ? (msg.allowedModules.filter(
+            (v): v is string => typeof v === 'string'
+          ) as readonly string[])
+        : [];
+
+      _setGlobalsAndFnProxies(msg);
+      _applyPermissionLockdown(msg.permissions);
+      _applyNodeHostLockdown(allowUnsafeNodeHostAccess);
+
+      // Lockdown ordering per plan §13:
+      //  5. blockShadowRealm
+      //  6. blockDynamicImport (+ fail-hard flag if vm missing)
+      //  7. freezeIntrinsics
+      //  8. baseline capture for inspect/snapshot filtering
+      //  9. lockWorkerIPC (browser/Deno only)
+      // 10. preventGlobalThisExtensions
+
+      if (_blockShadowRealm) {
+        _lockdownGlobals(['ShadowRealm']);
+      }
+
+      if (_blockDynamicImport) {
+        if (_vm) {
+          try {
+            _cachedImportCallback = _makeImportCallback();
+            _installImportBlocker(_vm);
+          } catch (err) {
+            // If allowlist validation fails at init we surface it on the
+            // first execute; remember the error so it is not lost.
+            _dynamicImportBlockingUnavailable = true;
+            _cachedImportCallback = err;
+          }
+        } else if (_isNodeWorker) {
+          // Node-like runtime without node:vm — record the gap; first
+          // execute fails hard with a clear message. Never silently
+          // downgrade security in Node.
+          _dynamicImportBlockingUnavailable = true;
+        }
+        // Browser / Deno workers: node:vm is intrinsically unavailable.
+        // We rely on the OS-level worker permission sandbox (Deno) or
+        // same-origin module restrictions (browser) as the primary
+        // defense. The shim/vm path is a Node-only extra layer.
+      }
+
+      if (_freezeIntrinsicsFlag) {
+        _freezeIntrinsics();
+      }
+
+      // Capture the baseline after lockdown so internally-hidden globals such as
+      // SharedWorker/require never leak into snapshots as restorable state.
+      _inspectBaselineGlobalNames = Object.getOwnPropertyNames(_scope).sort();
+
+      if (_lockWorkerIPC && !_nodeParentPort) {
+        try {
+          Object.defineProperty(_scope, 'postMessage', {
+            value: undefined,
+            writable: false,
+            configurable: false,
+          });
+        } catch {
+          // Best-effort.
+        }
+        try {
+          const currentHandler = _scope.onmessage;
+          Object.defineProperty(_scope, 'onmessage', {
+            value: currentHandler,
+            writable: false,
+            configurable: false,
+          });
+        } catch {
+          // Best-effort.
+        }
+      }
+
+      if (_preventGlobalThisExtensions) {
+        try {
+          Object.preventExtensions(_scope);
+        } catch {
+          // Best-effort.
+        }
+      }
+
+      return;
+    }
+
+    if (msg.type === 'fn-result') {
+      if (typeof msg.id !== 'number') {
+        return;
+      }
+
+      const pending = _fnPending.get(msg.id);
+      if (pending) {
+        _fnPending.delete(msg.id);
+        if (msg.error !== undefined) {
+          pending.reject(_deserializeError(msg.error));
+        } else {
+          pending.resolve(msg.value);
+        }
+      }
+      return;
+    }
+
+    if (msg.type === 'update-globals') {
+      if (typeof msg.id !== 'number') {
+        return;
+      }
+
+      try {
+        if (msg.globals && typeof msg.globals === 'object') {
+          _patchGlobals(msg.globals as Record<string, unknown>);
+        }
+        _send({ type: 'result', id: msg.id, value: undefined });
+      } catch (err) {
+        _send({ type: 'result', id: msg.id, error: _serializeError(err) });
+      }
+      return;
+    }
+
+    if (msg.type === 'inspect-globals') {
+      if (typeof msg.id !== 'number') {
+        return;
+      }
+
+      try {
+        const reservedNames = Array.isArray(msg.reservedNames)
+          ? msg.reservedNames.filter(
+              (value): value is string => typeof value === 'string'
+            )
+          : undefined;
+        _send({
+          type: 'result',
+          id: msg.id,
+          value: _buildInspectGlobalsSnapshot(reservedNames),
+        });
+      } catch (err) {
+        _send({ type: 'result', id: msg.id, error: _serializeError(err) });
+      }
+      return;
+    }
+
+    if (msg.type === 'snapshot-globals') {
+      if (typeof msg.id !== 'number') {
+        return;
+      }
+
+      try {
+        const reservedNames = Array.isArray(msg.reservedNames)
+          ? msg.reservedNames.filter(
+              (value): value is string => typeof value === 'string'
+            )
+          : undefined;
+        _send({
+          type: 'result',
+          id: msg.id,
+          value: _buildStructuredGlobalsSnapshot(reservedNames),
+        });
+      } catch (err) {
+        _send({ type: 'result', id: msg.id, error: _serializeError(err) });
+      }
+      return;
+    }
+
+    if (msg.type !== 'execute') {
+      return;
+    }
+
+    if (typeof msg.id !== 'number' || typeof msg.code !== 'string') {
+      return;
+    }
+
+    const id = msg.id;
+    const code = msg.code;
+    const isAsync = /\bawait\b/.test(code);
+    const { output, cleanup } = _setupOutputCapture();
+
+    // Fail-hard guard: dynamic-import blocking was requested but node:vm is
+    // unavailable. Never silently downgrade security.
+    if (_blockDynamicImport && _dynamicImportBlockingUnavailable) {
+      cleanup();
+      const msg =
+        _cachedImportCallback instanceof Error
+          ? _cachedImportCallback.message
+          : 'dynamic import blocking requires node:vm which is unavailable in this runtime';
+      _send({
+        type: 'result',
+        id,
+        error: _serializeError(new Error(msg)),
+      });
+      return;
+    }
+
+    // Which execution path is active decides the line-offset for error
+    // mapping. `vm.runInThisContext` with an async wrapper uses a 1-line
+    // preamble (`(async () => {\n…`); `new AsyncFunction` uses 2. The sync
+    // vm path has no preamble; indirect eval also has none.
+    const usingVmPath = Boolean(_vm) && _blockDynamicImport;
+    const asyncLineOffset = usingVmPath ? 1 : 2;
+
+    try {
+      _detachedFnErrors.length = 0;
+      const result = isAsync
+        ? await _executeAsyncSnippet(code)
+        : _executeSyncSnippet(code);
+      if (_fnPending.size > 0) {
+        await _waitForPendingFnCalls();
+      }
+      await Promise.resolve();
+      if (_detachedFnErrors.length > 0) {
+        throw _detachedFnErrors[0];
+      }
+      const value = _toOutputValue(result, output);
+
+      try {
+        _send({ type: 'result', id, value });
+      } catch {
+        // Value not structured-cloneable, fall back to string.
+        _send({ type: 'result', id, value: String(value) });
+      }
+    } catch (err) {
+      if (_isCodeExecutionError(err)) {
+        const lineOffset = isAsync ? asyncLineOffset : 0;
+        _send({
+          type: 'result',
+          id,
+          value: _formatCodeError(err, code, lineOffset),
+        });
+      } else {
+        _send({ type: 'result', id, error: _serializeError(err) });
+      }
+    } finally {
+      cleanup();
+    }
+  });
+}

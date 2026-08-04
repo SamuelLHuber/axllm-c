@@ -1,0 +1,174 @@
+module @ax.template version "0.1" {
+  dialect @ax.template version "0.1"
+
+  op ax.template.semantic @prompt_features {
+    attr core_kind = "semantic"
+    attr custom_prompt_template = true
+    attr default_prompt = true
+    attr prompt_conformance = true
+    attr template_engine = true
+    tag "prompt-feature-flags"
+  }
+
+  op ax.template.semantic @default_dspy_template {
+    attr core_kind = "semantic"
+    attr value = "DEFAULT_DSPY_TEMPLATE"
+    tag "src/ax/dsp/prompt.ts"
+  }
+
+  op ax.template.record @AxPromptTemplate {
+    attr core_kind = "record"
+    ref signature = @AxSignature
+    tag "src/ax/dsp/prompt.ts"
+  }
+
+  op ax.template.semantic @render_template_content {
+    attr core_kind = "func"
+    attr emit_module = "prompt"
+    tag "src/ax/agent/templateEngine.ts"
+    type signature = "(template:string, vars:json, context:string) -> string throws"
+    body @entry(%template: string, %vars: json, %context: string) {
+      %nodes = core.call @template_parse_impl(%template, %context)
+      %rendered = core.call @template_render_tree_impl(%nodes, %vars, %template, %context)
+      core.return %rendered
+    }
+  }
+
+  op ax.template.semantic @collect_template_variable_names {
+    attr core_kind = "func"
+    attr emit_module = "prompt"
+    tag "src/ax/agent/templateEngine.ts"
+    type signature = "(source:string, context:string) -> list<string> throws"
+    body @entry(%source: string, %context: string) {
+      %nodes = core.call @template_parse_impl(%source, %context)
+      %names = core.call @template_collect_vars_impl(%nodes)
+      core.return %names
+    }
+  }
+
+  op ax.template.semantic @validate_prompt_template_syntax {
+    attr core_kind = "func"
+    attr emit_module = "prompt"
+    tag "src/ax/agent/templateEngine.ts"
+    type signature = "(source:string, context:string, requiredVariables:json) -> json"
+    body @entry(%source: string, %context: string, %required_variables: json) {
+      %result = core.call @template_validate_impl(%source, %context, %required_variables)
+      core.return %result
+    }
+  }
+
+  op ax.template.semantic @template_parse_impl {
+    attr core_kind = "func"
+    attr emit_module = "prompt"
+    attr private = true
+    tag "template-parse-core-helper"
+    type signature = "(template:string, context:string) -> json throws"
+    body @entry(%template: string, %context: string) {
+      %nodes = core.call intrinsic.template.parse(%template, %context)
+      core.return %nodes
+    }
+  }
+
+  op ax.template.semantic @template_render_tree_impl {
+    attr core_kind = "func"
+    attr emit_module = "prompt"
+    attr private = true
+    tag "template-render-core-helper"
+    type signature = "(nodes:json, vars:json, source:string, context:string) -> string throws"
+    body @entry(%nodes: json, %vars: json, %source: string, %context: string) {
+      %rendered = core.call intrinsic.template.render_tree(%nodes, %vars, %source, %context)
+      core.return %rendered
+    }
+  }
+
+  op ax.template.semantic @template_collect_vars_impl {
+    attr core_kind = "func"
+    attr emit_module = "prompt"
+    attr private = true
+    tag "template-collect-vars-core-helper"
+    type signature = "(nodes:json) -> list<string>"
+    body @entry(%nodes: json) {
+      %names = core.call intrinsic.template.collect_vars(%nodes)
+      core.return %names
+    }
+  }
+
+  op ax.template.semantic @template_validate_impl {
+    attr core_kind = "func"
+    attr emit_module = "prompt"
+    attr private = true
+    tag "template-validate-core-helper"
+    type signature = "(source:string, context:string, requiredVariables:json) -> json"
+    body @entry(%source: string, %context: string, %required_variables: json) {
+      %result = core.call intrinsic.template.validate(%source, %context, %required_variables)
+      core.return %result
+    }
+  }
+
+  op ax.template.semantic @render_prompt {
+    attr core_kind = "func"
+    attr emit_module = "prompt"
+    tag "prompt-render"
+    type signature = "(AxSignature, json, list<Tool>, options?:json) -> list<ChatMessage> throws"
+    body @entry(%signature: AxSignature, %values: json, %functions: list<Tool>, %options: json) {
+      %instruction = core.get %options["instruction"]
+      %has_instruction = core.call intrinsic.is_not_none(%instruction)
+      core.if %has_instruction {
+        %user_content = core.call @prompt_user_content_impl(%signature, %values)
+        %messages = core.call @prompt_messages_impl(%instruction, %user_content)
+        core.return %messages
+      } else {
+        %system_content = core.call @prompt_structured_impl(%signature, %values, %functions, %options)
+        %user_content = core.call @prompt_user_content_impl(%signature, %values)
+        %messages = core.call @prompt_messages_impl(%system_content, %user_content)
+        core.return %messages
+      }
+      core.return
+    }
+  }
+
+  op ax.template.semantic @prompt_structured_impl {
+    attr core_kind = "func"
+    attr emit_module = "prompt"
+    attr private = true
+    tag "prompt-structured-core-helper"
+    type signature = "(AxSignature, json, list<Tool>, options?:json) -> string throws"
+    body @entry(%signature: AxSignature, %values: json, %functions: list<Tool>, %options: json) {
+      %content = core.call intrinsic.prompt.structured(%signature, %values, %functions, %options)
+      core.return %content
+    }
+  }
+
+  op ax.template.semantic @prompt_user_content_impl {
+    attr core_kind = "func"
+    attr emit_module = "prompt"
+    attr private = true
+    tag "prompt-user-content-core-helper"
+    type signature = "(AxSignature, json) -> json throws"
+    body @entry(%signature: AxSignature, %values: json) {
+      %content = core.call intrinsic.prompt.user_content(%signature, %values)
+      core.return %content
+    }
+  }
+
+  op ax.template.semantic @prompt_messages_impl {
+    attr core_kind = "func"
+    attr emit_module = "prompt"
+    attr private = true
+    tag "prompt-message-core-helper"
+    type signature = "(system:string, user:json) -> list<ChatMessage>"
+    body @entry(%system: string, %user: json) {
+      %system_message = core.map
+      core.set %system_message["role"] = "system"
+      core.set %system_message["content"] = %system
+      core.set %system_message["cache"] = false
+      %user_message = core.map
+      core.set %user_message["role"] = "user"
+      core.set %user_message["content"] = %user
+      %messages = core.list
+      core.append %messages, %system_message
+      core.append %messages, %user_message
+      core.return %messages
+    }
+  }
+}

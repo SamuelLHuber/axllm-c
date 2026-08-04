@@ -1,0 +1,3630 @@
+package axir
+
+const pyContextCacheRecoveryExample = `import json
+import os
+import time
+
+from axllm import GoogleGeminiClient
+
+
+def chat_response(text):
+    return {"status": 200, "json": {"candidates": [{"content": {"parts": [{"text": text}]}, "finishReason": "STOP"}]}}
+
+
+class ScriptedTransport:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.requests = []
+
+    def __call__(self, request):
+        self.requests.append(request)
+        return self.responses.pop(0)
+
+
+def client(transport):
+    return GoogleGeminiClient(model="gemini-3.5-flash", api_key="gemini-key", transport=transport, contextCache={"minTokens": 0, "ttlSeconds": 3600, "refreshWindowSeconds": 300})
+
+
+request = {"chat_prompt": [{"role": "system", "content": "stable context"}, {"role": "user", "content": "answer briefly"}]}
+future = lambda seconds: int(time.time() * 1000) + seconds * 1000
+
+recovery = ScriptedTransport([
+    {"status": 200, "json": {"name": "cachedContents/cache-1", "expireTime": future(3600)}},
+    {"status": 400, "json": {"error": {"message": "cachedContent is invalid"}}},
+    chat_response("uncached recovery"),
+])
+assert client(recovery).chat(request)["results"][0]["content"] == "uncached recovery"
+assert [item["method"] for item in recovery.requests] == ["POST", "POST", "POST"]
+assert "cachedContent" in recovery.requests[1]["json"] and "cachedContent" not in recovery.requests[2]["json"]
+
+refresh = ScriptedTransport([
+    {"status": 200, "json": {"name": "cachedContents/old", "expireTime": future(1)}}, chat_response("old"),
+    {"status": 500, "json": {"error": {"message": "refresh failed"}}},
+    {"status": 200, "json": {"name": "cachedContents/new", "expireTime": future(3600)}}, chat_response("recreated"),
+])
+refresh_client = client(refresh)
+refresh_client.chat(request)
+assert refresh_client.chat(request)["results"][0]["content"] == "recreated"
+assert [item["method"] for item in refresh.requests] == ["POST", "POST", "PATCH", "POST", "POST"]
+
+fallback = ScriptedTransport([
+    {"status": 200, "json": {"name": "cachedContents/old", "expireTime": future(1)}}, chat_response("old"),
+    {"status": 500, "json": {"error": {"message": "refresh failed"}}},
+    {"status": 500, "json": {"error": {"message": "recreate failed"}}}, chat_response("uncached fallback"),
+])
+fallback_client = client(fallback)
+fallback_client.chat(request)
+assert fallback_client.chat(request)["results"][0]["content"] == "uncached fallback"
+assert [item["method"] for item in fallback.requests] == ["POST", "POST", "PATCH", "POST", "POST"]
+
+if os.getenv("AX_CONTEXT_CACHE_LIVE") == "1":
+    key = os.getenv("GOOGLE_APIKEY") or os.getenv("GOOGLE_API_KEY")
+    if not key:
+        raise SystemExit("Set GOOGLE_APIKEY to run the live Gemini cache exercise")
+    entries = {}
+    registry = {"get": lambda namespace, cache_key: entries.get((namespace, cache_key)), "set": lambda namespace, cache_key, entry: entries.__setitem__((namespace, cache_key), entry)}
+    live = GoogleGeminiClient(model=os.getenv("AX_GEMINI_MODEL", "gemini-3.5-flash"), api_key=key, contextCache={"minTokens": 0, "ttlSeconds": 60, "refreshWindowSeconds": 120, "namespace": "live-example", "registry": registry})
+    live_request = {"chat_prompt": [{"role": "system", "content": "This is stable reference context. " * 4000}, {"role": "user", "content": "Reply with the word ready."}]}
+    live.chat(live_request)
+    first_expiry = next(iter(entries.values()))["expiresAt"]
+    live.chat(live_request)
+    second_expiry = next(iter(entries.values()))["expiresAt"]
+    assert second_expiry >= first_expiry
+    print(json.dumps({"live": True, "createdExpiry": first_expiry, "refreshedExpiry": second_expiry}))
+else:
+    print("python-context-cache-recovery-ok")
+`
+
+const goContextCacheRecoveryExample = `package main
+
+import (
+  "context"
+  "fmt"
+  "time"
+  ax "github.com/ax-llm/ax/packages/go"
+)
+
+func success(text string) ax.Value { return ax.Object("status", 200.0, "json", ax.Object("candidates", ax.Array(ax.Object("content", ax.Object("parts", ax.Array(ax.Object("text", text)))), "finishReason", "STOP"))) }
+func cache(name string, seconds int64) ax.Value { return ax.Object("status", 200.0, "json", ax.Object("name", name, "expireTime", float64(time.Now().Add(time.Duration(seconds)*time.Second).UnixMilli()))) }
+func failure(status float64, message string) ax.Value { return ax.Object("status", status, "json", ax.Object("error", ax.Object("message", message))) }
+func service(transport *ax.ScriptedTransport) *ax.GoogleGeminiClient { return ax.NewGoogleGeminiClient(map[string]ax.Value{"model":"gemini-3.5-flash", "api_key":"gemini-key", "transport":transport, "contextCache":ax.Object("minTokens",0.0,"ttlSeconds",3600.0,"refreshWindowSeconds",300.0)}) }
+func methods(requests []ax.Value) []string { out:=[]string{}; for _,request:=range requests { out=append(out, request.(map[string]ax.Value)["method"].(string)) }; return out }
+func same(actual []string, expected ...string) bool { if len(actual)!=len(expected){return false}; for i:=range actual{if actual[i]!=expected[i]{return false}}; return true }
+
+func main() {
+  request:=map[string]ax.Value{"chat_prompt":ax.Array(ax.Object("role","system","content","stable context"),ax.Object("role","user","content","answer briefly"))}
+  recovery:=ax.NewScriptedTransport([]ax.Value{cache("cachedContents/cache-1",3600),failure(400,"cachedContent is invalid"),success("uncached recovery")})
+  out,err:=service(recovery).Chat(context.Background(),request,nil); if err!=nil||out==nil||!same(methods(recovery.Requests),"POST","POST","POST"){panic(fmt.Sprint(out,err,recovery.Requests))}
+  refresh:=ax.NewScriptedTransport([]ax.Value{cache("cachedContents/old",1),success("old"),failure(500,"refresh failed"),cache("cachedContents/new",3600),success("recreated")})
+  refreshClient:=service(refresh); if _,err=refreshClient.Chat(context.Background(),request,nil);err!=nil{panic(err)}; if _,err=refreshClient.Chat(context.Background(),request,nil);err!=nil||!same(methods(refresh.Requests),"POST","POST","PATCH","POST","POST"){panic(fmt.Sprint(err,refresh.Requests))}
+  fallback:=ax.NewScriptedTransport([]ax.Value{cache("cachedContents/old",1),success("old"),failure(500,"refresh failed"),failure(500,"recreate failed"),success("uncached fallback")})
+  fallbackClient:=service(fallback); if _,err=fallbackClient.Chat(context.Background(),request,nil);err!=nil{panic(err)}; if _,err=fallbackClient.Chat(context.Background(),request,nil);err!=nil||!same(methods(fallback.Requests),"POST","POST","PATCH","POST","POST"){panic(fmt.Sprint(err,fallback.Requests))}
+  fmt.Println("go-context-cache-recovery-ok")
+}
+`
+
+const javaContextCacheRecoveryExample = `import dev.axllm.ax.GoogleGeminiClient;
+import dev.axllm.ax.OpenAICompatibleClient;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+public class ContextCacheRecoveryExample {
+  static Object success(String text) { return Map.of("status",200,"json",Map.of("candidates",List.of(Map.of("content",Map.of("parts",List.of(Map.of("text",text))),"finishReason","STOP")))); }
+  static Object cache(String name,long seconds) { return Map.of("status",200,"json",Map.of("name",name,"expireTime",System.currentTimeMillis()+seconds*1000)); }
+  static Object failure(int status,String message) { return Map.of("status",status,"json",Map.of("error",Map.of("message",message))); }
+  static final class Script implements OpenAICompatibleClient.Transport {
+    final ArrayDeque<Object> responses; final List<Map<String,Object>> requests=new ArrayList<>();
+    Script(Object... responses){this.responses=new ArrayDeque<>(List.of(responses));}
+    public Object call(Map<String,Object> request){requests.add(new LinkedHashMap<>(request));return responses.removeFirst();}
+    List<String> methods(){return requests.stream().map(value->String.valueOf(value.get("method"))).toList();}
+  }
+  static GoogleGeminiClient service(Script script){return new GoogleGeminiClient(Map.of("model","gemini-3.5-flash","api_key","gemini-key","transport",script,"contextCache",Map.of("minTokens",0,"ttlSeconds",3600,"refreshWindowSeconds",300)));}
+  public static void main(String[] args) throws Exception {
+    Map<String,Object> request=Map.of("chat_prompt",List.of(Map.of("role","system","content","stable context"),Map.of("role","user","content","answer briefly")));
+    Script recovery=new Script(cache("cachedContents/cache-1",3600),failure(400,"cachedContent is invalid"),success("uncached recovery")); service(recovery).chat(request); if(!recovery.methods().equals(List.of("POST","POST","POST")))throw new AssertionError(recovery.methods());
+    Script refresh=new Script(cache("cachedContents/old",1),success("old"),failure(500,"refresh failed"),cache("cachedContents/new",3600),success("recreated")); GoogleGeminiClient refreshClient=service(refresh);refreshClient.chat(request);refreshClient.chat(request);if(!refresh.methods().equals(List.of("POST","POST","PATCH","POST","POST")))throw new AssertionError(refresh.methods());
+    Script fallback=new Script(cache("cachedContents/old",1),success("old"),failure(500,"refresh failed"),failure(500,"recreate failed"),success("uncached fallback"));GoogleGeminiClient fallbackClient=service(fallback);fallbackClient.chat(request);fallbackClient.chat(request);if(!fallback.methods().equals(List.of("POST","POST","PATCH","POST","POST")))throw new AssertionError(fallback.methods());
+    System.out.println("java-context-cache-recovery-ok");
+  }
+}
+`
+
+const rustContextCacheRecoveryExample = `use axllm::{AxAIClient, AxError, AxResult, AxTransport, OpenAICompatibleClient};
+use serde_json::{json, Value};
+use std::collections::VecDeque;
+use std::sync::{Arc,Mutex};
+use std::time::{SystemTime,UNIX_EPOCH};
+
+#[derive(Clone)] struct Script(Arc<Mutex<State>>); struct State{responses:VecDeque<Value>,requests:Vec<Value>}
+impl Script{fn new(responses:Vec<Value>)->Self{Self(Arc::new(Mutex::new(State{responses:responses.into(),requests:vec![]})))}fn methods(&self)->Vec<String>{self.0.lock().unwrap().requests.iter().map(|value|value["method"].as_str().unwrap().to_string()).collect()}}
+impl AxTransport for Script{fn send(&mut self,request:Value)->AxResult<Value>{let mut state=self.0.lock().unwrap();state.requests.push(request);state.responses.pop_front().ok_or_else(||AxError::runtime("script exhausted"))}}
+fn now()->u64{SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()as u64}
+fn success(text:&str)->Value{json!({"status":200,"json":{"candidates":[{"content":{"parts":[{"text":text}]},"finishReason":"STOP"}]}})}
+fn cache(name:&str,seconds:u64)->Value{json!({"status":200,"json":{"name":name,"expireTime":now()+seconds*1000}})}
+fn failure(status:u16,message:&str)->Value{json!({"status":status,"json":{"error":{"message":message}}})}
+fn service(script:Script)->OpenAICompatibleClient{OpenAICompatibleClient::new("gemini-key","gemini-3.5-flash").with_profile("google-gemini").with_options(json!({"contextCache":{"minTokens":0,"ttlSeconds":3600,"refreshWindowSeconds":300}})).with_transport(script)}
+fn main()->AxResult<()>{
+ let request=json!({"chat_prompt":[{"role":"system","content":"stable context"},{"role":"user","content":"answer briefly"}]});
+ let recovery=Script::new(vec![cache("cachedContents/cache-1",3600),failure(400,"cachedContent is invalid"),success("uncached recovery")]);service(recovery.clone()).chat(request.clone())?;assert_eq!(recovery.methods(),vec!["POST","POST","POST"]);
+ let refresh=Script::new(vec![cache("cachedContents/old",1),success("old"),failure(500,"refresh failed"),cache("cachedContents/new",3600),success("recreated")]);let mut refresh_client=service(refresh.clone());refresh_client.chat(request.clone())?;refresh_client.chat(request.clone())?;assert_eq!(refresh.methods(),vec!["POST","POST","PATCH","POST","POST"]);
+ let fallback=Script::new(vec![cache("cachedContents/old",1),success("old"),failure(500,"refresh failed"),failure(500,"recreate failed"),success("uncached fallback")]);let mut fallback_client=service(fallback.clone());fallback_client.chat(request.clone())?;fallback_client.chat(request)?;assert_eq!(fallback.methods(),vec!["POST","POST","PATCH","POST","POST"]);
+ println!("rust-context-cache-recovery-ok");Ok(())
+}
+`
+
+const cppContextCacheRecoveryExample = `#include "axllm/axllm.hpp"
+#include <chrono>
+#include <iostream>
+
+struct Script : axllm::Transport {
+  std::vector<axllm::Value> responses; std::vector<axllm::Value> requests; std::size_t index=0;
+  explicit Script(std::vector<axllm::Value> values):responses(std::move(values)){}
+  axllm::Value call(axllm::Value request) override {requests.push_back(request);return responses.at(index++);}
+  std::vector<std::string> methods()const{std::vector<std::string> out;for(auto request:requests)out.push_back(axllm::display(axllm::Core::get(request,"method")));return out;}
+};
+double now_ms(){return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();}
+axllm::Value success(std::string text){return axllm::object({{"status",200},{"json",axllm::object({{"candidates",axllm::array({axllm::object({{"content",axllm::object({{"parts",axllm::array({axllm::object({{"text",text}})})}})},{"finishReason","STOP"}})})}})}});}
+axllm::Value cache(std::string name,int seconds){return axllm::object({{"status",200},{"json",axllm::object({{"name",name},{"expireTime",now_ms()+seconds*1000}})}});}
+axllm::Value failure(int status,std::string message){return axllm::object({{"status",status},{"json",axllm::object({{"error",axllm::object({{"message",message}})}})}});}
+axllm::GoogleGeminiClient service(Script* script){return axllm::GoogleGeminiClient(axllm::object({{"model","gemini-3.5-flash"},{"api_key","gemini-key"},{"contextCache",axllm::object({{"minTokens",0},{"ttlSeconds",3600},{"refreshWindowSeconds",300}})}}),script);}
+int main(){
+ auto request=axllm::object({{"chat_prompt",axllm::array({axllm::object({{"role","system"},{"content","stable context"}}),axllm::object({{"role","user"},{"content","answer briefly"}})})}});
+ Script recovery({cache("cachedContents/cache-1",3600),failure(400,"cachedContent is invalid"),success("uncached recovery")});auto recovery_client=service(&recovery);recovery_client.chat(request);if(recovery.methods()!=std::vector<std::string>({"POST","POST","POST"}))return 1;
+ Script refresh({cache("cachedContents/old",1),success("old"),failure(500,"refresh failed"),cache("cachedContents/new",3600),success("recreated")});auto refresh_client=service(&refresh);refresh_client.chat(request);refresh_client.chat(request);if(refresh.methods()!=std::vector<std::string>({"POST","POST","PATCH","POST","POST"}))return 2;
+ Script fallback({cache("cachedContents/old",1),success("old"),failure(500,"refresh failed"),failure(500,"recreate failed"),success("uncached fallback")});auto fallback_client=service(&fallback);fallback_client.chat(request);fallback_client.chat(request);if(fallback.methods()!=std::vector<std::string>({"POST","POST","PATCH","POST","POST"}))return 3;
+ std::cout<<"cpp-context-cache-recovery-ok\n";
+}
+`
+
+const pySignatureSchemaExample = `from axllm import s
+
+sig = s("question:string -> answer:string")
+schema = sig.to_json_schema("outputs")
+assert "answer" in schema["properties"], schema
+print("python-signature-schema-ok")
+`
+
+const pyAxGenScriptedClientToolExample = `from axllm import ax, f, fn
+
+
+class ScriptedClient:
+    def __init__(self):
+        self.calls = 0
+
+    def complete(self, request):
+        self.calls += 1
+        if self.calls == 1:
+            return {
+                "content": "",
+                "function_calls": [
+                    {"id": "call_1", "name": "search", "params": {"query": "ax docs"}}
+                ],
+            }
+        return {"content": "{\"answer\":\"Found Ax docs\"}"}
+
+
+search = (
+    fn("search")
+    .description("Search docs")
+    .arg("query", f.string().min(1))
+    .handler(lambda args: {"title": "Ax docs"})
+    .build()
+)
+
+qa = ax("query:string -> answer:string", {"functions": [search]})
+qa.add_assert({"field": "answer", "contains": "Ax", "message": "answer should mention Ax"})
+qa.add_field_processor("answer", "trim")
+out = qa.forward(ScriptedClient(), {"query": "ax docs"})
+assert out == {"answer": "Found Ax docs"}, out
+assert qa.get_traces()[-1]["output"] == out
+print("python-axgen-ok")
+`
+
+const pyAxGenOpenAIExample = `import json
+import os
+
+from axllm import OpenAICompatibleClient, ax
+
+
+api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_APIKEY")
+if not api_key:
+    raise SystemExit("Set OPENAI_API_KEY to run this provider API example.")
+
+client = OpenAICompatibleClient(
+    api_key=api_key,
+    model=os.getenv("AX_OPENAI_MODEL", "gpt-5.4-mini"),
+    model_config={"temperature": 0},
+)
+program = ax("question:string -> answer:string")
+out = program.forward(
+    client,
+    {
+        "question": "In one sentence, explain Ax as a language-agnostic LLM programming library."
+    },
+)
+print(json.dumps(out, indent=2, sort_keys=True))
+`
+
+const pyProviderMappingNoKeyExample = `from axllm import ai, set_usage_observer
+
+
+def scripted_transport(request):
+    return {
+        "status": 200,
+        "json": {
+            "id": "chatcmpl_example",
+            "model": "gpt-5.4-mini",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {"content": "hello from scripted transport"},
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+        },
+    }
+
+
+events = []
+set_usage_observer(events.append)
+service = ai(
+    "openai",
+    model="gpt-5.4-mini",
+    api_key="test-key",
+    transport=scripted_transport,
+    usage_context={"tenantId": "tenant-1", "feature": "no-key-example"},
+)
+response = service.chat(
+    {"chat_prompt": [{"role": "user", "content": "hello"}]},
+    {"usageContext": {"userId": "user-1", "requestId": "request-1"}},
+)
+set_usage_observer(None)
+assert response["results"][0]["content"] == "hello from scripted transport", response
+assert len(events) == 1, events
+assert events[0]["context"] == {
+    "tenantId": "tenant-1",
+    "feature": "no-key-example",
+    "userId": "user-1",
+    "requestId": "request-1",
+}, events
+print("python-axai-ok")
+`
+
+const pyAxFlowProgramGraphExample = `from axllm import ax, flow
+
+
+class ScriptedClient:
+    def complete(self, request):
+        return {"content": "{\"answer\":\"Paris\"}"}
+
+
+qa = ax("question:string -> answer:string")
+program = flow({"id": "example.flow"}).execute("qa", qa).returns({"answer": "answer"})
+out = program.forward(ScriptedClient(), {"question": "Capital of France?"})
+assert out == {"answer": "Paris"}, out
+assert program.get_plan()["steps"][0]["name"] == "qa"
+print("python-axflow-ok")
+`
+
+const pyFlowMermaidExample = `from axllm import flow
+
+
+source = """flowchart TD
+  %%ax classify: requestText:string -> route:class \"support, sales\"
+  %%ax reply: requestText:string -> replyText:string(max 300)
+  classify{route} -->|support| reply
+"""
+
+program = flow(source)
+rendered = str(program)
+assert "%%ax reply: requestText:string -> replyText:string(max 300)" in rendered
+assert "classify -->|support| reply" in rendered
+assert str(flow(rendered)) == rendered
+print("python-flow-mermaid-ok")
+`
+
+const pyRuntimeAdapterExample = `from axllm import AxCodeRuntime, AxCodeSession, RuntimeCapabilities, RuntimeEnvelope, agent
+
+
+class DemoSession(AxCodeSession):
+    def __init__(self, globals, options=None):
+        self.globals = dict(globals or {})
+        self.create_options = dict(options or {})
+        self.closed = False
+
+    def execute(self, code, options=None):
+        assert "reservedNames" in (options or {}), options
+        if code == "timeout()":
+            return RuntimeEnvelope.timeout("demo timeout")
+        self.globals["answer"] = "runtime"
+        return RuntimeEnvelope.final({"answer": self.globals["answer"]})
+
+    def inspect_globals(self, options=None):
+        return dict(self.globals)
+
+    def snapshot_globals(self, options=None):
+        return {"version": 1, "bindings": dict(self.globals), "globals": dict(self.globals), "closed": self.closed}
+
+    def patch_globals(self, snapshot, options=None):
+        self.globals = dict((snapshot or {}).get("bindings") or {})
+        return self.snapshot_globals(options)
+
+    def close(self):
+        self.closed = True
+        return {"closed": True}
+
+
+class DemoRuntime(AxCodeRuntime):
+    language = "Python"
+
+    def __init__(self):
+        self.capabilities = RuntimeCapabilities(language="Python", snapshot=True, patch=True).to_dict()
+        self.sessions = []
+
+    def create_session(self, globals, options=None):
+        session = DemoSession(globals, options)
+        self.sessions.append(session)
+        return session
+
+
+runtime = DemoRuntime()
+qa = agent("question:string -> answer:string", {"runtime": {"language": "Python"}})
+out = qa.test(runtime, "final()", {"question": "adapter"})
+assert out["kind"] == "final", out
+assert runtime.sessions[-1].closed
+
+runner = agent("question:string -> answer:string", {"runtime": {"language": "Python"}})
+step = runner.execute_actor_step(runtime, "final()", {"question": "adapter"})
+assert step["kind"] == "final", step
+snapshot = runner.export_session_state()
+runner.restore_session_state(snapshot)
+timeout = runner.execute_actor_step(runtime, "timeout()", {"question": "adapter"})
+assert timeout["error_category"] == "timeout", timeout
+print("python-runtime-adapter-ok")
+`
+
+const pyRuntimeProtocolExample = `import os
+from pathlib import Path
+
+from axllm import ProcessCodeRuntime, agent
+
+
+repo_root = Path(os.environ["AXIR_REPO_ROOT"])
+server = os.environ["AXIR_AXJS_RUNTIME_SERVER"]
+runtime = ProcessCodeRuntime(
+    ["node", "--import=tsx", server],
+    cwd=str(repo_root),
+)
+try:
+    qa = agent("question:string -> answer:string", {"runtime": {"language": "JavaScript"}})
+    out = qa.test(runtime, "answer = inputs.question; await final({ answer })", {"question": "protocol"})
+    assert out["kind"] == "final", out
+    assert out["completion_payload"]["args"][0]["answer"] == "protocol", out
+
+    runner = agent("question:string -> answer:string", {"runtime": {"language": "JavaScript"}})
+    step = runner.execute_actor_step(runtime, "answer = 'persisted'; await final({ answer })", {"question": "protocol"})
+    assert step["kind"] == "final", step
+    snapshot = runner.export_session_state()
+    assert "bindings" in snapshot, snapshot
+    runner.restore_session_state(snapshot)
+    inspected = runner.inspect_runtime()
+    assert "persisted" in str(inspected), inspected
+    closed = runner.close_runtime_session()
+    assert closed["closed"], closed
+finally:
+    runtime.shutdown()
+
+print("python-runtime-protocol-ok")
+`
+
+const pyOptimizerArtifactExample = `import json
+
+from axllm import OptimizerEngine, ax
+
+
+class ScriptedOptimizer(OptimizerEngine):
+    name = "fixture"
+    version = "1"
+
+    def optimize(self, request, evaluator=None):
+        return {
+            "componentMap": {"qa::instruction": "Prefer artifact-backed answers."},
+            "metadata": {
+                "evidence": {"avg": 1},
+                "provenance": {"sourceProgramKind": "axgen"},
+            },
+        }
+
+
+qa = ax("question:string -> answer:string", {"id": "qa", "instruction": "Base."})
+artifact = qa.optimize_with(ScriptedOptimizer(), [], {"apply": False})
+assert any(item["id"] == "qa::instruction" and item["current"] == "Base." for item in qa.get_optimizable_components())
+qa.apply_optimization(json.dumps(artifact))
+assert any(
+    item["id"] == "qa::instruction" and item["current"] == "Prefer artifact-backed answers."
+    for item in qa.get_optimizable_components()
+)
+print("python-optimizer-artifact-ok")
+`
+
+const pyACEPlaybookExample = `import json
+
+from axllm import ax, playbook
+
+
+# A scripted client stands in for a real provider so this example runs without
+# a key. Swap it for ai("openai", api_key=...) to grow a playbook against a live
+# model. The canned JSON satisfies the bound program AND the playbook's internal
+# reflector/curator sub-programs, so the full ACE loop is exercised offline.
+class ScriptedClient:
+    def complete(self, request):
+        return {
+            "content": json.dumps(
+                {
+                    "answer": "Ax composes typed LLM programs.",
+                    "reasoning": "The playbook lacked a brevity rule.",
+                    "errorIdentification": "Answer was too verbose.",
+                    "rootCauseAnalysis": "No guidance on conciseness.",
+                    "correctApproach": "Add a concise-answer guideline.",
+                    "keyInsight": "Prefer one-sentence answers.",
+                    "weaknessDescription": "The agent does not verify its final step.",
+                    "rootCause": "The final step is accepted without a check.",
+                    "proposedGuidance": "Verify the final step before completing the task.",
+                    "evidenceQuotes": ["final", "snapshot", "Answer"],
+                    "configRecommendations": [],
+                    "bulletTags": [],
+                    "operations": [
+                        {"type": "ADD", "section": "Guidelines", "content": "Answer in one concise sentence."}
+                    ],
+                }
+            )
+        }
+
+
+client = ScriptedClient()
+program = ax("question:string -> answer:string", {"id": "qa", "instruction": "Answer the question."})
+
+pb = playbook(program, {"studentAI": client, "maxEpochs": 1})
+
+
+def metric(args):
+    prediction = args.get("prediction") or {}
+    answer = str(prediction.get("answer") or "")
+    return 1.0 if answer else 0.0
+
+
+examples = [{"question": "What is Ax?"}, {"question": "Why typed signatures?"}]
+result = pb.evolve(examples, metric)
+rendered = pb.render()
+state = pb.to_json()
+assert "bestScore" in result, result
+assert "playbook" in state and "artifact" in state, state
+print(json.dumps({"bestScore": result["bestScore"], "rendered": rendered}, indent=2, sort_keys=True))
+print("python-ace-playbook-ok")
+`
+
+const pyAgentPlaybookExample = `import json
+
+from axllm import AxCodeRuntime, AxCodeSession, RuntimeEnvelope, agent
+
+
+# The actor returns model-authored Python code and a real runtime executes it.
+# The same offline response also satisfies the playbook reflector and curator.
+class ScriptedClient:
+    def complete(self, request):
+        return {
+            "content": json.dumps(
+                {
+                    "pythonCode": "final('Answer', {'answer': 'Ax composes typed LLM programs.'})",
+                    "answer": "Ax composes typed LLM programs.",
+                    "reasoning": "The playbook lacked a brevity rule.",
+                    "errorIdentification": "Answer was too verbose.",
+                    "rootCauseAnalysis": "No guidance on conciseness.",
+                    "correctApproach": "Add a concise-answer guideline.",
+                    "keyInsight": "Prefer one-sentence answers.",
+                    "weaknessDescription": "The agent does not verify its final step.",
+                    "rootCause": "The final step is accepted without a check.",
+                    "proposedGuidance": "Verify the final step before completing the task.",
+                    "evidenceQuotes": ["final", "snapshot", "Answer"],
+                    "configRecommendations": [],
+                    "bulletTags": [],
+                    "operations": [
+                        {"type": "ADD", "section": "Guidelines", "content": "Answer in one concise sentence."}
+                    ],
+                }
+            )
+        }
+
+
+class RuntimeSession(AxCodeSession):
+    def execute(self, code, options=None):
+        assert "pythonCode" not in code, code
+        return RuntimeEnvelope.final({"answer": "Ax composes typed LLM programs."})
+
+    def snapshot_globals(self, options=None):
+        return {"version": 1, "bindings": {}, "globals": {}, "closed": False}
+
+    def patch_globals(self, snapshot, options=None):
+        return snapshot
+
+
+class Runtime(AxCodeRuntime):
+    language = "Python"
+
+    def create_session(self, globals, options=None):
+        return RuntimeSession()
+
+
+client = ScriptedClient()
+runtime = Runtime()
+# agent.playbook() binds an evolving context playbook to an agent stage. The
+# "responder" target grows the user-facing answer stage; ACE remains an
+# implementation detail behind playbook(), just as optimize() hides GEPA.
+ag = agent(
+    "question:string -> answer:string",
+    {"name": "qa", "description": "Answer the question.", "ai": client, "runtime": runtime},
+)
+pb = ag.playbook({"target": "responder", "studentAI": client, "maxEpochs": 1})
+dataset = {"train": [{"input": {"question": "Answer briefly."}, "score": 0}]}
+
+# A zero minimum gain exercises verified acceptance. A positive minimum gain
+# rejects the same flat score and must restore the exact pre-proposal snapshot.
+accepted = pb.evolve(
+    dataset,
+    {"verify": True, "minHeldInGain": 0, "maxProposals": 1, "maxMetricCalls": 2},
+)
+before_rejection = json.dumps(pb.to_json(), sort_keys=True)
+rejected = pb.evolve(
+    dataset,
+    {"verify": True, "minHeldInGain": 0.1, "maxProposals": 1, "maxMetricCalls": 2},
+)
+after_rejection = json.dumps(pb.to_json(), sort_keys=True)
+
+assert accepted.get("metricCallsUsed") == 2, accepted
+assert accepted["outcomes"][0]["accepted"] is True, accepted
+assert rejected.get("metricCallsUsed") == 2, rejected
+assert rejected["outcomes"][0]["accepted"] is False, rejected
+assert after_rejection == before_rejection, (before_rejection, after_rejection)
+assert "playbook" in pb.to_json() and "artifact" in pb.to_json(), pb.to_json()
+print(json.dumps({"accepted": accepted["outcomes"][0], "rejected": rejected["outcomes"][0]}, indent=2, sort_keys=True))
+print("python-agent-playbook-ok")
+`
+
+const javaSignatureSchemaExample = `import dev.axllm.ax.*;
+import java.util.*;
+
+public final class SignatureSchemaExample {
+  public static void main(String[] args) {
+    AxSignature sig = Ax.s("question:string -> answer:string");
+    Map<String, Object> schema = sig.toJsonSchema("outputs", Map.of());
+    Map<?, ?> properties = (Map<?, ?>) schema.get("properties");
+    if (!properties.containsKey("answer")) throw new RuntimeException("bad schema: " + schema);
+    System.out.println("java-signature-schema-ok");
+  }
+}
+`
+
+const javaAxGenScriptedClientToolExample = `import dev.axllm.ax.*;
+import java.util.*;
+
+public final class AxGenScriptedClientToolExample {
+  static final class ScriptedClient implements AiClient {
+    int calls = 0;
+
+    public Map<String, Object> complete(Map<String, Object> request) {
+      calls += 1;
+      if (calls == 1) {
+        return Map.of(
+          "content", "",
+          "function_calls", List.of(Map.of("id", "call_1", "name", "search", "params", Map.of("query", "ax docs")))
+        );
+      }
+      return Map.of("content", "{\"answer\":\"Found Ax docs\"}");
+    }
+  }
+
+  public static void main(String[] args) {
+    Tool search = Ax.fn("search")
+      .description("Search docs")
+      .arg("query", Ax.f().string().min(1))
+      .handler(values -> Map.of("title", "Ax docs"))
+      .build();
+    AxGen qa = Ax.ax("query:string -> answer:string")
+      .addTool(search)
+      .addAssert(Map.of("field", "answer", "contains", "Ax", "message", "answer should mention Ax"))
+      .addFieldProcessor("answer", "trim");
+    Map<String, Object> out = qa.forward(new ScriptedClient(), Map.of("query", "ax docs"));
+    if (!"Found Ax docs".equals(out.get("answer"))) throw new RuntimeException("bad output: " + out);
+    if (qa.getTraces().isEmpty()) throw new RuntimeException("missing trace");
+    System.out.println("java-axgen-ok");
+  }
+}
+`
+
+const javaAxGenOpenAIExample = `import dev.axllm.ax.*;
+import java.util.*;
+
+public final class AxGenOpenAIExample {
+  public static void main(String[] args) throws Exception {
+    String apiKey = System.getenv("OPENAI_API_KEY");
+    if (apiKey == null || apiKey.isBlank()) apiKey = System.getenv("OPENAI_APIKEY");
+    if (apiKey == null || apiKey.isBlank()) {
+      throw new IllegalStateException("Set OPENAI_API_KEY to run this provider API example.");
+    }
+    OpenAICompatibleClient client = new OpenAICompatibleClient(Map.of(
+      "api_key", apiKey,
+      "model", System.getenv().getOrDefault("AX_OPENAI_MODEL", "gpt-5.4-mini"),
+      "model_config", Map.of("temperature", 0.0)
+    ));
+    AxGen program = Ax.ax("question:string -> answer:string");
+    Map<String, Object> out = program.forward(client, Map.of(
+      "question", "In one sentence, explain Ax as a language-agnostic LLM programming library."
+    ));
+    System.out.println(out);
+  }
+}
+`
+
+const javaProviderMappingNoKeyExample = `import dev.axllm.ax.*;
+import java.util.*;
+
+public final class ProviderMappingNoKeyExample {
+  public static void main(String[] args) throws Exception {
+    OpenAICompatibleClient.Transport transport = request -> Map.of(
+      "status", 200,
+      "json", Map.of(
+        "id", "chatcmpl_example",
+        "model", "gpt-5.4-mini",
+        "choices", List.of(Map.of(
+          "index", 0,
+          "finish_reason", "stop",
+          "message", Map.of("content", "hello from scripted transport")
+        )),
+        "usage", Map.of("prompt_tokens", 1, "completion_tokens", 2, "total_tokens", 3)
+      )
+    );
+    List<AxUsageEvent> events = new ArrayList<>();
+    AxGlobals.setUsageObserver(events::add);
+    AxAIService service = Ax.ai("openai", Map.of(
+      "model", "gpt-5.4-mini",
+      "api_key", "test-key",
+      "transport", transport,
+      "usageContext", Map.of("tenantId", "tenant-1", "feature", "no-key-example")
+    ));
+    Map<String, Object> response = service.chat(
+      Map.of("chat_prompt", List.of(Map.of("role", "user", "content", "hello"))),
+      Map.of("usageContext", Map.of("userId", "user-1", "requestId", "request-1"))
+    );
+    AxGlobals.setUsageObserver(null);
+    List<?> results = (List<?>) response.get("results");
+    Map<?, ?> first = (Map<?, ?>) results.get(0);
+    if (!"hello from scripted transport".equals(first.get("content"))) {
+      throw new RuntimeException("bad response: " + response);
+    }
+    if (events.size() != 1 || !"tenant-1".equals(((Map<?, ?>) events.get(0).value().get("context")).get("tenantId"))) {
+      throw new RuntimeException("bad usage event: " + events);
+    }
+    System.out.println("java-axai-ok");
+  }
+}
+`
+
+const javaAxFlowProgramGraphExample = `import dev.axllm.ax.*;
+import java.util.*;
+
+public final class AxFlowProgramGraphExample {
+  static final class ScriptedClient implements AiClient {
+    public Map<String, Object> complete(Map<String, Object> request) {
+      return Map.of("content", "{\"answer\":\"Paris\"}");
+    }
+  }
+
+  public static void main(String[] args) {
+    AxGen qa = Ax.ax("question:string -> answer:string");
+    AxFlow program = Ax.flow(Map.of("id", "example.flow")).execute("qa", qa).returns(Map.of("answer", "answer"));
+    Map<String, Object> out = program.forward(new ScriptedClient(), Map.of("question", "Capital of France?"));
+    if (!"Paris".equals(out.get("answer"))) throw new RuntimeException("bad output: " + out);
+    if (!"qa".equals(((Map<?, ?>) ((List<?>) program.getPlan().get("steps")).get(0)).get("name"))) throw new RuntimeException("bad plan");
+    System.out.println("java-axflow-ok");
+  }
+}
+`
+
+const javaFlowMermaidExample = `import dev.axllm.ax.*;
+
+public class FlowMermaidExample {
+  public static void main(String[] args) {
+    String source = String.join("\n",
+        "flowchart TD",
+        "  %%ax classify: requestText:string -> route:class \"support, sales\"",
+        "  %%ax reply: requestText:string -> replyText:string(max 300)",
+        "  classify{route} -->|support| reply");
+    AxFlow program = Ax.flow(source);
+    String rendered = program.toString();
+    if (!rendered.contains("%%ax reply: requestText:string -> replyText:string(max 300)")) throw new AssertionError(rendered);
+    if (!rendered.contains("classify -->|support| reply")) throw new AssertionError(rendered);
+    if (!Ax.flow(rendered).toString().equals(rendered)) throw new AssertionError("round-trip changed");
+    System.out.println("java-flow-mermaid-ok");
+  }
+}
+`
+
+const javaRuntimeAdapterExample = `import dev.axllm.ax.*;
+import java.util.*;
+
+public final class RuntimeAdapterExample {
+  @SuppressWarnings("unchecked")
+  static Map<String, Object> asMap(Object value) {
+    return value instanceof Map<?, ?> ? (Map<String, Object>) value : new LinkedHashMap<>();
+  }
+
+  static final class DemoRuntime implements AxCodeRuntime {
+    final AxRuntimeCapabilities capabilities = new AxRuntimeCapabilities().language("Python").snapshot(true).patch(true);
+    final List<DemoSession> sessions = new ArrayList<>();
+
+    public String language() { return "Python"; }
+    public AxCodeSession createSession(Map<String, Object> globals, Map<String, Object> options) {
+      DemoSession session = new DemoSession(globals, options);
+      sessions.add(session);
+      return session;
+    }
+  }
+
+  static final class DemoSession implements AxCodeSession {
+    Map<String, Object> globals;
+    final Map<String, Object> createOptions;
+    boolean closed = false;
+
+    DemoSession(Map<String, Object> globals, Map<String, Object> options) {
+      this.globals = new LinkedHashMap<>(globals == null ? Map.of() : globals);
+      this.createOptions = new LinkedHashMap<>(options == null ? Map.of() : options);
+    }
+
+    public Object execute(String code, Map<String, Object> options) {
+      if (options == null || !options.containsKey("reservedNames")) throw new RuntimeException("missing reservedNames");
+      if ("timeout()".equals(code)) return AxRuntimeEnvelope.timeout("demo timeout");
+      globals.put("answer", "runtime");
+      return AxRuntimeEnvelope.finalPayload(Map.of("answer", globals.get("answer")));
+    }
+
+    public Object inspectGlobals(Map<String, Object> options) { return new LinkedHashMap<>(globals); }
+    public Object snapshotGlobals(Map<String, Object> options) { return Map.of("version", 1, "bindings", new LinkedHashMap<>(globals), "globals", new LinkedHashMap<>(globals), "closed", closed); }
+    public Object patchGlobals(Object snapshot, Map<String, Object> options) {
+      globals = new LinkedHashMap<>(asMap(asMap(snapshot).get("bindings")));
+      return snapshotGlobals(options);
+    }
+    public Object close() { closed = true; return Map.of("closed", true); }
+  }
+
+  public static void main(String[] args) {
+    DemoRuntime runtime = new DemoRuntime();
+    AxAgent qa = Ax.agent("question:string -> answer:string", Map.of("runtime", Map.of("language", "Python")));
+    Map<String, Object> out = qa.test(runtime, "final()", Map.of("question", "adapter"));
+    if (!"final".equals(out.get("kind"))) throw new RuntimeException("bad test output: " + out);
+    if (!runtime.sessions.get(runtime.sessions.size() - 1).closed) throw new RuntimeException("test session was not closed");
+
+    AxAgent runner = Ax.agent("question:string -> answer:string", Map.of("runtime", Map.of("language", "Python")));
+    Map<String, Object> step = runner.executeActorStep(runtime, "final()", Map.of("question", "adapter"));
+    if (!"final".equals(step.get("kind"))) throw new RuntimeException("bad step output: " + step);
+    Map<String, Object> snapshot = asMap(runner.exportSessionState());
+    runner.restoreSessionState(snapshot);
+    Map<String, Object> timeout = runner.executeActorStep(runtime, "timeout()", Map.of("question", "adapter"));
+    if (!"timeout".equals(timeout.get("error_category"))) throw new RuntimeException("bad timeout: " + timeout);
+    System.out.println("java-runtime-adapter-ok");
+  }
+}
+`
+
+const javaRuntimeProtocolExample = `import dev.axllm.ax.*;
+import java.io.File;
+import java.util.*;
+
+public final class RuntimeProtocolExample {
+  @SuppressWarnings("unchecked")
+  static Map<String, Object> asMap(Object value) {
+    return value instanceof Map<?, ?> ? (Map<String, Object>) value : new LinkedHashMap<>();
+  }
+
+  public static void main(String[] args) throws Exception {
+    String repoRoot = System.getenv("AXIR_REPO_ROOT");
+    String server = System.getenv("AXIR_AXJS_RUNTIME_SERVER");
+    if (repoRoot == null || server == null) throw new RuntimeException("AXIR runtime protocol env vars are required");
+
+    try (AxProcessCodeRuntime runtime = new AxProcessCodeRuntime(
+      List.of("node", "--import=tsx", server),
+      new File(repoRoot),
+      Map.of()
+    )) {
+      AxAgent qa = Ax.agent("question:string -> answer:string", Map.of("runtime", Map.of("language", "JavaScript")));
+      Map<String, Object> out = qa.test(runtime, "answer = inputs.question; await final({ answer })", Map.of("question", "protocol"));
+      if (!"final".equals(out.get("kind"))) throw new RuntimeException("bad test output: " + out);
+      Map<String, Object> completion = asMap(out.get("completion_payload"));
+      Object firstArg = ((List<?>) completion.get("args")).get(0);
+      if (!"protocol".equals(asMap(firstArg).get("answer"))) throw new RuntimeException("bad final payload: " + out);
+
+      AxAgent runner = Ax.agent("question:string -> answer:string", Map.of("runtime", Map.of("language", "JavaScript")));
+      Map<String, Object> step = runner.executeActorStep(runtime, "answer = 'persisted'; await final({ answer })", Map.of("question", "protocol"));
+      if (!"final".equals(step.get("kind"))) throw new RuntimeException("bad step output: " + step);
+      Map<String, Object> snapshot = asMap(runner.exportSessionState());
+      if (!snapshot.containsKey("bindings")) throw new RuntimeException("bad snapshot: " + snapshot);
+      runner.restoreSessionState(snapshot);
+      Object inspected = runner.inspectRuntime();
+      if (!String.valueOf(inspected).contains("persisted")) throw new RuntimeException("bad inspect: " + inspected);
+      Map<String, Object> closed = asMap(runner.closeRuntimeSession());
+      if (!Boolean.TRUE.equals(closed.get("closed"))) throw new RuntimeException("bad close: " + closed);
+    }
+    System.out.println("java-runtime-protocol-ok");
+  }
+}
+`
+
+const javaOptimizerArtifactExample = `import dev.axllm.ax.*;
+import java.util.*;
+
+public final class OptimizerArtifactExample {
+  static final class ScriptedOptimizer implements OptimizerEngine {
+    public String name() { return "fixture"; }
+    public String version() { return "1"; }
+    public Map<String, Object> optimize(Map<String, Object> request) {
+      return Map.of(
+        "componentMap", Map.of("qa::instruction", "Prefer artifact-backed answers."),
+        "metadata", Map.of(
+          "evidence", Map.of("avg", 1),
+          "provenance", Map.of("sourceProgramKind", "axgen")
+        )
+      );
+    }
+  }
+
+  static boolean hasInstruction(AxGen gen, String value) {
+    for (Map<String, Object> item : gen.getOptimizableComponents()) {
+      if ("qa::instruction".equals(item.get("id")) && value.equals(item.get("current"))) return true;
+    }
+    return false;
+  }
+
+  public static void main(String[] args) {
+    AxGen qa = new AxGen(Ax.s("question:string -> answer:string"), Map.of("id", "qa", "instruction", "Base."));
+    Map<String, Object> artifact = qa.optimizeWith(new ScriptedOptimizer(), List.of(), Map.of("apply", false));
+    if (!hasInstruction(qa, "Base.")) throw new RuntimeException("apply=false mutated components");
+    qa.applyOptimization(Json.stringify(artifact));
+    if (!hasInstruction(qa, "Prefer artifact-backed answers.")) throw new RuntimeException("artifact not applied");
+    System.out.println("java-optimizer-artifact-ok");
+  }
+}
+`
+
+const cppSignatureSchemaExample = `#include "axllm/axllm.hpp"
+#include <iostream>
+
+int main() {
+  axllm::Value sig = axllm::s("question:string -> answer:string");
+  axllm::Value schema = axllm::to_json_schema(axllm::Core::get(sig, "outputs"));
+  if (!axllm::Core::truthy(axllm::Core::get(axllm::Core::get(schema, "properties"), "answer"))) return 1;
+  std::cout << "cpp-signature-schema-ok\n";
+}
+`
+
+const cppAxGenScriptedClientToolExample = `#include "axllm/axllm.hpp"
+#include <iostream>
+
+struct ScriptedClient : axllm::AIClient {
+  int calls = 0;
+
+  axllm::Value complete(axllm::Value) override {
+    calls += 1;
+    if (calls == 1) {
+      return axllm::object({
+        {"content", ""},
+        {"function_calls", axllm::array({
+          axllm::object({{"id", "call_1"}, {"name", "search"}, {"params", axllm::object({{"query", "ax docs"}})}})
+        })}
+      });
+    }
+    return axllm::object({{"content", "{\"answer\":\"Found Ax docs\"}"}});
+  }
+};
+
+int main() {
+  axllm::Value parameters = axllm::object({
+    {"type", "object"},
+    {"properties", axllm::object({{"query", axllm::object({{"type", "string"}})}})},
+    {"required", axllm::array({"query"})}
+  });
+  axllm::Tool search("search", "Search docs", parameters, [](axllm::Value) {
+    return axllm::object({{"title", "Ax docs"}});
+  });
+  auto qa = axllm::ax("query:string -> answer:string")
+      .add_tool(search)
+      .add_assert(axllm::object({{"field", "answer"}, {"contains", "Ax"}, {"message", "answer should mention Ax"}}))
+      .add_field_processor("answer", "trim");
+  ScriptedClient client;
+  axllm::Value out = qa.forward(client, axllm::object({{"query", "ax docs"}}));
+  if (!axllm::equal(axllm::Core::get(out, "answer"), "Found Ax docs")) return 1;
+  if (axllm::Core::truthy(axllm::Core::is_none(axllm::Core::get(qa.get_traces(), 0)))) return 1;
+  std::cout << "cpp-axgen-ok\n";
+}
+`
+
+const cppAxGenOpenAIExample = `#include "axllm/axllm.hpp"
+#include <cstdlib>
+#include <iostream>
+
+int main() {
+  const char* key = std::getenv("OPENAI_API_KEY");
+  if (key == nullptr || std::string(key).empty()) key = std::getenv("OPENAI_APIKEY");
+  if (key == nullptr || std::string(key).empty()) {
+    std::cerr << "Set OPENAI_API_KEY to run this provider API example.\n";
+    return 2;
+  }
+
+  axllm::OpenAICompatibleClient client(axllm::object({
+    {"api_key", key},
+    {"model", std::getenv("AX_OPENAI_MODEL") ? std::getenv("AX_OPENAI_MODEL") : "gpt-5.4-mini"},
+    {"model_config", axllm::object({{"temperature", 0}})}
+  }));
+  auto program = axllm::ax("question:string -> answer:string");
+  axllm::Value out = program.forward(client, axllm::object({
+    {"question", "In one sentence, explain Ax as a language-agnostic LLM programming library."}
+  }));
+  std::cout << axllm::stringify(out) << "\n";
+}
+`
+
+const cppProviderMappingNoKeyExample = `#include "axllm/axllm.hpp"
+#include <iostream>
+
+struct ScriptedTransport : axllm::Transport {
+  axllm::Value call(axllm::Value) override {
+    return axllm::object({
+      {"status", 200},
+      {"json", axllm::object({
+        {"id", "chatcmpl_example"},
+        {"model", "gpt-5.4-mini"},
+        {"choices", axllm::array({
+          axllm::object({
+            {"index", 0},
+            {"finish_reason", "stop"},
+            {"message", axllm::object({{"content", "hello from scripted transport"}})}
+          })
+        })},
+        {"usage", axllm::object({{"prompt_tokens", 1}, {"completion_tokens", 2}, {"total_tokens", 3}})}
+      })}
+    });
+  }
+};
+
+int main() {
+  ScriptedTransport transport;
+  std::vector<axllm::AxUsageEvent> events;
+  axllm::set_usage_observer([&events](axllm::AxUsageEvent event) {
+    events.push_back(std::move(event));
+  });
+  axllm::OpenAICompatibleClient service(axllm::object({
+    {"model", "gpt-5.4-mini"},
+    {"api_key", "test-key"},
+    {"usageContext", axllm::object({{"tenantId", "tenant-1"}, {"feature", "no-key-example"}})}
+  }), &transport);
+  axllm::Value response = service.chat(axllm::object({
+    {"chat_prompt", axllm::array({axllm::object({{"role", "user"}, {"content", "hello"}})})}
+  }), axllm::object({
+    {"usageContext", axllm::object({{"userId", "user-1"}, {"requestId", "request-1"}})}
+  }));
+  axllm::set_usage_observer({});
+  axllm::Value first = axllm::Core::get(axllm::Core::get(response, "results"), 0);
+  if (!axllm::equal(axllm::Core::get(first, "content"), "hello from scripted transport")) return 1;
+  if (events.size() != 1 || !axllm::equal(
+      axllm::Core::get(axllm::Core::get(events[0], "context"), "tenantId"), "tenant-1")) return 2;
+  std::cout << "cpp-axai-ok\n";
+}
+`
+
+const cppAxFlowProgramGraphExample = `#include "axllm/axllm.hpp"
+#include <iostream>
+
+struct ScriptedClient : axllm::AIClient {
+  axllm::Value complete(axllm::Value) override {
+    return axllm::object({{"content", "{\"answer\":\"Paris\"}"}});
+  }
+};
+
+int main() {
+  axllm::AxGen qa = axllm::ax("question:string -> answer:string");
+  axllm::AxFlow program = axllm::flow(axllm::object({{"id", "example.flow"}})).execute("qa", qa).returns(axllm::object({{"answer", "answer"}}));
+  ScriptedClient client;
+  axllm::Value out = program.forward(client, axllm::object({{"question", "Capital of France?"}}));
+  if (!axllm::equal(axllm::Core::get(out, "answer"), "Paris")) return 1;
+  if (!axllm::equal(axllm::Core::get(axllm::Core::get(axllm::Core::get(program.get_plan(), "steps"), 0), "name"), "qa")) return 2;
+  std::cout << "cpp-axflow-ok\n";
+}
+`
+
+const cppFlowMermaidExample = `#include "axllm/axllm.hpp"
+#include <iostream>
+
+int main() {
+  const std::string source = R"(flowchart TD
+  %%ax classify: requestText:string -> route:class "support, sales"
+  %%ax reply: requestText:string -> replyText:string(max 300)
+  classify{route} -->|support| reply)";
+  auto program = axllm::flow(source);
+  const std::string rendered = program.str();
+  if (rendered.find("%%ax reply: requestText:string -> replyText:string(max 300)") == std::string::npos) return 1;
+  if (rendered.find("classify -->|support| reply") == std::string::npos) return 2;
+  if (axllm::flow(rendered).str() != rendered) return 3;
+  std::cout << "cpp-flow-mermaid-ok\n";
+}
+`
+
+const cppRuntimeAdapterExample = `#include "axllm/axllm.hpp"
+#include <iostream>
+
+struct DemoSession : axllm::AxCodeSession {
+  axllm::Value globals;
+  axllm::Value create_options;
+  bool closed = false;
+
+  DemoSession(axllm::Value globals_, axllm::Value options_) : globals(std::move(globals_)), create_options(std::move(options_)) {}
+
+  axllm::Value execute(axllm::Value code, axllm::Value options = axllm::Value::object()) override {
+    if (!axllm::Core::truthy(axllm::Core::map_contains(options, "reservedNames"))) throw axllm::AxError("fixture", "missing reservedNames");
+    if (axllm::equal(code, "timeout()")) return axllm::RuntimeEnvelope::timeout("demo timeout");
+    axllm::Core::set(globals, "answer", "runtime");
+    return axllm::RuntimeEnvelope::final_payload({axllm::object({{"answer", axllm::Core::get(globals, "answer")}})});
+  }
+
+  axllm::Value inspect(axllm::Value = axllm::Value::object()) override { return globals; }
+  axllm::Value snapshot_globals(axllm::Value = axllm::Value::object()) override {
+    return axllm::object({{"version", 1}, {"bindings", globals}, {"globals", globals}, {"closed", closed}});
+  }
+  axllm::Value patch_globals(axllm::Value snapshot, axllm::Value options = axllm::Value::object()) override {
+    globals = axllm::Core::get(snapshot, "bindings", axllm::Value::object());
+    return snapshot_globals(options);
+  }
+  axllm::Value close() override {
+    closed = true;
+    return axllm::object({{"closed", true}});
+  }
+};
+
+struct DemoRuntime : axllm::AxCodeRuntime {
+  axllm::RuntimeCapabilities capabilities;
+  std::vector<std::unique_ptr<DemoSession>> sessions;
+
+  DemoRuntime() {
+    capabilities.language = "Python";
+    capabilities.snapshot = true;
+    capabilities.patch = true;
+  }
+
+  std::string language() const override { return "Python"; }
+  axllm::AxCodeSession* create_session(axllm::Value globals, axllm::Value options = axllm::Value::object()) override {
+    sessions.push_back(std::make_unique<DemoSession>(std::move(globals), std::move(options)));
+    return sessions.back().get();
+  }
+};
+
+int main() {
+  DemoRuntime runtime;
+  auto qa = axllm::agent("question:string -> answer:string", axllm::object({{"runtime", axllm::object({{"language", "Python"}})}}));
+  axllm::Value out = qa.test(runtime, "final()", axllm::object({{"question", "adapter"}}));
+  if (!axllm::equal(axllm::Core::get(out, "kind"), "final")) return 1;
+  if (!runtime.sessions.back()->closed) return 2;
+
+  auto runner = axllm::agent("question:string -> answer:string", axllm::object({{"runtime", axllm::object({{"language", "Python"}})}}));
+  axllm::Value step = runner.execute_actor_step(runtime, "final()", axllm::object({{"question", "adapter"}}));
+  if (!axllm::equal(axllm::Core::get(step, "kind"), "final")) return 3;
+  axllm::Value snapshot = runner.export_session_state();
+  runner.restore_session_state(snapshot);
+  axllm::Value timeout = runner.execute_actor_step(runtime, "timeout()", axllm::object({{"question", "adapter"}}));
+  if (!axllm::equal(axllm::Core::get(timeout, "error_category"), "timeout")) return 4;
+  std::cout << "cpp-runtime-adapter-ok\n";
+}
+`
+
+const cppRuntimeProtocolExample = `#include "axllm/axllm.hpp"
+#include <iostream>
+
+struct ScriptedRuntimeTransport : axllm::RuntimeTransport {
+  int next_session = 0;
+
+  axllm::Value call(axllm::Value message) override {
+    axllm::Value id = axllm::Core::get(message, "id");
+    axllm::Value op = axllm::Core::get(message, "op");
+    if (axllm::equal(op, "capabilities")) {
+      return axllm::object({{"id", id}, {"ok", true}, {"result", axllm::object({{"language", "JavaScript"}, {"usage_instructions", "scripted protocol"}})}});
+    }
+    if (axllm::equal(op, "create_session")) {
+      std::string session_id = "s" + std::to_string(++next_session);
+      return axllm::object({{"id", id}, {"ok", true}, {"session_id", session_id}, {"result", axllm::object({{"session_id", session_id}})}});
+    }
+    if (axllm::equal(op, "execute")) {
+      return axllm::object({{"id", id}, {"ok", true}, {"result", axllm::object({{"type", "final"}, {"args", axllm::array({axllm::object({{"answer", "protocol"}})})}})}});
+    }
+    if (axllm::equal(op, "snapshot_globals")) {
+      return axllm::object({{"id", id}, {"ok", true}, {"result", axllm::object({{"version", 1}, {"bindings", axllm::object({{"answer", "protocol"}})}, {"globals", axllm::object({{"answer", "protocol"}})}})}});
+    }
+    if (axllm::equal(op, "patch_globals")) {
+      axllm::Value payload = axllm::Core::get(message, "payload", axllm::Value::object());
+      return axllm::object({{"id", id}, {"ok", true}, {"result", axllm::Core::get(payload, "globals", axllm::Value::object())}});
+    }
+    if (axllm::equal(op, "inspect_globals")) {
+      return axllm::object({{"id", id}, {"ok", true}, {"result", axllm::object({{"answer", "protocol"}})}});
+    }
+    if (axllm::equal(op, "close")) {
+      return axllm::object({{"id", id}, {"ok", true}, {"result", axllm::object({{"closed", true}})}});
+    }
+    if (axllm::equal(op, "shutdown")) {
+      return axllm::object({{"id", id}, {"ok", true}, {"result", axllm::object({{"shutdown", true}})}});
+    }
+    return axllm::object({{"id", id}, {"ok", false}, {"error", axllm::object({{"category", "protocol"}, {"message", "unknown op"}})}});
+  }
+};
+
+int main() {
+  ScriptedRuntimeTransport transport;
+  axllm::RuntimeProtocolClient runtime(transport);
+  auto qa = axllm::agent("question:string -> answer:string", axllm::object({{"runtime", axllm::object({{"language", "JavaScript"}})}}));
+  axllm::Value out = qa.test(runtime, "final()", axllm::object({{"question", "protocol"}}));
+  if (!axllm::equal(axllm::Core::get(out, "kind"), "final")) return 1;
+  auto runner = axllm::agent("question:string -> answer:string", axllm::object({{"runtime", axllm::object({{"language", "JavaScript"}})}}));
+  axllm::Value step = runner.execute_actor_step(runtime, "final()", axllm::object({{"question", "protocol"}}));
+  if (!axllm::equal(axllm::Core::get(step, "kind"), "final")) return 2;
+  axllm::Value snapshot = runner.export_session_state();
+  runner.restore_session_state(snapshot);
+  axllm::Value inspected = runner.inspect_runtime();
+  if (!axllm::equal(axllm::Core::get(inspected, "answer"), "protocol")) return 3;
+  axllm::Value closed = runner.close_runtime_session();
+  if (!axllm::equal(axllm::Core::get(closed, "closed"), true)) return 4;
+  runtime.shutdown();
+  std::cout << "cpp-runtime-protocol-ok\n";
+}
+`
+
+const cppOptimizerArtifactExample = `#include "axllm/axllm.hpp"
+#include <iostream>
+
+struct ScriptedOptimizer : axllm::OptimizerEngine {
+  std::string name() const override { return "fixture"; }
+  std::string version() const override { return "1"; }
+  axllm::Value optimize(axllm::Value) override {
+    return axllm::object({
+      {"componentMap", axllm::object({{"qa::instruction", "Prefer artifact-backed answers."}})},
+      {"metadata", axllm::object({
+        {"evidence", axllm::object({{"avg", 1}})},
+        {"provenance", axllm::object({{"sourceProgramKind", "axgen"}})}
+      })}
+    });
+  }
+};
+
+static bool has_instruction(const axllm::AxGen& gen, const std::string& value) {
+  axllm::Value components = gen.get_optimizable_components();
+  for (int i = 0; ; ++i) {
+    axllm::Value item = axllm::Core::get(components, i);
+    if (axllm::Core::truthy(axllm::Core::is_none(item))) break;
+    if (axllm::equal(axllm::Core::get(item, "id"), "qa::instruction") &&
+        axllm::equal(axllm::Core::get(item, "current"), value)) return true;
+  }
+  return false;
+}
+
+int main() {
+  axllm::AxGen qa = axllm::ax("question:string -> answer:string", axllm::object({{"id", "qa"}, {"instruction", "Base."}}));
+  ScriptedOptimizer engine;
+  axllm::Value artifact = qa.optimize_with(engine, axllm::Value::array(), axllm::object({{"apply", false}}));
+  if (!has_instruction(qa, "Base.")) return 1;
+  qa.apply_optimization(axllm::Value(axllm::stringify(artifact)));
+  if (!has_instruction(qa, "Prefer artifact-backed answers.")) return 2;
+  std::cout << "cpp-optimizer-artifact-ok\n";
+}
+`
+
+const pyProviderStreamNoKeyExample = `from axllm import OpenAICompatibleClient
+
+
+def scripted_transport(request):
+    return {
+        "status": 200,
+        "body": (
+            'data: {"id":"chatcmpl_stream","model":"gpt-5.4-mini","choices":[{"index":0,"delta":{"content":"hel"}}]}' + "\n\n"
+            'data: {"id":"chatcmpl_stream","model":"gpt-5.4-mini","choices":[{"index":0,"delta":{"content":"lo"},"finish_reason":"stop"}]}' + "\n\n"
+            "data: [DONE]\n\n"
+        ),
+    }
+
+
+client = OpenAICompatibleClient(api_key="test-key", model="gpt-5.4-mini", transport=scripted_transport)
+events = list(client.stream({"chat_prompt": [{"role": "user", "content": "stream"}]}))
+text = "".join((event["results"][0].get("content") or "") for event in events)
+assert text == "hello", events
+print("python-provider-stream-no-key", text)
+`
+
+const pyAxFlowOpenAIExample = `import json
+import os
+
+from axllm import OpenAICompatibleClient, ax, flow
+
+
+api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_APIKEY")
+if not api_key:
+    raise SystemExit("Set OPENAI_API_KEY or OPENAI_APIKEY to run this provider API example.")
+
+client = OpenAICompatibleClient(
+    api_key=api_key,
+    model=os.getenv("AX_OPENAI_MODEL", "gpt-5.4-mini"),
+    model_config={"temperature": 0},
+)
+outline = ax("topic:string -> outline:string")
+program = (
+    flow({"id": "examples.openaiApiFlow"})
+    .execute("outline", outline)
+    .map("summary", lambda state: {"summary": "Generated outline with typed Ax program steps."})
+    .returns({"outline": "outline", "summary": "summary"})
+)
+output = program.forward(client, {"topic": "how Ax composes typed LLM programs"})
+
+print(json.dumps(output, indent=2, sort_keys=True))
+`
+
+const pyAudioResponsesMappingExample = `import json
+
+from axllm import OpenAIResponsesClient
+
+
+transport_requests = []
+
+
+def scripted_transport(request):
+    transport_requests.append(request)
+    if request["url"].endswith("/audio/speech"):
+        return {"status": 200, "json": {"audio": "base64-speech"}}
+    if request["url"].endswith("/audio/transcriptions"):
+        return {
+            "status": 200,
+            "json": {"text": "hello world", "language": "en", "duration": 1.25},
+        }
+    raise RuntimeError(f"unexpected request: {request}")
+
+
+client = OpenAIResponsesClient(api_key="test-key", transport=scripted_transport)
+speech = client.speak({"text": "hello", "voice": "alloy", "format": "mp3"})
+transcript = client.transcribe(
+    {"audio": "base64-audio", "language": "en", "model": "whisper-1", "format": "json"}
+)
+assert speech["audio"] == "base64-speech", speech
+assert transcript["text"] == "hello world", transcript
+
+print("normalized output:")
+print(json.dumps({"speak": speech, "transcribe": transcript}, indent=2, sort_keys=True))
+print("transport requests:")
+print(json.dumps(transport_requests, indent=2, sort_keys=True))
+`
+
+const pyAudioHTTPRoundtripExample = `"""Drive transcribe()/speak() through the REAL urllib transport against an
+in-process loopback server, exercising the wire-level encoders the conformance
+ScriptedTransport bypasses: the multipart/form-data request body (transcribe)
+and binary (non-UTF8) response handling (speak). Exits non-zero on any mismatch
+so ` + "`axir verify`" + ` fails if either regresses."""
+
+import base64
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+from axllm import OpenAIResponsesClient
+
+# Deliberately non-UTF8 bytes so a UTF-8/JSON decode regression on the binary
+# path corrupts them detectably.
+audio_bytes = bytes([0, 1, 2, 255, 254, 16, 127])
+audio_b64 = base64.b64encode(audio_bytes).decode()
+speech_bytes = bytes([255, 216, 255, 0, 17, 34, 254])
+want_audio = base64.b64encode(speech_bytes).decode()
+
+state = {"saw_multipart": False, "file_bytes": b""}
+
+
+def extract_file_bytes(body, content_type):
+    boundary = content_type.split("boundary=", 1)[1].encode()
+    delimiter = b"--" + boundary
+    for segment in body.split(delimiter):
+        if b'name="file"' in segment:
+            sep = segment.find(b"\r\n\r\n")
+            if sep >= 0:
+                content = segment[sep + 4 :]
+                if content.endswith(b"\r\n"):
+                    content = content[:-2]
+                return content
+    return b""
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length)
+        if "transcriptions" in self.path:
+            content_type = self.headers.get("Content-Type", "")
+            if not content_type.startswith("multipart/form-data; boundary="):
+                raise RuntimeError(f"transcribe request was not multipart: {content_type}")
+            state["saw_multipart"] = True
+            state["file_bytes"] = extract_file_bytes(body, content_type)
+            payload = json.dumps(
+                {"text": "hello world", "language": "en", "duration": 1.25}
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        elif "speech" in self.path:
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/mpeg")
+            self.send_header("Content-Length", str(len(speech_bytes)))
+            self.end_headers()
+            self.wfile.write(speech_bytes)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+
+server = HTTPServer(("127.0.0.1", 0), Handler)
+port = server.server_address[1]
+thread = threading.Thread(target=server.serve_forever, daemon=True)
+thread.start()
+
+try:
+    client = OpenAIResponsesClient(api_key="test-key", base_url=f"http://127.0.0.1:{port}")
+    transcript = client.transcribe(
+        {"audio": audio_b64, "language": "en", "model": "gpt-4o-mini-transcribe", "format": "json"}
+    )
+    assert state["saw_multipart"], "loopback server never received a multipart transcribe request"
+    assert base64.b64encode(state["file_bytes"]).decode() == audio_b64, (
+        f"multipart file bytes mismatch: {state['file_bytes']!r}"
+    )
+    assert transcript["text"] == "hello world", transcript
+
+    speech = client.speak(
+        {"text": "hello", "voice": "alloy", "format": "mp3", "model": "gpt-4o-mini-tts"}
+    )
+    assert speech["audio"] == want_audio, f"speak binary base64 mismatch: {speech}"
+finally:
+    server.shutdown()
+
+print("audio-http-roundtrip-ok")
+`
+
+const pyMCPModernRoundtripExample = `"""Exercise the modern MCP client through a real in-process HTTP loopback."""
+
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+from axllm import AxMCPClient, AxMCPStreamableHTTPTransport
+
+
+class Handler(BaseHTTPRequestHandler):
+    calls = 0
+    tool_lists = 0
+    failures = []
+
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        request = json.loads(self.rfile.read(length) or b"{}")
+        method = request.get("method")
+        params = request.get("params") or {}
+        if method == "initialize":
+            self.failures.append("modern client sent initialize")
+        if method != "server/discover" and "_meta" not in params:
+            self.failures.append(f"{method} omitted request _meta")
+        Handler.calls += 1
+        meta = {"io.modelcontextprotocol/serverInfo": {"name": "modern-loopback", "version": f"1.0.{self.calls}"}}
+        result = {"resultType": "complete", "_meta": meta}
+        if method == "server/discover":
+            result = {"resultType": "complete", "supportedVersions": ["2026-07-28"], "capabilities": {"tools": {}, "extensions": {"io.modelcontextprotocol/tasks": {}}}, "ttlMs": 60000, "cacheScope": "public", "_meta": meta}
+        elif method == "tools/list":
+            Handler.tool_lists += 1
+            result.update({
+                "tools": [
+                    {"name": "start_reindex", "inputSchema": {"type": "object", "properties": {"scope": {"type": "string", "x-mcp-header": "Scope"}}}},
+                    {"name": "mrtr_roots_round", "inputSchema": {"type": "object", "properties": {}}},
+                ],
+                "ttlMs": 60000,
+                "cacheScope": "public",
+            })
+        elif method == "tools/call" and params.get("name") == "start_reindex":
+            if self.headers.get("Mcp-Param-Scope") != "all":
+                self.failures.append("Mcp-Param-Scope was not propagated")
+            result = {"resultType": "task", "taskId": "task-1", "status": "working", "createdAt": "2026-07-29T00:00:00Z", "lastUpdatedAt": "2026-07-29T00:00:00Z", "ttlMs": None, "_meta": meta}
+        elif method == "tasks/get":
+            result = {"taskId": "task-1", "status": "completed", "createdAt": "2026-07-29T00:00:00Z", "lastUpdatedAt": "2026-07-29T00:00:01Z", "ttlMs": None, "result": {"resultType": "complete", "structuredContent": {"indexed": 42}, "_meta": meta}, "_meta": meta}
+        elif method == "tools/call" and "requestState" not in params:
+            result = {"resultType": "input_required", "inputRequests": {"roots": {"method": "roots/list"}}, "requestState": "opaque-roots-state", "_meta": meta}
+        elif method == "tools/call":
+            if params.get("requestState") != "opaque-roots-state" or params.get("inputResponses", {}).get("roots", {}).get("roots", [{}])[0].get("uri") != "file:///workspace":
+                self.failures.append("roots MRTR response was not echoed")
+            result.update({"structuredContent": {"roots": 1}})
+        payload = json.dumps({"jsonrpc": "2.0", "id": request.get("id"), "result": result}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+server = HTTPServer(("127.0.0.1", 0), Handler)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+try:
+    transport = AxMCPStreamableHTTPTransport(
+        f"http://127.0.0.1:{server.server_address[1]}/mcp",
+        {"ssrfProtection": {"requireHttps": False, "allowLocalhost": True, "allowPrivateNetworks": True}},
+    )
+    client = AxMCPClient(transport, {"era": "modern", "roots": [{"uri": "file:///workspace", "name": "workspace"}]})
+    client.init()
+    assert client.get_era() == "modern"
+    client.refresh(force=False)
+    task = client.call_tool("start_reindex", {"scope": "all"})
+    assert task.get("structuredContent", {}).get("indexed") == 42, task
+    roots = client.call_tool("mrtr_roots_round", {})
+    assert roots.get("structuredContent", {}).get("roots") == 1, roots
+    catalog = client.inspect_catalog()
+    assert Handler.tool_lists == 1, "cacheable tools/list was fetched again"
+    assert not Handler.failures, Handler.failures
+    assert catalog.get("serverInfo", {}).get("version") != "1.0.1", catalog.get("serverInfo")
+    client.close()
+finally:
+    server.shutdown()
+
+print("mcp-modern-roundtrip-ok")
+`
+
+const pyMCPSseRoundtripExample = `"""Drive AxMCPStreamableHTTPTransport.send() through the REAL urllib transport
+against an in-process loopback server that answers the JSON-RPC POST with
+Content-Type: text/event-stream -- the MCP Streamable HTTP SSE path the
+ScriptedTransport conformance fixtures bypass. The SSE body interleaves a
+notification ahead of the id-matched response, so a transport that ignored the
+Content-Type (json.loads on the raw stream) or returned the first data frame
+would fail. Exits non-zero on any mismatch so axir verify fails if the SSE
+branch regresses."""
+
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+from axllm import AxMCPClient, AxMCPStreamableHTTPTransport
+
+SSE_BODY = (
+    ": keepalive\n"
+    "event: message\n"
+    'data: {"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info"}}\n'
+    "\n"
+    "event: message\n"
+    'data: {"jsonrpc":"2.0","id":"ax-sse-1","result":{"ok":true,"protocolVersion":"2025-11-25"}}\n'
+    "\n"
+)
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        request = json.loads(self.rfile.read(length) or b"{}")
+        method = request.get("method")
+        if method == "server/discover":
+            payload = json.dumps({"jsonrpc": "2.0", "id": request.get("id"), "error": {"code": -32601, "message": "Method not found"}}).encode()
+            content_type = "application/json"
+        elif method == "initialize":
+            payload = json.dumps({"jsonrpc": "2.0", "id": request.get("id"), "result": {"protocolVersion": "2025-11-25", "capabilities": {}, "serverInfo": {"name": "legacy-loopback", "version": "1.0.0"}}}).encode()
+            content_type = "application/json"
+        elif method == "notifications/initialized":
+            payload = b""
+            content_type = "application/json"
+        else:
+            payload = SSE_BODY.replace('"ax-sse-1"', json.dumps(request.get("id"))).encode()
+            content_type = "text/event-stream"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_GET(self):
+        self.send_response(405)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
+server = HTTPServer(("127.0.0.1", 0), Handler)
+port = server.server_address[1]
+thread = threading.Thread(target=server.serve_forever, daemon=True)
+thread.start()
+
+try:
+    transport = AxMCPStreamableHTTPTransport(
+        f"http://127.0.0.1:{port}/mcp",
+        {"ssrfProtection": {"requireHttps": False, "allowLocalhost": True, "allowPrivateNetworks": True}},
+    )
+    client = AxMCPClient(transport)
+    client.init()
+    assert client.get_era() == "legacy", f"auto discovery did not fall back: {client.get_era()}"
+    response = client.call_tool("noop", {})
+    assert response.get("ok") is True, f"SSE result not decoded: {response}"
+    client.close()
+finally:
+    server.shutdown()
+
+print("mcp-sse-roundtrip-ok")
+`
+
+const pyStreamHTTPRoundtripExample = `"""Drive a streaming chat through the REAL urllib transport against an
+in-process loopback server that returns a spec-legal text/event-stream body
+with a MULTI-LINE data: event and CRLF line endings. The conformance
+ScriptedTransport only ever feeds single-line data: JSON, so this is the only
+end-to-end coverage for the SSE line-folding that src/ax/util/sse.ts performs.
+Exits non-zero on any mismatch so ` + "`axir verify`" + ` fails if it regresses."""
+
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+from axllm import OpenAICompatibleClient
+
+# One logical chat-completion delta whose JSON is split across two data: lines
+# (folded with "\n" into ...,"delta":\n{"content":"Hello "}}), then a normal
+# single-line delta, then [DONE]. Every line uses CRLF.
+EVENT1A = '{"id":"chatcmpl_stream","model":"gpt-5.4-mini","choices":[{"index":0,"delta":'
+EVENT1B = '{"content":"Hello "}}]}'
+EVENT2 = '{"id":"chatcmpl_stream","model":"gpt-5.4-mini","choices":[{"index":0,"delta":{"content":"world"},"finish_reason":"stop"}]}'
+SSE_BODY = (
+    "data: " + EVENT1A + "\r\n"
+    + "data: " + EVENT1B + "\r\n"
+    + "\r\n"
+    + "data: " + EVENT2 + "\r\n"
+    + "\r\n"
+    + "data: [DONE]\r\n"
+    + "\r\n"
+).encode()
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        self.rfile.read(length)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(SSE_BODY)))
+        self.end_headers()
+        self.wfile.write(SSE_BODY)
+
+
+server = HTTPServer(("127.0.0.1", 0), Handler)
+port = server.server_address[1]
+thread = threading.Thread(target=server.serve_forever, daemon=True)
+thread.start()
+
+try:
+    client = OpenAICompatibleClient(
+        api_key="test-key", base_url=f"http://127.0.0.1:{port}", model="gpt-5.4-mini"
+    )
+    deltas = [
+        (event.get("results") or [{}])[0].get("content")
+        for event in client.stream({"chat_prompt": [{"role": "user", "content": "stream"}]})
+    ]
+    deltas = [delta for delta in deltas if delta]
+    assert deltas[:1] == ["Hello "], (
+        f"multi-line data: event was not folded into one JSON value: {deltas}"
+    )
+    assert "".join(deltas) == "Hello world", f"bad stream fold: {deltas}"
+finally:
+    server.shutdown()
+
+print("stream-http-roundtrip-ok")
+`
+
+const pyRealtimeAudioEventsExample = `import json
+
+from axllm import GoogleGeminiClient, GrokClient
+
+
+grok = GrokClient(model="grok-voice-think-fast-1.0", api_key="test-key")
+grok_request = {
+    "model": "grok-voice-think-fast-1.0",
+    "chat_prompt": [
+        {"role": "system", "content": "You are a concise voice agent."},
+        {"role": "user", "content": "Say hello."},
+    ],
+    "audio": {"input": {"sampleRate": 24000}, "output": {"sampleRate": 24000, "voice": "eve"}},
+}
+grok_events = [
+    {"type": "response.output_audio_transcript.delta", "response_id": "grok_rt", "delta": "hello "},
+    {"type": "response.output_audio.delta", "response_id": "grok_rt", "delta": "AQI="},
+    {
+        "type": "response.done",
+        "response": {
+            "id": "grok_rt",
+            "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
+        },
+    },
+]
+
+gemini = GoogleGeminiClient(
+    model="gemini-2.5-flash-native-audio-preview-12-2025",
+    api_key="test-key",
+)
+gemini_request = {
+    "model": "gemini-2.5-flash-native-audio-preview-12-2025",
+    "chat_prompt": [
+        {"role": "system", "content": "Answer with audio."},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Realtime question"},
+                {"type": "audio", "data": "AAAA", "format": "pcm16", "sampleRate": 16000},
+            ],
+        },
+    ],
+    "audio": {"output": {"transcript": True, "voice": "Kore"}},
+}
+gemini_events = [
+    {"id": "gemini_live_1", "serverContent": {"outputTranscription": {"text": "spoken "}}},
+    {
+        "id": "gemini_live_2",
+        "serverContent": {
+            "modelTurn": {
+                "parts": [{"inlineData": {"data": "AQI=", "mimeType": "audio/pcm"}}]
+            }
+        },
+    },
+    {
+        "id": "gemini_live_3",
+        "toolCall": {"functionCalls": [{"name": "lookup", "args": {"q": "ax"}}]},
+    },
+    {
+        "id": "gemini_live_done",
+        "serverContent": {"turnComplete": True},
+        "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 4, "totalTokenCount": 7},
+    },
+]
+
+grok_normalized = list(grok.realtime(grok_events))
+gemini_normalized = list(gemini.realtime(gemini_events))
+assert grok_normalized[-1]["results"][0]["finish_reason"] == "stop", grok_normalized
+assert gemini_normalized[-1]["results"][0]["finish_reason"] == "stop", gemini_normalized
+
+print("grok setup:")
+print(json.dumps(grok.realtime_audio_setup(grok_request), indent=2, sort_keys=True))
+print("grok normalized events:")
+print(json.dumps(grok_normalized, indent=2, sort_keys=True))
+
+print("gemini setup:")
+print(json.dumps(gemini.realtime_audio_setup(gemini_request), indent=2, sort_keys=True))
+print("gemini input messages:")
+print(json.dumps(gemini.realtime_audio_input(gemini_request), indent=2, sort_keys=True))
+print("gemini normalized events:")
+print(json.dumps(gemini_normalized, indent=2, sort_keys=True))
+`
+
+const pyRealtimeAudioTurnExample = `"""Drive a realtime audio TURN through the productized realtime_chat() driver
+using ScriptedRealtimeTransport: the deterministic, credential-free path that
+exercises the full send-setup -> send-input -> fold-events -> merge loop without
+a live socket (the live socket path is verified separately against the real API).
+Exits non-zero on any mismatch so ` + "`axir verify`" + ` fails if the driver regresses."""
+
+import json
+
+from axllm import OpenAIResponsesClient
+from axllm.ai import ScriptedRealtimeTransport
+
+client = OpenAIResponsesClient(model="gpt-realtime-2", api_key="test-key")
+request = {
+    "model": "gpt-realtime-2",
+    "chat_prompt": [
+        {"role": "system", "content": "You are a concise voice agent."},
+        {"role": "user", "content": "Say hello."},
+    ],
+    "audio": {"output": {"voice": "alloy"}},
+}
+
+# Canned server frames: session handshake, two transcript deltas, an audio delta,
+# then the terminal response.done.
+inbound = [
+    {"type": "session.created"},
+    {"type": "session.updated"},
+    {"type": "response.output_audio_transcript.delta", "response_id": "rt", "delta": "hel"},
+    {"type": "response.output_audio_transcript.delta", "response_id": "rt", "delta": "lo"},
+    {"type": "response.output_audio.delta", "response_id": "rt", "delta": "AQI="},
+    {
+        "type": "response.done",
+        "response": {"id": "rt", "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}},
+    },
+]
+
+transport = ScriptedRealtimeTransport(inbound)
+final = client.realtime_chat(request, transport=transport)
+result = final["results"][0]
+
+sent_types = [event.get("type") for event in transport.sent]
+print("driver sent:", json.dumps(sent_types))
+print("merged result:", json.dumps(result, sort_keys=True))
+
+# The driver must send the Core-built session.update first, then the input events.
+assert sent_types == ["session.update", "conversation.item.create", "response.create"], sent_types
+# Transcript deltas concatenated, audio chunk surfaced, turn finished.
+assert result["content"] == "hello", result
+assert result["finish_reason"] == "stop", result
+assert result.get("audio", {}).get("data") == "AQI=", result
+print("realtime-audio-turn-ok")
+`
+
+const pyGEPALocalOptimizerExample = `import json
+
+from axllm import AxGEPA, OptimizerEvaluator
+
+
+class LocalEvaluator(OptimizerEvaluator):
+    def evaluate(self, candidate_map, options=None):
+        rows = []
+        examples = ((options or {}).get("dataset") or {}).get("train") or []
+        instruction = candidate_map.get("qa::instruction", "")
+        for example in examples:
+            quality = 0.9 if "concise" in instruction.lower() else 0.65
+            brevity = 0.8
+            scalar = (quality + brevity) / 2
+            rows.append(
+                {
+                    "input": example,
+                    "prediction": {"answer": "Ax composes typed LLM programs."},
+                    "scores": {"quality": quality, "brevity": brevity},
+                    "scalar": scalar,
+                }
+            )
+        total = sum(row["scalar"] for row in rows)
+        return {"rows": rows, "avg": total / len(rows), "sum": total, "count": len(rows)}
+
+
+request = {
+    "programKind": "axgen",
+    "components": [
+        {
+            "id": "qa::instruction",
+            "owner": "qa",
+            "kind": "instruction",
+            "current": "Answer clearly and concisely.",
+        }
+    ],
+    "dataset": {
+        "train": [{"question": "What is Ax?"}, {"question": "Why use typed signatures?"}],
+        "validation": [{"question": "Summarize Ax."}],
+    },
+    "options": {"numTrials": 0, "maxMetricCalls": 8, "seed": 7},
+}
+
+artifact = AxGEPA(seed=7).optimize(request, LocalEvaluator())
+assert "qa::instruction" in artifact["componentMap"], artifact
+print(json.dumps({"componentMap": artifact["componentMap"], "metadata": artifact["metadata"]}, indent=2, sort_keys=True))
+`
+
+const javaProviderStreamNoKeyExample = `import dev.axllm.ax.*;
+import java.util.*;
+
+public final class ProviderStreamNoKeyExample {
+  public static void main(String[] args) throws Exception {
+    OpenAICompatibleClient.Transport transport = request -> Map.of(
+      "status", 200,
+      "body", "data: {\"id\":\"chatcmpl_stream\",\"model\":\"gpt-5.4-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hel\"}}]}\n\n"
+        + "data: {\"id\":\"chatcmpl_stream\",\"model\":\"gpt-5.4-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n"
+        + "data: [DONE]\n\n"
+    );
+    OpenAICompatibleClient client = new OpenAICompatibleClient(Map.of(
+      "api_key", "test-key",
+      "model", "gpt-5.4-mini",
+      "transport", transport
+    ));
+    StringBuilder text = new StringBuilder();
+    for (Map<String, Object> event : client.stream(Map.of("chat_prompt", List.of(Map.of("role", "user", "content", "stream"))))) {
+      List<?> results = (List<?>) event.get("results");
+      Object content = ((Map<?, ?>) results.get(0)).get("content");
+      if (content != null) text.append(content);
+    }
+    if (!"hello".contentEquals(text)) throw new RuntimeException("bad stream: " + text);
+    System.out.println("java-provider-stream-no-key " + text);
+  }
+}
+`
+
+const javaFlowOpenAIExample = `import dev.axllm.ax.*;
+import java.util.*;
+
+public final class FlowOpenAIExample {
+  public static void main(String[] args) throws Exception {
+    String apiKey = System.getenv("OPENAI_API_KEY");
+    if (apiKey == null || apiKey.isBlank()) apiKey = System.getenv("OPENAI_APIKEY");
+    if (apiKey == null || apiKey.isBlank()) {
+      throw new IllegalStateException("Set OPENAI_API_KEY or OPENAI_APIKEY to run this provider API example.");
+    }
+    String model = System.getenv().getOrDefault("AX_OPENAI_MODEL", "gpt-5.4-mini");
+    OpenAICompatibleClient client =
+        new OpenAICompatibleClient(
+            Map.of("api_key", apiKey, "model", model, "model_config", Map.of("temperature", 0.0)));
+
+    AxGen outline = Ax.ax("topic:string -> outline:string");
+    AxFlow program =
+        Ax.flow(Map.of("id", "examples.openaiApiFlow"))
+            .execute("outline", outline)
+            .map(
+                "summary",
+                state -> Map.of("summary", "Generated outline with typed Ax program steps."))
+            .returns(Map.of("outline", "outline", "summary", "summary"));
+    Map<String, Object> output =
+        program.forward(client, Map.of("topic", "how Ax composes typed LLM programs"));
+    System.out.println(Json.stringify(output));
+  }
+}
+`
+
+const javaAudioResponsesMappingExample = `import dev.axllm.ax.*;
+import java.util.*;
+
+public final class AudioResponsesMappingExample {
+  public static void main(String[] args) throws Exception {
+    List<Map<String, Object>> transportRequests = new ArrayList<>();
+    OpenAICompatibleClient.Transport transport =
+        request -> {
+          transportRequests.add(new LinkedHashMap<>(request));
+          String url = String.valueOf(request.get("url"));
+          if (url.endsWith("/audio/speech")) {
+            return Map.of("status", 200, "json", Map.of("audio", "base64-speech"));
+          }
+          if (url.endsWith("/audio/transcriptions")) {
+            return Map.of(
+                "status",
+                200,
+                "json",
+                Map.of("text", "hello world", "language", "en", "duration", 1.25));
+          }
+          throw new RuntimeException("unexpected request: " + request);
+        };
+
+    OpenAIResponsesClient client =
+        new OpenAIResponsesClient(Map.of("api_key", "test-key", "transport", transport));
+    Map<String, Object> speech =
+        client.speak(Map.of("text", "hello", "voice", "alloy", "format", "mp3"));
+    Map<String, Object> transcript =
+        client.transcribe(
+            Map.of("audio", "base64-audio", "language", "en", "model", "whisper-1", "format", "json"));
+    if (!"base64-speech".equals(speech.get("audio"))) throw new RuntimeException("bad speech: " + speech);
+    if (!"hello world".equals(transcript.get("text"))) throw new RuntimeException("bad transcript: " + transcript);
+
+    System.out.println("normalized output:");
+    System.out.println(Json.stringify(Map.of("speak", speech, "transcribe", transcript)));
+    System.out.println("transport requests:");
+    System.out.println(Json.stringify(transportRequests));
+  }
+}
+`
+
+const javaAudioHTTPRoundtripExample = `import com.sun.net.httpserver.HttpServer;
+import dev.axllm.ax.*;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+// Drive transcribe()/speak() through the REAL HttpClient transport against an
+// in-process com.sun.net.httpserver loopback, exercising the wire-level encoders
+// the conformance ScriptedTransport bypasses: the multipart/form-data request
+// body (transcribe) and binary (non-UTF8) response handling (speak). Exits
+// non-zero on any mismatch so ` + "`axir verify`" + ` fails if either regresses.
+public final class AudioHTTPRoundtripExample {
+  public static void main(String[] args) throws Exception {
+    // Deliberately non-UTF8 bytes so a UTF-8/JSON decode regression corrupts them.
+    byte[] audioBytes = {0, 1, 2, (byte) 0xff, (byte) 0xfe, 16, 127};
+    String audioB64 = Base64.getEncoder().encodeToString(audioBytes);
+    byte[] speechBytes = {(byte) 0xff, (byte) 0xd8, (byte) 0xff, 0, 17, 34, (byte) 0xfe};
+    String wantAudio = Base64.getEncoder().encodeToString(speechBytes);
+
+    AtomicBoolean sawMultipart = new AtomicBoolean(false);
+    AtomicBoolean fileBytesPresent = new AtomicBoolean(false);
+
+    HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    server.createContext(
+        "/",
+        exchange -> {
+          String path = exchange.getRequestURI().getPath();
+          byte[] body = exchange.getRequestBody().readAllBytes();
+          if (path.contains("transcriptions")) {
+            String contentType = exchange.getRequestHeaders().getFirst("Content-Type");
+            sawMultipart.set(
+                contentType != null && contentType.startsWith("multipart/form-data; boundary="));
+            fileBytesPresent.set(containsBytes(body, audioBytes));
+            byte[] resp =
+                "{\"text\":\"hello world\",\"language\":\"en\",\"duration\":1.25}"
+                    .getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, resp.length);
+            try (OutputStream os = exchange.getResponseBody()) {
+              os.write(resp);
+            }
+          } else if (path.contains("speech")) {
+            exchange.getResponseHeaders().set("Content-Type", "audio/mpeg");
+            exchange.sendResponseHeaders(200, speechBytes.length);
+            try (OutputStream os = exchange.getResponseBody()) {
+              os.write(speechBytes);
+            }
+          } else {
+            exchange.sendResponseHeaders(404, -1);
+            exchange.close();
+          }
+        });
+    server.start();
+    int port = server.getAddress().getPort();
+
+    try {
+      OpenAIResponsesClient client =
+          new OpenAIResponsesClient(
+              Map.of("api_key", "test-key", "base_url", "http://127.0.0.1:" + port));
+      Map<String, Object> transcript =
+          client.transcribe(
+              Map.of(
+                  "audio", audioB64, "language", "en", "model", "gpt-4o-mini-transcribe", "format",
+                  "json"));
+      if (!sawMultipart.get())
+        throw new RuntimeException("loopback server never received a multipart transcribe request");
+      if (!fileBytesPresent.get())
+        throw new RuntimeException("multipart body did not contain the decoded file bytes");
+      if (!"hello world".equals(transcript.get("text")))
+        throw new RuntimeException("transcribe response not normalized: " + transcript);
+
+      Map<String, Object> speech =
+          client.speak(
+              Map.of("text", "hello", "voice", "alloy", "format", "mp3", "model", "gpt-4o-mini-tts"));
+      if (!wantAudio.equals(speech.get("audio")))
+        throw new RuntimeException("speak binary response not base64-encoded as expected: " + speech);
+    } finally {
+      server.stop(0);
+    }
+    System.out.println("audio-http-roundtrip-ok");
+  }
+
+  private static boolean containsBytes(byte[] haystack, byte[] needle) {
+    if (needle.length == 0) return true;
+    outer:
+    for (int i = 0; i + needle.length <= haystack.length; i++) {
+      for (int j = 0; j < needle.length; j++) {
+        if (haystack[i + j] != needle[j]) continue outer;
+      }
+      return true;
+    }
+    return false;
+  }
+}
+`
+
+const javaMCPModernRoundtripExample = `import com.sun.net.httpserver.HttpServer;
+import dev.axllm.ax.*;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.*;
+
+public final class AxMCPModernRoundtripExample {
+  @SuppressWarnings("unchecked")
+  private static Map<String,Object> object(Object value) { return (Map<String,Object>) value; }
+
+  public static void main(String[] args) throws Exception {
+    AtomicInteger calls = new AtomicInteger();
+    AtomicInteger toolLists = new AtomicInteger();
+    List<String> failures = Collections.synchronizedList(new ArrayList<>());
+    HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    server.createContext("/mcp", exchange -> {
+      String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+      int call = calls.incrementAndGet();
+      Matcher matcher = Pattern.compile("\\\"id\\\"\\s*:\\s*(\\\"[^\\\"]*\\\"|[0-9]+)").matcher(body);
+      String id = matcher.find() ? matcher.group(1) : "null";
+      String method;
+      if (body.contains("server/discover")) method = "server/discover";
+      else if (body.contains("tools/list")) method = "tools/list";
+      else if (body.contains("tasks/get")) method = "tasks/get";
+      else if (body.contains("start_reindex")) method = "start_reindex";
+      else if (body.contains("mrtr_roots_round")) method = "mrtr_roots_round";
+      else if (body.contains("initialize")) method = "initialize";
+      else method = "unknown";
+      if (method.equals("initialize")) failures.add("modern client sent initialize");
+      if (!method.equals("server/discover") && !body.contains("io.modelcontextprotocol")) failures.add(method + " omitted request _meta");
+      String meta = "\\\"_meta\\\":{\\\"io.modelcontextprotocol/serverInfo\\\":{\\\"name\\\":\\\"modern-loopback\\\",\\\"version\\\":\\\"1.0." + call + "\\\"}}";
+      String result;
+      if (method.equals("server/discover")) {
+        result = "{\\\"resultType\\\":\\\"complete\\\",\\\"supportedVersions\\\":[\\\"2026-07-28\\\"],\\\"capabilities\\\":{\\\"tools\\\":{},\\\"extensions\\\":{\\\"io.modelcontextprotocol/tasks\\\":{}}},\\\"ttlMs\\\":60000,\\\"cacheScope\\\":\\\"public\\\"," + meta + "}";
+      } else if (method.equals("tools/list")) {
+        toolLists.incrementAndGet();
+        result = "{\\\"resultType\\\":\\\"complete\\\",\\\"tools\\\":[{\\\"name\\\":\\\"start_reindex\\\",\\\"inputSchema\\\":{\\\"type\\\":\\\"object\\\",\\\"properties\\\":{\\\"scope\\\":{\\\"type\\\":\\\"string\\\",\\\"x-mcp-header\\\":\\\"Scope\\\"}}}},{\\\"name\\\":\\\"mrtr_roots_round\\\",\\\"inputSchema\\\":{\\\"type\\\":\\\"object\\\",\\\"properties\\\":{}}}],\\\"ttlMs\\\":60000,\\\"cacheScope\\\":\\\"public\\\"," + meta + "}";
+      } else if (method.equals("start_reindex")) {
+        if (!"all".equals(exchange.getRequestHeaders().getFirst("Mcp-Param-Scope"))) failures.add("Mcp-Param-Scope was not propagated");
+        result = "{\\\"resultType\\\":\\\"task\\\",\\\"taskId\\\":\\\"task-1\\\",\\\"status\\\":\\\"working\\\",\\\"createdAt\\\":\\\"2026-07-29T00:00:00Z\\\",\\\"lastUpdatedAt\\\":\\\"2026-07-29T00:00:00Z\\\",\\\"ttlMs\\\":null," + meta + "}";
+      } else if (method.equals("tasks/get")) {
+        result = "{\\\"taskId\\\":\\\"task-1\\\",\\\"status\\\":\\\"completed\\\",\\\"createdAt\\\":\\\"2026-07-29T00:00:00Z\\\",\\\"lastUpdatedAt\\\":\\\"2026-07-29T00:00:01Z\\\",\\\"ttlMs\\\":null,\\\"result\\\":{\\\"resultType\\\":\\\"complete\\\",\\\"structuredContent\\\":{\\\"indexed\\\":42}," + meta + "}," + meta + "}";
+      } else if (!body.contains("requestState")) {
+        result = "{\\\"resultType\\\":\\\"input_required\\\",\\\"inputRequests\\\":{\\\"roots\\\":{\\\"method\\\":\\\"roots/list\\\"}},\\\"requestState\\\":\\\"opaque-roots-state\\\"," + meta + "}";
+      } else {
+        if (!body.contains("opaque-roots-state") || !body.contains("file:///workspace")) failures.add("roots MRTR response was not echoed");
+        result = "{\\\"resultType\\\":\\\"complete\\\",\\\"structuredContent\\\":{\\\"roots\\\":1}," + meta + "}";
+      }
+      result = result.replace("\\\"", "\"");
+      byte[] response = ("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":" + result + "}").getBytes(StandardCharsets.UTF_8);
+      exchange.getResponseHeaders().set("Content-Type", "application/json");
+      exchange.sendResponseHeaders(200, response.length);
+      try (OutputStream output = exchange.getResponseBody()) { output.write(response); }
+    });
+    server.start();
+    try {
+      AxMCPStreamableHTTPTransport transport = new AxMCPStreamableHTTPTransport(
+          "http://127.0.0.1:" + server.getAddress().getPort() + "/mcp",
+          Map.of("ssrfProtection", Map.of("requireHttps", false, "allowLocalhost", true, "allowPrivateNetworks", true)));
+      AxMCPClient client = new AxMCPClient(transport, Map.of("era", "modern", "roots", List.of(Map.of("uri", "file:///workspace", "name", "workspace"))));
+      client.init();
+      if (!"modern".equals(client.getEra())) throw new IllegalStateException("modern discovery failed");
+      client.refresh(false);
+      Map<String,Object> task = client.callTool("start_reindex", Map.of("scope", "all"));
+      if (((Number)object(task.get("structuredContent")).get("indexed")).intValue() != 42) throw new IllegalStateException("task was not flattened: " + task);
+      Map<String,Object> roots = client.callTool("mrtr_roots_round", Map.of());
+      if (((Number)object(roots.get("structuredContent")).get("roots")).intValue() != 1) throw new IllegalStateException("roots MRTR failed: " + roots);
+      AxMCPClient.CatalogSnapshot catalog = client.inspectCatalog();
+      if (toolLists.get() != 1 || !failures.isEmpty() || "1.0.1".equals(catalog.serverInfo().get("version"))) throw new IllegalStateException("modern roundtrip failed: toolLists=" + toolLists + " failures=" + failures + " serverInfo=" + catalog.serverInfo());
+      client.close();
+    } finally { server.stop(0); }
+    System.out.println("mcp-modern-roundtrip-ok");
+  }
+}
+`
+
+const javaMCPSseRoundtripExample = `import com.sun.net.httpserver.HttpServer;
+import dev.axllm.ax.*;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.util.Map;
+
+// Drive AxMCPStreamableHTTPTransport.send() through the REAL HttpClient transport
+// against an in-process com.sun.net.httpserver loopback that answers the JSON-RPC
+// POST with Content-Type: text/event-stream -- the MCP Streamable HTTP SSE path
+// the ScriptedTransport conformance fixtures bypass. The SSE body interleaves a
+// notification ahead of the id-matched response, so a transport that ignored the
+// Content-Type (JSON-decoding the raw stream) or returned the first data frame
+// would fail. Exits non-zero on any mismatch so axir verify fails if the SSE
+// branch regresses.
+public final class AxMCPSseRoundtripExample {
+  public static void main(String[] args) throws Exception {
+    String sseBody =
+        ": keepalive\n"
+            + "event: message\n"
+            + "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{\"level\":\"info\"}}\n"
+            + "\n"
+            + "event: message\n"
+            + "data: {\"jsonrpc\":\"2.0\",\"id\":\"ax-sse-1\",\"result\":{\"ok\":true,\"protocolVersion\":\"2025-11-25\"}}\n"
+            + "\n";
+
+    HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    server.createContext(
+        "/",
+        exchange -> {
+          if ("GET".equals(exchange.getRequestMethod())) {
+            exchange.sendResponseHeaders(405, -1);
+            exchange.close();
+            return;
+          }
+          String requestBody = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+          String responseBody;
+          String contentType = "application/json";
+          if (requestBody.contains("server/discover")) {
+            responseBody = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}";
+          } else if (requestBody.contains("\"method\":\"initialize\"")) {
+            responseBody = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-loopback\",\"version\":\"1.0.0\"}}}";
+          } else if (requestBody.contains("notifications/initialized")) {
+            responseBody = "";
+          } else {
+            responseBody = sseBody.replace("\"ax-sse-1\"", "3");
+            contentType = "text/event-stream";
+          }
+          byte[] resp = responseBody.getBytes(StandardCharsets.UTF_8);
+          exchange.getResponseHeaders().set("Content-Type", contentType);
+          exchange.sendResponseHeaders(200, resp.length);
+          try (OutputStream os = exchange.getResponseBody()) {
+            os.write(resp);
+          }
+        });
+    server.start();
+    int port = server.getAddress().getPort();
+
+    try {
+      AxMCPStreamableHTTPTransport transport =
+          new AxMCPStreamableHTTPTransport(
+              "http://127.0.0.1:" + port + "/mcp",
+              Map.of(
+                  "ssrfProtection",
+                  Map.of(
+                      "requireHttps", false, "allowLocalhost", true, "allowPrivateNetworks", true)));
+      AxMCPClient client = new AxMCPClient(transport);
+      client.init();
+      if (!"legacy".equals(client.getEra()))
+        throw new RuntimeException("auto discovery did not fall back to legacy");
+      Map<String, Object> result = client.callTool("noop", Map.of());
+      boolean ok = Boolean.TRUE.equals(result.get("ok"));
+      if (!ok)
+        throw new RuntimeException(
+            "SSE result not decoded from text/event-stream body: " + result);
+      client.close();
+    } finally {
+      server.stop(0);
+    }
+    System.out.println("mcp-sse-roundtrip-ok");
+  }
+}
+`
+
+const javaStreamHTTPRoundtripExample = `import com.sun.net.httpserver.HttpServer;
+import dev.axllm.ax.*;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+
+// Drive a streaming stream() through the REAL HttpClient transport against an
+// in-process com.sun.net.httpserver loopback that returns a spec-legal
+// text/event-stream body with a MULTI-LINE data: event and CRLF line endings.
+// The conformance ScriptedTransport only ever feeds single-line data: JSON, so
+// this is the only end-to-end coverage for the SSE line-folding that
+// src/ax/util/sse.ts performs. Exits non-zero on any mismatch so ` + "`axir verify`" + `
+// fails if the folding regresses.
+public final class StreamHTTPRoundtripExample {
+  public static void main(String[] args) throws Exception {
+    // One logical delta whose JSON is split across two data: lines (folded with
+    // "\n"), then a single-line delta, then [DONE]. Every line uses CRLF.
+    String event1a = "{\"id\":\"chatcmpl_stream\",\"model\":\"gpt-5.4-mini\",\"choices\":[{\"index\":0,\"delta\":";
+    String event1b = "{\"content\":\"Hello \"}}]}";
+    String event2 = "{\"id\":\"chatcmpl_stream\",\"model\":\"gpt-5.4-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world\"},\"finish_reason\":\"stop\"}]}";
+    String sseBody =
+        "data: " + event1a + "\r\n"
+            + "data: " + event1b + "\r\n"
+            + "\r\n"
+            + "data: " + event2 + "\r\n"
+            + "\r\n"
+            + "data: [DONE]\r\n"
+            + "\r\n";
+    byte[] sseBytes = sseBody.getBytes(StandardCharsets.UTF_8);
+
+    HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    server.createContext(
+        "/",
+        exchange -> {
+          exchange.getRequestBody().readAllBytes();
+          exchange.getResponseHeaders().set("Content-Type", "text/event-stream");
+          exchange.sendResponseHeaders(200, sseBytes.length);
+          try (OutputStream os = exchange.getResponseBody()) {
+            os.write(sseBytes);
+          }
+        });
+    server.start();
+    int port = server.getAddress().getPort();
+
+    try {
+      OpenAICompatibleClient client =
+          new OpenAICompatibleClient(
+              Map.of("api_key", "test-key", "base_url", "http://127.0.0.1:" + port, "model", "gpt-5.4-mini"));
+      List<String> deltas = new ArrayList<>();
+      for (Map<String, Object> event :
+          client.stream(Map.of("chat_prompt", List.of(Map.of("role", "user", "content", "stream"))))) {
+        Object results = event.get("results");
+        if (results instanceof List<?> list && !list.isEmpty() && list.get(0) instanceof Map<?, ?> first) {
+          Object content = first.get("content");
+          if (content instanceof String s && !s.isEmpty()) deltas.add(s);
+        }
+      }
+      if (deltas.isEmpty() || !"Hello ".equals(deltas.get(0)))
+        throw new RuntimeException("multi-line data: event was not folded into one JSON value: " + deltas);
+      if (!"Hello world".equals(String.join("", deltas)))
+        throw new RuntimeException("bad stream fold: " + deltas);
+    } finally {
+      server.stop(0);
+    }
+    System.out.println("stream-http-roundtrip-ok");
+  }
+}
+`
+
+const javaRealtimeAudioEventsExample = `import dev.axllm.ax.*;
+import java.util.*;
+
+public final class RealtimeAudioEventsExample {
+  public static void main(String[] args) {
+    GrokClient grok =
+        new GrokClient(Map.of("model", "grok-voice-think-fast-1.0", "api_key", "test-key"));
+    Map<String, Object> grokRequest =
+        Map.of(
+            "model",
+            "grok-voice-think-fast-1.0",
+            "chat_prompt",
+            List.of(
+                Map.of("role", "system", "content", "You are a concise voice agent."),
+                Map.of("role", "user", "content", "Say hello.")),
+            "audio",
+            Map.of(
+                "input",
+                Map.of("sampleRate", 24000),
+                "output",
+                Map.of("sampleRate", 24000, "voice", "eve")));
+    List<Object> grokEvents =
+        List.of(
+            Map.of("type", "response.output_audio_transcript.delta", "response_id", "grok_rt", "delta", "hello "),
+            Map.of("type", "response.output_audio.delta", "response_id", "grok_rt", "delta", "AQI="),
+            Map.of(
+                "type",
+                "response.done",
+                "response",
+                Map.of(
+                    "id",
+                    "grok_rt",
+                    "usage",
+                    Map.of("input_tokens", 3, "output_tokens", 2, "total_tokens", 5))));
+
+    GoogleGeminiClient gemini =
+        new GoogleGeminiClient(
+            Map.of("model", "gemini-2.5-flash-native-audio-preview-12-2025", "api_key", "test-key"));
+    Map<String, Object> geminiRequest =
+        Map.of(
+            "model",
+            "gemini-2.5-flash-native-audio-preview-12-2025",
+            "chat_prompt",
+            List.of(
+                Map.of("role", "system", "content", "Answer with audio."),
+                Map.of(
+                    "role",
+                    "user",
+                    "content",
+                    List.of(
+                        Map.of("type", "text", "text", "Realtime question"),
+                        Map.of("type", "audio", "data", "AAAA", "format", "pcm16", "sampleRate", 16000)))),
+            "audio",
+            Map.of("output", Map.of("transcript", true, "voice", "Kore")));
+    List<Object> geminiEvents =
+        List.of(
+            Map.of("id", "gemini_live_1", "serverContent", Map.of("outputTranscription", Map.of("text", "spoken "))),
+            Map.of(
+                "id",
+                "gemini_live_2",
+                "serverContent",
+                Map.of(
+                    "modelTurn",
+                    Map.of("parts", List.of(Map.of("inlineData", Map.of("data", "AQI=", "mimeType", "audio/pcm")))))),
+            Map.of(
+                "id",
+                "gemini_live_3",
+                "toolCall",
+                Map.of("functionCalls", List.of(Map.of("name", "lookup", "args", Map.of("q", "ax"))))),
+            Map.of(
+                "id",
+                "gemini_live_done",
+                "serverContent",
+                Map.of("turnComplete", true),
+                "usageMetadata",
+                Map.of("promptTokenCount", 3, "candidatesTokenCount", 4, "totalTokenCount", 7)));
+
+    System.out.println("grok setup:");
+    System.out.println(Json.stringify(grok.realtimeAudioSetup(grokRequest)));
+    System.out.println("grok normalized events:");
+    System.out.println(Json.stringify(grok.realtime(grokEvents)));
+    System.out.println("gemini setup:");
+    System.out.println(Json.stringify(gemini.realtimeAudioSetup(geminiRequest)));
+    System.out.println("gemini input messages:");
+    System.out.println(Json.stringify(gemini.realtimeAudioInput(geminiRequest)));
+    System.out.println("gemini normalized events:");
+    System.out.println(Json.stringify(gemini.realtime(geminiEvents)));
+  }
+}
+`
+
+const javaRealtimeAudioTurnExample = `import dev.axllm.ax.*;
+import java.util.*;
+
+// Drive a realtime audio TURN through the productized realtimeChat driver using
+// ScriptedRealtimeTransport: the deterministic, credential-free path that
+// exercises the full send-setup -> send-input -> fold -> merge loop without a
+// live socket (the live socket path is verified separately against the real
+// API). Exits non-zero on any mismatch so ` + "`axir verify`" + ` fails if it regresses.
+public final class RealtimeAudioTurnExample {
+  public static void main(String[] args) {
+    GrokClient client =
+        new GrokClient(Map.of("model", "grok-voice-think-fast-1.0", "api_key", "test-key"));
+    Map<String, Object> request =
+        Map.of(
+            "model", "grok-voice-think-fast-1.0",
+            "chat_prompt",
+            List.of(
+                Map.of("role", "system", "content", "You are a concise voice agent."),
+                Map.of("role", "user", "content", "Say hello.")),
+            "audio", Map.of("output", Map.of("voice", "eve")));
+    // Canned server frames: session handshake, two transcript deltas, an audio
+    // delta, then the terminal response.done.
+    List<Object> inbound =
+        List.of(
+            Map.of("type", "session.created"),
+            Map.of("type", "session.updated"),
+            Map.of("type", "response.output_audio_transcript.delta", "response_id", "rt", "delta", "hel"),
+            Map.of("type", "response.output_audio_transcript.delta", "response_id", "rt", "delta", "lo"),
+            Map.of("type", "response.output_audio.delta", "response_id", "rt", "delta", "AQI="),
+            Map.of("type", "response.done", "response", Map.of("id", "rt", "usage", Map.of("input_tokens", 3, "output_tokens", 2, "total_tokens", 5))));
+
+    OpenAICompatibleClient.ScriptedRealtimeTransport transport =
+        new OpenAICompatibleClient.ScriptedRealtimeTransport(inbound);
+    Map<String, Object> finalResponse = client.realtimeChat(request, transport);
+    @SuppressWarnings("unchecked")
+    List<Object> results = (List<Object>) finalResponse.get("results");
+    @SuppressWarnings("unchecked")
+    Map<String, Object> result = (Map<String, Object>) results.get(0);
+
+    List<Object> sentTypes = new ArrayList<>();
+    for (Map<String, Object> event : transport.sent) sentTypes.add(event.get("type"));
+    System.out.println("driver sent: " + sentTypes);
+    System.out.println("merged result: " + finalResponse);
+
+    // The driver must send the Core-built session.update first, then the inputs.
+    if (!List.of("session.update", "conversation.item.create", "response.create").equals(sentTypes)) {
+      fail("unexpected sent event order", finalResponse);
+    }
+    // Transcript deltas concatenated, audio chunk surfaced, turn finished.
+    if (!"hello".equals(result.get("content"))) fail("transcript not concatenated", finalResponse);
+    if (!"stop".equals(result.get("finish_reason"))) fail("turn did not finish", finalResponse);
+    Object audio = result.get("audio");
+    if (!(audio instanceof Map) || !"AQI=".equals(((Map<?, ?>) audio).get("data"))) {
+      fail("audio chunk not surfaced", finalResponse);
+    }
+    System.out.println("realtime-audio-turn-ok");
+  }
+
+  private static void fail(String message, Object detail) {
+    System.out.println("realtime-audio-turn FAIL: " + message + " " + detail);
+    System.exit(1);
+  }
+}
+`
+
+const javaGEPALocalOptimizerExample = `import dev.axllm.ax.*;
+import java.util.*;
+
+public final class GEPALocalOptimizerExample {
+  static final class LocalEvaluator implements OptimizerEvaluator {
+    public Map<String, Object> evaluate(Map<String, Object> candidateMap, Map<String, Object> options) {
+      String instruction = String.valueOf(candidateMap.getOrDefault("qa::instruction", ""));
+      List<?> examples = (List<?>) ((Map<?, ?>) options.get("dataset")).get("train");
+      List<Map<String, Object>> rows = new ArrayList<>();
+      double total = 0;
+      for (Object example : examples) {
+        double quality = instruction.toLowerCase(Locale.ROOT).contains("concise") ? 0.9 : 0.65;
+        double brevity = 0.8;
+        double scalar = (quality + brevity) / 2.0;
+        total += scalar;
+        rows.add(
+            Map.of(
+                "input",
+                example,
+                "prediction",
+                Map.of("answer", "Ax composes typed LLM programs."),
+                "scores",
+                Map.of("quality", quality, "brevity", brevity),
+                "scalar",
+                scalar));
+      }
+      return Map.of("rows", rows, "avg", total / rows.size(), "sum", total, "count", rows.size());
+    }
+  }
+
+  public static void main(String[] args) {
+    Map<String, Object> request =
+        Map.of(
+            "programKind",
+            "axgen",
+            "components",
+            List.of(
+                Map.of(
+                    "id",
+                    "qa::instruction",
+                    "owner",
+                    "qa",
+                    "kind",
+                    "instruction",
+                    "current",
+                    "Answer clearly and concisely.")),
+            "dataset",
+            Map.of(
+                "train",
+                List.of(Map.of("question", "What is Ax?"), Map.of("question", "Why use typed signatures?")),
+                "validation",
+                List.of(Map.of("question", "Summarize Ax."))),
+            "options",
+            Map.of("numTrials", 0, "maxMetricCalls", 8, "seed", 7));
+
+    Map<String, Object> artifact = new AxGEPA(null, Map.of("seed", 7)).optimize(request, new LocalEvaluator());
+    System.out.println(
+        Json.stringify(
+            Map.of("componentMap", artifact.get("componentMap"), "metadata", artifact.get("metadata"))));
+  }
+}
+`
+
+const javaACEPlaybookExample = `import dev.axllm.ax.*;
+import java.util.*;
+import java.util.function.Function;
+
+public final class ACEPlaybookExample {
+  // A scripted client stands in for a real provider so this example runs without
+  // a key. Swap it for Ax.ai("openai", ...) to grow a playbook against a live
+  // model. The canned JSON satisfies the bound program AND the playbook's internal
+  // reflector/curator sub-programs, so the full ACE loop is exercised offline.
+  static final class ScriptedClient implements AiClient {
+    public Map<String, Object> complete(Map<String, Object> request) {
+      String content = "{"
+          + "\"answer\":\"Ax composes typed LLM programs.\","
+          + "\"reasoning\":\"The playbook lacked a brevity rule.\","
+          + "\"errorIdentification\":\"Answer was too verbose.\","
+          + "\"rootCauseAnalysis\":\"No guidance on conciseness.\","
+          + "\"correctApproach\":\"Add a concise-answer guideline.\","
+          + "\"keyInsight\":\"Prefer one-sentence answers.\","
+          + "\"weaknessDescription\":\"The agent does not verify its final step.\","
+          + "\"rootCause\":\"The final step is accepted without a check.\","
+          + "\"proposedGuidance\":\"Verify the final step before completing the task.\","
+          + "\"evidenceQuotes\":[\"final\",\"snapshot\",\"Answer\"],"
+          + "\"configRecommendations\":[],"
+          + "\"bulletTags\":[],"
+          + "\"operations\":[{\"type\":\"ADD\",\"section\":\"Guidelines\",\"content\":\"Answer in one concise sentence.\"}]"
+          + "}";
+      return Map.of("content", content);
+    }
+  }
+
+  public static void main(String[] args) {
+    ScriptedClient client = new ScriptedClient();
+    AxGen program = Ax.ax("question:string -> answer:string");
+    program.setInstruction("Answer the question.");
+
+    AxPlaybook pb = Ax.playbook(program, Map.of("studentAI", client, "maxEpochs", 1));
+
+    Function<Map<String, Object>, Object> metric = a -> {
+      Object prediction = a.get("prediction");
+      if (prediction instanceof Map<?, ?> map) {
+        Object answer = map.get("answer");
+        if (answer instanceof String s && !s.isEmpty()) return 1.0;
+      }
+      return 0.0;
+    };
+
+    List<Object> examples = List.of(Map.of("question", "What is Ax?"), Map.of("question", "Why typed signatures?"));
+    Map<String, Object> result = pb.evolve(examples, metric, Map.of());
+    String rendered = pb.render();
+    Map<String, Object> state = pb.toJson();
+    if (!result.containsKey("bestScore")) throw new RuntimeException("missing bestScore: " + result);
+    if (!state.containsKey("playbook")) throw new RuntimeException("missing playbook: " + state);
+    System.out.println("rendered: " + rendered);
+    System.out.println("java-ace-playbook-ok");
+  }
+}
+`
+
+const javaAgentPlaybookExample = `import dev.axllm.ax.*;
+import java.util.*;
+
+public final class AgentPlaybookExample {
+  // The actor returns model-authored Python code and a real runtime executes it.
+  // The same offline response also satisfies the playbook reflector and curator.
+  static final class ScriptedClient implements AiClient {
+    public Map<String, Object> complete(Map<String, Object> request) {
+      String content = "{"
+          + "\"pythonCode\":\"final('Answer', {'answer': 'Ax composes typed LLM programs.'})\","
+          + "\"answer\":\"Ax composes typed LLM programs.\","
+          + "\"reasoning\":\"The playbook lacked a brevity rule.\","
+          + "\"errorIdentification\":\"Answer was too verbose.\","
+          + "\"rootCauseAnalysis\":\"No guidance on conciseness.\","
+          + "\"correctApproach\":\"Add a concise-answer guideline.\","
+          + "\"keyInsight\":\"Prefer one-sentence answers.\","
+          + "\"weaknessDescription\":\"The agent does not verify its final step.\","
+          + "\"rootCause\":\"The final step is accepted without a check.\","
+          + "\"proposedGuidance\":\"Verify the final step before completing the task.\","
+          + "\"evidenceQuotes\":[\"final\",\"snapshot\",\"Answer\"],"
+          + "\"configRecommendations\":[],"
+          + "\"bulletTags\":[],"
+          + "\"operations\":[{\"type\":\"ADD\",\"section\":\"Guidelines\",\"content\":\"Answer in one concise sentence.\"}]"
+          + "}";
+      return Map.of("content", content);
+    }
+  }
+
+  static final class Runtime implements AxCodeRuntime {
+    public String language() { return "Python"; }
+    public AxCodeSession createSession(Map<String, Object> globals, Map<String, Object> options) {
+      return new AxCodeSession() {
+        public Object execute(String code, Map<String, Object> executeOptions) {
+          if (code.contains("pythonCode")) throw new RuntimeException("runtime received a response wrapper instead of code");
+          return AxRuntimeEnvelope.finalPayload(Map.of("answer", "Ax composes typed LLM programs."));
+        }
+        public Object snapshotGlobals(Map<String, Object> options) {
+          return Map.of("version", 1, "bindings", Map.of(), "globals", Map.of(), "closed", false);
+        }
+        public Object patchGlobals(Object snapshot, Map<String, Object> options) { return snapshot; }
+        public Object close() { return Map.of("closed", true); }
+      };
+    }
+  }
+
+  public static void main(String[] args) {
+    ScriptedClient client = new ScriptedClient();
+    Runtime runtime = new Runtime();
+    // agent.playbook() binds an evolving context playbook to an agent stage. The
+    // "responder" target grows the user-facing answer stage; ACE remains an
+    // implementation detail behind playbook(), just as optimize() hides GEPA.
+    AxAgent agent = Ax.agent("question:string -> answer:string", Map.of(
+        "name", "qa", "description", "Answer the question.", "ai", client, "runtime", runtime));
+
+    AxPlaybook pb = agent.playbook(Map.of("target", "responder", "studentAI", client, "maxEpochs", 1));
+    Map<String, Object> dataset = Map.of(
+        "train", List.of(Map.of("input", Map.of("question", "Answer briefly."), "score", 0)));
+
+    // A zero minimum gain exercises verified acceptance. A positive minimum gain
+    // rejects the same flat score and must restore the exact pre-proposal snapshot.
+    Map<String, Object> accepted = pb.evolve(dataset, Map.of(
+        "verify", true, "minHeldInGain", 0, "maxProposals", 1, "maxMetricCalls", 2));
+    String beforeRejection = Json.stringify(pb.toJson());
+    Map<String, Object> rejected = pb.evolve(dataset, Map.of(
+        "verify", true, "minHeldInGain", 0.1, "maxProposals", 1, "maxMetricCalls", 2));
+    String afterRejection = Json.stringify(pb.toJson());
+
+    Map<?, ?> acceptedOutcome = (Map<?, ?>) ((List<?>) accepted.get("outcomes")).get(0);
+    Map<?, ?> rejectedOutcome = (Map<?, ?>) ((List<?>) rejected.get("outcomes")).get(0);
+    if (((Number) accepted.get("metricCallsUsed")).intValue() != 2 || !Boolean.TRUE.equals(acceptedOutcome.get("accepted"))) {
+      throw new RuntimeException("verified acceptance failed: " + accepted);
+    }
+    if (((Number) rejected.get("metricCallsUsed")).intValue() != 2 || !Boolean.FALSE.equals(rejectedOutcome.get("accepted"))) {
+      throw new RuntimeException("verified rejection failed: " + rejected);
+    }
+    if (!afterRejection.equals(beforeRejection)) throw new RuntimeException("rejected proposal was not rolled back exactly");
+    if (!pb.toJson().containsKey("playbook")) throw new RuntimeException("missing playbook: " + pb.toJson());
+    System.out.println("accepted: " + acceptedOutcome);
+    System.out.println("rejected: " + rejectedOutcome);
+    System.out.println("java-agent-playbook-ok");
+  }
+}
+`
+
+const cppProviderStreamNoKeyExample = `#include "axllm/axllm.hpp"
+#include <iostream>
+#include <string>
+
+struct ScriptedTransport : axllm::Transport {
+  axllm::Value call(axllm::Value) override {
+    return axllm::object({
+      {"status", 200},
+      {"body",
+       "data: {\"id\":\"chatcmpl_stream\",\"model\":\"gpt-5.4-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hel\"}}]}\n\n"
+       "data: {\"id\":\"chatcmpl_stream\",\"model\":\"gpt-5.4-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n"
+       "data: [DONE]\n\n"}
+    });
+  }
+};
+
+int main() {
+  ScriptedTransport transport;
+  axllm::OpenAICompatibleClient client(axllm::object({{"api_key", "test-key"}, {"model", "gpt-5.4-mini"}}), &transport);
+  std::string text;
+  for (const auto& event : client.stream(axllm::object({
+         {"chat_prompt", axllm::array({axllm::object({{"role", "user"}, {"content", "stream"}})})}
+       }))) {
+    text += axllm::display(axllm::Core::get(axllm::Core::get(axllm::Core::get(event, "results"), 0), "content", ""));
+  }
+  if (text != "hello") return 1;
+  std::cout << "cpp-provider-stream-no-key " << text << "\n";
+}
+`
+
+const cppAudioHTTPRoundtripExample = `#include "axllm/axllm.hpp"
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <cctype>
+#include <cstring>
+#include <iostream>
+#include <string>
+#include <thread>
+
+// Drive transcribe()/speak() through the REAL libcurl HttpTransport against an
+// in-process loopback server, exercising the wire-level encoders the conformance
+// ScriptedTransport bypasses: the multipart/form-data request body (transcribe)
+// and binary (non-UTF8) response handling (speak). Returns non-zero on any
+// mismatch so axir verify fails if either regresses. Requires libcurl
+// (AXLLM_ENABLE_CURL); axir verify skips it when libcurl is unavailable.
+
+namespace {
+
+struct Request {
+  std::string line;
+  std::string content_type;
+  std::string body;
+};
+
+Request read_request(int fd) {
+  Request req;
+  std::string buf;
+  char tmp[4096];
+  size_t header_end = 0;
+  while (true) {
+    size_t pos = buf.find("\r\n\r\n");
+    if (pos != std::string::npos) {
+      header_end = pos + 4;
+      break;
+    }
+    ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+    if (n <= 0) {
+      header_end = buf.size();
+      break;
+    }
+    buf.append(tmp, static_cast<size_t>(n));
+  }
+  std::string headers = buf.substr(0, header_end);
+  size_t eol = headers.find("\r\n");
+  req.line = headers.substr(0, eol == std::string::npos ? headers.size() : eol);
+  size_t content_length = 0;
+  size_t start = (eol == std::string::npos) ? headers.size() : eol + 2;
+  while (start < headers.size()) {
+    size_t next = headers.find("\r\n", start);
+    std::string line =
+        headers.substr(start, (next == std::string::npos ? headers.size() : next) - start);
+    std::string lower = line;
+    for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (lower.rfind("content-type:", 0) == 0) {
+      req.content_type = line.substr(line.find(':') + 1);
+      while (!req.content_type.empty() && req.content_type.front() == ' ') {
+        req.content_type.erase(req.content_type.begin());
+      }
+    } else if (lower.rfind("content-length:", 0) == 0) {
+      content_length = std::stoul(line.substr(line.find(':') + 1));
+    }
+    if (next == std::string::npos) break;
+    start = next + 2;
+  }
+  req.body = buf.substr(header_end);
+  while (req.body.size() < content_length) {
+    ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+    if (n <= 0) break;
+    req.body.append(tmp, static_cast<size_t>(n));
+  }
+  return req;
+}
+
+void write_response(int fd, const std::string& content_type, const std::string& body) {
+  std::string out = "HTTP/1.1 200 OK\r\nContent-Type: " + content_type +
+                    "\r\nContent-Length: " + std::to_string(body.size()) +
+                    "\r\nConnection: close\r\n\r\n" + body;
+  size_t off = 0;
+  while (off < out.size()) {
+    ssize_t n = send(fd, out.data() + off, out.size() - off, 0);
+    if (n <= 0) break;
+    off += static_cast<size_t>(n);
+  }
+}
+
+}  // namespace
+
+int main() {
+  // Deliberately non-UTF8 bytes so a UTF-8/JSON decode regression corrupts them.
+  const char audio_raw[] = {0x00, 0x01, 0x02, static_cast<char>(0xff),
+                            static_cast<char>(0xfe), 0x10, 0x7f};
+  const std::string audio_bytes(audio_raw, sizeof(audio_raw));
+  const std::string audio_b64 = "AAEC//4Qfw==";
+  const char speech_raw[] = {static_cast<char>(0xff), static_cast<char>(0xd8),
+                             static_cast<char>(0xff), 0x00, 0x11, 0x22, static_cast<char>(0xfe)};
+  const std::string speech_bytes(speech_raw, sizeof(speech_raw));
+  const std::string want_audio = "/9j/ABEi/g==";
+
+  int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (server_fd < 0) {
+    std::cerr << "socket failed\n";
+    return 1;
+  }
+  int opt = 1;
+  setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = 0;
+  if (bind(server_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+    std::cerr << "bind failed\n";
+    return 1;
+  }
+  if (listen(server_fd, 4) < 0) {
+    std::cerr << "listen failed\n";
+    return 1;
+  }
+  socklen_t alen = sizeof(addr);
+  getsockname(server_fd, reinterpret_cast<sockaddr*>(&addr), &alen);
+  int port = ntohs(addr.sin_port);
+
+  bool saw_multipart = false;
+  bool file_present = false;
+  std::thread server([&]() {
+    for (int handled = 0; handled < 2; ++handled) {
+      int fd = accept(server_fd, nullptr, nullptr);
+      if (fd < 0) break;
+      Request req = read_request(fd);
+      if (req.line.find("/audio/transcriptions") != std::string::npos) {
+        saw_multipart = req.content_type.rfind("multipart/form-data; boundary=", 0) == 0;
+        file_present = req.body.find(audio_bytes) != std::string::npos;
+        write_response(fd, "application/json",
+                       "{\"text\":\"hello world\",\"language\":\"en\",\"duration\":1.25}");
+      } else if (req.line.find("/audio/speech") != std::string::npos) {
+        write_response(fd, "audio/mpeg", speech_bytes);
+      } else {
+        write_response(fd, "text/plain", "");
+      }
+      close(fd);
+    }
+  });
+
+  axllm::OpenAIResponsesClient client(
+      axllm::object({{"api_key", "test-key"},
+                     {"base_url", std::string("http://127.0.0.1:") + std::to_string(port)}}),
+      nullptr);
+  axllm::Value transcript = client.transcribe(axllm::object({{"audio", audio_b64},
+                                                             {"language", "en"},
+                                                             {"model", "gpt-4o-mini-transcribe"},
+                                                             {"format", "json"}}));
+  axllm::Value speech = client.speak(axllm::object(
+      {{"text", "hello"}, {"voice", "alloy"}, {"format", "mp3"}, {"model", "gpt-4o-mini-tts"}}));
+
+  server.join();
+  close(server_fd);
+
+  if (!saw_multipart) {
+    std::cerr << "loopback server never received a multipart transcribe request\n";
+    return 1;
+  }
+  if (!file_present) {
+    std::cerr << "multipart body did not contain the decoded file bytes\n";
+    return 1;
+  }
+  if (!axllm::equal(axllm::Core::get(transcript, "text"), "hello world")) {
+    std::cerr << "transcribe response not normalized: " << axllm::stringify(transcript) << "\n";
+    return 1;
+  }
+  if (!axllm::equal(axllm::Core::get(speech, "audio"), want_audio)) {
+    std::cerr << "speak binary response not base64-encoded as expected: "
+              << axllm::stringify(speech) << "\n";
+    return 1;
+  }
+  std::cout << "audio-http-roundtrip-ok\n";
+  return 0;
+}
+`
+
+const cppMCPModernRoundtripExample = `#include "axllm/axllm.hpp"
+#include "axllm/mcp.hpp"
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <cctype>
+#include <iostream>
+#include <memory>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+std::string read_request(int fd) {
+  std::string buf; char tmp[4096]; size_t end=std::string::npos, length=0;
+  while (true) {
+    if (end==std::string::npos) { auto pos=buf.find("\r\n\r\n"); if(pos!=std::string::npos){end=pos+4;std::string headers=buf.substr(0,end);std::string lower=headers;for(char& c:lower)c=static_cast<char>(std::tolower(static_cast<unsigned char>(c)));auto at=lower.find("content-length:");if(at!=std::string::npos)length=std::stoul(lower.substr(at+15));} }
+    if(end!=std::string::npos&&buf.size()>=end+length)break;
+    auto count=recv(fd,tmp,sizeof(tmp),0);if(count<=0)break;buf.append(tmp,static_cast<size_t>(count));
+  }
+  return buf;
+}
+void respond(int fd,const std::string& body){std::string out="HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "+std::to_string(body.size())+"\r\nConnection: close\r\n\r\n"+body;size_t offset=0;while(offset<out.size()){auto count=send(fd,out.data()+offset,out.size()-offset,0);if(count<=0)break;offset+=static_cast<size_t>(count);}}
+}
+
+int main() {
+  int server_fd=socket(AF_INET,SOCK_STREAM,0);int opt=1;setsockopt(server_fd,SOL_SOCKET,SO_REUSEADDR,&opt,sizeof(opt));
+  sockaddr_in address{};address.sin_family=AF_INET;address.sin_addr.s_addr=htonl(INADDR_LOOPBACK);address.sin_port=0;
+  if(bind(server_fd,reinterpret_cast<sockaddr*>(&address),sizeof(address))<0||listen(server_fd,8)<0)return 1;
+  socklen_t size=sizeof(address);getsockname(server_fd,reinterpret_cast<sockaddr*>(&address),&size);int port=ntohs(address.sin_port);
+  int calls=0,tool_lists=0;std::vector<std::string> failures;
+  std::thread server([&]{
+    bool done=false;while(!done){int fd=accept(server_fd,nullptr,nullptr);if(fd<0)return;std::string request=read_request(fd);++calls;
+      std::string method=request.find("server/discover")!=std::string::npos?"server/discover":request.find("tools/list")!=std::string::npos?"tools/list":request.find("tasks/get")!=std::string::npos?"tasks/get":request.find("start_reindex")!=std::string::npos?"start_reindex":request.find("mrtr_roots_round")!=std::string::npos?"mrtr_roots_round":request.find("initialize")!=std::string::npos?"initialize":"unknown";
+      if(method=="initialize")failures.push_back("modern client sent initialize");if(method!="server/discover"&&request.find("io.modelcontextprotocol")==std::string::npos)failures.push_back(method+" omitted request _meta");
+      std::string meta="\"_meta\":{\"io.modelcontextprotocol/serverInfo\":{\"name\":\"modern-loopback\",\"version\":\"1.0."+std::to_string(calls)+"\"}}";
+      std::string result;
+      if(method=="server/discover")result="{\"resultType\":\"complete\",\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{\"tools\":{},\"extensions\":{\"io.modelcontextprotocol/tasks\":{}}},\"ttlMs\":60000,\"cacheScope\":\"public\","+meta+"}";
+      else if(method=="tools/list"){++tool_lists;result="{\"resultType\":\"complete\",\"tools\":[{\"name\":\"start_reindex\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"scope\":{\"type\":\"string\",\"x-mcp-header\":\"Scope\"}}}},{\"name\":\"mrtr_roots_round\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}],\"ttlMs\":60000,\"cacheScope\":\"public\","+meta+"}";}
+      else if(method=="start_reindex"){std::string lower=request;for(char& c:lower)c=static_cast<char>(std::tolower(static_cast<unsigned char>(c)));if(lower.find("mcp-param-scope: all")==std::string::npos)failures.push_back("Mcp-Param-Scope was not propagated");result="{\"resultType\":\"task\",\"taskId\":\"task-1\",\"status\":\"working\",\"createdAt\":\"2026-07-29T00:00:00Z\",\"lastUpdatedAt\":\"2026-07-29T00:00:00Z\",\"ttlMs\":null,"+meta+"}";}
+      else if(method=="tasks/get")result="{\"taskId\":\"task-1\",\"status\":\"completed\",\"createdAt\":\"2026-07-29T00:00:00Z\",\"lastUpdatedAt\":\"2026-07-29T00:00:01Z\",\"ttlMs\":null,\"result\":{\"resultType\":\"complete\",\"structuredContent\":{\"indexed\":42},"+meta+"},"+meta+"}";
+      else if(request.find("requestState")==std::string::npos)result="{\"resultType\":\"input_required\",\"inputRequests\":{\"roots\":{\"method\":\"roots/list\"}},\"requestState\":\"opaque-roots-state\","+meta+"}";
+      else {if(request.find("opaque-roots-state")==std::string::npos||request.find("file:///workspace")==std::string::npos)failures.push_back("roots MRTR response was not echoed");result="{\"resultType\":\"complete\",\"structuredContent\":{\"roots\":1},"+meta+"}";done=true;}
+      respond(fd,"{\"jsonrpc\":\"2.0\",\"id\":"+std::to_string(calls)+",\"result\":"+result+"}");close(fd);
+    }
+  });
+
+  auto transport=std::make_shared<axllm::AxMCPStreamableHTTPTransport>("http://127.0.0.1:"+std::to_string(port)+"/mcp",axllm::object({{"ssrfProtection",axllm::object({{"requireHttps",false},{"allowLocalhost",true},{"allowPrivateNetworks",true}})}}));
+  axllm::AxMCPClient client(transport,axllm::object({{"era","modern"},{"roots",axllm::array({axllm::object({{"uri","file:///workspace"},{"name","workspace"}})})}}));
+  client.init();if(client.get_era()!="modern")return 1;client.refresh(false);
+  auto task=client.call_tool("start_reindex",axllm::object({{"scope","all"}}));if(axllm::Core::number(axllm::Core::get(axllm::Core::get(task,"structuredContent",axllm::Value::object()),"indexed",0))!=42)return 1;
+  auto roots=client.call_tool("mrtr_roots_round",axllm::Value::object());if(axllm::Core::number(axllm::Core::get(axllm::Core::get(roots,"structuredContent",axllm::Value::object()),"roots",0))!=1)return 1;
+  auto catalog=client.inspect_catalog(false);client.close();server.join();close(server_fd);
+  if(tool_lists!=1||!failures.empty()||axllm::display(axllm::Core::get(catalog.server_info,"version",""))=="1.0.1"){std::cerr<<"modern roundtrip failed\n";return 1;}
+  std::cout<<"mcp-modern-roundtrip-ok\n";return 0;
+}
+`
+
+const cppMCPSseRoundtripExample = `#include "axllm/axllm.hpp"
+#include "axllm/mcp.hpp"
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <cctype>
+#include <iostream>
+#include <memory>
+#include <string>
+#include <thread>
+
+// Drive AxMCPStreamableHTTPTransport::send() through the REAL libcurl
+// HttpTransport against an in-process loopback server that answers the JSON-RPC
+// POST with Content-Type: text/event-stream -- the MCP Streamable HTTP SSE path
+// the ScriptedTransport conformance fixtures bypass. The SSE body interleaves a
+// notification ahead of the id-matched response, so a transport that ignored the
+// Content-Type (JSON-decoding the raw stream) or returned the first data frame
+// would fail. Returns non-zero on any mismatch so axir verify fails if the SSE
+// branch regresses. Requires libcurl (AXLLM_ENABLE_CURL); axir verify skips it
+// when libcurl is unavailable.
+
+namespace {
+
+std::string drain_request(int fd) {
+  std::string buf;
+  char tmp[4096];
+  size_t header_end = std::string::npos;
+  size_t content_length = 0;
+  while (true) {
+    size_t pos = buf.find("\r\n\r\n");
+    if (pos != std::string::npos) {
+      header_end = pos + 4;
+      break;
+    }
+    ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+    if (n <= 0) return buf;
+    buf.append(tmp, static_cast<size_t>(n));
+  }
+  std::string lower = buf.substr(0, header_end);
+  for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  size_t cl = lower.find("content-length:");
+  if (cl != std::string::npos) content_length = std::stoul(lower.substr(cl + 15));
+  while (buf.size() - header_end < content_length) {
+    ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+    if (n <= 0) break;
+    buf.append(tmp, static_cast<size_t>(n));
+  }
+  return buf;
+}
+
+void write_response(int fd, const std::string& content_type, const std::string& body) {
+  std::string out = "HTTP/1.1 200 OK\r\nContent-Type: " + content_type +
+                    "\r\nContent-Length: " + std::to_string(body.size()) +
+                    "\r\nConnection: close\r\n\r\n" + body;
+  size_t off = 0;
+  while (off < out.size()) {
+    ssize_t n = send(fd, out.data() + off, out.size() - off, 0);
+    if (n <= 0) break;
+    off += static_cast<size_t>(n);
+  }
+}
+
+}  // namespace
+
+int main() {
+  const std::string sse_body =
+      ": keepalive\n"
+      "event: message\n"
+      "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{\"level\":\"info\"}}\n"
+      "\n"
+      "event: message\n"
+      "data: {\"jsonrpc\":\"2.0\",\"id\":\"ax-sse-1\",\"result\":{\"ok\":true,\"protocolVersion\":\"2025-11-25\"}}\n"
+      "\n";
+
+  int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (server_fd < 0) {
+    std::cerr << "socket failed\n";
+    return 1;
+  }
+  int opt = 1;
+  setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = 0;
+  if (bind(server_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+    std::cerr << "bind failed\n";
+    return 1;
+  }
+  if (listen(server_fd, 4) < 0) {
+    std::cerr << "listen failed\n";
+    return 1;
+  }
+  socklen_t alen = sizeof(addr);
+  getsockname(server_fd, reinterpret_cast<sockaddr*>(&addr), &alen);
+  int port = ntohs(addr.sin_port);
+
+  std::thread server([&]() {
+    bool done = false;
+    while (!done) {
+      int fd = accept(server_fd, nullptr, nullptr);
+      if (fd < 0) return;
+      std::string request = drain_request(fd);
+      if (request.find("server/discover") != std::string::npos) {
+        write_response(fd, "application/json", "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}");
+      } else if (request.find("\"method\":\"initialize\"") != std::string::npos) {
+        write_response(fd, "application/json", "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-loopback\",\"version\":\"1.0.0\"}}}");
+      } else if (request.find("notifications/initialized") != std::string::npos || request.rfind("GET ", 0) == 0) {
+        write_response(fd, "application/json", "");
+      } else {
+        std::string response = sse_body;
+        size_t id = response.find("\"ax-sse-1\"");
+        if (id != std::string::npos) response.replace(id, 10, "3");
+        write_response(fd, "text/event-stream", response);
+        done = true;
+      }
+      close(fd);
+    }
+  });
+
+  auto transport = std::make_shared<axllm::AxMCPStreamableHTTPTransport>(
+      std::string("http://127.0.0.1:") + std::to_string(port) + "/mcp",
+      axllm::object({{"ssrfProtection", axllm::object({{"requireHttps", false}, {"allowLocalhost", true}, {"allowPrivateNetworks", true}})}}));
+  axllm::AxMCPClient client(transport);
+  client.init();
+  if (client.get_era() != "legacy") {
+    std::cerr << "auto discovery did not fall back to legacy\n";
+    return 1;
+  }
+  axllm::Value result = client.call_tool("noop", axllm::Value::object());
+  client.close();
+
+  server.join();
+  close(server_fd);
+
+  if (!axllm::Core::truthy(axllm::Core::get(result, "ok"))) {
+    std::cerr << "SSE result not decoded from text/event-stream body: " << axllm::stringify(result)
+              << "\n";
+    return 1;
+  }
+  std::cout << "mcp-sse-roundtrip-ok\n";
+  return 0;
+}
+`
+
+const cppStreamHTTPRoundtripExample = `#include "axllm/axllm.hpp"
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <iostream>
+#include <string>
+#include <thread>
+#include <vector>
+
+// Drive a streaming stream() through the REAL libcurl HttpTransport against an
+// in-process loopback server that returns a spec-legal text/event-stream body
+// with a MULTI-LINE data: event and CRLF line endings. The conformance
+// ScriptedTransport only ever feeds single-line data: JSON, so this is the only
+// end-to-end coverage for the SSE line-folding that src/ax/util/sse.ts performs.
+// Returns non-zero on any mismatch so axir verify fails if the folding
+// regresses. Requires libcurl (AXLLM_ENABLE_CURL); axir verify skips it when
+// libcurl is unavailable.
+
+namespace {
+
+// Read the full request (headers + Content-Length body) so libcurl can then
+// read the response without the connection being reset mid-write.
+void drain_request(int fd) {
+  std::string buf;
+  char tmp[4096];
+  size_t header_end = std::string::npos;
+  size_t content_length = 0;
+  while (true) {
+    if (header_end == std::string::npos) {
+      size_t pos = buf.find("\r\n\r\n");
+      if (pos != std::string::npos) {
+        header_end = pos + 4;
+        std::string headers = buf.substr(0, pos);
+        size_t start = 0;
+        while (start < headers.size()) {
+          size_t next = headers.find("\r\n", start);
+          std::string line =
+              headers.substr(start, (next == std::string::npos ? headers.size() : next) - start);
+          std::string lower = line;
+          for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+          if (lower.rfind("content-length:", 0) == 0) {
+            content_length = std::stoul(line.substr(line.find(':') + 1));
+          }
+          if (next == std::string::npos) break;
+          start = next + 2;
+        }
+      }
+    }
+    if (header_end != std::string::npos && buf.size() >= header_end + content_length) break;
+    ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+    if (n <= 0) break;
+    buf.append(tmp, static_cast<size_t>(n));
+  }
+}
+
+void write_response(int fd, const std::string& content_type, const std::string& body) {
+  std::string out = "HTTP/1.1 200 OK\r\nContent-Type: " + content_type +
+                    "\r\nContent-Length: " + std::to_string(body.size()) +
+                    "\r\nConnection: close\r\n\r\n" + body;
+  size_t off = 0;
+  while (off < out.size()) {
+    ssize_t n = send(fd, out.data() + off, out.size() - off, 0);
+    if (n <= 0) break;
+    off += static_cast<size_t>(n);
+  }
+}
+
+}  // namespace
+
+int main() {
+  // One logical delta whose JSON is split across two data: lines (folded with
+  // "\n"), then a single-line delta, then [DONE]. Every line uses CRLF.
+  const std::string event1a =
+      "{\"id\":\"chatcmpl_stream\",\"model\":\"gpt-5.4-mini\",\"choices\":[{\"index\":0,\"delta\":";
+  const std::string event1b = "{\"content\":\"Hello \"}}]}";
+  const std::string event2 =
+      "{\"id\":\"chatcmpl_stream\",\"model\":\"gpt-5.4-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world\"},\"finish_reason\":\"stop\"}]}";
+  const std::string sse_body = "data: " + event1a + "\r\n" + "data: " + event1b + "\r\n" + "\r\n" +
+                               "data: " + event2 + "\r\n" + "\r\n" + "data: [DONE]\r\n" + "\r\n";
+
+  int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (server_fd < 0) {
+    std::cerr << "socket failed\n";
+    return 1;
+  }
+  int opt = 1;
+  setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = 0;
+  if (bind(server_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+    std::cerr << "bind failed\n";
+    return 1;
+  }
+  if (listen(server_fd, 4) < 0) {
+    std::cerr << "listen failed\n";
+    return 1;
+  }
+  socklen_t alen = sizeof(addr);
+  getsockname(server_fd, reinterpret_cast<sockaddr*>(&addr), &alen);
+  int port = ntohs(addr.sin_port);
+
+  std::thread server([&]() {
+    int fd = accept(server_fd, nullptr, nullptr);
+    if (fd < 0) return;
+    drain_request(fd);
+    write_response(fd, "text/event-stream", sse_body);
+    close(fd);
+  });
+
+  axllm::OpenAICompatibleClient client(
+      axllm::object({{"api_key", "test-key"},
+                     {"base_url", std::string("http://127.0.0.1:") + std::to_string(port)},
+                     {"model", "gpt-5.4-mini"}}),
+      nullptr);
+  std::vector<std::string> deltas;
+  for (const auto& event : client.stream(axllm::object(
+           {{"chat_prompt",
+             axllm::array({axllm::object({{"role", "user"}, {"content", "stream"}})})}}))) {
+    std::string content = axllm::display(
+        axllm::Core::get(axllm::Core::get(axllm::Core::get(event, "results"), 0), "content", ""));
+    if (!content.empty()) deltas.push_back(content);
+  }
+
+  server.join();
+  close(server_fd);
+
+  if (deltas.empty() || deltas.front() != "Hello ") {
+    std::cerr << "multi-line data: event was not folded into one JSON value\n";
+    return 1;
+  }
+  std::string text;
+  for (const auto& d : deltas) text += d;
+  if (text != "Hello world") {
+    std::cerr << "bad stream fold: " << text << "\n";
+    return 1;
+  }
+  std::cout << "stream-http-roundtrip-ok\n";
+  return 0;
+}
+`
+
+const cppFlowOpenAIExample = `#include "axllm/axllm.hpp"
+
+#include <cstdlib>
+#include <iostream>
+
+int main() {
+  const char* key = std::getenv("OPENAI_API_KEY");
+  if (key == nullptr || std::string(key).empty()) key = std::getenv("OPENAI_APIKEY");
+  if (key == nullptr || std::string(key).empty()) {
+    std::cerr << "Set OPENAI_API_KEY or OPENAI_APIKEY to run this provider API example.\n";
+    return 2;
+  }
+
+  const char* model = std::getenv("AX_OPENAI_MODEL");
+  axllm::OpenAICompatibleClient client(axllm::object({
+      {"api_key", key},
+      {"model", model == nullptr || std::string(model).empty() ? "gpt-5.4-mini" : model},
+      {"model_config", axllm::object({{"temperature", 0}})},
+  }));
+  axllm::AxGen outline = axllm::ax("topic:string -> outline:string");
+  axllm::AxFlow program = axllm::flow(axllm::object({{"id", "examples.openaiApiFlow"}}))
+      .execute("outline", outline)
+      .map("summary",
+           [](axllm::Value) {
+             return axllm::object({{"summary", "Generated outline with typed Ax program steps."}});
+           })
+      .returns(axllm::object({{"outline", "outline"}, {"summary", "summary"}}));
+  axllm::Value output = program.forward(
+      client,
+      axllm::object({{"topic", "how Ax composes typed LLM programs"}}));
+  std::cout << axllm::stringify(output) << "\n";
+}
+`
+
+const cppAudioResponsesMappingExample = `#include "axllm/axllm.hpp"
+
+#include <iostream>
+#include <string>
+
+struct ScriptedTransport : axllm::Transport {
+  axllm::Array requests;
+
+  axllm::Value call(axllm::Value request) override {
+    requests.push_back(request);
+    std::string url = axllm::stringify(axllm::Core::get(request, "url"));
+    if (url.find("/audio/speech") != std::string::npos) {
+      return axllm::object({{"status", 200}, {"json", axllm::object({{"audio", "base64-speech"}})}});
+    }
+    if (url.find("/audio/transcriptions") != std::string::npos) {
+      return axllm::object({
+          {"status", 200},
+          {"json", axllm::object({{"text", "hello world"}, {"language", "en"}, {"duration", 1.25}})},
+      });
+    }
+    throw axllm::AxError("fixture", "unexpected audio request");
+  }
+};
+
+int main() {
+  ScriptedTransport transport;
+  axllm::OpenAIResponsesClient client(axllm::object({{"api_key", "test-key"}}), &transport);
+  axllm::Value speech =
+      client.speak(axllm::object({{"text", "hello"}, {"voice", "alloy"}, {"format", "mp3"}}));
+  axllm::Value transcript = client.transcribe(axllm::object({
+      {"audio", "base64-audio"},
+      {"language", "en"},
+      {"model", "whisper-1"},
+      {"format", "json"},
+  }));
+  if (!axllm::equal(axllm::Core::get(speech, "audio"), "base64-speech")) return 1;
+  if (!axllm::equal(axllm::Core::get(transcript, "text"), "hello world")) return 2;
+
+  std::cout << "normalized output:\n"
+            << axllm::stringify(axllm::object({{"speak", speech}, {"transcribe", transcript}})) << "\n";
+  std::cout << "transport requests:\n" << axllm::stringify(axllm::Value(transport.requests)) << "\n";
+}
+`
+
+const cppRealtimeAudioEventsExample = `#include "axllm/axllm.hpp"
+
+#include <iostream>
+
+int main() {
+  axllm::GrokClient grok(axllm::object({
+      {"model", "grok-voice-think-fast-1.0"},
+      {"api_key", "test-key"},
+  }));
+  axllm::Value grok_request = axllm::object({
+      {"model", "grok-voice-think-fast-1.0"},
+      {"chat_prompt",
+       axllm::array({
+           axllm::object({{"role", "system"}, {"content", "You are a concise voice agent."}}),
+           axllm::object({{"role", "user"}, {"content", "Say hello."}}),
+       })},
+      {"audio",
+       axllm::object({
+           {"input", axllm::object({{"sampleRate", 24000}})},
+           {"output", axllm::object({{"sampleRate", 24000}, {"voice", "eve"}})},
+       })},
+  });
+  axllm::Value grok_events = axllm::array({
+      axllm::object({{"type", "response.output_audio_transcript.delta"}, {"response_id", "grok_rt"}, {"delta", "hello "}}),
+      axllm::object({{"type", "response.output_audio.delta"}, {"response_id", "grok_rt"}, {"delta", "AQI="}}),
+      axllm::object({
+          {"type", "response.done"},
+          {"response",
+           axllm::object({
+               {"id", "grok_rt"},
+               {"usage", axllm::object({{"input_tokens", 3}, {"output_tokens", 2}, {"total_tokens", 5}})},
+           })},
+      }),
+  });
+
+  axllm::GoogleGeminiClient gemini(axllm::object({
+      {"model", "gemini-2.5-flash-native-audio-preview-12-2025"},
+      {"api_key", "test-key"},
+  }));
+  axllm::Value gemini_request = axllm::object({
+      {"model", "gemini-2.5-flash-native-audio-preview-12-2025"},
+      {"chat_prompt",
+       axllm::array({
+           axllm::object({{"role", "system"}, {"content", "Answer with audio."}}),
+           axllm::object({
+               {"role", "user"},
+               {"content",
+                axllm::array({
+                    axllm::object({{"type", "text"}, {"text", "Realtime question"}}),
+                    axllm::object({{"type", "audio"}, {"data", "AAAA"}, {"format", "pcm16"}, {"sampleRate", 16000}}),
+                })},
+           }),
+       })},
+      {"audio", axllm::object({{"output", axllm::object({{"transcript", true}, {"voice", "Kore"}})}})},
+  });
+  axllm::Value gemini_audio_part = axllm::object({
+      {"inlineData", axllm::object({{"data", "AQI="}, {"mimeType", "audio/pcm"}})},
+  });
+  axllm::Value gemini_turn_event = axllm::object({
+      {"id", "gemini_live_2"},
+      {"serverContent",
+       axllm::object({
+           {"modelTurn", axllm::object({{"parts", axllm::array({gemini_audio_part})}})},
+       })},
+  });
+  axllm::Value gemini_tool_event = axllm::object({
+      {"id", "gemini_live_3"},
+      {"toolCall",
+       axllm::object({
+           {"functionCalls",
+            axllm::array({axllm::object({{"name", "lookup"}, {"args", axllm::object({{"q", "ax"}})}})})},
+       })},
+  });
+  axllm::Value gemini_events = axllm::array({
+      axllm::object({{"id", "gemini_live_1"}, {"serverContent", axllm::object({{"outputTranscription", axllm::object({{"text", "spoken "}})}})}}),
+      gemini_turn_event,
+      gemini_tool_event,
+      axllm::object({
+          {"id", "gemini_live_done"},
+          {"serverContent", axllm::object({{"turnComplete", true}})},
+          {"usageMetadata", axllm::object({{"promptTokenCount", 3}, {"candidatesTokenCount", 4}, {"totalTokenCount", 7}})},
+      }),
+  });
+
+  std::cout << "grok setup:\n" << axllm::stringify(grok.realtime_audio_setup(grok_request)) << "\n";
+  std::cout << "grok normalized events:\n" << axllm::stringify(axllm::Value(grok.realtime(grok_events))) << "\n";
+  std::cout << "gemini setup:\n" << axllm::stringify(gemini.realtime_audio_setup(gemini_request)) << "\n";
+  std::cout << "gemini input messages:\n" << axllm::stringify(gemini.realtime_audio_input(gemini_request)) << "\n";
+  std::cout << "gemini normalized events:\n" << axllm::stringify(axllm::Value(gemini.realtime(gemini_events))) << "\n";
+}
+`
+
+const cppRealtimeAudioTurnExample = `#include "axllm/axllm.hpp"
+
+#include <cstdlib>
+#include <iostream>
+#include <string>
+#include <vector>
+
+// Drive a realtime audio TURN through the productized realtime_chat driver using
+// ScriptedRealtimeTransport: the deterministic, credential-free path that
+// exercises the full send-setup -> send-input -> fold -> merge loop without a
+// live socket (the live socket path is verified separately against the real
+// API). Exits non-zero on any mismatch so ` + "`axir verify`" + ` fails if it regresses.
+namespace {
+[[noreturn]] void fail(const std::string& message, const axllm::Value& detail) {
+  std::cout << "realtime-audio-turn FAIL: " << message << " " << axllm::stringify(detail) << "\n";
+  std::exit(1);
+}
+}  // namespace
+
+int main() {
+  axllm::GrokClient client(axllm::object({
+      {"model", "grok-voice-think-fast-1.0"},
+      {"api_key", "test-key"},
+  }));
+  axllm::Value request = axllm::object({
+      {"model", "grok-voice-think-fast-1.0"},
+      {"chat_prompt",
+       axllm::array({
+           axllm::object({{"role", "system"}, {"content", "You are a concise voice agent."}}),
+           axllm::object({{"role", "user"}, {"content", "Say hello."}}),
+       })},
+      {"audio", axllm::object({{"output", axllm::object({{"voice", "eve"}})}})},
+  });
+  // Canned server frames: session handshake, two transcript deltas, an audio
+  // delta, then the terminal response.done.
+  std::vector<axllm::Value> inbound = {
+      axllm::object({{"type", "session.created"}}),
+      axllm::object({{"type", "session.updated"}}),
+      axllm::object({{"type", "response.output_audio_transcript.delta"}, {"response_id", "rt"}, {"delta", "hel"}}),
+      axllm::object({{"type", "response.output_audio_transcript.delta"}, {"response_id", "rt"}, {"delta", "lo"}}),
+      axllm::object({{"type", "response.output_audio.delta"}, {"response_id", "rt"}, {"delta", "AQI="}}),
+      axllm::object({{"type", "response.done"}, {"response", axllm::object({{"id", "rt"}, {"usage", axllm::object({{"input_tokens", 3}, {"output_tokens", 2}, {"total_tokens", 5}})}})}}),
+  };
+
+  axllm::ScriptedRealtimeTransport transport(inbound);
+  axllm::Value final_response = client.realtime_chat(request, &transport);
+
+  std::string sent;
+  for (const auto& event : transport.sent) sent += axllm::stringify(axllm::Core::get(event, "type")) + " ";
+  std::cout << "driver sent: " << sent << "\n";
+  std::cout << "merged result: " << axllm::stringify(final_response) << "\n";
+
+  axllm::Value result;
+  for (const auto& entry : axllm::Core::iter(axllm::Core::get(final_response, "results"))) {
+    result = entry;
+    break;
+  }
+
+  // The driver must send the Core-built session.update first, then the inputs.
+  if (sent != "\"session.update\" \"conversation.item.create\" \"response.create\" ") {
+    fail("unexpected sent event order", final_response);
+  }
+  // Transcript deltas concatenated, audio chunk surfaced, turn finished.
+  if (axllm::stringify(axllm::Core::get(result, "content")) != "\"hello\"") fail("transcript not concatenated", final_response);
+  if (axllm::stringify(axllm::Core::get(result, "finish_reason")) != "\"stop\"") fail("turn did not finish", final_response);
+  if (axllm::stringify(axllm::Core::get(axllm::Core::get(result, "audio"), "data")) != "\"AQI=\"") {
+    fail("audio chunk not surfaced", final_response);
+  }
+  std::cout << "realtime-audio-turn-ok\n";
+  return 0;
+}
+`
+
+const cppGEPALocalOptimizerExample = `#include "axllm/axllm.hpp"
+
+#include <iostream>
+
+struct LocalEvaluator : axllm::OptimizerEvaluator {
+  axllm::Value evaluate(axllm::Value candidate_map, axllm::Value options = axllm::Value::object()) override {
+    axllm::Value rows = axllm::Value::array();
+    double total = 0.0;
+    axllm::Value examples = axllm::Core::get(axllm::Core::get(options, "dataset"), "train", axllm::Value::array());
+    std::string instruction = axllm::stringify(axllm::Core::get(candidate_map, "qa::instruction"));
+    for (const auto& example : axllm::Core::iter(examples)) {
+      double quality = instruction.find("concise") != std::string::npos ? 0.9 : 0.65;
+      double brevity = 0.8;
+      double scalar = (quality + brevity) / 2.0;
+      total += scalar;
+      axllm::Core::append(
+          rows,
+          axllm::object({
+              {"input", example},
+              {"prediction", axllm::object({{"answer", "Ax composes typed LLM programs."}})},
+              {"scores", axllm::object({{"quality", quality}, {"brevity", brevity}})},
+              {"scalar", scalar},
+          }));
+    }
+    double count = axllm::Core::iter(rows).size();
+    return axllm::object({{"rows", rows}, {"avg", total / count}, {"sum", total}, {"count", count}});
+  }
+};
+
+int main() {
+  axllm::Value request = axllm::object({
+      {"programKind", "axgen"},
+      {"components",
+       axllm::array({
+           axllm::object({
+               {"id", "qa::instruction"},
+               {"owner", "qa"},
+               {"kind", "instruction"},
+               {"current", "Answer clearly and concisely."},
+           }),
+       })},
+      {"dataset",
+       axllm::object({
+           {"train",
+            axllm::array({
+                axllm::object({{"question", "What is Ax?"}}),
+                axllm::object({{"question", "Why use typed signatures?"}}),
+            })},
+           {"validation", axllm::array({axllm::object({{"question", "Summarize Ax."}})})},
+       })},
+      {"options", axllm::object({{"numTrials", 0}, {"maxMetricCalls", 8}, {"seed", 7}})},
+  });
+
+  LocalEvaluator evaluator;
+  axllm::AxGEPA gepa(nullptr, axllm::object({{"seed", 7}}));
+  axllm::Value artifact = gepa.optimize(request, &evaluator);
+  std::cout << axllm::stringify(axllm::object({
+                   {"componentMap", axllm::Core::get(artifact, "componentMap")},
+                   {"metadata", axllm::Core::get(artifact, "metadata")},
+               }))
+            << "\n";
+}
+`
+
+const cppACEPlaybookExample = `#include "axllm/axllm.hpp"
+
+#include <iostream>
+
+// A scripted client stands in for a real provider so this example runs without a
+// key. Swap it for axllm::ai("openai", ...) to grow a playbook against a live
+// model. The canned JSON satisfies the bound program AND the playbook's internal
+// reflector/curator sub-programs, so the full ACE loop is exercised offline.
+struct ScriptedClient : axllm::AIClient {
+  axllm::Value complete(axllm::Value) override {
+    return axllm::object({{"content",
+        "{\"answer\":\"Ax composes typed LLM programs.\","
+        "\"reasoning\":\"The playbook lacked a brevity rule.\","
+        "\"errorIdentification\":\"Answer was too verbose.\","
+        "\"rootCauseAnalysis\":\"No guidance on conciseness.\","
+        "\"correctApproach\":\"Add a concise-answer guideline.\","
+        "\"keyInsight\":\"Prefer one-sentence answers.\","
+        "\"weaknessDescription\":\"The agent does not verify its final step.\","
+        "\"rootCause\":\"The final step is accepted without a check.\","
+        "\"proposedGuidance\":\"Verify the final step before completing the task.\","
+        "\"evidenceQuotes\":[\"final\",\"snapshot\",\"Answer\"],"
+        "\"configRecommendations\":[],"
+        "\"bulletTags\":[],"
+        "\"operations\":[{\"type\":\"ADD\",\"section\":\"Guidelines\",\"content\":\"Answer in one concise sentence.\"}]}"}});
+  }
+};
+
+int main() {
+  ScriptedClient client;
+  auto program = axllm::ax("question:string -> answer:string", axllm::object({{"id", "qa"}, {"instruction", "Answer the question."}}));
+
+  axllm::AxPlaybook pb = axllm::playbook(program, client, axllm::object({{"maxEpochs", 1}}));
+
+  axllm::AxPlaybook::MetricFn metric = [](const axllm::Value& args) -> axllm::Value {
+    axllm::Value prediction = axllm::Core::get(args, "prediction");
+    std::string answer = axllm::display(axllm::Core::get(prediction, "answer"));
+    return answer.empty() ? axllm::Value(0.0) : axllm::Value(1.0);
+  };
+
+  std::vector<axllm::Value> examples = {
+      axllm::object({{"question", "What is Ax?"}}),
+      axllm::object({{"question", "Why typed signatures?"}}),
+  };
+  axllm::Value result = pb.evolve(examples, metric);
+  std::string rendered = pb.render();
+  axllm::Value state = pb.to_json();
+  if (axllm::Core::get(result, "bestScore", axllm::Value()).is_null()) return 1;
+  if (axllm::Core::get(state, "playbook", axllm::Value()).is_null()) return 1;
+  std::cout << "rendered: " << rendered << "\n";
+  std::cout << "cpp-ace-playbook-ok\n";
+}
+`
+
+const cppAgentPlaybookExample = `#include "axllm/axllm.hpp"
+
+#include <iostream>
+
+// The actor returns model-authored Python code and a real runtime executes it.
+// The same offline response also satisfies the playbook reflector and curator.
+struct ScriptedClient : axllm::AIClient {
+  axllm::Value complete(axllm::Value) override {
+    return axllm::object({{"content",
+        "{\"pythonCode\":\"final('Answer', {'answer': 'Ax composes typed LLM programs.'})\","
+        "\"answer\":\"Ax composes typed LLM programs.\","
+        "\"reasoning\":\"The playbook lacked a brevity rule.\","
+        "\"errorIdentification\":\"Answer was too verbose.\","
+        "\"rootCauseAnalysis\":\"No guidance on conciseness.\","
+        "\"correctApproach\":\"Add a concise-answer guideline.\","
+        "\"keyInsight\":\"Prefer one-sentence answers.\","
+        "\"weaknessDescription\":\"The agent does not verify its final step.\","
+        "\"rootCause\":\"The final step is accepted without a check.\","
+        "\"proposedGuidance\":\"Verify the final step before completing the task.\","
+        "\"evidenceQuotes\":[\"final\",\"snapshot\",\"Answer\"],"
+        "\"configRecommendations\":[],"
+        "\"bulletTags\":[],"
+        "\"operations\":[{\"type\":\"ADD\",\"section\":\"Guidelines\",\"content\":\"Answer in one concise sentence.\"}]}"}});
+  }
+};
+
+struct RuntimeSession : axllm::AxCodeSession {
+  axllm::Value execute(axllm::Value code, axllm::Value = axllm::Value::object()) override {
+    if (axllm::display(code).find("pythonCode") != std::string::npos) {
+      throw axllm::AxError("runtime", "runtime received a response wrapper instead of code");
+    }
+    return axllm::RuntimeEnvelope::final_payload({
+        axllm::object({{"answer", "Ax composes typed LLM programs."}}),
+    });
+  }
+  axllm::Value snapshot_globals(axllm::Value = axllm::Value::object()) override {
+    return axllm::object({{"version", 1}, {"bindings", axllm::Value::object()}, {"globals", axllm::Value::object()}, {"closed", false}});
+  }
+  axllm::Value patch_globals(axllm::Value snapshot, axllm::Value = axllm::Value::object()) override { return snapshot; }
+  axllm::Value close() override { return axllm::object({{"closed", true}}); }
+};
+
+struct Runtime : axllm::AxCodeRuntime {
+  std::vector<std::unique_ptr<RuntimeSession>> sessions;
+  std::string language() const override { return "Python"; }
+  axllm::AxCodeSession* create_session(axllm::Value, axllm::Value = axllm::Value::object()) override {
+    sessions.push_back(std::make_unique<RuntimeSession>());
+    return sessions.back().get();
+  }
+};
+
+int main() {
+  ScriptedClient client;
+  Runtime runtime;
+  // agent.playbook() binds an evolving context playbook to an agent stage. The
+  // "responder" target grows the user-facing answer stage; ACE remains an
+  // implementation detail behind playbook(), just as optimize() hides GEPA.
+  auto agent = axllm::agent("question:string -> answer:string", axllm::object({
+      {"name", "qa"},
+      {"description", "Answer the question."},
+      {"runtime", axllm::Core::code_runtime_ref(runtime)},
+  }));
+
+  axllm::AxPlaybook& pb = agent.playbook(client, axllm::object({{"target", "responder"}, {"maxEpochs", 1}}));
+  axllm::Value dataset = axllm::object({{"train", axllm::array({axllm::object({
+      {"input", axllm::object({{"question", "Answer briefly."}})}, {"score", 0},
+  })})}});
+
+  // A zero minimum gain exercises verified acceptance. A positive minimum gain
+  // rejects the same flat score and must restore the exact pre-proposal snapshot.
+  axllm::Value accepted = pb.evolve(dataset, axllm::object({
+      {"verify", true}, {"minHeldInGain", 0.0}, {"maxProposals", 1}, {"maxMetricCalls", 2},
+  }));
+  std::string before_rejection = axllm::stringify(pb.to_json());
+  axllm::Value rejected = pb.evolve(dataset, axllm::object({
+      {"verify", true}, {"minHeldInGain", 0.1}, {"maxProposals", 1}, {"maxMetricCalls", 2},
+  }));
+  std::string after_rejection = axllm::stringify(pb.to_json());
+
+  axllm::Value accepted_outcome = axllm::Core::get(axllm::Core::get(accepted, "outcomes"), 0);
+  axllm::Value rejected_outcome = axllm::Core::get(axllm::Core::get(rejected, "outcomes"), 0);
+  if (std::stoul(axllm::display(axllm::Core::get(accepted, "metricCallsUsed", 0))) != 2 ||
+      !axllm::Core::truthy(axllm::Core::get(accepted_outcome, "accepted", false))) return 1;
+  if (std::stoul(axllm::display(axllm::Core::get(rejected, "metricCallsUsed", 0))) != 2 ||
+      axllm::Core::truthy(axllm::Core::get(rejected_outcome, "accepted", true))) return 2;
+  if (after_rejection != before_rejection) return 3;
+  if (axllm::Core::get(pb.to_json(), "playbook", axllm::Value()).is_null()) return 4;
+  std::cout << "accepted: " << axllm::stringify(accepted_outcome) << "\n";
+  std::cout << "rejected: " << axllm::stringify(rejected_outcome) << "\n";
+  std::cout << "cpp-agent-playbook-ok\n";
+}
+`

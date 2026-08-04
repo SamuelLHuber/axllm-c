@@ -1,0 +1,37 @@
+import {
+  type AxMCPSSRFProtectionContext,
+  type AxMCPSSRFProtectionOptions,
+  fetchWithSSRFProtection,
+} from './ssrf.js';
+
+export async function fetchJSON<T>(
+  url: string,
+  headers?: Record<string, string>,
+  ssrf?: Readonly<{
+    protection?: AxMCPSSRFProtectionOptions;
+    context?: AxMCPSSRFProtectionContext;
+    fetch?: typeof globalThis.fetch;
+  }>
+): Promise<T> {
+  const res = await fetchWithSSRFProtection(url, {
+    headers,
+    ssrfProtection: ssrf?.protection,
+    ssrfContext: ssrf?.context,
+    fetch: ssrf?.fetch,
+  });
+  if (!res.ok)
+    throw new Error(`HTTP ${res.status} fetching ${url}: ${res.statusText}`);
+  return (await res.json()) as T;
+}
+
+export function toQuery(params: Record<string, string | undefined>): string {
+  const usp = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined) usp.set(k, v);
+  }
+  return usp.toString();
+}
+
+export function stripTrailingSlash(url: string): string {
+  return url.endsWith('/') ? url.slice(0, -1) : url;
+}

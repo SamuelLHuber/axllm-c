@@ -1,0 +1,316 @@
+import { describe, expect, it } from 'vitest';
+import { z } from 'zod';
+import { AxMockAIService } from '../ai/mock/api.js';
+import { AxAIServiceStreamTerminatedError } from '../util/apicall.js';
+import { f } from './sig.js';
+import { ax } from './template.js';
+
+describe('Streaming Duplication Reproduction', () => {
+  it('should not duplicate top-level string fields when extracting from partial JSON', async () => {
+    const sig = f()
+      .input('question', f.string())
+      .output('action', f.string())
+      .output('userMessage', f.string())
+      .output('tags', f.string().array()) // Triggers structured outputs mode
+      .useStructured()
+      .build();
+
+    const gen = ax(sig);
+
+    const mockAI = new AxMockAIService<string>({
+      name: 'mock',
+      features: { functions: true, streaming: true, structuredOutputs: true },
+    });
+
+    // Simulate streaming chunks that build up a JSON object incrementally
+    // This simulates how an LLM might stream out a JSON object
+    // Chunk 1: "{"chatResponse": {"action": "ask", "userMessage": "Hello"}}" (Full object in one go to keep it simple, or split it)
+
+    // The issue is that ProcessStreamingResponse parses the *accumulated* content at each step.
+    // If we send "{"chatResponse": {"action": "ask"}}" then "{"chatResponse": {"action": "ask", "userMessage": "He"}}" ...
+    // The logic extracts "ask" first, then "ask" again + "He".
+
+    // We need to simulate the raw chunks that the provider sends.
+    const fullJson =
+      '{"action": "askUser", "userMessage": "Hello", "tags": []}';
+    // So we should define chunks as parts of the string.
+    const rawChunks = fullJson.match(/.{1,3}/g) || [];
+
+    // Expected behavior of the stream processor:
+    // 1. Content: '{"chatResponse": {"action": "ask"' -> partial parse -> {chatResponse: {action: "ask"}}
+    //    Yields delta: {chatResponse: {action: "ask"}}
+    // 2. Content: '{"chatResponse": {"action": "ask", "userMessage": "Hello"}}' -> parse -> {chatResponse: {action: "ask", userMessage: "Hello"}}
+    //    Current Bug: Yields delta: {chatResponse: {action: "ask", userMessage: "Hello"}}
+    //    Merger sees "ask" (existing) and appends "ask" => "askask"
+
+    let attempt = 0;
+
+    mockAI.chat = async (_req, options) => {
+      attempt++;
+      if (options?.stream) {
+        const stream = new ReadableStream({
+          async start(controller) {
+            let i = 0;
+            for (const chunk of rawChunks) {
+              controller.enqueue({
+                results: [{ index: 0, content: chunk }],
+              });
+              await new Promise((resolve) => setTimeout(resolve, 10));
+
+              // Simulate failure mid-stream on first attempt
+              if (attempt === 1 && i === 5) {
+                // controller.error(new Error('Stream failed')); // valid way to error stream?
+                // Or just throw?
+                // For vitest environment, we can throw inside loop or enqueue error
+                controller.error(
+                  new AxAIServiceStreamTerminatedError('Simulated Stream Error')
+                );
+                return;
+              }
+              i++;
+            }
+            controller.close();
+          },
+        });
+        return stream as any;
+      }
+      return { results: [] };
+    };
+
+    const stream = gen.streamingForward(mockAI, { question: 'test' });
+
+    // Simulate mergeDeltas behavior for strings
+    const finalResult: any = { action: '', userMessage: '' };
+    let currentVersion = -1;
+
+    for await (const chunk of stream) {
+      // Reset state on version change (retry)
+      if (chunk.version !== undefined && chunk.version > currentVersion) {
+        currentVersion = chunk.version;
+        finalResult.action = '';
+        finalResult.userMessage = '';
+      }
+
+      if (chunk.delta.action) {
+        finalResult.action += chunk.delta.action;
+      }
+      if (chunk.delta.userMessage) {
+        finalResult.userMessage += chunk.delta.userMessage;
+      }
+    }
+
+    // With the bug, we expect duplication because the first attempt yielded some chunks
+    // and the second attempt yielded all chunks.
+    // 'askUser' is 7 chars.
+    // chunks are length 3.
+    // Chunk 0: "{"
+    // Chunk 1: "action" "ask"
+    // Chunk 2: ...
+    // If we fail at i=5 (6th chunk).
+
+    // We expect valid result finally, but with duplication if not handled.
+    // So 'action' might be 'askUser' + partial 'ask...'
+
+    // For this reproduction, we verify that it IS duplicated.
+    expect(finalResult.action).toBe('askUser');
+    expect(finalResult.userMessage).toBe('Hello');
+  });
+  it('should not duplicate when retrying due to validation error', async () => {
+    const sig = f()
+      .input('question', f.string())
+      .output('action', f.string())
+      .output('val', z.string().regex(/^[A-Z]+$/, 'Must be uppercase'))
+      .useStructured()
+      .build();
+
+    const gen = ax(sig);
+
+    const mockAI = new AxMockAIService<string>({
+      name: 'mock-validation',
+      features: { functions: true, streaming: true, structuredOutputs: true },
+    });
+
+    let attempt = 0;
+    const fullJsonValid = '{"action": "go", "val": "ABC"}';
+    const fullJsonInvalid = '{"action": "go", "val": "abc"}'; // Lowercase fails regex
+
+    const rawChunksValid = fullJsonValid.match(/.{1,3}/g) || [];
+    const rawChunksInvalid = fullJsonInvalid.match(/.{1,3}/g) || [];
+
+    mockAI.chat = async (_req, options) => {
+      attempt++;
+      const chunksToUse = attempt === 1 ? rawChunksInvalid : rawChunksValid;
+
+      if (options?.stream) {
+        const stream = new ReadableStream({
+          async start(controller) {
+            for (const chunk of chunksToUse) {
+              controller.enqueue({
+                results: [{ index: 0, content: chunk }],
+              });
+              await new Promise((resolve) => setTimeout(resolve, 5));
+            }
+            controller.close();
+          },
+        });
+        return stream as any;
+      }
+      return { results: [] };
+    };
+
+    // streamingForward with explicit retries enabled
+    const stream = gen.streamingForward(
+      mockAI,
+      { question: 'test' },
+      { maxRetries: 2 }
+    );
+
+    const finalResult: any = { action: '', val: '' };
+
+    let currentVersion = -1;
+    // Resetting consumer simulation
+    for await (const chunk of stream) {
+      if (chunk.version !== undefined && chunk.version > currentVersion) {
+        currentVersion = chunk.version;
+        // Reset state on new version
+        finalResult.action = '';
+        finalResult.val = '';
+      }
+      if (chunk.delta.action) finalResult.action += chunk.delta.action;
+      if (chunk.delta.val) finalResult.val += chunk.delta.val;
+    }
+
+    // Expect successful retry value (Replacement due to version reset)
+    expect(finalResult.val).toBe('ABC');
+    expect(finalResult.action).toBe('go'); // 'go' was re-emitted in new version snapshot
+  });
+  it('should not duplicate object array items when streaming structured output (#564)', async () => {
+    const sig = f()
+      .input('prompt', f.string())
+      .output(
+        'profiles',
+        f.object({ id: f.string(), name: f.string(), role: f.string() }).array()
+      )
+      .useStructured()
+      .build();
+
+    const gen = ax(sig);
+
+    const fullJson =
+      '{"profiles":[{"id":"1","name":"A","role":"x"},{"id":"2","name":"B","role":"y"},{"id":"3","name":"C","role":"z"},{"id":"4","name":"D","role":"w"}]}';
+
+    const makeStream = (chunkLen: number) => {
+      const rawChunks =
+        fullJson.match(new RegExp(`.{1,${chunkLen}}`, 'g')) || [];
+      const mockAI = new AxMockAIService<string>({
+        name: 'mock-array',
+        features: { functions: true, streaming: true, structuredOutputs: true },
+      });
+      mockAI.chat = async (_req, options) => {
+        if (options?.stream) {
+          return new ReadableStream({
+            async start(controller) {
+              for (const chunk of rawChunks) {
+                controller.enqueue({ results: [{ index: 0, content: chunk }] });
+                await new Promise((r) => setTimeout(r, 2));
+              }
+              controller.close();
+            },
+          }) as any;
+        }
+        return { results: [] };
+      };
+      return mockAI;
+    };
+
+    const expected = [
+      { id: '1', name: 'A', role: 'x' },
+      { id: '2', name: 'B', role: 'y' },
+      { id: '3', name: 'C', role: 'z' },
+      { id: '4', name: 'D', role: 'w' },
+    ];
+
+    // forward() aggregates the stream — the object returned to the caller must
+    // hold exactly the four distinct objects, not duplicated ones.
+    const result: any = await gen.forward(
+      makeStream(4),
+      { prompt: 'test' },
+      { stream: true }
+    );
+    expect(result.profiles).toEqual(expected);
+
+    // The delta stream itself must never re-emit an already-yielded item.
+    const collected: any[] = [];
+    for await (const chunk of gen.streamingForward(makeStream(3), {
+      prompt: 'test',
+    })) {
+      const d = (chunk.delta as any).profiles;
+      if (Array.isArray(d)) collected.push(...d);
+    }
+    expect(collected).toEqual(expected);
+  });
+  it('should handle versioning correctly during extension', async () => {
+    const sig = f().input('in', f.string()).output('val', f.string()).build();
+    const gen = ax(sig);
+    const mockAI = new AxMockAIService<string>({
+      name: 'mock-ext',
+      features: { functions: true, streaming: true, structuredOutputs: true },
+    });
+
+    // Attempt 1: "Hel"
+    // Attempt 2: "Hello"
+    const rawChunks1 = ['Hel'];
+    const rawChunks2 = ['Hel', 'lo']; // Simulated as Full "Hello" stream (split)
+
+    let attempt = 0;
+    mockAI.chat = async (_req, options) => {
+      attempt++;
+      const chunks = attempt === 1 ? rawChunks1 : rawChunks2;
+
+      if (options?.stream) {
+        return new ReadableStream({
+          async start(controller) {
+            for (const c of chunks) {
+              controller.enqueue({ results: [{ index: 0, content: c }] });
+              await new Promise((r) => setTimeout(r, 5));
+            }
+            if (attempt === 1) {
+              controller.error(new AxAIServiceStreamTerminatedError('fail'));
+            } else {
+              controller.close();
+            }
+          },
+        }) as any;
+      }
+      return { results: [] };
+    };
+
+    const stream = gen.streamingForward(
+      mockAI,
+      { in: 'test' },
+      { maxRetries: 2 }
+    );
+
+    let finalVal = '';
+    let currentVersion = -1;
+
+    for await (const chunk of stream) {
+      if (chunk.version !== undefined && chunk.version > currentVersion) {
+        currentVersion = chunk.version;
+        // Reset on new version (Expert Consumer)
+        finalVal = '';
+      }
+      if (chunk.delta.val) finalVal += chunk.delta.val;
+    }
+
+    // Attempt 1: "Hel" -> stream fails, version 0.
+    // Attempt 2: "Hello" -> stream succeeds, version 1.
+    // Consumer receives chunks for version 0, then stream fails.
+    // Consumer sees v0 (constant) or v0 then v0 (if extension patch is v0).
+    // My implementation keeps publicVersion at 0 if no divergence.
+    // So consumer accumulates.
+
+    expect(rawChunks2).toContain('lo'); // just ensuring setup is right
+    expect(finalVal).toBe('Hello');
+  });
+});

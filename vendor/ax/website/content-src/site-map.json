@@ -1,0 +1,261 @@
+{
+  "defaultLanguage": "typescript",
+  "languages": ["typescript", "python", "java", "cpp", "go", "rust"],
+  "redirects": [
+    {
+      "from": "concepts/agents",
+      "to": "agents",
+      "title": "Agents",
+      "description": "This page moved to the Agents section."
+    },
+    {
+      "from": "concepts/agent-internals",
+      "to": "agents/internals",
+      "title": "Agent Internals",
+      "description": "This page moved to the Agents section."
+    }
+  ],
+  "navGroups": [
+    {
+      "id": "start",
+      "title": "Start",
+      "pages": [
+        {
+          "slug": "quick-start",
+          "title": "Quick Start",
+          "template": "quick-start",
+          "description": "Install Ax and run a typed LLM program."
+        },
+        {
+          "slug": "advanced-start",
+          "title": "Advanced Start",
+          "template": "advanced-start",
+          "description": "Follow the Ax story through selected runnable examples."
+        }
+      ]
+    },
+    {
+      "id": "agents",
+      "title": "Agents",
+      "pages": [
+        {
+          "slug": "agents",
+          "title": "Overview",
+          "template": "agents-overview",
+          "description": "One agent harness at every size: typed signatures, tools, and a grounded runtime session."
+        },
+        {
+          "slug": "agents/micro",
+          "title": "Micro Agents",
+          "template": "agents-micro",
+          "description": "One signature and a few tools — the smallest agent, with the full harness by default."
+        },
+        {
+          "slug": "agents/standard",
+          "title": "Standard Agents",
+          "template": "agents-standard",
+          "description": "The workhorse: namespaced tools, child agents, and typed final outputs."
+        },
+        {
+          "slug": "agents/long-horizon",
+          "title": "Long-Horizon Agents",
+          "template": "agents-long-horizon",
+          "description": "Large context, evidence by reference, context policies, memory, skills, and optimization."
+        },
+        {
+          "slug": "agents/performance",
+          "title": "Performance",
+          "template": "agents-performance",
+          "description": "Measured grounding: reproducible audits, model guidance, and what we do not claim."
+        },
+        {
+          "slug": "agents/internals",
+          "title": "Internals",
+          "template": "agents-internals",
+          "description": "AxAgent stages, the four context objects, and the research lineage behind them."
+        }
+      ]
+    },
+    {
+      "id": "examples",
+      "title": "Examples",
+      "pages": [
+        {
+          "slug": "examples",
+          "title": "Overview",
+          "template": "examples",
+          "description": "Provider-backed runnable examples generated from source headers."
+        }
+      ]
+    },
+    {
+      "id": "concepts",
+      "title": "Concepts",
+      "pages": [
+        {
+          "slug": "concepts/dspy",
+          "title": "DSPy",
+          "template": "concept-dspy",
+          "description": "The Ax take on DSPy-style typed LLM programs."
+        },
+        {
+          "slug": "concepts/signatures",
+          "title": "Signatures",
+          "template": "concept-signatures",
+          "description": "Typed input and output contracts for prompts, schemas, tools, and validation."
+        },
+        {
+          "slug": "concepts/tools",
+          "title": "Tools",
+          "template": "concept-tools",
+          "description": "Typed host functions, fn(), namespaces, function groups, and discovery."
+        },
+        {
+          "slug": "concepts/mcp",
+          "title": "MCP",
+          "template": "concept-mcp",
+          "description": "Connect MCP servers as Ax tools for generation, agents, prompts, resources, and runtime workflows."
+        },
+        {
+          "slug": "concepts/mcp-subscriptions",
+          "title": "MCP Subscriptions",
+          "template": "concept-mcp-subscriptions",
+          "description": "Discover an MCP endpoint catalog, select resources, maintain subscriptions, and wake or resume Ax programs safely."
+        },
+        {
+          "slug": "concepts/event-runtime",
+          "title": "Event Runtime",
+          "template": "concept-event-runtime",
+          "description": "Wake and resume Ax programs safely from subscriptions, webhooks, timers, queues, and application events."
+        },
+        {
+          "slug": "concepts/optimization",
+          "title": "Optimization",
+          "template": "concept-optimization",
+          "description": "GEPA, Pareto tradeoffs, demos, artifacts, and evaluation."
+        },
+        {
+          "slug": "concepts/playbook",
+          "title": "Playbook",
+          "template": "concept-playbook",
+          "description": "Evolving context playbooks that grow offline from examples and online from feedback."
+        },
+        {
+          "slug": "concepts/llms",
+          "title": "LLMs",
+          "template": "concept-llms",
+          "description": "Provider clients, model catalogs, routing, audio, embeddings, thinking, and context caching."
+        },
+        {
+          "slug": "concepts/telemetry",
+          "title": "Telemetry",
+          "template": "concept-telemetry",
+          "description": "Traces, metrics, usage, costs, optimizer metrics, and production debugging."
+        }
+      ]
+    },
+    {
+      "id": "subsystems",
+      "title": "Subsystems",
+      "pages": [
+        {
+          "slug": "subsystems/ai",
+          "title": "ai() LLM Models",
+          "template": "subsystem-ai",
+          "description": "Create provider clients and select models."
+        },
+        {
+          "slug": "subsystems/ax",
+          "title": "ax() Generation",
+          "template": "subsystem-ax",
+          "description": "Run structured generation with tools, streaming, validation, traces, and usage."
+        },
+        {
+          "slug": "subsystems/s",
+          "title": "s() Signatures",
+          "template": "subsystem-s",
+          "description": "Parse or build signatures."
+        },
+        {
+          "slug": "subsystems/agent",
+          "title": "agent() Agents",
+          "template": "subsystem-agent",
+          "description": "Build agents with tools, child agents, runtime profiles, and context controls."
+        },
+        {
+          "slug": "subsystems/flow",
+          "title": "flow() Workflows",
+          "template": "subsystem-flow",
+          "subsystem": "flow",
+          "description": "Compose typed programs into multi-step workflows; author or export them as mermaid flowcharts."
+        },
+        {
+          "slug": "subsystems/optimize",
+          "title": "optimize() GEPA",
+          "template": "subsystem-optimize",
+          "description": "Tune programs with the top-level GEPA helper."
+        }
+      ]
+    },
+    {
+      "id": "skills",
+      "title": "Skills",
+      "pages": [
+        {
+          "slug": "skills",
+          "title": "Overview",
+          "template": "skills",
+          "description": "Install language-specific Ax skills for coding agents."
+        }
+      ]
+    },
+    {
+      "id": "api",
+      "title": "API Docs",
+      "pages": [
+        {
+          "slug": "api/ai",
+          "title": "ai() API",
+          "template": "api",
+          "subsystem": "ai",
+          "description": "Provider, model, routing, media, and embedding APIs."
+        },
+        {
+          "slug": "api/ax",
+          "title": "ax() API",
+          "template": "api",
+          "subsystem": "ax",
+          "description": "Structured generation APIs."
+        },
+        {
+          "slug": "api/s",
+          "title": "s() API",
+          "template": "api",
+          "subsystem": "s",
+          "description": "Signature and field APIs."
+        },
+        {
+          "slug": "api/agent",
+          "title": "agent() API",
+          "template": "api",
+          "subsystem": "agent",
+          "description": "Agent, runtime, context, skill, memory, MCP, and RLM APIs."
+        },
+        {
+          "slug": "api/flow",
+          "title": "flow() API",
+          "template": "api",
+          "subsystem": "flow",
+          "description": "Flow builder, workflow graph, and mermaid APIs."
+        },
+        {
+          "slug": "api/optimize",
+          "title": "optimize() API",
+          "template": "api",
+          "subsystem": "optimize",
+          "description": "GEPA optimizer, Pareto, artifact, and evaluation APIs."
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "expected_error_contains": "runtime protocol",
+  "kind": "agent_runtime_protocol",
+  "mode": "malformed_json",
+  "name": "runtime-protocol-malformed-response",
+  "operation": "capabilities_error"
+}

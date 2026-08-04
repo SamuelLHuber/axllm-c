@@ -1,0 +1,5 @@
+vendor/ax/node_modules/
+vendor/ax/*/node_modules/
+vendor/ax/*/*/node_modules/
+/tmp/
+.DS_Store

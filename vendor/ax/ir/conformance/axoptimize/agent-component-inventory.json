@@ -1,0 +1,26 @@
+{
+  "expected_components_subset": [
+    {
+      "id": "task.root.responder::instruction",
+      "kind": "instruction"
+    },
+    {
+      "id": "root::instruction",
+      "kind": "instruction",
+      "owner": "root"
+    },
+    {
+      "id": "root.agent.runtime",
+      "kind": "runtime-policy"
+    },
+    {
+      "id": "root.agent.policy",
+      "kind": "agent-policy"
+    }
+  ],
+  "kind": "optimize",
+  "name": "agent-component-inventory",
+  "operation": "components",
+  "program": "agent",
+  "signature": "question:string -> answer:string"
+}

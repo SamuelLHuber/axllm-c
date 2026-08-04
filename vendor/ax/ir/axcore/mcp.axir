@@ -1,0 +1,2033 @@
+module @ax.mcp version "0.1" {
+  dialect @ax.mcp version "0.1"
+
+  op ax.mcp.interface @AxMCPTransport {
+    attr contract = "mcp-transport"
+    attr core_kind = "interface"
+    attr public = true
+    tag "axmcp"
+  }
+
+  op ax.mcp.record @AxMCPTokenSet {
+    attr core_kind = "record"
+    attr public = true
+    tag "axmcp"
+    type fields = "accessToken:string,refreshToken?:string,expiresAt?:number,issuer?:string,tokenType?:string,scope?:string"
+  }
+
+  op ax.mcp.record @AxMCPOAuthOptions {
+    attr core_kind = "record"
+    attr public = true
+    tag "axmcp"
+    type fields = "clientId?:string,clientSecret?:string,redirectUri?:string,scopes?:list<string>,tokenStore?:json,onAuthCode?:json,ssrfProtection?:json,requireIss?:bool,grantType?:string,resource?:string,authorizationServerMetadata?:json"
+  }
+
+  op ax.mcp.record @AxMCPClient {
+    attr core_kind = "record"
+    attr public = true
+    ref transport = @AxMCPTransport
+    tag "axmcp"
+    type signature = "(AxMCPTransport, options?:json) -> AxMCPClient"
+  }
+
+  op ax.mcp.record @AxMCPStreamableHTTPTransport {
+    attr core_kind = "record"
+    attr public = true
+    ref transport = @AxMCPTransport
+    tag "axmcp"
+    type signature = "(endpoint:string, options?:json) -> AxMCPStreamableHTTPTransport"
+  }
+
+  op ax.mcp.record @AxMCPStdioTransport {
+    attr core_kind = "record"
+    attr public = true
+    ref transport = @AxMCPTransport
+    tag "axmcp"
+    type signature = "(command:string, args?:list<string>, options?:json) -> AxMCPStdioTransport"
+  }
+
+  op ax.mcp.record @AxExecutionContext {
+    attr core_kind = "record"
+    attr public = true
+    tag "axmcp"
+    type signature = "(mcp?:list<AxMCPClient>, ucp?:list<AxUCPClient>, options?:json) -> AxExecutionContext"
+  }
+
+  op ax.mcp.record @AxMCPContinuationState {
+    attr core_kind = "record"
+    attr public = true
+    tag "axmcp"
+    type fields = "namespaces:list<string>,tasks:list<json>,subscriptions:list<json>,catalogFingerprint:string"
+  }
+
+  op ax.mcp.record @AxMCPCatalogSnapshot {
+    attr core_kind = "record"
+    attr public = true
+    tag "axmcp"
+    type fields = "namespace:string,protocolVersion?:string,revision:number,serverInfo?:json,serverCapabilities:json,tools:list<json>,prompts:list<json>,resources:list<json>,resourceTemplates:list<json>,subscriptions:list<string>"
+  }
+
+  op ax.mcp.record @AxMCPResourceSubscriptionPlan {
+    attr core_kind = "record"
+    attr public = true
+    tag "axmcp"
+    type fields = "selected:list<string>,additions:list<string>,removals:list<string>"
+  }
+
+  op ax.mcp.record @AxMCPResourceSubscriptionOwnershipTransition {
+    attr core_kind = "record"
+    attr public = true
+    tag "axmcp"
+    type fields = "owners:list<string>,wireAction:string,changed:bool"
+  }
+
+  op ax.mcp.semantic @mcp_execution_context_descriptor {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    tag "axmcp"
+    type signature = "(namespaces:list<string>, inheritance?:json) -> json"
+    body @entry(%namespaces: list<json>, %inheritance: json) {
+      %out = core.map
+      core.set %out["namespaces"] = %namespaces
+      %missing = core.call intrinsic.is_none(%inheritance)
+      core.if %missing {
+        core.set %out["inheritance"] = "all"
+      } else {
+        core.set %out["inheritance"] = %inheritance
+      }
+      core.set %out["native"] = true
+      core.set %out["lossyAdapter"] = false
+      core.return %out
+    }
+  }
+
+  op ax.mcp.semantic @mcp_protocol_constants {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    tag "axmcp"
+    type signature = "() -> json"
+    body @entry {
+      %versions = core.list
+      core.append %versions, "2026-07-28"
+      core.append %versions, "2025-11-25"
+      core.append %versions, "2025-06-18"
+      core.append %versions, "2025-03-26"
+      core.append %versions, "2024-11-05"
+      %out = core.map
+      core.set %out["protocolVersion"] = "2025-11-25"
+      core.set %out["modernProtocolVersion"] = "2026-07-28"
+      core.set %out["supportedProtocolVersions"] = %versions
+      core.return %out
+    }
+  }
+
+  op ax.mcp.semantic @mcp_modern_request_headers {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    tag "axmcp"
+    type signature = "(method:string, name?:string, protocol_version?:string) -> json"
+    body @entry(%method: string, %name: string, %protocol_version: string) {
+      %out = core.map
+      %version_missing = core.call intrinsic.is_none(%protocol_version)
+      core.if %version_missing {
+        core.set %out["MCP-Protocol-Version"] = "2026-07-28"
+      } else {
+        core.set %out["MCP-Protocol-Version"] = %protocol_version
+      }
+      core.set %out["Mcp-Method"] = %method
+      %missing = core.call intrinsic.is_none(%name)
+      core.if %missing {
+      } else {
+        core.set %out["Mcp-Name"] = %name
+      }
+      core.return %out
+    }
+  }
+
+  op ax.mcp.semantic @mcp_classify_discovery_result {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    tag "axmcp-modern-era"
+    type signature = "(result:json) -> json"
+    body @entry(%result: json) {
+      %out = core.map
+      %none = core.call intrinsic.none()
+      core.set %out["valid"] = false
+      core.set %out["serverInfo"] = %none
+      %empty_meta = core.map
+      core.set %out["meta"] = %empty_meta
+      %is_object = core.type_is %result type "object"
+      core.if %is_object {
+        %result_type = core.get %result["resultType"] default ""
+        %complete = core.call intrinsic.eq(%result_type, "complete")
+        %versions = core.get %result["supportedVersions"] default null
+        %versions_list = core.type_is %versions type "list"
+        %versions_valid = core.let %versions_list
+        core.if %versions_list {
+          core.for %version in %versions {
+            %version_string = core.type_is %version type "string"
+            %version_invalid = core.call intrinsic.not(%version_string)
+            core.if %version_invalid {
+              %versions_valid = core.const false
+            }
+          }
+        }
+        %capabilities = core.get %result["capabilities"] default null
+        %capabilities_valid = core.type_is %capabilities type "object"
+        %ttl = core.get %result["ttlMs"] default null
+        %ttl_number = core.type_is %ttl type "number"
+        %ttl_valid = core.const false
+        core.if %ttl_number {
+          %ttl_text = core.call intrinsic.json.stringify(%ttl)
+          %ttl_integer = core.regex_match %ttl_text pattern "^[0-9]+$"
+          %ttl_nonnegative = core.call intrinsic.gte(%ttl, 0)
+          %ttl_valid = core.call intrinsic.and(%ttl_integer, %ttl_nonnegative)
+        }
+        %scope = core.get %result["cacheScope"] default ""
+        %private_scope = core.call intrinsic.eq(%scope, "private")
+        %public_scope = core.call intrinsic.eq(%scope, "public")
+        %scope_valid = core.call intrinsic.or(%private_scope, %public_scope)
+        %shape_a = core.call intrinsic.and(%complete, %versions_valid)
+        %shape_b = core.call intrinsic.and(%capabilities_valid, %ttl_valid)
+        %shape_c = core.call intrinsic.and(%shape_a, %shape_b)
+        %valid = core.call intrinsic.and(%shape_c, %scope_valid)
+        core.if %valid {
+          core.set %out["valid"] = true
+          core.set %out["supportedVersions"] = %versions
+          core.set %out["capabilities"] = %capabilities
+          core.set %out["ttlMs"] = %ttl
+          core.set %out["cacheScope"] = %scope
+          %meta_raw = core.get %result["_meta"] default null
+          %meta_is_object = core.type_is %meta_raw type "object"
+          core.if %meta_is_object {
+            %meta_base = core.map
+            %meta = core.call intrinsic.map.merge(%meta_base, %meta_raw)
+            core.set %out["meta"] = %meta
+            %server_info_raw = core.get %meta["io.modelcontextprotocol/serverInfo"] default null
+            %server_info_object = core.type_is %server_info_raw type "object"
+            core.if %server_info_object {
+              %server_name = core.get %server_info_raw["name"] default null
+              %server_version = core.get %server_info_raw["version"] default null
+              %server_name_string = core.type_is %server_name type "string"
+              %server_version_string = core.type_is %server_version type "string"
+              %server_info_valid = core.call intrinsic.and(%server_name_string, %server_version_string)
+              core.if %server_info_valid {
+                %server_info_base = core.map
+                %server_info = core.call intrinsic.map.merge(%server_info_base, %server_info_raw)
+                core.set %out["serverInfo"] = %server_info
+              }
+            }
+          }
+        }
+      }
+      core.return %out
+    }
+  }
+
+  op ax.mcp.semantic @mcp_resolve_known_era {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    tag "axmcp-modern-era"
+    type signature = "(configured:string, hint?:string, cached?:string, stored?:string) -> json"
+    body @entry(%configured: string, %hint: string, %cached: string, %stored: string) {
+      %out = core.map
+      %configured_modern = core.call intrinsic.eq(%configured, "modern")
+      %configured_legacy = core.call intrinsic.eq(%configured, "legacy")
+      %configured_known = core.call intrinsic.or(%configured_modern, %configured_legacy)
+      core.if %configured_known {
+        core.set %out["era"] = %configured
+        core.set %out["probe"] = false
+        core.return %out
+      }
+      %hint_modern = core.call intrinsic.eq(%hint, "modern")
+      %hint_legacy = core.call intrinsic.eq(%hint, "legacy")
+      %hint_known = core.call intrinsic.or(%hint_modern, %hint_legacy)
+      core.if %hint_known {
+        core.set %out["era"] = %hint
+        core.set %out["probe"] = false
+        core.return %out
+      }
+      %cached_modern = core.call intrinsic.eq(%cached, "modern")
+      %cached_legacy = core.call intrinsic.eq(%cached, "legacy")
+      %cached_known = core.call intrinsic.or(%cached_modern, %cached_legacy)
+      core.if %cached_known {
+        core.set %out["era"] = %cached
+        core.set %out["probe"] = false
+        core.return %out
+      }
+      %stored_modern = core.call intrinsic.eq(%stored, "modern")
+      %stored_legacy = core.call intrinsic.eq(%stored, "legacy")
+      %stored_known = core.call intrinsic.or(%stored_modern, %stored_legacy)
+      core.if %stored_known {
+        core.set %out["era"] = %stored
+        core.set %out["probe"] = false
+        core.return %out
+      }
+      core.set %out["era"] = "modern"
+      core.set %out["probe"] = true
+      core.return %out
+    }
+  }
+
+  op ax.mcp.semantic @mcp_select_mutual_version {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    tag "axmcp-modern-era"
+    type signature = "(error_data:json, client_versions:list<string>) -> string"
+    body @entry(%error_data: json, %client_versions: list<json>) {
+      %is_object = core.type_is %error_data type "object"
+      core.if %is_object {
+        %supported = core.get %error_data["supported"] default null
+        %supported_list = core.type_is %supported type "list"
+        core.if %supported_list {
+          core.for %version in %client_versions {
+            %mutual = core.call intrinsic.contains(%supported, %version)
+            core.if %mutual {
+              core.return %version
+            }
+          }
+        }
+      }
+      core.return ""
+    }
+  }
+
+  op ax.mcp.semantic @mcp_build_request_meta {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    tag "axmcp-modern-era"
+    type signature = "(existing:json, protocol_version:string, client_capabilities:json, client_info:json, log_level?:string, traceparent?:string, tracestate?:string) -> json"
+    body @entry(%existing: json, %protocol_version: string, %client_capabilities: json, %client_info: json, %log_level: string, %traceparent: string, %tracestate: string) {
+      %empty = core.map
+      %out = core.let %empty
+      %existing_object = core.type_is %existing type "object"
+      core.if %existing_object {
+        %out = core.call intrinsic.map.merge(%empty, %existing)
+      }
+      core.set %out["io.modelcontextprotocol/protocolVersion"] = %protocol_version
+      core.set %out["io.modelcontextprotocol/clientCapabilities"] = %client_capabilities
+      core.set %out["io.modelcontextprotocol/clientInfo"] = %client_info
+      %log_missing = core.call intrinsic.is_none(%log_level)
+      %has_log = core.call intrinsic.not(%log_missing)
+      core.if %has_log {
+        core.set %out["io.modelcontextprotocol/logLevel"] = %log_level
+      }
+      %has_traceparent = core.call intrinsic.truthy(%traceparent)
+      core.if %has_traceparent {
+        core.set %out["traceparent"] = %traceparent
+      }
+      %has_tracestate = core.call intrinsic.truthy(%tracestate)
+      core.if %has_tracestate {
+        core.set %out["tracestate"] = %tracestate
+      }
+      core.return %out
+    }
+  }
+
+  op ax.mcp.semantic @mcp_client_capabilities {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    tag "axmcp-modern-era"
+    type signature = "(has_roots:bool, has_sampling:bool, has_elicitation:bool, era:string, tasks_extension:bool) -> json"
+    body @entry(%has_roots: bool, %has_sampling: bool, %has_elicitation: bool, %era: string, %tasks_extension: bool) {
+      %out = core.map
+      core.if %has_roots {
+        %roots = core.map
+        core.set %roots["listChanged"] = true
+        core.set %out["roots"] = %roots
+      }
+      core.if %has_sampling {
+        %sampling = core.map
+        %sampling_context = core.map
+        %sampling_tools = core.map
+        core.set %sampling["context"] = %sampling_context
+        core.set %sampling["tools"] = %sampling_tools
+        core.set %out["sampling"] = %sampling
+      }
+      core.if %has_elicitation {
+        %elicitation = core.map
+        %elicitation_form = core.map
+        %elicitation_url = core.map
+        core.set %elicitation["form"] = %elicitation_form
+        core.set %elicitation["url"] = %elicitation_url
+        core.set %out["elicitation"] = %elicitation
+      }
+      %modern = core.call intrinsic.eq(%era, "modern")
+      %add_tasks = core.call intrinsic.and(%modern, %tasks_extension)
+      core.if %add_tasks {
+        %extensions = core.map
+        %tasks = core.map
+        core.set %extensions["io.modelcontextprotocol/tasks"] = %tasks
+        core.set %out["extensions"] = %extensions
+      }
+      core.return %out
+    }
+  }
+
+  op ax.mcp.semantic @mcp_negotiate_extensions {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    tag "axmcp-modern-era"
+    type signature = "(client_ext:json, server_ext:json) -> json"
+    body @entry(%client_ext: json, %server_ext: json) {
+      %out = core.map
+      %client_object = core.type_is %client_ext type "object"
+      %server_object = core.type_is %server_ext type "object"
+      %both_objects = core.call intrinsic.and(%client_object, %server_object)
+      core.if %both_objects {
+        %names = core.call intrinsic.map.keys(%client_ext)
+        core.for %name in %names {
+          %server_has = core.call intrinsic.map.contains(%server_ext, %name)
+          core.if %server_has {
+            %client_value = core.get %client_ext[%name] default null
+            %server_value = core.get %server_ext[%name] default null
+            %client_value_object = core.type_is %client_value type "object"
+            %server_value_object = core.type_is %server_value type "object"
+            %values_objects = core.call intrinsic.and(%client_value_object, %server_value_object)
+            core.if %values_objects {
+              %merged = core.call intrinsic.map.merge(%client_value, %server_value)
+              core.set %out[%name] = %merged
+            } else {
+              core.set %out[%name] = %server_value
+            }
+          }
+        }
+      }
+      core.return %out
+    }
+  }
+
+  op ax.mcp.semantic @mcp_request_name {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    tag "axmcp-modern-era"
+    type signature = "(method:string, params:json) -> string"
+    body @entry(%method: string, %params: json) {
+      %params_object = core.type_is %params type "object"
+      core.if %params_object {
+        %tools_call = core.call intrinsic.eq(%method, "tools/call")
+        %prompts_get = core.call intrinsic.eq(%method, "prompts/get")
+        %named = core.call intrinsic.or(%tools_call, %prompts_get)
+        core.if %named {
+          %name = core.get %params["name"] default ""
+          %name_string = core.type_is %name type "string"
+          core.if %name_string {
+            core.return %name
+          }
+        }
+        %resources_read = core.call intrinsic.eq(%method, "resources/read")
+        core.if %resources_read {
+          %uri = core.get %params["uri"] default ""
+          %uri_string = core.type_is %uri type "string"
+          core.if %uri_string {
+            core.return %uri
+          }
+        }
+      }
+      core.return ""
+    }
+  }
+
+  op ax.mcp.semantic @mcp_header_value_plan {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    tag "axmcp-param-headers"
+    type signature = "(value:string) -> json"
+    body @entry(%value: string) {
+      %out = core.map
+      %edge_space = core.regex_match %value pattern "^[\\t ]|[\\t ]$"
+      %sentinel_prefix = core.call intrinsic.string.starts_with(%value, "=?base64?")
+      %sentinel_suffix = core.call intrinsic.string.ends_with(%value, "?=")
+      %sentinel = core.call intrinsic.and(%sentinel_prefix, %sentinel_suffix)
+      %unsafe_octet = core.regex_match %value pattern "[^\\t -~]"
+      %edge_or_sentinel = core.call intrinsic.or(%edge_space, %sentinel)
+      %encode = core.call intrinsic.or(%edge_or_sentinel, %unsafe_octet)
+      core.if %encode {
+        core.set %out["mode"] = "encode"
+      } else {
+        core.set %out["mode"] = "plain"
+      }
+      core.return %out
+    }
+  }
+
+  op ax.mcp.semantic @mcp_param_header_bindings {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr effect = "throws"
+    attr emit_module = "mcp"
+    tag "axmcp-param-headers"
+    type signature = "(input_schema:json) -> json throws"
+    body @entry(%input_schema: json) {
+      %bindings = core.list
+      %schema_object = core.type_is %input_schema type "object"
+      %not_object = core.call intrinsic.not(%schema_object)
+      core.if %not_object {
+        core.return %bindings
+      }
+      %root_annotated = core.call intrinsic.map.contains(%input_schema, "x-mcp-header")
+      core.if %root_annotated {
+        %root_error = core.call intrinsic.error.validation("x-mcp-header at inputSchema is not statically reachable through properties")
+        core.raise %root_error
+      }
+      %seen_names = core.list
+      %properties = core.get %input_schema["properties"] default null
+      %properties_object = core.type_is %properties type "object"
+      core.if %properties_object {
+        %property_names = core.call intrinsic.map.keys(%properties)
+        core.for %property_name in %property_names {
+          %property_schema = core.get %properties[%property_name] default null
+          %property_object = core.type_is %property_schema type "object"
+          core.if %property_object {
+            %annotated = core.call intrinsic.map.contains(%property_schema, "x-mcp-header")
+            core.if %annotated {
+              %header_name = core.get %property_schema["x-mcp-header"] default null
+              %header_string = core.type_is %header_name type "string"
+              %header_not_string = core.call intrinsic.not(%header_string)
+              core.if %header_not_string {
+                %name_type_error = core.call intrinsic.error.validation("x-mcp-header must be a non-empty string")
+                core.raise %name_type_error
+              }
+              %header_length = core.call intrinsic.len(%header_name)
+              %header_nonempty = core.call intrinsic.gt(%header_length, 0)
+              %header_invalid = core.call intrinsic.not(%header_nonempty)
+              core.if %header_invalid {
+                %name_error = core.call intrinsic.error.validation("x-mcp-header must be a non-empty string")
+                core.raise %name_error
+              }
+              %token_valid = core.regex_match %header_name pattern "^[!#$%&'*+\\-.^_`|~0-9A-Za-z]+$"
+              %token_invalid = core.call intrinsic.not(%token_valid)
+              core.if %token_invalid {
+                %token_error = core.call intrinsic.error.validation("x-mcp-header value is not an RFC 9110 field-name token")
+                core.raise %token_error
+              }
+              %normalized_name = core.call intrinsic.string.lower(%header_name)
+              %normalized_full_name = core.call intrinsic.string.format("mcp-param-{}", %normalized_name)
+              %duplicate = core.call intrinsic.contains(%seen_names, %normalized_full_name)
+              core.if %duplicate {
+                %duplicate_error = core.call intrinsic.error.validation("x-mcp-header value is not case-insensitively unique")
+                core.raise %duplicate_error
+              }
+              core.append %seen_names, %normalized_full_name
+              %property_type = core.get %property_schema["type"] default null
+              %type_string = core.call intrinsic.eq(%property_type, "string")
+              %type_integer = core.call intrinsic.eq(%property_type, "integer")
+              %type_boolean = core.call intrinsic.eq(%property_type, "boolean")
+              %type_scalar_a = core.call intrinsic.or(%type_string, %type_integer)
+              %type_valid = core.call intrinsic.or(%type_scalar_a, %type_boolean)
+              %type_invalid = core.call intrinsic.not(%type_valid)
+              core.if %type_invalid {
+                %type_error = core.call intrinsic.error.validation("x-mcp-header requires type string, integer, or boolean")
+                core.raise %type_error
+              }
+              %binding = core.map
+              %full_header_name = core.call intrinsic.string.format("Mcp-Param-{}", %header_name)
+              core.set %binding["headerName"] = %full_header_name
+              %path = core.list
+              core.append %path, %property_name
+              core.set %binding["path"] = %path
+              core.set %binding["type"] = %property_type
+              core.append %bindings, %binding
+            }
+            %child_base = core.map
+            %child_schema = core.call intrinsic.map.merge(%child_base, %property_schema)
+            core.call intrinsic.map.delete(%child_schema, "x-mcp-header")
+            %child_bindings = core.call @mcp_param_header_bindings(%child_schema)
+            core.for %child_binding in %child_bindings {
+              %child_header_name = core.get %child_binding["headerName"] default ""
+              %child_normalized = core.call intrinsic.string.lower(%child_header_name)
+              %child_duplicate = core.call intrinsic.contains(%seen_names, %child_normalized)
+              core.if %child_duplicate {
+                %child_duplicate_error = core.call intrinsic.error.validation("x-mcp-header value is not case-insensitively unique")
+                core.raise %child_duplicate_error
+              }
+              core.append %seen_names, %child_normalized
+              %child_path = core.get %child_binding["path"] default null
+              %prefixed_path = core.list
+              core.append %prefixed_path, %property_name
+              core.for %child_part in %child_path {
+                core.append %prefixed_path, %child_part
+              }
+              %prefixed_binding_base = core.map
+              %prefixed_binding = core.call intrinsic.map.merge(%prefixed_binding_base, %child_binding)
+              core.set %prefixed_binding["path"] = %prefixed_path
+              core.append %bindings, %prefixed_binding
+            }
+          }
+        }
+      }
+      %schema_keys = core.call intrinsic.map.keys(%input_schema)
+      core.for %schema_key in %schema_keys {
+        %is_properties = core.call intrinsic.eq(%schema_key, "properties")
+        %is_annotation = core.call intrinsic.eq(%schema_key, "x-mcp-header")
+        %skip_keyword = core.call intrinsic.or(%is_properties, %is_annotation)
+        %visit_keyword = core.call intrinsic.not(%skip_keyword)
+        core.if %visit_keyword {
+          %keyword_value = core.get %input_schema[%schema_key] default null
+          %keyword_object = core.type_is %keyword_value type "object"
+          core.if %keyword_object {
+            %keyword_bindings = core.call @mcp_param_header_bindings(%keyword_value)
+            %keyword_binding_count = core.call intrinsic.len(%keyword_bindings)
+            %keyword_annotated = core.call intrinsic.gt(%keyword_binding_count, 0)
+            core.if %keyword_annotated {
+              %keyword_error = core.call intrinsic.error.validation("x-mcp-header is not statically reachable through properties")
+              core.raise %keyword_error
+            }
+          }
+          %keyword_list = core.type_is %keyword_value type "list"
+          core.if %keyword_list {
+            core.for %keyword_item in %keyword_value {
+              %keyword_item_object = core.type_is %keyword_item type "object"
+              core.if %keyword_item_object {
+                %item_bindings = core.call @mcp_param_header_bindings(%keyword_item)
+                %item_binding_count = core.call intrinsic.len(%item_bindings)
+                %item_annotated = core.call intrinsic.gt(%item_binding_count, 0)
+                core.if %item_annotated {
+                  %item_error = core.call intrinsic.error.validation("x-mcp-header is not statically reachable through properties")
+                  core.raise %item_error
+                }
+              }
+            }
+          }
+        }
+      }
+      core.return %bindings
+    }
+  }
+
+  op ax.mcp.semantic @mcp_param_header_values {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr effect = "throws"
+    attr emit_module = "mcp"
+    tag "axmcp-param-headers"
+    type signature = "(bindings:json, arguments:json) -> json throws"
+    body @entry(%bindings: json, %arguments: json) {
+      %out = core.map
+      %bindings_list = core.type_is %bindings type "list"
+      %not_bindings = core.call intrinsic.not(%bindings_list)
+      core.if %not_bindings {
+        core.return %out
+      }
+      core.for %binding in %bindings {
+        %header_name = core.get %binding["headerName"] default ""
+        %path = core.get %binding["path"] default null
+        %expected_type = core.get %binding["type"] default ""
+        %current = core.let %arguments
+        %present = core.const true
+        core.for %part in %path {
+          %current_object = core.type_is %current type "object"
+          core.if %current_object {
+            %has_part = core.call intrinsic.map.contains(%current, %part)
+            core.if %has_part {
+              %current = core.get %current[%part] default null
+            } else {
+              %present = core.const false
+            }
+          } else {
+            %present = core.const false
+          }
+        }
+        %is_null = core.call intrinsic.is_none(%current)
+        %not_null = core.call intrinsic.not(%is_null)
+        %emit_value = core.call intrinsic.and(%present, %not_null)
+        core.if %emit_value {
+          %expects_string = core.call intrinsic.eq(%expected_type, "string")
+          core.if %expects_string {
+            %is_string = core.type_is %current type "string"
+            %invalid_string = core.call intrinsic.not(%is_string)
+            core.if %invalid_string {
+              %string_error = core.call intrinsic.error.validation("MCP parameter header expected string")
+              core.raise %string_error
+            }
+            core.set %out[%header_name] = %current
+          } else {
+            %expects_boolean = core.call intrinsic.eq(%expected_type, "boolean")
+            core.if %expects_boolean {
+              %is_boolean = core.type_is %current type "boolean"
+              %invalid_boolean = core.call intrinsic.not(%is_boolean)
+              core.if %invalid_boolean {
+                %boolean_error = core.call intrinsic.error.validation("MCP parameter header expected boolean")
+                core.raise %boolean_error
+              }
+              core.if %current {
+                core.set %out[%header_name] = "true"
+              } else {
+                core.set %out[%header_name] = "false"
+              }
+            } else {
+              %is_number = core.type_is %current type "number"
+              %not_number = core.call intrinsic.not(%is_number)
+              core.if %not_number {
+                %number_error = core.call intrinsic.error.validation("MCP parameter header expected integer")
+                core.raise %number_error
+              }
+              %number_text = core.call intrinsic.json.stringify(%current)
+              %is_integer = core.regex_match %number_text pattern "^-?(0|[1-9][0-9]*)$"
+              %absolute = core.call intrinsic.math.abs(%current)
+              %safe_high = core.call intrinsic.mul(9007199, 1000000000)
+              %safe_max = core.call intrinsic.add(%safe_high, 254740991)
+              %is_safe = core.call intrinsic.lte(%absolute, %safe_max)
+              %valid_integer = core.call intrinsic.and(%is_integer, %is_safe)
+              %invalid_integer = core.call intrinsic.not(%valid_integer)
+              core.if %invalid_integer {
+                %integer_error = core.call intrinsic.error.validation("MCP parameter header expected integer")
+                core.raise %integer_error
+              }
+              core.set %out[%header_name] = %number_text
+            }
+          }
+        }
+      }
+      core.return %out
+    }
+  }
+
+  op ax.mcp.semantic @mcp_fold_cache_info {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    tag "axmcp-cacheable-results"
+    type signature = "(pages:list<json>, fetched_at:number) -> json"
+    body @entry(%pages: list<json>, %fetched_at: number) {
+      %out = core.map
+      core.set %out["fetchedAt"] = %fetched_at
+      %page_count = core.call intrinsic.len(%pages)
+      %has_pages = core.call intrinsic.gt(%page_count, 0)
+      %ttl_valid = core.let %has_pages
+      %first_ttl = core.const true
+      %min_ttl = core.let 0
+      %private_scope = core.const false
+      %public_scope = core.let %has_pages
+      core.for %page in %pages {
+        %ttl = core.get %page["ttlMs"] default null
+        %ttl_number = core.type_is %ttl type "number"
+        %ttl_integer = core.const false
+        %ttl_nonnegative = core.const false
+        core.if %ttl_number {
+          %ttl_text = core.call intrinsic.json.stringify(%ttl)
+          %ttl_integer = core.regex_match %ttl_text pattern "^[0-9]+$"
+          %ttl_nonnegative = core.call intrinsic.gte(%ttl, 0)
+        }
+        %page_ttl_valid = core.call intrinsic.and(%ttl_integer, %ttl_nonnegative)
+        core.if %page_ttl_valid {
+          core.if %first_ttl {
+            %min_ttl = core.let %ttl
+            %first_ttl = core.const false
+          } else {
+            %smaller = core.call intrinsic.lt(%ttl, %min_ttl)
+            core.if %smaller {
+              %min_ttl = core.let %ttl
+            }
+          }
+        } else {
+          %ttl_valid = core.const false
+        }
+        %scope = core.get %page["cacheScope"] default ""
+        %page_private = core.call intrinsic.eq(%scope, "private")
+        %page_public = core.call intrinsic.eq(%scope, "public")
+        core.if %page_private {
+          %private_scope = core.const true
+        }
+        %not_public = core.call intrinsic.not(%page_public)
+        core.if %not_public {
+          %public_scope = core.const false
+        }
+      }
+      core.if %ttl_valid {
+        core.set %out["ttlMs"] = %min_ttl
+        %expires_at = core.call intrinsic.add(%fetched_at, %min_ttl)
+        core.set %out["expiresAt"] = %expires_at
+      }
+      core.if %private_scope {
+        core.set %out["cacheScope"] = "private"
+      } else {
+        core.if %public_scope {
+          core.set %out["cacheScope"] = "public"
+        }
+      }
+      core.return %out
+    }
+  }
+
+  op ax.mcp.semantic @mcp_cache_freshness {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    tag "axmcp-cacheable-results"
+    type signature = "(cache_info:json, now:number) -> bool"
+    body @entry(%cache_info: json, %now: number) {
+      %cache_object = core.type_is %cache_info type "object"
+      core.if %cache_object {
+        %expires_at = core.get %cache_info["expiresAt"] default null
+        %expires_number = core.type_is %expires_at type "number"
+        core.if %expires_number {
+          %fresh = core.call intrinsic.lt(%now, %expires_at)
+          core.return %fresh
+        }
+      }
+      core.return false
+    }
+  }
+
+  op ax.mcp.semantic @mcp_validate_modern_task {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    tag "axmcp-tasks-v2"
+    type signature = "(task:json) -> bool"
+    body @entry(%task: json) {
+      %is_object = core.type_is %task type "object"
+      core.if %is_object {
+        %task_id = core.get %task["taskId"] default null
+        %status = core.get %task["status"] default null
+        %created_at = core.get %task["createdAt"] default null
+        %updated_at = core.get %task["lastUpdatedAt"] default null
+        %task_id_string = core.type_is %task_id type "string"
+        %created_string = core.type_is %created_at type "string"
+        %updated_string = core.type_is %updated_at type "string"
+        %working = core.call intrinsic.eq(%status, "working")
+        %input_required = core.call intrinsic.eq(%status, "input_required")
+        %completed = core.call intrinsic.eq(%status, "completed")
+        %failed = core.call intrinsic.eq(%status, "failed")
+        %cancelled = core.call intrinsic.eq(%status, "cancelled")
+        %status_a = core.call intrinsic.or(%working, %input_required)
+        %status_b = core.call intrinsic.or(%completed, %failed)
+        %status_c = core.call intrinsic.or(%status_a, %status_b)
+        %status_valid = core.call intrinsic.or(%status_c, %cancelled)
+        %has_ttl = core.call intrinsic.map.contains(%task, "ttlMs")
+        %ttl = core.get %task["ttlMs"] default null
+        %ttl_null = core.call intrinsic.eq(%ttl, null)
+        %ttl_number = core.type_is %ttl type "number"
+        %ttl_type = core.call intrinsic.or(%ttl_null, %ttl_number)
+        %ttl_valid = core.call intrinsic.and(%has_ttl, %ttl_type)
+        %has_poll = core.call intrinsic.map.contains(%task, "pollIntervalMs")
+        %poll = core.get %task["pollIntervalMs"] default null
+        %poll_number = core.type_is %poll type "number"
+        %no_poll = core.call intrinsic.not(%has_poll)
+        %poll_valid = core.call intrinsic.or(%no_poll, %poll_number)
+        %identity_valid = core.call intrinsic.and(%task_id_string, %status_valid)
+        %dates_valid = core.call intrinsic.and(%created_string, %updated_string)
+        %base_valid = core.call intrinsic.and(%identity_valid, %dates_valid)
+        %cache_valid = core.call intrinsic.and(%ttl_valid, %poll_valid)
+        %valid = core.call intrinsic.and(%base_valid, %cache_valid)
+        core.return %valid
+      }
+      core.return false
+    }
+  }
+
+  op ax.mcp.semantic @mcp_server_request_plan {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    tag "axmcp-server-requests"
+    type signature = "(request:json, roots:json, has_elicitation:bool) -> json"
+    body @entry(%request: json, %roots: json, %has_elicitation: bool) {
+      %out = core.map
+      %id = core.get %request["id"] default null
+      %method = core.get %request["method"] default ""
+      %params = core.get %request["params"] default null
+      %ping = core.call intrinsic.eq(%method, "ping")
+      core.if %ping {
+        %response = core.map
+        %result = core.map
+        core.set %response["jsonrpc"] = "2.0"
+        core.set %response["id"] = %id
+        core.set %response["result"] = %result
+        core.set %out["action"] = "respond"
+        core.set %out["response"] = %response
+        core.return %out
+      }
+      %roots_list = core.call intrinsic.eq(%method, "roots/list")
+      core.if %roots_list {
+        %roots_missing = core.call intrinsic.is_none(%roots)
+        core.if %roots_missing {
+        } else {
+          %roots_text = core.call intrinsic.json.stringify(%roots)
+          %roots_copy = core.call intrinsic.json.parse(%roots_text)
+          %result = core.map
+          core.set %result["roots"] = %roots_copy
+          %response = core.map
+          core.set %response["jsonrpc"] = "2.0"
+          core.set %response["id"] = %id
+          core.set %response["result"] = %result
+          core.set %out["action"] = "respond"
+          core.set %out["response"] = %response
+          core.return %out
+        }
+      }
+      %elicitation = core.call intrinsic.eq(%method, "elicitation/create")
+      %can_elicit = core.call intrinsic.and(%elicitation, %has_elicitation)
+      core.if %can_elicit {
+        core.set %out["action"] = "elicitation"
+        core.set %out["id"] = %id
+        %params_missing = core.call intrinsic.is_none(%params)
+        core.if %params_missing {
+          %empty = core.map
+          core.set %out["params"] = %empty
+        } else {
+          core.set %out["params"] = %params
+        }
+        core.return %out
+      }
+      %error = core.map
+      core.set %error["code"] = -32601
+      %message = core.call intrinsic.string.format("Unsupported server request: {}", %method)
+      core.set %error["message"] = %message
+      %response = core.map
+      core.set %response["jsonrpc"] = "2.0"
+      core.set %response["id"] = %id
+      core.set %response["error"] = %error
+      core.set %out["action"] = "respond"
+      core.set %out["response"] = %response
+      core.return %out
+    }
+  }
+
+  op ax.mcp.semantic @mcp_task_terminal_outcome {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    tag "axmcp-tasks-v2"
+    type signature = "(task:json) -> json"
+    body @entry(%task: json) {
+      %out = core.map
+      %task_id = core.get %task["taskId"] default ""
+      %status = core.get %task["status"] default ""
+      %completed = core.call intrinsic.eq(%status, "completed")
+      core.if %completed {
+        %has_result = core.call intrinsic.map.contains(%task, "result")
+        core.if %has_result {
+          core.set %out["kind"] = "result"
+          %result = core.get %task["result"] default null
+          core.set %out["result"] = %result
+        } else {
+          core.set %out["kind"] = "violation"
+          %message = core.call intrinsic.string.format("MCP protocol violation: completed task {} omitted result", %task_id)
+          core.set %out["message"] = %message
+        }
+        core.return %out
+      }
+      %failed = core.call intrinsic.eq(%status, "failed")
+      core.if %failed {
+        %error = core.get %task["error"] default null
+        %error_object = core.type_is %error type "object"
+        core.if %error_object {
+          %code = core.get %error["code"] default null
+          %error_message = core.get %error["message"] default null
+          %code_number = core.type_is %code type "number"
+          %message_string = core.type_is %error_message type "string"
+          %typed_error = core.call intrinsic.and(%code_number, %message_string)
+          core.if %typed_error {
+            core.set %out["kind"] = "protocol_error"
+            core.set %out["code"] = %code
+            core.set %out["message"] = %error_message
+            %has_data = core.call intrinsic.map.contains(%error, "data")
+            core.if %has_data {
+              %data = core.get %error["data"] default null
+              core.set %out["data"] = %data
+            }
+            core.return %out
+          }
+        }
+        core.set %out["kind"] = "failure"
+        %message = core.call intrinsic.string.format("MCP task {} failed", %task_id)
+        core.set %out["message"] = %message
+        core.return %out
+      }
+      %cancelled = core.call intrinsic.eq(%status, "cancelled")
+      core.if %cancelled {
+        core.set %out["kind"] = "cancelled"
+        %message = core.call intrinsic.string.format("MCP task {} cancelled", %task_id)
+        core.set %out["message"] = %message
+        core.return %out
+      }
+      %input_required = core.call intrinsic.eq(%status, "input_required")
+      core.if %input_required {
+        %has_requests = core.call intrinsic.map.contains(%task, "inputRequests")
+        core.if %has_requests {
+          core.set %out["kind"] = "input_required"
+          %requests = core.get %task["inputRequests"] default null
+          core.set %out["inputRequests"] = %requests
+        } else {
+          core.set %out["kind"] = "violation"
+          %message = core.call intrinsic.string.format("MCP protocol violation: input_required task {} omitted inputRequests", %task_id)
+          core.set %out["message"] = %message
+        }
+        core.return %out
+      }
+      core.set %out["kind"] = "pending"
+      core.return %out
+    }
+  }
+
+  op ax.mcp.semantic @mcp_mrtr_plan_round {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    tag "axmcp-mrtr-roots"
+    type signature = "(result:json, era:string, method:string, round:number, max_rounds?:number) -> json"
+    body @entry(%result: json, %era: string, %method: string, %round: number, %max_rounds: number) {
+      %out = core.map
+      %result_type = core.get %result["resultType"] default ""
+      %input_required = core.call intrinsic.eq(%result_type, "input_required")
+      core.if %input_required {
+      } else {
+        core.set %out["action"] = "complete"
+        core.return %out
+      }
+
+      %modern = core.call intrinsic.eq(%era, "modern")
+      core.if %modern {
+      } else {
+        core.set %out["action"] = "violation"
+        %message = core.call intrinsic.string.format("MCP protocol violation: legacy server returned input_required for {}", %method)
+        core.set %out["message"] = %message
+        core.return %out
+      }
+
+      %limit_missing = core.call intrinsic.is_none(%max_rounds)
+      core.if %limit_missing {
+        %at_default_limit = core.call intrinsic.gte(%round, 5)
+        core.if %at_default_limit {
+          core.set %out["action"] = "violation"
+          %message = core.call intrinsic.string.format("MCP {} exceeded {} input rounds", %method, 5)
+          core.set %out["message"] = %message
+          core.return %out
+        }
+      } else {
+        %at_configured_limit = core.call intrinsic.gte(%round, %max_rounds)
+        core.if %at_configured_limit {
+          core.set %out["action"] = "violation"
+          %message = core.call intrinsic.string.format("MCP {} exceeded {} input rounds", %method, %max_rounds)
+          core.set %out["message"] = %message
+          core.return %out
+        }
+      }
+
+      %has_requests = core.call intrinsic.map.contains(%result, "inputRequests")
+      %has_state = core.call intrinsic.map.contains(%result, "requestState")
+      %has_either = core.call intrinsic.or(%has_requests, %has_state)
+      core.if %has_either {
+      } else {
+        core.set %out["action"] = "violation"
+        %message = core.call intrinsic.string.format("MCP protocol violation: input_required result for {} omitted both inputRequests and requestState", %method)
+        core.set %out["message"] = %message
+        core.return %out
+      }
+
+      core.if %has_state {
+        %state = core.get %result["requestState"] default null
+        %state_string = core.type_is %state type "string"
+        core.if %state_string {
+        } else {
+          core.set %out["action"] = "violation"
+          %message = core.call intrinsic.string.format("MCP protocol violation: input_required requestState for {} must be a string", %method)
+          core.set %out["message"] = %message
+          core.return %out
+        }
+        core.set %out["requestState"] = %state
+      }
+
+      core.set %out["action"] = "continue"
+      core.set %out["hasInputRequests"] = %has_requests
+      core.set %out["hasRequestState"] = %has_state
+      core.if %has_requests {
+        %requests = core.get %result["inputRequests"] default null
+        core.set %out["inputRequests"] = %requests
+      }
+      core.return %out
+    }
+  }
+
+  op ax.mcp.semantic @mcp_mrtr_plan_fulfillment {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    tag "axmcp-mrtr-elicitation"
+    type signature = "(input_requests:json, roots:json, has_elicitation:bool, has_sampling:bool) -> json"
+    body @entry(%input_requests: json, %roots: json, %has_elicitation: bool, %has_sampling: bool) {
+      %out = core.map
+      %responses = core.map
+      %pending = core.map
+      %keys = core.call intrinsic.map.keys(%input_requests)
+      core.for %key in %keys {
+        %request = core.get %input_requests[%key] default null
+        %method = core.get %request["method"] default ""
+        %is_roots = core.call intrinsic.eq(%method, "roots/list")
+        core.if %is_roots {
+          %roots_missing = core.call intrinsic.is_none(%roots)
+          core.if %roots_missing {
+            core.set %out["ok"] = false
+            core.set %out["message"] = "MCP protocol violation: server requested roots/list without a matching client handler"
+            core.return %out
+          }
+          %roots_text = core.call intrinsic.json.stringify(%roots)
+          %roots_copy = core.call intrinsic.json.parse(%roots_text)
+          %response = core.map
+          core.set %response["roots"] = %roots_copy
+          core.set %responses[%key] = %response
+        } else {
+          %is_sampling = core.call intrinsic.eq(%method, "sampling/createMessage")
+          core.if %is_sampling {
+            core.if %has_sampling {
+              core.set %pending[%key] = %request
+            } else {
+              core.set %out["ok"] = false
+              core.set %out["message"] = "MCP protocol violation: server requested sampling/createMessage without a matching client handler"
+              core.return %out
+            }
+          } else {
+            %is_elicitation = core.call intrinsic.eq(%method, "elicitation/create")
+            core.if %is_elicitation {
+              core.if %has_elicitation {
+                core.set %pending[%key] = %request
+              } else {
+                core.set %out["ok"] = false
+                core.set %out["message"] = "MCP protocol violation: server requested elicitation/create without a matching client handler"
+                core.return %out
+              }
+            } else {
+              core.set %out["ok"] = false
+              %message = core.call intrinsic.string.format("MCP protocol violation: unsupported MRTR input request method {}", %method)
+              core.set %out["message"] = %message
+              core.return %out
+            }
+          }
+        }
+      }
+      core.set %out["ok"] = true
+      core.set %out["responses"] = %responses
+      core.set %out["pending"] = %pending
+      core.return %out
+    }
+  }
+
+  op ax.mcp.semantic @mcp_mrtr_next_params {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    tag "axmcp-mrtr-roots"
+    type signature = "(base_params:json, input_responses?:json, request_state?:string) -> json"
+    body @entry(%base_params: json, %input_responses: json, %request_state: string) {
+      %base_text = core.call intrinsic.json.stringify(%base_params)
+      %out = core.call intrinsic.json.parse(%base_text)
+      %responses_missing = core.call intrinsic.is_none(%input_responses)
+      core.if %responses_missing {
+      } else {
+        core.set %out["inputResponses"] = %input_responses
+      }
+      %state_missing = core.call intrinsic.is_none(%request_state)
+      core.if %state_missing {
+      } else {
+        core.set %out["requestState"] = %request_state
+      }
+      core.return %out
+    }
+  }
+
+  op ax.mcp.semantic @mcp_jsonrpc_request {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    tag "axmcp"
+    type signature = "(id:string, method:string, params?:json) -> json"
+    body @entry(%id: string, %method: string, %params: json) {
+      %out = core.map
+      core.set %out["jsonrpc"] = "2.0"
+      core.set %out["id"] = %id
+      core.set %out["method"] = %method
+      %missing = core.call intrinsic.is_none(%params)
+      core.if %missing {
+      } else {
+        core.set %out["params"] = %params
+      }
+      core.return %out
+    }
+  }
+
+  op ax.mcp.semantic @mcp_jsonrpc_notification {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    tag "axmcp"
+    type signature = "(method:string, params?:json) -> json"
+    body @entry(%method: string, %params: json) {
+      %out = core.map
+      core.set %out["jsonrpc"] = "2.0"
+      core.set %out["method"] = %method
+      %missing = core.call intrinsic.is_none(%params)
+      core.if %missing {
+      } else {
+        core.set %out["params"] = %params
+      }
+      core.return %out
+    }
+  }
+
+  op ax.mcp.semantic @mcp_normalize_error {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    tag "axmcp"
+    type signature = "(response:json) -> json"
+    body @entry(%response: json) {
+      %err = core.get %response["error"] default null
+      %missing = core.call intrinsic.is_none(%err)
+      core.if %missing {
+        %ok = core.map
+        %result = core.get %response["result"] default null
+        core.set %ok["ok"] = true
+        core.set %ok["result"] = %result
+        core.return %ok
+      } else {
+        %code = core.get %err["code"] default 0
+        %message = core.get %err["message"] default "MCP JSON-RPC error"
+        %data = core.get %err["data"] default null
+        %out = core.map
+        core.set %out["ok"] = false
+        core.set %out["category"] = "mcp"
+        core.set %out["code"] = %code
+        core.set %out["message"] = %message
+        core.set %out["data"] = %data
+        core.return %out
+      }
+      core.return %response
+    }
+  }
+
+  op ax.mcp.semantic @mcp_resource_subscription_selection {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    attr public = true
+    tag "axmcp"
+    type signature = "(resources:list<json>, mode:string, explicit_uris:list<string>) -> list<string>"
+    body @entry(%resources: list<json>, %mode: string, %explicit_uris: list<json>) {
+      %selected = core.list
+      %is_explicit = core.call intrinsic.eq(%mode, "explicit")
+      core.if %is_explicit {
+        core.for %uri in %explicit_uris {
+          %empty = core.call intrinsic.eq(%uri, "")
+          %duplicate = core.call intrinsic.contains(%selected, %uri)
+          %skip = core.call intrinsic.or(%empty, %duplicate)
+          core.if %skip {
+          } else {
+            core.append %selected, %uri
+          }
+        }
+      } else {
+        %is_all = core.call intrinsic.eq(%mode, "all")
+        %is_selector = core.call intrinsic.eq(%mode, "selector")
+        %uses_resources = core.call intrinsic.or(%is_all, %is_selector)
+        core.if %uses_resources {
+          core.for %resource in %resources {
+            %uri = core.get %resource["uri"] default ""
+            %empty = core.call intrinsic.eq(%uri, "")
+            %duplicate = core.call intrinsic.contains(%selected, %uri)
+            %skip = core.call intrinsic.or(%empty, %duplicate)
+            core.if %skip {
+            } else {
+              core.append %selected, %uri
+            }
+          }
+        }
+      }
+      core.return %selected
+    }
+  }
+
+  op ax.mcp.semantic @mcp_resource_subscription_plan {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    attr public = true
+    tag "axmcp"
+    type signature = "(desired:list<string>, current:list<string>) -> json"
+    body @entry(%desired: list<json>, %current: list<json>) {
+      %selected = core.list
+      core.for %uri in %desired {
+        %duplicate = core.call intrinsic.contains(%selected, %uri)
+        core.if %duplicate {
+        } else {
+          core.append %selected, %uri
+        }
+      }
+      %additions = core.list
+      core.for %uri in %selected {
+        %owned = core.call intrinsic.contains(%current, %uri)
+        core.if %owned {
+        } else {
+          core.append %additions, %uri
+        }
+      }
+      %removals = core.list
+      core.for %uri in %current {
+        %wanted = core.call intrinsic.contains(%selected, %uri)
+        core.if %wanted {
+        } else {
+          core.append %removals, %uri
+        }
+      }
+      %out = core.map
+      core.set %out["selected"] = %selected
+      core.set %out["additions"] = %additions
+      core.set %out["removals"] = %removals
+      core.return %out
+    }
+  }
+
+  op ax.mcp.semantic @mcp_resource_subscription_ownership {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    attr public = true
+    tag "axmcp"
+    type signature = "(owners:list<string>, owner:string, operation:string) -> json"
+    body @entry(%owners: list<json>, %owner: string, %operation: string) {
+      %out_owners = core.list
+      %out = core.map
+      core.set %out["wireAction"] = "none"
+      core.set %out["changed"] = false
+      %has_owner = core.call intrinsic.contains(%owners, %owner)
+      %is_acquire = core.call intrinsic.eq(%operation, "acquire")
+      core.if %is_acquire {
+        core.for %current in %owners {
+          core.append %out_owners, %current
+        }
+        core.if %has_owner {
+        } else {
+          %before = core.call intrinsic.len(%owners)
+          %was_empty = core.call intrinsic.eq(%before, 0)
+          core.if %was_empty {
+            core.set %out["wireAction"] = "subscribe"
+          }
+          core.append %out_owners, %owner
+          core.set %out["changed"] = true
+        }
+      } else {
+        core.for %current in %owners {
+          %matches = core.call intrinsic.eq(%current, %owner)
+          core.if %matches {
+          } else {
+            core.append %out_owners, %current
+          }
+        }
+        core.if %has_owner {
+          %remaining = core.call intrinsic.len(%out_owners)
+          %now_empty = core.call intrinsic.eq(%remaining, 0)
+          core.if %now_empty {
+            core.set %out["wireAction"] = "unsubscribe"
+          }
+          core.set %out["changed"] = true
+        }
+      }
+      core.set %out["owners"] = %out_owners
+      core.return %out
+    }
+  }
+
+  op ax.mcp.semantic @mcp_listen_interests {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    attr public = true
+    tag "axmcp-subscriptions-listen"
+    type signature = "(subscribed_uris:list<string>, filters?:json) -> json"
+    body @entry(%subscribed_uris: list<json>, %filters: json) {
+      %out = core.map
+      %filters_object = core.type_is %filters type "object"
+      core.if %filters_object {
+        %out = core.call intrinsic.map.merge(%out, %filters)
+      }
+      %subscriptions = core.list
+      core.for %uri in %subscribed_uris {
+        %uri_string = core.type_is %uri type "string"
+        core.if %uri_string {
+          %empty = core.call intrinsic.eq(%uri, "")
+          %duplicate = core.call intrinsic.contains(%subscriptions, %uri)
+          %skip = core.call intrinsic.or(%empty, %duplicate)
+          core.if %skip {
+          } else {
+            core.append %subscriptions, %uri
+          }
+        }
+      }
+      %count = core.call intrinsic.len(%subscriptions)
+      %has_subscriptions = core.call intrinsic.gt(%count, 0)
+      core.if %has_subscriptions {
+        core.set %out["resourceSubscriptions"] = %subscriptions
+      } else {
+        core.call intrinsic.map.delete(%out, "resourceSubscriptions")
+      }
+      core.return %out
+    }
+  }
+
+  op ax.mcp.semantic @mcp_notification_subscription_filter {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    attr public = true
+    tag "axmcp-subscriptions-listen"
+    type signature = "(message:json, active_subscription_id?:string) -> json"
+    body @entry(%message: json, %active_subscription_id: string) {
+      %out = core.map
+      core.set %out["deliver"] = true
+      core.set %out["acknowledged"] = false
+      %none = core.call intrinsic.none()
+      core.set %out["subscriptionId"] = %none
+      %message_text = core.call intrinsic.json.stringify(%message)
+      %clean_message = core.call intrinsic.json.parse(%message_text)
+      %message_object = core.type_is %clean_message type "object"
+      core.if %message_object {
+        %params = core.get %clean_message["params"] default null
+        %params_object = core.type_is %params type "object"
+        core.if %params_object {
+          %meta = core.get %params["_meta"] default null
+          %meta_object = core.type_is %meta type "object"
+          core.if %meta_object {
+            %subscription_id = core.get %meta["io.modelcontextprotocol/subscriptionId"] default null
+            %subscription_string = core.type_is %subscription_id type "string"
+            core.if %subscription_string {
+              core.set %out["subscriptionId"] = %subscription_id
+              %active_missing = core.call intrinsic.is_none(%active_subscription_id)
+              core.if %active_missing {
+              } else {
+                %same_subscription = core.call intrinsic.eq(%subscription_id, %active_subscription_id)
+                core.if %same_subscription {
+                } else {
+                  core.set %out["deliver"] = false
+                }
+              }
+            }
+            core.call intrinsic.map.delete(%meta, "io.modelcontextprotocol/subscriptionId")
+            %meta_keys = core.call intrinsic.map.keys(%meta)
+            %meta_count = core.call intrinsic.len(%meta_keys)
+            %meta_empty = core.call intrinsic.eq(%meta_count, 0)
+            core.if %meta_empty {
+              core.call intrinsic.map.delete(%params, "_meta")
+            }
+          }
+        }
+        %method = core.get %clean_message["method"] default ""
+        %is_ack = core.call intrinsic.eq(%method, "notifications/subscriptions/acknowledged")
+        %delivered = core.get %out["deliver"] default false
+        %ack_deliver = core.call intrinsic.and(%is_ack, %delivered)
+        core.if %ack_deliver {
+          %params = core.get %clean_message["params"] default null
+          %params_object = core.type_is %params type "object"
+          core.if %params_object {
+            %notifications = core.get %params["notifications"] default null
+            %notifications_object = core.type_is %notifications type "object"
+            core.if %notifications_object {
+              %received = core.get %out["subscriptionId"] default null
+              %received_string = core.type_is %received type "string"
+              %active_missing = core.call intrinsic.is_none(%active_subscription_id)
+              %matches_active = core.const false
+              core.if %active_missing {
+                %matches_active = core.let %received_string
+              } else {
+                %matches_active = core.call intrinsic.eq(%received, %active_subscription_id)
+              }
+              core.if %matches_active {
+                core.set %out["acknowledged"] = true
+              }
+            }
+          }
+        }
+      }
+      core.set %out["message"] = %clean_message
+      core.return %out
+    }
+  }
+
+  op ax.mcp.semantic @mcp_oauth_parse_www_authenticate {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    attr public = true
+    tag "axmcp-oauth"
+    type signature = "(www_authenticate:string) -> json"
+    body @entry(%www_authenticate: string) {
+      %out = core.map
+      %scopes = core.list
+      core.set %out["scopes"] = %scopes
+      %parts = core.call intrinsic.string.split(%www_authenticate, ",")
+      core.for %raw in %parts {
+        %part = core.string_trim %raw
+        %lower = core.call intrinsic.string.lower(%part)
+        %bearer = core.call intrinsic.string.starts_with(%lower, "bearer ")
+        core.if %bearer {
+          %part = core.call intrinsic.string.slice(%part, 7)
+          %part = core.string_trim %part
+        }
+        %pair = core.call intrinsic.string.split_once(%part, "=")
+        %found = core.get %pair["found"] default false
+        core.if %found {
+          %name = core.get %pair["left"] default ""
+          %name = core.string_trim %name
+          %name = core.call intrinsic.string.lower(%name)
+          %value = core.get %pair["right"] default ""
+          %value = core.string_trim %value
+          %value = core.call intrinsic.string.replace(%value, "\"", "")
+          %is_resource = core.call intrinsic.eq(%name, "resource_metadata")
+          core.if %is_resource {
+            core.set %out["resourceMetadata"] = %value
+          }
+          %is_scope = core.call intrinsic.eq(%name, "scope")
+          core.if %is_scope {
+            %scopes = core.call intrinsic.string.split_trim_nonempty(%value, " ")
+            core.set %out["scopes"] = %scopes
+          }
+        }
+      }
+      core.return %out
+    }
+  }
+
+  op ax.mcp.semantic @mcp_oauth_discovery_endpoints {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    attr public = true
+    tag "axmcp-oauth"
+    type signature = "(requested_url:string, issuer:string, resource_metadata_url:string) -> json"
+    body @entry(%requested_url: string, %issuer: string, %resource_metadata_url: string) {
+      %out = core.map
+      %resource_endpoints = core.list
+      %as_endpoints = core.list
+      core.set %out["resourceMetadataEndpoints"] = %resource_endpoints
+      core.set %out["authorizationServerMetadataEndpoints"] = %as_endpoints
+      %requested_scheme = core.call intrinsic.string.split_once(%requested_url, "://")
+      %requested_valid = core.get %requested_scheme["found"] default false
+      core.if %requested_valid {
+      } else {
+        core.set %out["ok"] = false
+        core.set %out["message"] = "OAuth requested URL is invalid"
+        core.return %out
+      }
+      %requested_rest = core.get %requested_scheme["right"] default ""
+      %requested_scheme_name = core.get %requested_scheme["left"] default ""
+      %requested_parts = core.call intrinsic.string.split_once(%requested_rest, "/")
+      %requested_authority = core.get %requested_parts["left"] default ""
+      %requested_origin = core.call intrinsic.string.format("{}://{}", %requested_scheme_name, %requested_authority)
+      %requested_path_raw = core.get %requested_parts["right"] default ""
+      %requested_query = core.call intrinsic.string.split_once(%requested_path_raw, "?")
+      %requested_path_raw = core.get %requested_query["left"] default ""
+      %requested_path = core.call intrinsic.string.format("/{}", %requested_path_raw)
+      %requested_trim = core.call intrinsic.string.remove_suffix(%requested_path, "/")
+      %requested_path = core.get %requested_trim["value"] default ""
+      %has_header_endpoint = core.call intrinsic.truthy(%resource_metadata_url)
+      core.if %has_header_endpoint {
+        core.append %resource_endpoints, %resource_metadata_url
+      } else {
+        %has_path = core.call intrinsic.truthy(%requested_path)
+        core.if %has_path {
+          %path_endpoint = core.call intrinsic.string.format("{}/.well-known/oauth-protected-resource{}", %requested_origin, %requested_path)
+          core.append %resource_endpoints, %path_endpoint
+        }
+        %root_endpoint = core.call intrinsic.string.format("{}/.well-known/oauth-protected-resource", %requested_origin)
+        core.append %resource_endpoints, %root_endpoint
+      }
+      %has_issuer = core.call intrinsic.truthy(%issuer)
+      core.if %has_issuer {
+        %issuer_scheme = core.call intrinsic.string.split_once(%issuer, "://")
+        %issuer_valid = core.get %issuer_scheme["found"] default false
+        core.if %issuer_valid {
+        } else {
+          core.set %out["ok"] = false
+          core.set %out["message"] = "OAuth issuer URL is invalid"
+          core.return %out
+        }
+        %issuer_rest = core.get %issuer_scheme["right"] default ""
+        %issuer_scheme_name = core.get %issuer_scheme["left"] default ""
+        %issuer_parts = core.call intrinsic.string.split_once(%issuer_rest, "/")
+        %issuer_authority = core.get %issuer_parts["left"] default ""
+        %issuer_origin = core.call intrinsic.string.format("{}://{}", %issuer_scheme_name, %issuer_authority)
+        %issuer_path_raw = core.get %issuer_parts["right"] default ""
+        %issuer_query = core.call intrinsic.string.split_once(%issuer_path_raw, "?")
+        %issuer_path_raw = core.get %issuer_query["left"] default ""
+        %issuer_path = core.call intrinsic.string.format("/{}", %issuer_path_raw)
+        %issuer_trim = core.call intrinsic.string.remove_suffix(%issuer_path, "/")
+        %issuer_path = core.get %issuer_trim["value"] default ""
+        %issuer_has_path = core.call intrinsic.truthy(%issuer_path)
+        core.if %issuer_has_path {
+          %oauth_path = core.call intrinsic.string.format("{}/.well-known/oauth-authorization-server{}", %issuer_origin, %issuer_path)
+          %oidc_path = core.call intrinsic.string.format("{}/.well-known/openid-configuration{}", %issuer_origin, %issuer_path)
+          %oidc_suffix = core.call intrinsic.string.format("{}{}{}", %issuer_origin, %issuer_path, "/.well-known/openid-configuration")
+          core.append %as_endpoints, %oauth_path
+          core.append %as_endpoints, %oidc_path
+          core.append %as_endpoints, %oidc_suffix
+        } else {
+          %oauth_root = core.call intrinsic.string.format("{}/.well-known/oauth-authorization-server", %issuer_origin)
+          %oidc_root = core.call intrinsic.string.format("{}/.well-known/openid-configuration", %issuer_origin)
+          core.append %as_endpoints, %oauth_root
+          core.append %as_endpoints, %oidc_root
+        }
+      }
+      core.set %out["ok"] = true
+      core.return %out
+    }
+  }
+
+  op ax.mcp.semantic @mcp_oauth_validate_resource_coverage {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    attr public = true
+    tag "axmcp-oauth"
+    type signature = "(requested_url:string, metadata:json) -> json"
+    body @entry(%requested_url: string, %metadata: json) {
+      %out = core.map
+      %resource = core.get %metadata["resource"] default null
+      %resource_string = core.type_is %resource type "string"
+      core.if %resource_string {
+      } else {
+        core.set %out["ok"] = false
+        core.set %out["message"] = "Protected resource metadata is missing resource"
+        core.return %out
+      }
+      %resource_trim = core.call intrinsic.string.remove_suffix(%resource, "/")
+      %resource = core.get %resource_trim["value"] default %resource
+      %requested_trim = core.call intrinsic.string.remove_suffix(%requested_url, "/")
+      %requested = core.get %requested_trim["value"] default %requested_url
+      %exact = core.call intrinsic.eq(%requested, %resource)
+      %resource_prefix = core.call intrinsic.string.format("{}/", %resource)
+      %nested = core.call intrinsic.string.starts_with(%requested, %resource_prefix)
+      %covered = core.call intrinsic.or(%exact, %nested)
+      core.if %covered {
+      } else {
+        core.set %out["ok"] = false
+        %message = core.call intrinsic.string.format("Protected resource metadata resource {} does not cover requested URL {}", %resource, %requested_url)
+        core.set %out["message"] = %message
+        core.return %out
+      }
+      %issuers = core.get %metadata["authorization_servers"] default null
+      %issuers_list = core.type_is %issuers type "list"
+      core.if %issuers_list {
+      } else {
+        core.set %out["ok"] = false
+        core.set %out["message"] = "No authorization_servers advertised by protected resource"
+        core.return %out
+      }
+      %issuer_count = core.call intrinsic.len(%issuers)
+      %has_issuers = core.call intrinsic.gt(%issuer_count, 0)
+      core.if %has_issuers {
+      } else {
+        core.set %out["ok"] = false
+        core.set %out["message"] = "No authorization_servers advertised by protected resource"
+        core.return %out
+      }
+      %clean_issuers = core.list
+      core.for %issuer in %issuers {
+        %issuer_string = core.type_is %issuer type "string"
+        core.if %issuer_string {
+          core.append %clean_issuers, %issuer
+        } else {
+          core.set %out["ok"] = false
+          core.set %out["message"] = "Protected resource metadata authorization_servers must contain strings"
+          core.return %out
+        }
+      }
+      core.set %out["ok"] = true
+      core.set %out["resource"] = %resource
+      core.set %out["issuers"] = %clean_issuers
+      core.return %out
+    }
+  }
+
+  op ax.mcp.semantic @mcp_oauth_validate_as_metadata {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    attr public = true
+    tag "axmcp-oauth"
+    type signature = "(metadata:json, expected_issuer:string, require_authorization:bool, client_auth_method:string) -> json"
+    body @entry(%metadata: json, %expected_issuer: string, %require_authorization: bool, %client_auth_method: string) {
+      %out = core.map
+      %none_auth = core.call intrinsic.eq(%client_auth_method, "none")
+      %secret_post = core.call intrinsic.eq(%client_auth_method, "client_secret_post")
+      %auth_supported = core.call intrinsic.or(%none_auth, %secret_post)
+      core.if %auth_supported {
+      } else {
+        core.set %out["ok"] = false
+        core.set %out["message"] = "OAuth client auth method must be none or client_secret_post"
+        core.return %out
+      }
+      %issuer = core.get %metadata["issuer"] default null
+      %issuer_string = core.type_is %issuer type "string"
+      %token_endpoint = core.get %metadata["token_endpoint"] default null
+      %token_string = core.type_is %token_endpoint type "string"
+      %base_valid = core.call intrinsic.and(%issuer_string, %token_string)
+      core.if %base_valid {
+      } else {
+        core.set %out["ok"] = false
+        core.set %out["message"] = "Authorization server metadata is missing issuer or token_endpoint"
+        core.return %out
+      }
+      %issuer_matches = core.call intrinsic.eq(%issuer, %expected_issuer)
+      core.if %issuer_matches {
+      } else {
+        core.set %out["ok"] = false
+        %message = core.call intrinsic.string.format("OAuth AS metadata issuer mismatch: expected {}, received {}", %expected_issuer, %issuer)
+        core.set %out["message"] = %message
+        core.return %out
+      }
+      %advertised_auth = core.get %metadata["token_endpoint_auth_methods_supported"] default null
+      %advertised_list = core.type_is %advertised_auth type "list"
+      core.if %advertised_list {
+        %method_advertised = core.call intrinsic.contains(%advertised_auth, %client_auth_method)
+        core.if %method_advertised {
+        } else {
+          core.set %out["ok"] = false
+          %message = core.call intrinsic.string.format("Authorization server does not advertise token endpoint auth method {}", %client_auth_method)
+          core.set %out["message"] = %message
+          core.return %out
+        }
+      }
+      %authorization_endpoint = core.get %metadata["authorization_endpoint"] default null
+      core.if %require_authorization {
+        %authorization_string = core.type_is %authorization_endpoint type "string"
+        core.if %authorization_string {
+        } else {
+          core.set %out["ok"] = false
+          core.set %out["message"] = "Authorization server metadata is missing authorization_endpoint"
+          core.return %out
+        }
+        %challenge_methods = core.get %metadata["code_challenge_methods_supported"] default null
+        %challenge_list = core.type_is %challenge_methods type "list"
+        core.if %challenge_list {
+          %has_s256 = core.call intrinsic.contains(%challenge_methods, "S256")
+          core.if %has_s256 {
+          } else {
+            core.set %out["ok"] = false
+            core.set %out["message"] = "Authorization server does not advertise PKCE S256 support"
+            core.return %out
+          }
+        } else {
+          core.set %out["ok"] = false
+          core.set %out["message"] = "Authorization server does not advertise PKCE S256 support"
+          core.return %out
+        }
+      }
+      core.set %out["ok"] = true
+      core.set %out["issuer"] = %issuer
+      core.set %out["tokenEndpoint"] = %token_endpoint
+      core.if %require_authorization {
+        core.set %out["authorizationEndpoint"] = %authorization_endpoint
+      }
+      %require_iss = core.get %metadata["authorization_response_iss_parameter_supported"] default false
+      core.set %out["requireIss"] = %require_iss
+      core.return %out
+    }
+  }
+
+  op ax.mcp.semantic @mcp_oauth_authorization_request_params {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    attr public = true
+    tag "axmcp-oauth"
+    type signature = "(client_id:string, redirect_uri:string, scopes:list<string>, resource:string, state:string, code_challenge:string) -> json"
+    body @entry(%client_id: string, %redirect_uri: string, %scopes: list<string>, %resource: string, %state: string, %code_challenge: string) {
+      %out = core.map
+      core.set %out["response_type"] = "code"
+      core.set %out["client_id"] = %client_id
+      core.set %out["redirect_uri"] = %redirect_uri
+      core.set %out["state"] = %state
+      core.set %out["code_challenge"] = %code_challenge
+      core.set %out["code_challenge_method"] = "S256"
+      %scope_count = core.call intrinsic.len(%scopes)
+      %has_scopes = core.call intrinsic.gt(%scope_count, 0)
+      core.if %has_scopes {
+        %scope = core.call intrinsic.string.join(" ", %scopes)
+        core.set %out["scope"] = %scope
+      }
+      %has_resource = core.call intrinsic.truthy(%resource)
+      core.if %has_resource {
+        core.set %out["resource"] = %resource
+      }
+      core.return %out
+    }
+  }
+
+  op ax.mcp.semantic @mcp_oauth_grant_body {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    attr public = true
+    tag "axmcp-oauth"
+    type signature = "(grant_type:string, client_id:string, client_secret:string, client_auth_method:string, resource:string, scopes:list<string>, code:string, redirect_uri:string, code_verifier:string, refresh_token:string) -> json"
+    body @entry(%grant_type: string, %client_id: string, %client_secret: string, %client_auth_method: string, %resource: string, %scopes: list<string>, %code: string, %redirect_uri: string, %code_verifier: string, %refresh_token: string) {
+      %out = core.map
+      %body = core.map
+      %none_auth = core.call intrinsic.eq(%client_auth_method, "none")
+      %secret_post = core.call intrinsic.eq(%client_auth_method, "client_secret_post")
+      %auth_supported = core.call intrinsic.or(%none_auth, %secret_post)
+      core.if %auth_supported {
+      } else {
+        core.set %out["ok"] = false
+        core.set %out["message"] = "OAuth client auth method must be none or client_secret_post"
+        core.return %out
+      }
+      %has_client_id = core.call intrinsic.truthy(%client_id)
+      core.if %has_client_id {
+      } else {
+        core.set %out["ok"] = false
+        core.set %out["message"] = "OAuth client ID required"
+        core.return %out
+      }
+      core.set %body["grant_type"] = %grant_type
+      core.set %body["client_id"] = %client_id
+      core.if %secret_post {
+        %has_secret = core.call intrinsic.truthy(%client_secret)
+        core.if %has_secret {
+          core.set %body["client_secret"] = %client_secret
+        } else {
+          core.set %out["ok"] = false
+          core.set %out["message"] = "OAuth client secret required"
+          core.return %out
+        }
+      }
+      %is_code = core.call intrinsic.eq(%grant_type, "authorization_code")
+      %is_refresh = core.call intrinsic.eq(%grant_type, "refresh_token")
+      %is_client = core.call intrinsic.eq(%grant_type, "client_credentials")
+      core.if %is_code {
+        %has_code = core.call intrinsic.truthy(%code)
+        %has_redirect = core.call intrinsic.truthy(%redirect_uri)
+        %has_verifier = core.call intrinsic.truthy(%code_verifier)
+        %code_a = core.call intrinsic.and(%has_code, %has_redirect)
+        %code_valid = core.call intrinsic.and(%code_a, %has_verifier)
+        core.if %code_valid {
+          core.set %body["code"] = %code
+          core.set %body["redirect_uri"] = %redirect_uri
+          core.set %body["code_verifier"] = %code_verifier
+        } else {
+          core.set %out["ok"] = false
+          core.set %out["message"] = "OAuth authorization_code grant requires code, redirect_uri, and code_verifier"
+          core.return %out
+        }
+      } else {
+        core.if %is_refresh {
+          %has_refresh = core.call intrinsic.truthy(%refresh_token)
+          core.if %has_refresh {
+            core.set %body["refresh_token"] = %refresh_token
+          } else {
+            core.set %out["ok"] = false
+            core.set %out["message"] = "OAuth refresh_token grant requires refresh_token"
+            core.return %out
+          }
+        } else {
+          core.if %is_client {
+          } else {
+            core.set %out["ok"] = false
+            %message = core.call intrinsic.string.format("OAuth unsupported grant type {}", %grant_type)
+            core.set %out["message"] = %message
+            core.return %out
+          }
+        }
+      }
+      %has_resource = core.call intrinsic.truthy(%resource)
+      core.if %has_resource {
+        core.set %body["resource"] = %resource
+      }
+      %scope_count = core.call intrinsic.len(%scopes)
+      %has_scopes = core.call intrinsic.gt(%scope_count, 0)
+      core.if %has_scopes {
+        %scope = core.call intrinsic.string.join(" ", %scopes)
+        core.set %body["scope"] = %scope
+      }
+      core.set %out["ok"] = true
+      core.set %out["body"] = %body
+      core.return %out
+    }
+  }
+
+  op ax.mcp.semantic @mcp_oauth_parse_token_response {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    attr public = true
+    tag "axmcp-oauth"
+    type signature = "(response:json, now_ms:number, previous_refresh_token:string, issuer:string) -> json"
+    body @entry(%response: json, %now_ms: number, %previous_refresh_token: string, %issuer: string) {
+      %out = core.map
+      %access_token = core.get %response["access_token"] default null
+      %access_string = core.type_is %access_token type "string"
+      core.if %access_string {
+      } else {
+        core.set %out["ok"] = false
+        core.set %out["message"] = "OAuth token response is missing access_token"
+        core.return %out
+      }
+      %token_type = core.get %response["token_type"] default null
+      %token_type_string = core.type_is %token_type type "string"
+      core.if %token_type_string {
+      } else {
+        core.set %out["ok"] = false
+        core.set %out["message"] = "OAuth token response is missing token_type"
+        core.return %out
+      }
+      %token_type_lower = core.call intrinsic.string.lower(%token_type)
+      %bearer = core.call intrinsic.eq(%token_type_lower, "bearer")
+      core.if %bearer {
+      } else {
+        %message = core.call intrinsic.string.format("OAuth returned unsupported token_type {}", %token_type)
+        core.set %out["ok"] = false
+        core.set %out["message"] = %message
+        core.return %out
+      }
+      %token = core.map
+      core.set %token["accessToken"] = %access_token
+      core.set %token["tokenType"] = "Bearer"
+      %refresh_token = core.get %response["refresh_token"] default null
+      %refresh_string = core.type_is %refresh_token type "string"
+      core.if %refresh_string {
+        core.set %token["refreshToken"] = %refresh_token
+      } else {
+        %has_previous = core.call intrinsic.truthy(%previous_refresh_token)
+        core.if %has_previous {
+          core.set %token["refreshToken"] = %previous_refresh_token
+        }
+      }
+      %expires_in = core.get %response["expires_in"] default null
+      %expires_number = core.type_is %expires_in type "number"
+      core.if %expires_number {
+        %expires_nonnegative = core.call intrinsic.gte(%expires_in, 0)
+        core.if %expires_nonnegative {
+          %expires_ms = core.call intrinsic.mul(%expires_in, 1000)
+          %expires_at = core.call intrinsic.add(%now_ms, %expires_ms)
+          core.set %token["expiresAt"] = %expires_at
+        } else {
+          core.set %out["ok"] = false
+          core.set %out["message"] = "OAuth token response expires_in must be non-negative"
+          core.return %out
+        }
+      }
+      %scope = core.get %response["scope"] default null
+      %scope_string = core.type_is %scope type "string"
+      core.if %scope_string {
+        core.set %token["scope"] = %scope
+      }
+      %has_issuer = core.call intrinsic.truthy(%issuer)
+      core.if %has_issuer {
+        core.set %token["issuer"] = %issuer
+      }
+      core.set %out["ok"] = true
+      core.set %out["token"] = %token
+      core.return %out
+    }
+  }
+
+  op ax.mcp.semantic @mcp_oauth_plan_ensure_token {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    attr public = true
+    tag "axmcp-oauth"
+    type signature = "(token:json, now_ms:number, force_refresh:bool, grant_type:string, has_on_auth_code:bool) -> json"
+    body @entry(%token: json, %now_ms: number, %force_refresh: bool, %grant_type: string, %has_on_auth_code: bool) {
+      %out = core.map
+      %token_object = core.type_is %token type "object"
+      core.if %token_object {
+        %access_token = core.get %token["accessToken"] default null
+        %has_access = core.call intrinsic.truthy(%access_token)
+        %fresh = core.const true
+        %expires_at = core.get %token["expiresAt"] default null
+        %expires_number = core.type_is %expires_at type "number"
+        core.if %expires_number {
+          %refresh_at = core.call intrinsic.add(%expires_at, -60000)
+          %fresh = core.call intrinsic.lt(%now_ms, %refresh_at)
+        }
+        %not_forced = core.call intrinsic.not(%force_refresh)
+        %usable_a = core.call intrinsic.and(%has_access, %fresh)
+        %usable = core.call intrinsic.and(%usable_a, %not_forced)
+        core.if %usable {
+          core.set %out["ok"] = true
+          core.set %out["action"] = "cached"
+          core.set %out["token"] = %token
+          core.return %out
+        }
+        %refresh_token = core.get %token["refreshToken"] default null
+        %has_refresh = core.call intrinsic.truthy(%refresh_token)
+        core.if %has_refresh {
+          core.set %out["ok"] = true
+          core.set %out["action"] = "refresh"
+          core.set %out["refreshToken"] = %refresh_token
+          core.return %out
+        }
+      }
+      %client_credentials = core.call intrinsic.eq(%grant_type, "client_credentials")
+      core.if %client_credentials {
+        core.set %out["ok"] = true
+        core.set %out["action"] = "client_credentials"
+        core.return %out
+      }
+      core.if %has_on_auth_code {
+        core.set %out["ok"] = true
+        core.set %out["action"] = "authorize"
+        core.return %out
+      }
+      core.set %out["ok"] = false
+      core.set %out["message"] = "Authorization required. Provide oauth.onAuthCode to complete the flow"
+      core.return %out
+    }
+  }
+
+  op ax.mcp.semantic @mcp_oauth_validate_issuer {
+    attr body_source = "core"
+    attr core_kind = "func"
+    attr emit_module = "mcp"
+    attr public = true
+    tag "axmcp-oauth"
+    type signature = "(response:json, expected_issuer:string, require_iss:bool) -> json"
+    body @entry(%response: json, %expected_issuer: string, %require_iss: bool) {
+      %state = core.get %response["state"] default null
+      %expected_state = core.get %response["expectedState"] default null
+      %state_matches = core.call intrinsic.eq(%state, %expected_state)
+      core.if %state_matches {
+      } else {
+        %out = core.map
+        core.set %out["ok"] = false
+        core.set %out["message"] = "OAuth state mismatch"
+        core.return %out
+      }
+      %returned_issuer = core.get %response["iss"] default null
+      %issuer_missing = core.call intrinsic.is_none(%returned_issuer)
+      core.if %issuer_missing {
+        core.if %require_iss {
+          %out = core.map
+          core.set %out["ok"] = false
+          core.set %out["message"] = "OAuth authorization response issuer is required"
+          core.return %out
+        }
+      } else {
+        %issuer_matches = core.call intrinsic.eq(%returned_issuer, %expected_issuer)
+        core.if %issuer_matches {
+        } else {
+          %message = core.call intrinsic.string.format("OAuth issuer mismatch: expected {}, received {}", %expected_issuer, %returned_issuer)
+          %out = core.map
+          core.set %out["ok"] = false
+          core.set %out["message"] = %message
+          core.return %out
+        }
+      }
+      %out = core.map
+      core.set %out["ok"] = true
+      core.return %out
+    }
+  }
+}

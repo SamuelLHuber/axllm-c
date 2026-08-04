@@ -1,0 +1,7 @@
+{
+  "expected_error_contains": "response id mismatch",
+  "kind": "agent_runtime_protocol",
+  "mode": "id_mismatch",
+  "name": "runtime-protocol-id-mismatch",
+  "operation": "capabilities_error"
+}

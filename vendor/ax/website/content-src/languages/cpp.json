@@ -1,0 +1,459 @@
+{
+  "id": "cpp",
+  "label": "C++",
+  "shortLabel": "C++",
+  "fence": "cpp",
+  "packageName": "axllm",
+  "install": [
+    "include(FetchContent)",
+    "FetchContent_Declare(axllm GIT_REPOSITORY https://github.com/ax-llm/ax GIT_TAG main SOURCE_SUBDIR packages/cpp)",
+    "FetchContent_MakeAvailable(axllm)",
+    "target_link_libraries(your_app PRIVATE axllm::axllm)"
+  ],
+  "exampleRoot": "packages/cpp/examples",
+  "academy": {
+    "unitExamples": {
+      "dspy": "src/examples/cpp/generation/structured_generation.cpp",
+      "models-signatures": "src/examples/cpp/generation/structured_generation.cpp",
+      "axgen": "src/examples/cpp/generation/basic_generation.cpp",
+      "axflow": "src/examples/cpp/flows/branch_flow.cpp",
+      "axagent": "src/examples/cpp/short-agents/tools_agent.cpp",
+      "rlm": "src/examples/cpp/long-agents/incident_log_forensics.cpp",
+      "peek-context": "src/examples/cpp/long-agents/codebase_peek_map.cpp",
+      "optimization": "src/examples/cpp/optimization/axgen_optimization.cpp",
+      "mcp": "src/examples/cpp/mcp/native_mcp_tools.cpp",
+      "notifications": "src/examples/cpp/mcp/resource_wake_agent.cpp",
+      "production": "src/examples/cpp/long-agents/smart_defaults_agent.cpp"
+    },
+    "capstoneExample": "src/examples/cpp/mcp/task_resume_flow.cpp",
+    "exerciseAnswers": {
+      "signature-semantic-contract": ["axllm::s", "s"],
+      "ai-providers-models": ["axllm::ai", "ai"],
+      "fluent-fields-validation": ["FieldType"],
+      "typed-tools": ["Tool"],
+      "optimize-gen-flow": ["AxGEPA"]
+    },
+    "snippets": {
+      "flow": [
+        "std::string mermaid = R\"(flowchart TD",
+        "  %%ax classify: request:string -> route:class \"support, sales\"",
+        "  classify{route})\";",
+        "auto program = axllm::flow(mermaid);",
+        "std::cout << program.str();"
+      ],
+      "rlm": [
+        "auto investigator = axllm::agent(signature, axllm::object({",
+        "    {\"contextFields\", axllm::array({\"logs\"})},",
+        "    {\"contextPolicy\", axllm::object({{\"preset\", \"lean\"}, {\"budget\", \"balanced\"}})},",
+        "    {\"runtime\", axllm::object({{\"language\", \"JavaScript\"}})},",
+        "}));"
+      ],
+      "contextMap": [
+        "auto analyst = axllm::agent(signature, axllm::object({",
+        "    {\"contextFields\", axllm::array({\"codebase\"})},",
+        "    {\"contextPolicy\", axllm::object({{\"preset\", \"adaptive\"}, {\"budget\", \"balanced\"}})},",
+        "    {\"contextMap\", axllm::object({{\"maxChars\", 1800}, {\"infiniteEvolve\", false}, {\"evolveSteps\", 1}})},",
+        "}));"
+      ],
+      "memorySkills": [
+        "auto assistant = axllm::agent(signature, axllm::object({",
+        "    {\"memoriesCatalog\", memories},",
+        "    {\"skillsCatalog\", skills},",
+        "}));"
+      ]
+    }
+  },
+  "apiKind": "axir",
+  "optimizeName": "AxGEPA",
+  "optimizeIntro": "Use the generated `AxGEPA` optimizer surface for portable GEPA tuning. TypeScript also exposes the convenience `optimize()` helper; generated packages currently keep the optimizer explicit.",
+  "apiReference": "/cpp/api/reference/",
+  "apiSections": {
+    "ai": ["AxAI"],
+    "ax": ["AxGen", "Tools"],
+    "s": ["Signatures"],
+    "agent": ["Agents And RLM", "Runtime Profiles", "MCP"],
+    "flow": ["Flow"],
+    "optimize": ["Optimizers"]
+  },
+  "snippets": {
+    "ai": {
+      "balancer": {
+        "sourcePath": "src/examples/cpp/generation/adaptive_balancer.cpp",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "auto store = std::make_shared<axllm::AxInMemoryBalancerStatsStore>();",
+          "auto strategy = std::make_shared<axllm::AxBalancerAdaptiveStrategy>();",
+          "strategy->deadline_ms = 6000; strategy->bad_outcome_cost = 0.02;",
+          "strategy->stats_store = store; strategy->route_key = stable_route_key;",
+          "strategy->slice = workflow_slice; strategy->on_routing_event = analytics_hook;",
+          "axllm::AxBalancerOptions options; options.strategy = strategy;",
+          "axllm::AxBalancer balancer(services, options);"
+        ]
+      },
+      "audio": [
+        "// Realtime audio over WebSocket — build with -DAXLLM_ENABLE_REALTIME=ON",
+        "axllm::OpenAIResponsesClient client(axllm::object({{\"model\", \"gpt-realtime-2\"}, {\"api_key\", std::getenv(\"OPENAI_APIKEY\")}}));",
+        "axllm::Value request = axllm::object({{\"model\", \"gpt-realtime-2\"}, {\"chat_prompt\", axllm::array({axllm::object({{\"role\", \"user\"}, {\"content\", \"Say hello.\"}})})}, {\"audio\", axllm::object({{\"output\", axllm::object({{\"voice\", \"alloy\"}})}})}});",
+        "axllm::Value result = client.realtime_chat(request, nullptr);  // one merged turn: transcript + base64 PCM audio",
+        "// Realtime models also route transparently through chat(); chat() accepts input_audio parts; transcribe()/speak() do batch STT/TTS."
+      ]
+    },
+    "quickStart": [
+      "#include <axllm/axllm.hpp>",
+      "",
+      "auto llm = axllm::ai(\"openai\", axllm::object({{\"apiKey\", std::getenv(\"OPENAI_API_KEY\")}}));",
+      "auto classify = axllm::ax(\"review:string -> sentiment:class \\\"positive, negative, neutral\\\"\");"
+    ],
+    "dspy": [
+      "auto qa = axllm::ax(\"question:string -> answer:string, confidence:number\");"
+    ],
+    "signature": [
+      "auto sig = axllm::s(\"email:string -> priority:class \\\"high, normal, low\\\"\");"
+    ],
+    "ax": ["auto answer = axllm::ax(\"question:string -> answer:string\");"],
+    "flow": [
+      "std::string mermaid = R\"(flowchart TD",
+      "  %%ax research: topicText:string -> factList:string[]",
+      "  %%ax audience: topicText:string -> audienceAngle:string",
+      "  %%ax join: factList:string[], audienceAngle:string -> briefText:string",
+      "  research & audience --> join)\";",
+      "auto program = axllm::flow(mermaid);",
+      "std::cout << program.str();"
+    ],
+    "agent": [
+      "auto helper = axllm::agent(\"question:string -> answer:string\");"
+    ],
+    "llm": [
+      "auto client = axllm::ai(\"openai\", axllm::object({{\"apiKey\", std::getenv(\"OPENAI_API_KEY\")}}));"
+    ],
+    "telemetry": {
+      "sourcePath": "src/examples/cpp/generation/usage_observer.cpp",
+      "code": [
+        "axllm::set_usage_observer([&](axllm::AxUsageEvent event) {",
+        "  usage_queue.push(std::move(event));",
+        "});",
+        "client.chat(request, axllm::object({",
+        "  {\"usageContext\", axllm::object({{\"tenantId\", tenant_id}, {\"userId\", user_id}, {\"requestId\", request_id}})},",
+        "}));"
+      ],
+      "verified": true,
+      "requiresCredentials": true
+    },
+    "optimize": [
+      "auto engine = axllm::AxGEPA(reflectionClient, axllm::object({}));",
+      "auto result = engine.optimize(request, evaluator);"
+    ],
+    "playbook": [
+      "auto pb = axllm::playbook(program, student_ai);",
+      "pb.evolve(examples, metric);   // grow a playbook offline from examples",
+      "auto rendered = pb.render();   // the playbook is now applied to the program",
+      "auto state = pb.to_json();     // persist; restore later with playbook(...).load(state)"
+    ]
+  },
+  "snippetGroups": {
+    "signatures": {
+      "string": {
+        "sourcePath": "src/examples/cpp/generation/basic_generation.cpp",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "auto program = axllm::ax(\"question:string -> answer:string\");",
+          "auto output = program.forward(client, axllm::object({{\"question\", \"What is Ax?\"}}));"
+        ]
+      },
+      "fluent": {
+        "sourcePath": "src/examples/cpp/generation/signature-constraints.cpp",
+        "verified": true,
+        "requiresCredentials": true,
+        "notes": [
+          "C++ exposes the generated native signature records directly."
+        ],
+        "code": [
+          "auto request_type = axllm::Core::record_new(\"FieldType\", axllm::object({",
+          "  {\"name\", \"string\"}, {\"minLength\", 10}, {\"maxLength\", 500},",
+          "}));",
+          "auto request_field = field(\"requestText\", \"Request Text\", request_type);"
+        ]
+      },
+      "validation": {
+        "sourcePath": "src/examples/cpp/generation/signature-constraints.cpp",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "auto code_type = axllm::Core::record_new(\"FieldType\", axllm::object({",
+          "  {\"name\", \"string\"},",
+          "  {\"pattern\", \"^[A-Z]{3}-\\\\d{4}$\"},",
+          "  {\"patternDescription\", \"Must look like ABC-1234\"},",
+          "}));"
+        ]
+      },
+      "hybrid": {
+        "sourcePath": "src/examples/cpp/generation/signature-constraints.cpp",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "axllm::Core::validate_signature(signature);",
+          "axllm::AxGen program = axllm::ax(signature);",
+          "axllm::Value output = program.forward(client, inputs);"
+        ]
+      }
+    },
+    "flow": {
+      "branch": {
+        "sourcePath": "src/examples/cpp/flows/branch_flow.cpp",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "axllm::AxGen classifier = axllm::ax(\"request:string -> route:class \\\"support, sales, engineering\\\"\");",
+          "axllm::AxGen responder = axllm::ax(\"request:string, route:string -> response:string\");",
+          "axllm::AxFlow program = axllm::flow(axllm::object({{\"id\", \"examples.branchFlow\"}}))",
+          "    .execute(\"classifier\", classifier, axllm::object({{\"reads\", axllm::array({\"request\"})}, {\"writes\", axllm::array({\"classifierResult\", \"route\"})}}))",
+          "    .execute(\"responder\", responder, axllm::object({{\"reads\", axllm::array({\"request\", \"route\"})}, {\"writes\", axllm::array({\"responderResult\", \"response\"})}}))",
+          "    .returns(axllm::object({{\"route\", \"route\"}, {\"response\", \"response\"}}));"
+        ]
+      },
+      "parallel": {
+        "sourcePath": "src/examples/cpp/flows/parallel-flow.cpp",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "axllm::AxFlow program = axllm::flow(axllm::object({{\"id\", \"examples.parallelFlow\"}}))",
+          "    .execute(\"research\", research, axllm::object({{\"reads\", axllm::array({\"topicText\"})}, {\"writes\", axllm::array({\"researchResult\", \"factList\"})}}))",
+          "    .execute(\"audience\", audience, axllm::object({{\"reads\", axllm::array({\"topicText\"})}, {\"writes\", axllm::array({\"audienceResult\", \"audienceAngle\"})}}))",
+          "    .execute(\"join\", join, axllm::object({{\"reads\", axllm::array({\"factList\", \"audienceAngle\"})}, {\"writes\", axllm::array({\"joinResult\", \"briefText\"})}}))",
+          "    .returns(axllm::object({{\"briefText\", \"briefText\"}}));"
+        ]
+      },
+      "refine": {
+        "sourcePath": "src/examples/cpp/flows/refine-flow.cpp",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "axllm::AxFlow program = axllm::flow(axllm::object({{\"id\", \"examples.refineFlow\"}}))",
+          "    .execute(\"draft\", draft, axllm::object({{\"reads\", axllm::array({\"topicText\"})}, {\"writes\", axllm::array({\"draftResult\", \"draftText\"})}}))",
+          "    .execute(\"critique\", critique, axllm::object({{\"reads\", axllm::array({\"draftText\"})}, {\"writes\", axllm::array({\"critiqueResult\", \"critiqueText\"})}}))",
+          "    .execute(\"revise\", revise, axllm::object({{\"reads\", axllm::array({\"draftText\", \"critiqueText\"})}, {\"writes\", axllm::array({\"reviseResult\", \"revisedText\"})}}))",
+          "    .returns(axllm::object({{\"revisedText\", \"revisedText\"}}));"
+        ]
+      }
+    },
+    "agents": {
+      "playbookEvolve": {
+        "sourcePath": "src/examples/cpp/optimization/agent_playbook_evolve.cpp",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "axllm::Value evolution = assistant.get_playbook()->evolve(",
+          "    dataset,",
+          "    axllm::object({{\"verify\", true}, {\"maxProposals\", 1}}));"
+        ]
+      }
+    },
+    "tools": {
+      "basic": [
+        "auto search = axllm::Tool(",
+        "  \"search\",",
+        "  \"Search docs\",",
+        "  axllm::object({",
+        "    {\"type\", \"object\"},",
+        "    {\"properties\", axllm::object({{\"query\", axllm::object({{\"type\", \"string\"}})}})},",
+        "    {\"required\", axllm::array({\"query\"})}",
+        "  }),",
+        "  [](axllm::Value) { return axllm::object({{\"title\", \"Ax docs\"}}); }",
+        ");"
+      ],
+      "standardSchema": [
+        "// TypeScript owns the zod/valibot/arktype Standard Schema adapters.",
+        "// Generated packages expose the same Ax concept as JSON-schema-compatible tool descriptors.",
+        "auto lookup = axllm::Tool(",
+        "  \"lookupProduct\",",
+        "  \"Look up product inventory\",",
+        "  axllm::object({{\"type\", \"object\"}}),",
+        "  handler",
+        ");"
+      ],
+      "namespaces": [
+        "auto policy = axllm::Tool(\"findPolicy\", \"Find policies\", axllm::object({}), handler);",
+        "// Group related tools under domain namespaces where the package surface supports it.",
+        "// Runtime calls should read like kb.findPolicy(...) or billing.lookupInvoice(...)."
+      ],
+      "ax": [
+        "auto answer = axllm::ax(\"question:string -> answer:string\");",
+        "auto out = answer.forward(llm, axllm::object({",
+        "  {\"question\", \"Can this customer get a refund?\"}",
+        "}), axllm::object({{\"functions\", axllm::array({search})}}));"
+      ],
+      "agentFlat": [
+        "auto assistant = axllm::agent(\"message:string -> reply:string\", axllm::object({",
+        "  {\"functions\", axllm::array({search})},",
+        "  {\"contextFields\", axllm::array({})}",
+        "}));"
+      ],
+      "agentGroups": [
+        "auto assistant = axllm::agent(\"message:string -> reply:string\", axllm::object({",
+        "  {\"functionDiscovery\", true},",
+        "  {\"functions\", axllm::array({axllm::object({",
+        "    {\"namespace\", \"kb\"},",
+        "    {\"title\", \"Knowledge Base\"},",
+        "    {\"selectionCriteria\", \"Use for policy or documentation lookup.\"},",
+        "    {\"functions\", axllm::array({search})}",
+        "  })})}",
+        "}));"
+      ]
+    },
+    "mcp": {
+      "era": {
+        "sourcePath": "src/examples/cpp/mcp/native_mcp_tools.cpp",
+        "illustrative": true,
+        "notes": [
+          "Generated C++ supports automatic dual-era classification and modern discovery."
+        ],
+        "code": [
+          "auto mcp = std::make_shared<axllm::AxMCPClient>(transport, axllm::object({{\"namespace\", \"inventory\"}}));",
+          "auto catalog = mcp->inspect_catalog();"
+        ]
+      },
+      "mrtrElicitation": {
+        "illustrative": true,
+        "notes": [
+          "The setter installs a real host callback before initialization; sampling remains unsupported."
+        ],
+        "code": [
+          "axllm::AxMCPClient client(transport, axllm::object({",
+          "    {\"era\", \"modern\"},",
+          "    {\"roots\", axllm::array({axllm::object({{\"uri\", \"file:///workspace\"}})})},",
+          "}));",
+          "client.set_elicitation_handler([](axllm::Value params, axllm::Value context) {",
+          "    return axllm::object({",
+          "        {\"action\", \"accept\"},",
+          "        {\"content\", axllm::object({{\"confirmed\", true}})},",
+          "    });",
+          "});",
+          "auto result = client.call_tool(\"mrtr_one_round\", axllm::Value::object());"
+        ]
+      },
+      "native": {
+        "sourcePath": "src/examples/cpp/mcp/native_mcp_tools.cpp",
+        "code": [
+          "auto transport = std::make_shared<axllm::AxMCPStreamableHTTPTransport>(endpoint);",
+          "auto mcp = std::make_shared<axllm::AxMCPClient>(transport, axllm::object({{\"namespace\", \"inventory\"}}));",
+          "axllm::AxExecutionContext context({mcp});",
+          "auto program = axllm::ax(\"request:string -> answer:string\");",
+          "context.attach(program);",
+          "axllm::OpenAICompatibleClient llm(axllm::object({",
+          "  {\"api_key\", key}, {\"model\", \"gpt-5.4-mini\"},",
+          "}));",
+          "auto catalog = mcp->inspect_catalog();",
+          "std::cout << \"MCP catalog: \" << axllm::Core::iter(catalog.tools).size()",
+          "          << \" tools, \" << axllm::Core::iter(catalog.resources).size()",
+          "          << \" resources\\n\";",
+          "std::cout << axllm::stringify(program.forward(",
+          "  llm, axllm::object({{\"request\", \"Reindex inventory.\"}})",
+          ")) << \"\\n\";",
+          "mcp->close();"
+        ]
+      },
+      "resourceWake": {
+        "code": [
+          "auto source = std::make_shared<axllm::AxMCPEventSource>(",
+          "  client, \"inventory\", \"tenant:demo\", \"authenticated\",",
+          "  axllm::AxMCPResourceSubscriptionPolicy::all());",
+          "axllm::AxEventTarget target;",
+          "target.id = \"inventory-agent\";",
+          "target.retrySafety = \"idempotent\";",
+          "target.mapInput = [](const axllm::AxEventEnvelope& event,",
+          "                     const axllm::AxEventContinuation*) {",
+          "  return axllm::object({{\"uri\", axllm::Core::get(event.data, \"uri\")}});",
+          "};",
+          "target.invoke = invoke_agent;",
+          "axllm::AxEventRuntime runtime({axllm::AxEventRoute{",
+          "  \"resource-wake\", \"wake\",",
+          "  axllm::object({{\"types\", axllm::array({\"mcp.resource.updated\"})}}),",
+          "  \"inventory-agent\", true,",
+          "}});",
+          "runtime.register_target(std::move(target)).add_source(source).start();"
+        ]
+      },
+      "taskResume": {
+        "code": [
+          "auto result = client->call_tool(",
+          "  \"start_reindex\", axllm::object({{\"scope\", \"all\"}}));",
+          "auto task_id = axllm::display(axllm::Core::get(",
+          "  axllm::Core::get(result, \"task\", axllm::Value::object()),",
+          "  \"taskId\", \"\"));",
+          "target.waitFor = axllm::array({axllm::object({",
+          "  {\"kind\", \"mcp.task\"}, {\"value\", \"taskKey\"},",
+          "  {\"metadata\", axllm::object({{\"taskId\", task_id}})},",
+          "})});",
+          "runtime.register_target(std::move(target)).start();",
+          "runtime.publish(start_event, \"tenant:demo\", \"authenticated\");",
+          "source->start_scoped([&](axllm::AxEventEnvelope event,",
+          "                            std::string scope, std::string trust) {",
+          "  runtime.publish(event, scope, trust);",
+          "});"
+        ]
+      }
+    },
+    "event": {
+      "wake": {
+        "code": [
+          "auto source = std::make_shared<axllm::AxMCPEventSource>(",
+          "  client, \"inventory\", \"tenant:demo\", \"authenticated\",",
+          "  axllm::AxMCPResourceSubscriptionPolicy::all());",
+          "axllm::AxEventTarget target;",
+          "target.id = \"inventory-agent\";",
+          "target.mapInput = [](const axllm::AxEventEnvelope& event,",
+          "                     const axllm::AxEventContinuation*) {",
+          "  return axllm::object({{\"uri\", axllm::Core::get(event.data, \"uri\")}});",
+          "};",
+          "target.invoke = invoke_agent;",
+          "axllm::AxEventRuntime runtime({axllm::AxEventRoute{",
+          "  \"resource-wake\", \"wake\",",
+          "  axllm::object({{\"types\", axllm::array({\"mcp.resource.updated\"})}}),",
+          "  \"inventory-agent\", true,",
+          "}});",
+          "runtime.register_target(std::move(target)).add_source(source).start();"
+        ]
+      },
+      "resume": {
+        "code": [
+          "axllm::AxEventTarget target;",
+          "target.id = \"reindex-flow\";",
+          "target.waitFor = axllm::array({axllm::object({",
+          "  {\"kind\", \"mcp.task\"}, {\"value\", \"taskKey\"},",
+          "  {\"metadata\", axllm::object({{\"taskId\", task_id}})},",
+          "})});",
+          "target.mapInput = [](const axllm::AxEventEnvelope& event,",
+          "                     const axllm::AxEventContinuation* continuation) {",
+          "  return axllm::object({{\"taskId\", continuation",
+          "    ? axllm::Core::get(continuation->metadata, \"taskId\")",
+          "    : axllm::Core::get(event.data, \"taskId\")}});",
+          "};",
+          "target.invoke = invoke_flow;",
+          "axllm::AxEventRuntime runtime({",
+          "  axllm::AxEventRoute{\"task-start\", \"wake\", start_match, \"reindex-flow\"},",
+          "  axllm::AxEventRoute{\"task-resume\", \"resume\", resume_match, \"reindex-flow\"},",
+          "});",
+          "runtime.register_target(std::move(target)).start();"
+        ]
+      },
+      "ucp": {
+        "code": [
+          "void handle_ucp_webhook(const HttpRequest& request) {",
+          "  // Verify signer profile, RFC 9421 signature, digest, freshness,",
+          "  // key rotation, and replay state before publishing.",
+          "  auto order = verify_ucp_request(request);",
+          "  auto identity = lookup_buyer_identity(order.checkout_id);",
+          "  axllm::AxEventEnvelope event;",
+          "  event.id = order.id;",
+          "  event.source = \"ucp://orders\";",
+          "  event.type = \"ucp.order.fulfilled\";",
+          "  event.data = order.data;",
+          "  runtime.publish(event, identity, \"authenticated\");",
+          "}"
+        ]
+      }
+    }
+  }
+}

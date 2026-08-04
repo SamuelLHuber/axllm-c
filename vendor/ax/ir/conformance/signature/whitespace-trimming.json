@@ -1,0 +1,35 @@
+{
+  "expected_signature": {
+    "description": null,
+    "inputs": [
+      {
+        "name": "question",
+        "title": "Question",
+        "type": {
+          "isArray": false,
+          "name": "string"
+        },
+        "isOptional": false,
+        "isInternal": false,
+        "isCached": false
+      }
+    ],
+    "outputs": [
+      {
+        "name": "answer",
+        "title": "Answer",
+        "type": {
+          "isArray": false,
+          "name": "number"
+        },
+        "isOptional": false,
+        "isInternal": false,
+        "isCached": false
+      }
+    ]
+  },
+  "expected_to_string": "question:string -> answer:number",
+  "kind": "signature",
+  "name": "whitespace-trimming",
+  "signature": "\t question:string  ->  answer:number \n"
+}

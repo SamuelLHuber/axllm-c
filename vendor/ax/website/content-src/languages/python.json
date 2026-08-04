@@ -1,0 +1,497 @@
+{
+  "id": "python",
+  "label": "Python",
+  "shortLabel": "Py",
+  "fence": "python",
+  "packageName": "axllm",
+  "install": ["pip install axllm"],
+  "exampleRoot": "packages/python/examples",
+  "academy": {
+    "unitExamples": {
+      "dspy": "src/examples/python/generation/structured.py",
+      "models-signatures": "src/examples/python/generation/structured.py",
+      "axgen": "src/examples/python/generation/axgen-openai.py",
+      "axflow": "src/examples/python/flows/branch-flow.py",
+      "axagent": "src/examples/python/short-agents/tools-agent.py",
+      "rlm": "src/examples/python/long-agents/incident-log-forensics.py",
+      "peek-context": "src/examples/python/long-agents/codebase-peek-map.py",
+      "optimization": "src/examples/python/optimization/axgen-optimization.py",
+      "mcp": "src/examples/python/mcp/native-mcp-tools.py",
+      "notifications": "src/examples/python/mcp/resource-wake-agent.py",
+      "production": "src/examples/python/long-agents/smart-defaults-agent.py"
+    },
+    "capstoneExample": "src/examples/python/mcp/task-resume-flow.py",
+    "exerciseAnswers": {
+      "signature-semantic-contract": ["s"],
+      "ai-providers-models": ["ai"],
+      "fluent-fields-validation": ["f"],
+      "typed-tools": ["fn"],
+      "optimize-gen-flow": ["AxGEPA"]
+    },
+    "snippets": {
+      "flow": [
+        "mermaid = '''flowchart TD",
+        "  %%ax classify: request:string -> route:class \"support, sales\"",
+        "  classify{route}",
+        "'''",
+        "program = flow(mermaid)",
+        "print(program)  # canonical portable Mermaid"
+      ],
+      "rlm": [
+        "investigator = agent(signature, {",
+        "    \"contextFields\": [\"logs\"],",
+        "    \"contextPolicy\": {\"preset\": \"lean\", \"budget\": \"balanced\"},",
+        "    \"runtime\": {\"language\": \"JavaScript\"},",
+        "})"
+      ],
+      "contextMap": [
+        "analyst = agent(signature, {",
+        "    \"contextFields\": [\"codebase\"],",
+        "    \"contextPolicy\": {\"preset\": \"adaptive\", \"budget\": \"balanced\"},",
+        "    \"contextMap\": {\"maxChars\": 1800, \"infiniteEvolve\": False, \"evolveSteps\": 1},",
+        "})"
+      ],
+      "memorySkills": [
+        "assistant = agent(signature, {",
+        "    \"memoriesCatalog\": memories,",
+        "    \"skillsCatalog\": skills,",
+        "})"
+      ]
+    }
+  },
+  "apiKind": "axir",
+  "optimizeName": "AxGEPA",
+  "optimizeIntro": "Use the generated `AxGEPA` optimizer surface for portable GEPA tuning. TypeScript also exposes the convenience `optimize()` helper; generated packages currently keep the optimizer explicit.",
+  "apiReference": "/python/api/reference/",
+  "apiSections": {
+    "ai": ["AxAI"],
+    "ax": ["AxGen", "Tools"],
+    "s": ["Signatures"],
+    "agent": ["Agents And RLM", "Runtime Profiles", "MCP"],
+    "flow": ["Flow"],
+    "optimize": ["Optimizers"]
+  },
+  "snippets": {
+    "ai": {
+      "balancer": {
+        "sourcePath": "src/examples/python/generation/adaptive-balancer.py",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "store = AxInMemoryBalancerStatsStore()",
+          "strategy = AxBalancerAdaptiveStrategy(",
+          "    deadline_ms=6_000, bad_outcome_cost=0.02, namespace=\"support-v1\",",
+          "    stats_store=store, route_key=lambda _service, index: route_keys[index],",
+          "    slice=lambda context: workflow_slice(context),",
+          "    on_routing_event=lambda event: analytics.record(event),",
+          ")",
+          "balancer = AxBalancer(services, AxBalancerOptions(strategy=strategy))"
+        ]
+      },
+      "audio": [
+        "# Realtime audio over WebSocket — pip install axllm[realtime]",
+        "client = OpenAIResponsesClient(model=\"gpt-realtime-2\", api_key=os.environ[\"OPENAI_APIKEY\"])",
+        "request = {\"model\": \"gpt-realtime-2\", \"chat_prompt\": [{\"role\": \"user\", \"content\": \"Say hello.\"}], \"audio\": {\"output\": {\"voice\": \"alloy\"}}}",
+        "final = client.realtime_chat(request)  # one merged turn: transcript + base64 PCM audio",
+        "# Realtime models also route transparently through chat(); .chat() accepts input_audio parts; transcribe()/speak() do batch STT/TTS."
+      ]
+    },
+    "quickStart": [
+      "from axllm import ai, ax",
+      "",
+      "llm = ai('openai', api_key=os.environ['OPENAI_API_KEY'])",
+      "classify = ax('review:string -> sentiment:class \"positive, negative, neutral\"')"
+    ],
+    "dspy": [
+      "from axllm import ai, ax",
+      "",
+      "qa = ax('question:string -> answer:string, confidence:number')"
+    ],
+    "signature": [
+      "from axllm import s",
+      "",
+      "sig = s('email:string -> priority:class \"high, normal, low\"')"
+    ],
+    "ax": [
+      "from axllm import ax",
+      "",
+      "answer = ax('question:string -> answer:string')"
+    ],
+    "flow": [
+      "mermaid = '''flowchart TD",
+      "  %%ax research: topicText:string -> factList:string[]",
+      "  %%ax audience: topicText:string -> audienceAngle:string",
+      "  %%ax join: factList:string[], audienceAngle:string -> briefText:string",
+      "  research & audience --> join",
+      "'''",
+      "program = flow(mermaid)",
+      "print(program)  # canonical portable Mermaid"
+    ],
+    "agent": [
+      "from axllm import agent",
+      "",
+      "helper = agent('question:string -> answer:string')"
+    ],
+    "llm": [
+      "from axllm import ai",
+      "",
+      "client = ai('openai', api_key=os.environ['OPENAI_API_KEY'])"
+    ],
+    "telemetry": {
+      "sourcePath": "src/examples/python/generation/usage-observer.py",
+      "code": [
+        "from axllm import set_usage_observer",
+        "",
+        "set_usage_observer(usage_queue.put_nowait)",
+        "client.chat(request, {",
+        "    \"usageContext\": {\"tenantId\": tenant_id, \"userId\": user_id, \"requestId\": request_id}",
+        "})"
+      ],
+      "verified": true,
+      "requiresCredentials": true
+    },
+    "optimize": [
+      "from axllm import AxGEPA",
+      "",
+      "engine = AxGEPA(reflection_client)",
+      "result = engine.optimize(request, evaluator)"
+    ],
+    "playbook": [
+      "from axllm import playbook",
+      "",
+      "pb = playbook(program, {\"studentAI\": student_ai})",
+      "pb.evolve(examples, metric)   # grow a playbook offline from examples",
+      "pb.update({\"example\": ex, \"prediction\": pred, \"feedback\": \"...\"})  # refine online",
+      "pb.apply_to(program)"
+    ]
+  },
+  "snippetGroups": {
+    "signatures": {
+      "string": {
+        "sourcePath": "src/examples/python/generation/axgen-openai.py",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "program = ax(\"question:string -> answer:string\")",
+          "output = program.forward(client, {\"question\": \"What is Ax?\"})"
+        ]
+      },
+      "fluent": {
+        "sourcePath": "src/examples/python/generation/signature-constraints.py",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "signature = (",
+          "    f()",
+          "    .input(\"requestText\", f.string(\"Booking request\").min(10).max(500))",
+          "    .input(\"contactEmail\", f.string(\"Contact email\").email())",
+          "    .output(\"partySize\", f.number(\"Guests\").min(1).max(12))",
+          "    .build()",
+          ")"
+        ]
+      },
+      "validation": {
+        "sourcePath": "src/examples/python/generation/signature-constraints.py",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "signature = (",
+          "    f()",
+          "    .output(\"partySize\", f.number(\"Guests\").min(1).max(12))",
+          "    .output(\"bookingCode\", f.string().regex(r\"^[A-Z]{3}-\\d{4}$\"))",
+          "    .build()",
+          ")"
+        ]
+      },
+      "hybrid": {
+        "sourcePath": "src/examples/python/generation/signature-constraints.py",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "signature = f().input(\"requestText\", f.string().min(10)).output(\"partySize\", f.number().min(1)).build()",
+          "program = ax(signature)",
+          "output = program.forward(client, {\"requestText\": request, \"contactEmail\": email})"
+        ]
+      }
+    },
+    "flow": {
+      "branch": {
+        "sourcePath": "src/examples/python/flows/branch-flow.py",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "classifier = ax('request:string -> route:class \"support, sales, engineering\"')",
+          "responder = ax(\"request:string, route:string -> response:string\")",
+          "program = (",
+          "    flow({\"id\": \"examples.branchFlow\"})",
+          "    .execute(\"classifier\", classifier, {\"reads\": [\"request\"], \"writes\": [\"classifierResult\", \"route\"]})",
+          "    .execute(\"responder\", responder, {\"reads\": [\"request\", \"route\"], \"writes\": [\"responderResult\", \"response\"]})",
+          "    .returns({\"route\": \"route\", \"response\": \"response\"})",
+          ")"
+        ]
+      },
+      "parallel": {
+        "sourcePath": "src/examples/python/flows/parallel-flow.py",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "program = (",
+          "    flow({\"id\": \"examples.parallelFlow\"})",
+          "    .execute(\"research\", research, {\"reads\": [\"topicText\"], \"writes\": [\"researchResult\", \"factList\"]})",
+          "    .execute(\"audience\", audience, {\"reads\": [\"topicText\"], \"writes\": [\"audienceResult\", \"audienceAngle\"]})",
+          "    .execute(\"join\", join, {\"reads\": [\"factList\", \"audienceAngle\"], \"writes\": [\"joinResult\", \"briefText\"]})",
+          "    .returns({\"briefText\": \"briefText\"})",
+          ")"
+        ]
+      },
+      "refine": {
+        "sourcePath": "src/examples/python/flows/refine-flow.py",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "program = (",
+          "    flow({\"id\": \"examples.refineFlow\"})",
+          "    .execute(\"draft\", draft, {\"reads\": [\"topicText\"], \"writes\": [\"draftResult\", \"draftText\"]})",
+          "    .execute(\"critique\", critique, {\"reads\": [\"draftText\"], \"writes\": [\"critiqueResult\", \"critiqueText\"]})",
+          "    .execute(\"revise\", revise, {\"reads\": [\"draftText\", \"critiqueText\"], \"writes\": [\"reviseResult\", \"revisedText\"]})",
+          "    .returns({\"revisedText\": \"revisedText\"})",
+          ")"
+        ]
+      }
+    },
+    "agents": {
+      "playbookEvolve": {
+        "sourcePath": "src/examples/python/optimization/agent-playbook-evolve.py",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "evolution = assistant.playbook().evolve(",
+          "    dataset,",
+          "    {\"verify\": True, \"maxProposals\": 1, \"runtime\": runtime},",
+          ")"
+        ]
+      }
+    },
+    "tools": {
+      "basic": [
+        "from axllm import f, fn",
+        "",
+        "search = (",
+        "    fn('search')",
+        "    .description('Search docs')",
+        "    .arg('query', f.string('Search query'))",
+        "    .handler(lambda args: ['hit for ' + args['query']])",
+        "    .build()",
+        ")"
+      ],
+      "standardSchema": [
+        "# TypeScript owns the zod/valibot/arktype Standard Schema adapters.",
+        "# Generated packages expose the same Ax concept as JSON-schema-compatible tool descriptors.",
+        "lookup_product = (",
+        "    fn('lookupProduct')",
+        "    .description('Look up product inventory')",
+        "    .arg('productName', f.string('Exact product name'))",
+        "    .handler(lambda args: {'price': 79.99, 'inStock': True})",
+        "    .build()",
+        ")"
+      ],
+      "namespaces": [
+        "policy = (",
+        "    fn('findPolicy')",
+        "    .namespace('kb')",
+        "    .description('Find policies')",
+        "    .arg('topic', f.string())",
+        "    .handler(lambda args: ['policy: ' + args['topic']])",
+        "    .build()",
+        ")",
+        "# Put related generated-package tools under domain namespaces where the package surface supports it.",
+        "# Runtime calls should read like kb.findPolicy(...) or billing.lookupInvoice(...)."
+      ],
+      "ax": [
+        "answer = ax('question:string -> answer:string')",
+        "out = answer.forward(llm, {'question': 'Can this customer get a refund?'}, {'functions': [search]})"
+      ],
+      "agentFlat": [
+        "assistant = agent('message:string -> reply:string', {",
+        "    'functions': [search],",
+        "    'contextFields': [],",
+        "})"
+      ],
+      "agentGroups": [
+        "assistant = agent('message:string -> reply:string', {",
+        "    'functionDiscovery': True,",
+        "    'functions': [{",
+        "        'namespace': 'kb',",
+        "        'title': 'Knowledge Base',",
+        "        'selectionCriteria': 'Use for policy or documentation lookup.',",
+        "        'functions': [search],",
+        "    }],",
+        "})"
+      ]
+    },
+    "mcp": {
+      "era": {
+        "sourcePath": "src/examples/python/mcp/native-mcp-tools.py",
+        "illustrative": true,
+        "notes": [
+          "Generated Python supports automatic dual-era classification and modern discovery."
+        ],
+        "code": [
+          "mcp = AxMCPClient(AxMCPStreamableHTTPTransport(endpoint), {\"namespace\": \"inventory\"})",
+          "catalog = mcp.inspect_catalog()"
+        ]
+      },
+      "mrtrElicitation": {
+        "illustrative": true,
+        "notes": [
+          "The callback is advertised only for modern MCP; sampling remains unsupported."
+        ],
+        "code": [
+          "client = AxMCPClient(transport, {",
+          "    \"era\": \"modern\",",
+          "    \"roots\": [{\"uri\": \"file:///workspace\", \"name\": \"workspace\"}],",
+          "    \"elicitation\": lambda params, context: {",
+          "        \"action\": \"accept\",",
+          "        \"content\": {\"confirmed\": True},",
+          "    },",
+          "})",
+          "result = client.call_tool(\"mrtr_one_round\", {})"
+        ]
+      },
+      "native": {
+        "sourcePath": "src/examples/python/mcp/native-mcp-tools.py",
+        "code": [
+          "mcp = AxMCPClient(AxMCPStreamableHTTPTransport(endpoint), {\"namespace\": \"inventory\"})",
+          "llm = OpenAICompatibleClient(api_key=api_key, model=\"gpt-5.4-mini\")",
+          "program = ax(",
+          "    'request:string -> answer:string \"Use the inventory MCP tool.\"',",
+          "    {\"mcp\": mcp},",
+          ")",
+          "try:",
+          "    catalog = mcp.inspect_catalog()",
+          "    print({",
+          "        \"tools\": [tool[\"name\"] for tool in catalog[\"tools\"]],",
+          "        \"resources\": catalog[\"resources\"],",
+          "        \"resourceTemplates\": catalog[\"resourceTemplates\"],",
+          "    })",
+          "    print(program.forward(llm, {\"request\": \"Reindex inventory.\"}))",
+          "finally:",
+          "    mcp.close()"
+        ]
+      },
+      "resourceWake": {
+        "sourcePath": "src/examples/python/mcp/resource-wake-agent.py",
+        "code": [
+          "source = AxMCPEventSource(",
+          "    client,",
+          "    \"inventory\",",
+          "    identity_scope=\"tenant:demo\",",
+          "    trust=\"authenticated\",",
+          "    resource_subscriptions=\"all\",",
+          ")",
+          "target = AxEventTarget(",
+          "    \"inventory-agent\",",
+          "    invoke,",
+          "    mapInput=lambda event, _: {\"uri\": event.data[\"uri\"]},",
+          "    retrySafety=\"idempotent\",",
+          ")",
+          "runtime = AxEventRuntime(",
+          "    [AxEventRoute(\"resource-wake\", \"wake\",",
+          "        {\"types\": [\"mcp.resource.updated\"]},",
+          "        \"inventory-agent\", True)],",
+          "    {\"targets\": [target], \"sources\": [source]},",
+          ")",
+          "runtime.start()"
+        ]
+      },
+      "taskResume": {
+        "code": [
+          "target = AxEventTarget(",
+          "    \"reindex-flow\", invoke,",
+          "    mapInput=lambda event, continuation: {",
+          "        \"taskId\": continuation.metadata[\"taskId\"]",
+          "        if continuation else event.data[\"taskId\"]",
+          "    },",
+          "    waitFor=[{\"kind\": \"mcp.task\", \"value\": \"taskKey\", \"metadata\": {}}],",
+          ")",
+          "runtime = AxEventRuntime([",
+          "    AxEventRoute(\"task-start\", \"wake\",",
+          "        {\"types\": [\"app.task.started\"]}, \"reindex-flow\"),",
+          "    AxEventRoute(\"task-progress\", \"observe\",",
+          "        {\"types\": [\"mcp.progress\"]}),",
+          "    AxEventRoute(\"task-resume\", \"resume\",",
+          "        {\"types\": [\"mcp.task.status\"]}, \"reindex-flow\"),",
+          "], {\"targets\": [target], \"sources\": [started, mcp]})",
+          "runtime.start()",
+          "task_id = client.call_tool(\"start_reindex\", {\"scope\": \"all\"})[\"task\"][\"taskId\"]",
+          "target.waitFor[0][\"metadata\"] = {\"taskId\": task_id}"
+        ]
+      }
+    },
+    "event": {
+      "wake": {
+        "sourcePath": "src/examples/python/mcp/resource-wake-agent.py",
+        "code": [
+          "source = AxMCPEventSource(",
+          "    client, \"inventory\",",
+          "    identity_scope=\"tenant:demo\",",
+          "    trust=\"authenticated\",",
+          "    resource_subscriptions=\"all\",",
+          ")",
+          "target = AxEventTarget(",
+          "    \"inventory-agent\", invoke,",
+          "    mapInput=lambda event, _: {\"uri\": event.data[\"uri\"]},",
+          ")",
+          "runtime = AxEventRuntime(",
+          "    [AxEventRoute(\"resource-wake\", \"wake\",",
+          "        {\"types\": [\"mcp.resource.updated\"]},",
+          "        \"inventory-agent\", True)],",
+          "    {\"targets\": [target], \"sources\": [source]},",
+          ")",
+          "runtime.start()"
+        ]
+      },
+      "resume": {
+        "code": [
+          "target = AxEventTarget(",
+          "    \"reindex-flow\", invoke,",
+          "    mapInput=lambda event, continuation: {",
+          "        \"taskId\": continuation.metadata[\"taskId\"]",
+          "        if continuation else event.data[\"taskId\"]",
+          "    },",
+          "    waitFor=[{",
+          "        \"kind\": \"mcp.task\", \"value\": \"taskKey\",",
+          "        \"metadata\": {\"taskId\": task_id},",
+          "    }],",
+          ")",
+          "routes = [",
+          "    AxEventRoute(\"task-start\", \"wake\",",
+          "        {\"types\": [\"app.task.started\"]}, \"reindex-flow\"),",
+          "    AxEventRoute(\"task-resume\", \"resume\",",
+          "        {\"types\": [\"mcp.task.status\"]}, \"reindex-flow\"),",
+          "]",
+          "runtime = AxEventRuntime(routes, {\"targets\": [target]})",
+          "runtime.start()"
+        ]
+      },
+      "ucp": {
+        "code": [
+          "def handle_ucp_webhook(request):",
+          "    # Verify signer profile, RFC 9421 signature, digest, freshness,",
+          "    # key rotation, and replay state before publishing.",
+          "    order = verify_ucp_request(request)",
+          "    identity_scope = lookup_buyer_identity(order[\"checkout_id\"])",
+          "    runtime.publish(",
+          "        AxEventEnvelope(",
+          "            order[\"id\"], \"ucp://orders\",",
+          "            \"ucp.order.fulfilled\", order,",
+          "        ),",
+          "        identity_scope=identity_scope,",
+          "        trust=\"authenticated\",",
+          "    )",
+          "    return Response(status=202)"
+        ]
+      }
+    }
+  }
+}

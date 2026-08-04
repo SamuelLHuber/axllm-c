@@ -1,0 +1,967 @@
+import {
+  applyCapstoneResult,
+  applyCheckpointResult,
+  applyDiagnosticAnswer,
+  applyPracticeAnswer,
+  applyReviewResult,
+  capstoneReady,
+  checkpointExerciseSet,
+  checkpointReady,
+  courseStats,
+  createProgress,
+  dailyReviewSet,
+  dayStreak,
+  evaluateExercise,
+  exercisesForRole,
+  finishDiagnostic,
+  MAX_DIAGNOSTIC_QUESTIONS,
+  MIN_DIAGNOSTIC_QUESTIONS,
+  migrateProgress,
+  pickExercise,
+  recommendedTasks,
+  reviewExerciseSet,
+  reviewForecast,
+  reviewPassed,
+  selectDiagnosticTopic,
+  setDailyGoal,
+  shuffledChoiceOrder,
+  storageKey,
+  topicById,
+  topicStatus,
+} from './academy-engine.js';
+
+const root = document.querySelector('[data-academy-root]');
+const dataElement = document.querySelector('#academy-course-data');
+let recoveredState = false;
+let renderedExerciseCount = 0;
+const exerciseSessionSeed = `${Date.now()}:${Math.random()}`;
+
+if (root && dataElement) {
+  const course = JSON.parse(dataElement.textContent || '{}');
+  let progress = readProgress(course);
+
+  const save = (next) => {
+    progress = migrateProgress(course, next);
+    try {
+      localStorage.setItem(storageKey(course), JSON.stringify(progress));
+    } catch {
+      // The course still works for this page view when storage is unavailable.
+    }
+    return progress;
+  };
+
+  const page = root.dataset.academyPage;
+  if (page === 'dashboard') initDashboard(course, progress, save);
+  if (page === 'diagnostic') initDiagnostic(course, progress, save);
+  if (page === 'review') initDailyReview(course, progress, save);
+  if (page === 'topic') initTopic(course, progress, save, root.dataset.topicId);
+  if (page === 'checkpoint') {
+    initCheckpoint(course, progress, save, root.dataset.unitId);
+  }
+  if (page === 'capstone') initCapstone(course, progress, save);
+}
+
+function readProgress(course) {
+  try {
+    const raw = localStorage.getItem(storageKey(course));
+    if (!raw) return createProgress(course);
+    return migrateProgress(course, JSON.parse(raw));
+  } catch {
+    recoveredState = true;
+    return createProgress(course);
+  }
+}
+
+function initDashboard(course, initialProgress, save) {
+  let progress = initialProgress;
+  let roadmapInitialized = false;
+  const render = () => {
+    const stats = courseStats(course, progress);
+    const goal = progress.dailyGoal;
+    const summary = root.querySelector('[data-academy-progress-summary]');
+    const percent = root.querySelector('[data-academy-progress-percent]');
+    const count = root.querySelector('[data-academy-progress-count]');
+    const goalLabel = root.querySelector('[data-academy-daily-goal-label]');
+    const today = root.querySelector('[data-academy-today-xp]');
+    const streak = root.querySelector('[data-academy-streak]');
+    const forecast = root.querySelector('[data-academy-forecast]');
+    const courseRing = root.querySelector('[data-academy-course-ring-value]');
+    const totalXP = root.querySelector('[data-academy-total-xp]');
+    const earnedStats = root.querySelector('[data-academy-earned-stats]');
+    if (today) today.textContent = String(stats.todayXP);
+    if (goalLabel) goalLabel.textContent = String(goal);
+    if (percent) percent.textContent = `${stats.percent}%`;
+    if (courseRing) {
+      courseRing.style.strokeDasharray = `${stats.percent} ${100 - stats.percent}`;
+    }
+    if (count) count.textContent = String(stats.learned);
+    if (streak) {
+      const count = dayStreak(progress);
+      streak.textContent = `${count} day${count === 1 ? '' : 's'} streak`;
+    }
+    if (forecast) renderForecast(forecast, reviewForecast(course, progress));
+    if (totalXP) totalXP.textContent = String(progress.totalXP);
+    earnedStats?.classList.toggle('academy-is-hidden', progress.totalXP === 0);
+    forecast?.classList.toggle('academy-is-hidden', progress.totalXP === 0);
+    if (summary) {
+      summary.setAttribute(
+        'aria-label',
+        `${stats.learned} of ${stats.total} lessons learned, ${stats.todayXP} of ${goal} daily XP`
+      );
+    }
+
+    const label = root.querySelector('[data-academy-progress-label]');
+    const detail = root.querySelector('[data-academy-progress-detail]');
+    if (label) {
+      label.textContent = stats.learned
+        ? `${stats.learned} lesson${stats.learned === 1 ? '' : 's'} learned`
+        : 'Ready to begin';
+      label.classList.toggle('academy-is-hidden', progress.totalXP === 0);
+    }
+    if (detail) {
+      detail.textContent = `${stats.due} review${stats.due === 1 ? '' : 's'} due`;
+      detail.classList.toggle('academy-is-hidden', stats.learned < 1);
+    }
+
+    const tasks = recommendedTasks(course, progress);
+    renderUpNext(progress, tasks);
+    const nextTask = tasks.find((task) => task.type !== 'diagnostic');
+    const continueLink = root.querySelector('[data-academy-continue]');
+    if (continueLink) {
+      if (nextTask) {
+        continueLink.href = nextTask.href;
+        continueLink.textContent = continueActionLabel(nextTask, stats.learned);
+        continueLink.setAttribute(
+          'aria-label',
+          `${continueLink.textContent}: ${nextTask.title}`
+        );
+      } else {
+        continueLink.href = '#academy-map-title';
+        continueLink.textContent = 'Review the course';
+        continueLink.setAttribute(
+          'aria-label',
+          'Review the course learning path'
+        );
+      }
+    }
+    const startingQuiz = root.querySelector(
+      '[data-academy-starting-quiz-label]'
+    );
+    if (startingQuiz) {
+      startingQuiz.textContent =
+        progress.diagnostic.status === 'in-progress'
+          ? 'Continue starting quiz'
+          : progress.diagnostic.status === 'complete'
+            ? 'Retake starting quiz'
+            : 'Already experienced? Find your starting point';
+    }
+
+    for (const card of root.querySelectorAll('[data-academy-topic-card]')) {
+      const topicId = card.dataset.academyTopicCard;
+      const status = topicStatus(course, progress, topicId);
+      card.dataset.status = status;
+      const marker = card.querySelector('[data-academy-topic-status]');
+      if (marker) marker.textContent = statusMarker(status);
+      card.setAttribute(
+        'aria-label',
+        `${card.textContent.trim()} · ${statusLabel(status)}`
+      );
+    }
+
+    for (const unit of course.units) {
+      const unitElement = root.querySelector(
+        `[data-academy-unit="${unit.id}"]`
+      );
+      if (!unitElement) continue;
+      const learned = unit.topics.filter(
+        (topic) => progress.topics[topic.id].stability > 0
+      ).length;
+      const complete = learned === unit.topics.length;
+      const remaining = unit.topics.length - learned;
+      unitElement.dataset.complete = String(complete);
+      const progressLabel = unitElement.querySelector(
+        '[data-academy-unit-progress]'
+      );
+      if (progressLabel) {
+        progressLabel.textContent = `${learned} of ${unit.topics.length}`;
+      }
+      const ring = unitElement.querySelector('[data-academy-unit-ring]');
+      if (ring) {
+        const ringValue = ring.querySelector('[data-academy-unit-ring-value]');
+        const ringPercent = Math.round((learned / unit.topics.length) * 100);
+        if (ringValue) {
+          ringValue.style.strokeDasharray = `${ringPercent} ${100 - ringPercent}`;
+        }
+        ring.setAttribute(
+          'aria-label',
+          `${learned} of ${unit.topics.length} lessons learned`
+        );
+      }
+      const reviewStatus = unitElement.querySelector(
+        '[data-academy-unit-review-status]'
+      );
+      if (reviewStatus) {
+        reviewStatus.textContent = complete
+          ? 'Ready now · 5 questions'
+          : `Available after ${remaining} more lesson${remaining === 1 ? '' : 's'} · 5 questions`;
+      }
+      const reviewLink = unitElement.querySelector(
+        '[data-academy-unit-review-link]'
+      );
+      if (reviewLink) {
+        reviewLink.textContent = complete
+          ? 'Start knowledge check →'
+          : 'Finish lessons to unlock';
+        reviewLink.setAttribute('aria-disabled', String(!complete));
+        if (complete) reviewLink.removeAttribute('tabindex');
+        else reviewLink.setAttribute('tabindex', '-1');
+      }
+    }
+
+    if (!roadmapInitialized) {
+      const activeTopic = course.units
+        .flatMap((unit) => unit.topics)
+        .find((topic) =>
+          ['ready', 'learning'].includes(
+            topicStatus(course, progress, topic.id)
+          )
+        );
+      const activeUnit = course.units.find((unit) =>
+        unit.topics.some((topic) => topic.id === activeTopic?.id)
+      );
+      for (const unitElement of root.querySelectorAll('[data-academy-unit]')) {
+        unitElement.open = unitElement.dataset.academyUnit === activeUnit?.id;
+      }
+      roadmapInitialized = true;
+    }
+  };
+
+  const goalSelect = root.querySelector('[data-academy-daily-goal]');
+  if (goalSelect) {
+    goalSelect.value = String(progress.dailyGoal);
+    goalSelect.addEventListener('change', () => {
+      progress = save(setDailyGoal(progress, goalSelect.value));
+      setSettingsStatus(`Daily goal set to ${progress.dailyGoal} XP.`);
+      render();
+    });
+  }
+
+  root.querySelector('[data-academy-export]')?.addEventListener('click', () => {
+    const blob = new Blob([JSON.stringify(progress, null, 2)], {
+      type: 'application/json',
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `ax-academy-${course.id}-progress.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+    setSettingsStatus('Progress exported.');
+  });
+
+  root
+    .querySelector('[data-academy-import]')
+    ?.addEventListener('change', async (event) => {
+      const file = event.target.files?.[0];
+      if (!file) return;
+      try {
+        const imported = JSON.parse(await file.text());
+        progress = save(migrateProgress(course, imported));
+        roadmapInitialized = false;
+        setSettingsStatus('Progress imported.');
+        render();
+      } catch {
+        setSettingsStatus('That file is not valid Ax Academy progress.', true);
+      }
+      event.target.value = '';
+    });
+
+  root.querySelector('[data-academy-reset]')?.addEventListener('click', () => {
+    if (!window.confirm('Reset all Ax Academy progress on this device?'))
+      return;
+    progress = save(createProgress(course));
+    roadmapInitialized = false;
+    if (goalSelect) goalSelect.value = String(progress.dailyGoal);
+    setSettingsStatus('Progress reset.');
+    render();
+  });
+
+  if (recoveredState) {
+    setSettingsStatus(
+      'Unreadable saved progress was replaced with a clean state.',
+      true
+    );
+  }
+  render();
+}
+
+function renderUpNext(progress, tasks) {
+  const host = root.querySelector('[data-academy-up-next-list]');
+  if (!host) return;
+  const zeroState =
+    progress.totalXP === 0 &&
+    progress.diagnostic.status === 'not-started' &&
+    Object.values(progress.topics).every(
+      (state) => state.attempts === 0 && state.stability === 0
+    );
+  const lesson = tasks.find((task) => task.type === 'lesson');
+  const diagnostic = tasks.find((task) => task.type === 'diagnostic');
+  const selected = zeroState
+    ? [lesson, diagnostic].filter(Boolean)
+    : tasks.slice(0, 3);
+  host.replaceChildren();
+  const icons = {
+    lesson: '→',
+    diagnostic: '?',
+    review: '↻',
+    remediation: '!',
+    checkpoint: '✓',
+    capstone: '◆',
+  };
+  for (const task of selected) {
+    const card = document.createElement('a');
+    card.className = 'academy-next-card';
+    card.href = task.href;
+    card.dataset.taskType = task.type;
+    const icon = document.createElement('span');
+    icon.className = 'academy-next-icon';
+    icon.setAttribute('aria-hidden', 'true');
+    icon.textContent = icons[task.type] ?? '→';
+    const copy = document.createElement('span');
+    copy.className = 'academy-next-copy';
+    const eyebrow = document.createElement('small');
+    eyebrow.textContent = task.eyebrow;
+    const title = document.createElement('strong');
+    title.textContent = task.title;
+    const detail = document.createElement('span');
+    detail.textContent =
+      task.type === 'diagnostic' && zeroState
+        ? '~3 min · optional'
+        : task.detail;
+    copy.append(eyebrow, title, detail);
+    const arrow = document.createElement('span');
+    arrow.className = 'academy-next-arrow';
+    arrow.setAttribute('aria-hidden', 'true');
+    arrow.textContent = '→';
+    card.append(icon, copy, arrow);
+    host.append(card);
+  }
+}
+
+function setSettingsStatus(message, error = false) {
+  const status = root.querySelector('[data-academy-settings-status]');
+  if (!status) return;
+  status.textContent = message;
+  status.dataset.error = String(error);
+}
+
+function continueActionLabel(task, learnedCount) {
+  return {
+    review: 'Review now',
+    remediation: 'Practice again',
+    lesson:
+      learnedCount === 0 ? 'Build your first AI program' : 'Continue building',
+    checkpoint: 'Start knowledge check',
+    capstone: 'Start final project',
+  }[task.type];
+}
+
+function initDiagnostic(course, initialProgress, save) {
+  let progress = initialProgress;
+  const intro = root.querySelector('[data-academy-diagnostic-intro]');
+  const quiz = root.querySelector('[data-academy-diagnostic-quiz]');
+  const result = root.querySelector('[data-academy-diagnostic-result]');
+  const start = root.querySelector('[data-academy-diagnostic-start]');
+
+  if (progress.diagnostic.status === 'in-progress') {
+    intro.hidden = true;
+    quiz.hidden = false;
+    showNext();
+  } else if (progress.diagnostic.status === 'complete') {
+    start.textContent = 'Retake starting quiz';
+    showDiagnosticSummary(course, progress, result);
+  }
+
+  start?.addEventListener('click', () => {
+    progress = structuredClone(progress);
+    progress.diagnostic = {
+      status: 'in-progress',
+      asked: [],
+      results: {},
+      completedAt: null,
+    };
+    progress = save(progress);
+    intro.hidden = true;
+    result.hidden = true;
+    quiz.hidden = false;
+    showNext();
+  });
+
+  function showNext() {
+    const topic = selectDiagnosticTopic(course, progress);
+    if (!topic) return complete();
+    const exercise = pickExercise(
+      topic,
+      'diagnostic',
+      Math.floor(Date.now() / 86_400_000)
+    );
+    renderExercise(quiz, exercise, {
+      index: progress.diagnostic.asked.length + 1,
+      total: MAX_DIAGNOSTIC_QUESTIONS,
+      context: `Testing: ${topic.title}`,
+      onAnswered(correct) {
+        progress = save(
+          applyDiagnosticAnswer(course, progress, topic.id, correct)
+        );
+      },
+      onNext() {
+        if (progress.diagnostic.asked.length >= MAX_DIAGNOSTIC_QUESTIONS) {
+          complete();
+          return;
+        }
+        if (progress.diagnostic.asked.length >= MIN_DIAGNOSTIC_QUESTIONS) {
+          showDiagnosticDecision();
+          return;
+        }
+        showNext();
+      },
+    });
+  }
+
+  function showDiagnosticDecision() {
+    quiz.replaceChildren();
+    const box = document.createElement('div');
+    box.className = 'academy-decision';
+    const title = document.createElement('h2');
+    title.textContent = `${progress.diagnostic.asked.length} questions complete`;
+    const copy = document.createElement('p');
+    copy.textContent =
+      'You can finish now, or answer up to three more questions for a more precise starting point.';
+    const actions = document.createElement('div');
+    actions.className = 'academy-actions';
+    const finish = button('See my starting point', true);
+    finish.addEventListener('click', complete);
+    const continueButton = button('Answer more questions');
+    continueButton.addEventListener('click', showNext);
+    actions.append(finish, continueButton);
+    box.append(title, copy, actions);
+    quiz.append(box);
+  }
+
+  function complete() {
+    progress = save(finishDiagnostic(progress));
+    quiz.hidden = true;
+    showDiagnosticSummary(course, progress, result);
+  }
+}
+
+function showDiagnosticSummary(course, progress, host) {
+  if (!host) return;
+  const stats = courseStats(course, progress);
+  const directCorrect = Object.values(progress.diagnostic.results).filter(
+    Boolean
+  ).length;
+  const provisional = Object.values(progress.topics).filter(
+    (state) => state.provisional
+  ).length;
+  host.hidden = false;
+  host.replaceChildren();
+  const heading = document.createElement('h2');
+  heading.textContent = 'Your starting point is ready';
+  const copy = document.createElement('p');
+  copy.textContent = `You answered ${directCorrect} questions correctly. We marked ${provisional} earlier lesson${provisional === 1 ? '' : 's'} as likely known, with ${stats.total - stats.learned} lessons left to learn.`;
+  const note = document.createElement('p');
+  note.textContent =
+    'We will check the lessons marked as likely known again soon. Your recommendations will adjust as you practice.';
+  const link = document.createElement('a');
+  link.className = 'academy-button academy-button-primary';
+  link.href = `${academyRoot(course)}/`;
+  link.textContent = 'Show my next lesson';
+  host.append(heading, copy, note, link);
+}
+
+function initTopic(course, initialProgress, save, topicId) {
+  let progress = initialProgress;
+  const topic = topicById(course, topicId);
+  const host = root.querySelector('[data-academy-topic-practice]');
+  const stateLabel = root.querySelector('[data-academy-topic-state]');
+  const countLabel = root.querySelector('[data-academy-practice-count]');
+  if (!topic || !host) return;
+  const status = topicStatus(course, progress, topicId);
+  if (stateLabel) stateLabel.textContent = statusLabel(status);
+
+  if (status === 'locked') {
+    const missing = topic.prerequisites.filter(
+      (prerequisite) => progress.topics[prerequisite]?.stability === 0
+    );
+    renderLocked(host, course, missing);
+    return;
+  }
+
+  if (status === 'review' || status === 'provisional') {
+    const exercises = reviewExerciseSet(course, progress, topicId);
+    runExerciseSequence(host, exercises, {
+      context: 'Spaced review',
+      onComplete(records) {
+        const correctCount = records.filter((record) => record.correct).length;
+        progress = save(
+          applyReviewResult(
+            course,
+            progress,
+            topicId,
+            correctCount,
+            records.length
+          )
+        );
+        const passed = reviewPassed(correctCount, records.length);
+        showCompletion(
+          course,
+          host,
+          passed ? 'Review strengthened' : 'Review scheduled for repair',
+          passed
+            ? `You answered ${correctCount} of ${records.length} correctly. The next interval is longer.`
+            : `You answered ${correctCount} of ${records.length} correctly. This topic is back in your focused queue.`
+        );
+        if (stateLabel) {
+          stateLabel.textContent = statusLabel(
+            topicStatus(course, progress, topicId)
+          );
+        }
+      },
+    });
+    return;
+  }
+
+  let attempts = 0;
+  const showPractice = () => {
+    const pool = exercisesForRole(topic, 'practice');
+    const exercise = pool[attempts % pool.length];
+    if (countLabel) {
+      countLabel.textContent = `Answer 2 in a row to learn this · attempt ${attempts + 1}`;
+    }
+    renderExercise(host, exercise, {
+      index: attempts + 1,
+      total: 5,
+      context: attempts === 0 ? 'Practice' : 'Build a two-answer streak',
+      onAnswered(correct) {
+        attempts += 1;
+        const result = applyPracticeAnswer(course, progress, topicId, correct);
+        progress = save(result.progress);
+        if (countLabel) {
+          countLabel.textContent = `Answer 2 in a row to learn this · attempt ${attempts}`;
+        }
+      },
+      onNext() {
+        const learned = progress.topics[topicId].stability > 0;
+        if (learned) {
+          showCompletion(
+            course,
+            host,
+            'Lesson learned',
+            'You built a two-answer streak. The first spaced review is scheduled for tomorrow.'
+          );
+          if (stateLabel) stateLabel.textContent = 'Learned · review in 1 day';
+          return;
+        }
+        if (attempts >= 5) {
+          showCompletion(
+            course,
+            host,
+            'Keep this in your learning queue',
+            'Revisit the worked example, then return from the dashboard for another focused attempt.'
+          );
+          return;
+        }
+        showPractice();
+      },
+    });
+  };
+  showPractice();
+}
+
+function initCheckpoint(course, initialProgress, save, unitId) {
+  let progress = initialProgress;
+  const host = root.querySelector('[data-academy-checkpoint-quiz]');
+  const result = root.querySelector('[data-academy-checkpoint-result]');
+  if (!host) return;
+  if (!checkpointReady(course, progress, unitId)) {
+    const unit = course.units.find((candidate) => candidate.id === unitId);
+    const missing = unit.topics
+      .filter((topic) => progress.topics[topic.id].stability === 0)
+      .map((topic) => topic.id);
+    renderLocked(
+      host,
+      course,
+      missing,
+      'Finish the lessons in this unit before starting the knowledge check.'
+    );
+    return;
+  }
+  const exercises = checkpointExerciseSet(course, unitId);
+  runExerciseSequence(host, exercises, {
+    context: 'Unit knowledge check',
+    onComplete(records) {
+      const outcome = applyCheckpointResult(course, progress, unitId, records);
+      progress = save(outcome.progress);
+      host.hidden = true;
+      result.hidden = false;
+      result.replaceChildren();
+      const heading = document.createElement('h2');
+      heading.textContent = outcome.passed
+        ? 'Knowledge check passed'
+        : 'Review and retry';
+      const copy = document.createElement('p');
+      copy.textContent = `${outcome.correctCount} of ${records.length} correct. ${outcome.passed ? 'You are ready to move on.' : 'Missed lessons have returned to your learning queue.'}`;
+      const link = document.createElement('a');
+      link.className = 'academy-button academy-button-primary';
+      link.href = `${academyRoot(course)}/`;
+      link.textContent = 'Return to my queue';
+      result.append(heading, copy, link);
+    },
+  });
+}
+
+function initCapstone(course, initialProgress, save) {
+  let progress = initialProgress;
+  const host = root.querySelector('[data-academy-capstone-quiz]');
+  const result = root.querySelector('[data-academy-capstone-result]');
+  if (!host) return;
+  if (!capstoneReady(course, progress)) {
+    const missing = course.finalCapstone.prerequisites.filter(
+      (topicId) => progress.topics[topicId]?.stability === 0
+    );
+    renderLocked(
+      host,
+      course,
+      missing,
+      'Finish the required lessons before starting the final project.'
+    );
+    return;
+  }
+  runExerciseSequence(host, course.finalCapstone.exercises, {
+    context: 'Final architecture check',
+    onComplete(records) {
+      const correctCount = records.filter((record) => record.correct).length;
+      const outcome = applyCapstoneResult(progress, correctCount);
+      progress = save(outcome.progress);
+      host.hidden = true;
+      result.hidden = false;
+      result.replaceChildren();
+      const heading = document.createElement('h2');
+      heading.textContent = outcome.passed
+        ? 'Course complete'
+        : 'Review how the pieces connect';
+      const copy = document.createElement('p');
+      copy.textContent = outcome.passed
+        ? 'You connected reliable AI programs, workflows, agents, external tools, long-running tasks, and live events into one production system.'
+        : `${correctCount} of 3 correct. Review the relevant lessons and try again.`;
+      const link = document.createElement('a');
+      link.className = 'academy-button academy-button-primary';
+      link.href = `${academyRoot(course)}/`;
+      link.textContent = 'Return to the Academy';
+      result.append(heading, copy, link);
+    },
+  });
+}
+
+function initDailyReview(course, initialProgress, save) {
+  let progress = initialProgress;
+  const host = root.querySelector('[data-academy-review-queue]');
+  const result = root.querySelector('[data-academy-review-result]');
+  if (!host || !result) return;
+  const exercises = dailyReviewSet(course, progress);
+  if (exercises.length === 0) {
+    host.hidden = true;
+    showDailyReviewSummary(course, result, []);
+    return;
+  }
+  runExerciseSequence(host, exercises, {
+    context: 'Daily mixed review',
+    onAnswered(record) {
+      progress = save(
+        applyReviewResult(
+          course,
+          progress,
+          record.topicId,
+          record.correct ? 1 : 0,
+          1
+        )
+      );
+    },
+    onComplete(records) {
+      host.hidden = true;
+      showDailyReviewSummary(course, result, records);
+    },
+  });
+}
+
+function showDailyReviewSummary(course, host, records) {
+  host.hidden = false;
+  host.replaceChildren();
+  const heading = document.createElement('h2');
+  heading.textContent = records.length
+    ? 'Daily review complete'
+    : 'You are caught up';
+  const copy = document.createElement('p');
+  const strengthened = records.filter((record) => record.correct).length;
+  copy.textContent = records.length
+    ? `${strengthened} strengthened · ${records.length - strengthened} scheduled for repair.`
+    : 'No lessons are due right now. Your forecast will show what is coming next.';
+  host.append(heading, copy);
+  if (records.length) {
+    const list = document.createElement('ul');
+    for (const record of records) {
+      const topic = topicById(course, record.topicId);
+      const item = document.createElement('li');
+      item.textContent = `${record.correct ? 'Strengthened' : 'Missed'}: ${topic?.title ?? record.topicId}`;
+      list.append(item);
+    }
+    host.append(list);
+  }
+  const link = document.createElement('a');
+  link.className = 'academy-button academy-button-primary';
+  link.href = `${academyRoot(course)}/`;
+  link.textContent = 'Return to my queue';
+  host.append(link);
+}
+
+function runExerciseSequence(
+  host,
+  exercises,
+  { context, onAnswered, onComplete }
+) {
+  const records = [];
+  let index = 0;
+  const show = () => {
+    const exercise = exercises[index];
+    if (!exercise) {
+      onComplete(records);
+      return;
+    }
+    renderExercise(host, exercise, {
+      index: index + 1,
+      total: exercises.length,
+      context,
+      onAnswered(correct) {
+        const record = { topicId: exercise.topicId, correct };
+        records.push(record);
+        onAnswered?.(record);
+      },
+      onNext() {
+        index += 1;
+        show();
+      },
+    });
+  };
+  show();
+}
+
+function renderForecast(host, forecast) {
+  host.replaceChildren();
+  for (const [index, bucket] of forecast.entries()) {
+    const item = document.createElement('span');
+    const date = new Date(`${bucket.date}T12:00:00`);
+    const label =
+      index === 0
+        ? 'Today'
+        : date.toLocaleDateString(undefined, { weekday: 'short' });
+    item.innerHTML = `<strong>${bucket.count}</strong><small>${label}</small>`;
+    host.append(item);
+  }
+}
+
+function renderExercise(
+  host,
+  exercise,
+  { index, total, context, onAnswered, onNext }
+) {
+  host.hidden = false;
+  host.replaceChildren();
+  const form = document.createElement('form');
+  form.className = 'academy-question';
+
+  const meta = document.createElement('div');
+  meta.className = 'academy-question-meta';
+  const label = document.createElement('span');
+  label.textContent = context;
+  const count = document.createElement('span');
+  count.textContent = `${index} / ${total}`;
+  meta.append(label, count);
+
+  const prompt = document.createElement('h2');
+  prompt.id = `academy-prompt-${exercise.id}`;
+  prompt.tabIndex = -1;
+  prompt.textContent = exercise.prompt;
+  form.append(meta, prompt);
+
+  if (exercise.contextCode) {
+    const context = document.createElement('pre');
+    context.className = 'academy-question-context';
+    const code = document.createElement('code');
+    code.textContent = exercise.contextCode;
+    context.append(code);
+    form.append(context);
+  }
+
+  let answerControl;
+  if (exercise.type === 'choice') {
+    const choices = document.createElement('div');
+    choices.className = 'academy-choices';
+    choices.setAttribute('role', 'radiogroup');
+    choices.setAttribute('aria-labelledby', prompt.id);
+    const order = shuffledChoiceOrder(
+      exercise,
+      `${exerciseSessionSeed}:${exercise.id}:${index}:${renderedExerciseCount++}`
+    );
+    for (const choiceIndex of order) {
+      const choice = exercise.choices[choiceIndex];
+      const option = document.createElement('label');
+      option.className = 'academy-choice';
+      const input = document.createElement('input');
+      input.type = 'radio';
+      input.name = exercise.id;
+      input.value = String(choiceIndex);
+      const text = document.createElement('span');
+      text.textContent = choice;
+      option.append(input, text);
+      choices.append(option);
+    }
+    answerControl = choices;
+  } else {
+    const labelElement = document.createElement('label');
+    labelElement.className = 'academy-code-answer';
+    const labelText = document.createElement('span');
+    labelText.textContent = 'Your answer';
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.name = exercise.id;
+    input.autocomplete = 'off';
+    input.spellcheck = false;
+    labelElement.append(labelText, input);
+    answerControl = labelElement;
+  }
+  form.append(answerControl);
+
+  const feedback = document.createElement('div');
+  feedback.className = 'academy-feedback';
+  feedback.hidden = true;
+  feedback.setAttribute('aria-live', 'polite');
+
+  const actions = document.createElement('div');
+  actions.className = 'academy-question-actions';
+  const submit = button('Check answer', true);
+  submit.type = 'submit';
+  actions.append(submit);
+  form.append(feedback, actions);
+
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    const formData = new FormData(form);
+    const submitted = formData.get(exercise.id);
+    if (submitted === null || String(submitted).trim() === '') {
+      feedback.hidden = false;
+      feedback.dataset.correct = 'false';
+      feedback.textContent = 'Choose or enter an answer first.';
+      return;
+    }
+    const correct = evaluateExercise(exercise, submitted);
+    onAnswered(correct);
+    for (const input of form.querySelectorAll('input')) input.disabled = true;
+    feedback.hidden = false;
+    feedback.dataset.correct = String(correct);
+    const result = document.createElement('strong');
+    result.textContent = correct ? 'Correct.' : 'Not yet.';
+    const explanation = document.createElement('span');
+    explanation.textContent = exercise.explanation;
+    feedback.replaceChildren(result, explanation);
+    actions.replaceChildren();
+    const next = button(index === total ? 'See result' : 'Next question', true);
+    next.addEventListener('click', onNext);
+    actions.append(next);
+  });
+
+  host.append(form);
+  if (index > 1) prompt.focus();
+}
+
+function renderLocked(
+  host,
+  course,
+  topicIds,
+  message = 'Complete the prerequisites first.'
+) {
+  host.replaceChildren();
+  const box = document.createElement('div');
+  box.className = 'academy-locked';
+  const heading = document.createElement('h2');
+  heading.textContent = 'This task is still locked';
+  const copy = document.createElement('p');
+  copy.textContent = message;
+  const list = document.createElement('ul');
+  for (const topicId of topicIds) {
+    const topic = topicById(course, topicId);
+    if (!topic) continue;
+    const item = document.createElement('li');
+    const link = document.createElement('a');
+    link.href = `${academyRoot(course)}/topics/${topic.id}/`;
+    link.textContent = topic.title;
+    item.append(link);
+    list.append(item);
+  }
+  const dashboard = document.createElement('a');
+  dashboard.className = 'academy-button';
+  dashboard.href = `${academyRoot(course)}/`;
+  dashboard.textContent = 'Return to my queue';
+  box.append(heading, copy, list, dashboard);
+  host.append(box);
+}
+
+function showCompletion(course, host, title, copy) {
+  host.replaceChildren();
+  const box = document.createElement('div');
+  box.className = 'academy-result';
+  const heading = document.createElement('h2');
+  heading.textContent = title;
+  const paragraph = document.createElement('p');
+  paragraph.textContent = copy;
+  const link = document.createElement('a');
+  link.className = 'academy-button academy-button-primary';
+  link.href = `${academyRoot(course)}/`;
+  link.textContent = 'Continue from my queue';
+  box.append(heading, paragraph, link);
+  host.append(box);
+}
+
+function academyRoot(course) {
+  return `/${course.language}/academy`;
+}
+
+function button(label, primary = false) {
+  const element = document.createElement('button');
+  element.type = 'button';
+  element.className = `academy-button${primary ? ' academy-button-primary' : ''}`;
+  element.textContent = label;
+  return element;
+}
+
+function statusMarker(status) {
+  return {
+    locked: '○',
+    ready: '→',
+    learning: '••',
+    provisional: '◇',
+    mastered: '✓',
+    review: '↻',
+  }[status];
+}
+
+function statusLabel(status) {
+  return {
+    locked: 'Locked',
+    ready: 'Ready to learn',
+    learning: 'Learning',
+    provisional: 'Marked as likely known · review due',
+    mastered: 'Learned',
+    review: 'Spaced review due',
+  }[status];
+}

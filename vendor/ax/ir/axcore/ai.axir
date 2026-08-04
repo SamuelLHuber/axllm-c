@@ -1,0 +1,648 @@
+module @ax.ai version "0.1" {
+  dialect @ax.ai version "0.1"
+
+  op ax.ai.error @AxAIServiceError {
+    attr core_kind = "error"
+    tag "src/ax/util/apicall.ts"
+    type fields = "message:string,status?:i64,code?:string,response_body?:json,request?:json,retryable?:bool"
+  }
+
+  op ax.ai.record @ChatMessage {
+    attr core_kind = "record"
+    tag "src/ax/ai/types.ts"
+    type fields = "role:string,content:json,name?:string,toolCalls?:list<json>"
+  }
+
+  op ax.ai.record @AxChatRequest {
+    attr core_kind = "record"
+    tag "src/ax/ai/types.ts"
+    type fields = "chatPrompt:list<ChatMessage>,functions?:list<json>,functionCall?:json,responseFormat?:json,modelConfig?:AxModelConfig,model?:string"
+  }
+
+  op ax.ai.record @AxChatResponse {
+    attr core_kind = "record"
+    tag "src/ax/ai/types.ts"
+    type fields = "results:list<json>,sessionId?:string,remoteId?:string,remoteRequestId?:string,remoteSessionId?:string,modelUsage?:AxModelUsage"
+  }
+
+  op ax.ai.record @AxEmbedRequest {
+    attr core_kind = "record"
+    tag "src/ax/ai/types.ts"
+    type fields = "texts:list<string>,embedModel?:string,modelConfig?:AxModelConfig"
+  }
+
+  op ax.ai.record @AxEmbedResponse {
+    attr core_kind = "record"
+    tag "src/ax/ai/types.ts"
+    type fields = "embeddings:list<list<f64>>,sessionId?:string,remoteId?:string,remoteRequestId?:string,remoteSessionId?:string,modelUsage?:AxModelUsage"
+  }
+
+  op ax.ai.record @AxModelConfig {
+    attr core_kind = "record"
+    tag "src/ax/ai/types.ts"
+    type fields = "maxTokens?:i64,temperature?:f64,topP?:f64,presencePenalty?:f64,frequencyPenalty?:f64,stopSequences?:list<string>,stream?:bool,n?:i64"
+  }
+
+  op ax.ai.record @AxAIServiceOptions {
+    attr core_kind = "record"
+    tag "src/ax/ai/types.ts"
+    type fields = "debug?:bool,stream?:bool,functionCallMode?:string,timeout?:i64,retry?:json,useExpensiveModel?:string,sessionId?:string,usageContext?:AxUsageContext"
+  }
+
+  op ax.ai.record @AxTokenUsage {
+    attr core_kind = "record"
+    tag "src/ax/ai/types.ts"
+    type fields = "promptTokens:i64,completionTokens:i64,totalTokens:i64,thoughtsTokens?:i64,reasoningTokens?:i64,cacheReadTokens?:i64,cacheCreationTokens?:i64,serviceTier?:string,speed?:string"
+  }
+
+  op ax.ai.record @AxModelUsage {
+    attr core_kind = "record"
+    tag "src/ax/ai/types.ts"
+    type fields = "ai:string,model:string,tokens?:AxTokenUsage"
+  }
+
+  op ax.ai.record @AxUsageContext {
+    attr core_kind = "record"
+    attr public = true
+    tag "src/ax/ai/types.ts"
+    type fields = "tenantId?:string,userId?:string,requestId?:string,runId?:string,parentRunId?:string,feature?:string,attributes?:json"
+  }
+
+  op ax.ai.record @AxUsageEvent {
+    attr core_kind = "record"
+    attr public = true
+    tag "src/ax/ai/types.ts"
+    type fields = "operation:string,ai:string,model:string,tokens:AxTokenUsage,context?:AxUsageContext,sessionId?:string,remoteId?:string,remoteRequestId?:string,remoteSessionId?:string,streaming:bool"
+  }
+
+  op ax.ai.interface @AxUsageObserver {
+    attr core_kind = "interface"
+    attr public = true
+    tag "usage-observer-host-boundary"
+    type observe = "(AxUsageEvent) -> void"
+  }
+
+  op ax.ai.record @AxAIFeatures {
+    attr core_kind = "record"
+    tag "src/ax/ai/base.ts"
+    type fields = "functions:bool,streaming:bool,structuredOutputs:bool,media:json,caching:json,thinking:bool,multiTurn:bool"
+  }
+
+  op ax.ai.interface @AIClient {
+    attr core_kind = "interface"
+    attr public = true
+    type complete = "(AxChatRequest) -> AxChatResponse throws"
+    type stream = "(AxChatRequest) -> stream<AxChatResponse> throws"
+  }
+
+  op ax.ai.semantic @ai_factory {
+    attr core_kind = "func"
+    attr effect = "throws"
+    ref service = @AxAIService
+    type signature = "(provider:string, options?:json) -> AxAIService throws"
+  }
+
+  op ax.ai.semantic @select_model {
+    attr core_kind = "func"
+    attr effect = "throws"
+    tag "src/ax/ai/base.ts"
+    type signature = "(AxAIService, requested?:string, embed?:bool) -> string throws"
+  }
+
+  op ax.ai.semantic @merge_model_config {
+    attr core_kind = "func"
+    attr emit_module = "ai"
+    tag "src/ax/ai/base.ts"
+    type signature = "(AxModelConfig, AxModelConfig?, AxAIServiceOptions?) -> AxModelConfig"
+    body @entry(%base: json, %override: json, %options: json) {
+      %merged = core.call intrinsic.map.merge(%base, %override)
+      %has_stream_option = core.call intrinsic.map.contains(%options, "stream")
+      core.if %has_stream_option {
+        %stream = core.get %options["stream"]
+        core.set %merged["stream"] = %stream
+      }
+      %out = core.map
+      core.for %key in %merged {
+        %value = core.get %merged[%key]
+        %include = core.call intrinsic.is_not_none(%value)
+        core.if %include {
+          core.set %out[%key] = %value
+        }
+      }
+      core.return %out
+    }
+  }
+
+  op ax.ai.semantic @validate_chat_request {
+    attr core_kind = "func"
+    attr effect = "throws"
+    attr emit_module = "ai"
+    tag "src/ax/ai/types.ts"
+    type signature = "(AxChatRequest) -> void throws"
+    body @entry(%request: AxChatRequest) {
+      %realtime = core.get %request["realtime"]
+      %has_realtime = core.call intrinsic.truthy(%realtime)
+      core.if %has_realtime {
+        %error = core.call intrinsic.ai.error.unsupported("OpenAI-compatible beta does not support realtime requests")
+        core.raise %error
+      }
+      %prompt = core.get %request["chat_prompt"]
+      %prompt_is_list = core.type_is %prompt type "list"
+      %prompt_len = core.call intrinsic.len(%prompt)
+      %prompt_empty = core.call intrinsic.eq(%prompt_len, 0)
+      %prompt_not_list = core.call intrinsic.not(%prompt_is_list)
+      %bad_prompt = core.call intrinsic.or(%prompt_not_list, %prompt_empty)
+      core.if %bad_prompt {
+        %error = core.call intrinsic.ai.error.response("Chat prompt is empty")
+        core.raise %error
+      }
+      core.for %message in %prompt {
+        %role = core.get %message["role"]
+        %is_system = core.call intrinsic.eq(%role, "system")
+        %is_user = core.call intrinsic.eq(%role, "user")
+        %is_assistant = core.call intrinsic.eq(%role, "assistant")
+        %is_function = core.call intrinsic.eq(%role, "function")
+        %valid_left = core.call intrinsic.or(%is_system, %is_user)
+        %valid_right = core.call intrinsic.or(%is_assistant, %is_function)
+        %valid_role = core.call intrinsic.or(%valid_left, %valid_right)
+        %invalid_role = core.call intrinsic.not(%valid_role)
+        core.if %invalid_role {
+          %message_text = core.call intrinsic.string.format("Invalid chat message role: {}", %role)
+          %error = core.call intrinsic.ai.error.response(%message_text)
+          core.raise %error
+        }
+        %content = core.get %message["content"]
+        %function_calls = core.get %message["function_calls"]
+        %has_content = core.call intrinsic.truthy(%content)
+        %has_calls = core.call intrinsic.truthy(%function_calls)
+        %has_assistant_payload = core.call intrinsic.or(%has_content, %has_calls)
+        %missing_assistant_payload = core.call intrinsic.not(%has_assistant_payload)
+        %bad_assistant = core.call intrinsic.and(%is_assistant, %missing_assistant_payload)
+        core.if %bad_assistant {
+          %error = core.call intrinsic.ai.error.response("Assistant content is required when no tool calls are provided")
+          core.raise %error
+        }
+      }
+      core.return
+    }
+  }
+
+  op ax.ai.semantic @build_chat_request {
+    attr core_kind = "func"
+    attr effect = "throws"
+    attr emit_module = "ai"
+    ref validate = @validate_chat_request
+    type signature = "(AxAIService, AxChatRequest, AxAIServiceOptions?) -> json throws"
+    body @entry(%service: AxAIService, %request: AxChatRequest, %options: json) {
+      core.call @validate_chat_request(%request)
+      %payload = core.call @openai_build_chat_request(%request)
+      core.return %payload
+    }
+  }
+
+  op ax.ai.semantic @normalize_chat_response {
+    attr core_kind = "func"
+    attr effect = "throws"
+    attr emit_module = "ai"
+    tag "src/ax/ai/openai/api.ts"
+    type signature = "(json) -> AxChatResponse throws"
+    body @entry(%raw: json) {
+      %response = core.call @openai_normalize_chat_response(%raw)
+      core.return %response
+    }
+  }
+
+  op ax.ai.semantic @normalize_stream_delta {
+    attr core_kind = "func"
+    attr effect = "throws"
+    attr emit_module = "ai"
+    tag "src/ax/ai/openai/api.ts"
+    type signature = "(json, json) -> AxChatResponse throws"
+    body @entry(%raw: json, %state: json) {
+      %response = core.call @openai_normalize_stream_delta(%raw, %state)
+      core.return %response
+    }
+  }
+
+  op ax.ai.semantic @build_embed_request {
+    attr core_kind = "func"
+    attr effect = "throws"
+    attr emit_module = "ai"
+    type signature = "(AxAIService, AxEmbedRequest, AxAIServiceOptions?) -> json throws"
+    body @entry(%service: AxAIService, %request: AxEmbedRequest, %options: json) {
+      %payload = core.call @openai_build_embed_request(%request)
+      core.return %payload
+    }
+  }
+
+  op ax.ai.semantic @normalize_embed_response {
+    attr core_kind = "func"
+    attr effect = "throws"
+    attr emit_module = "ai"
+    tag "src/ax/ai/openai/api.ts"
+    type signature = "(json) -> AxEmbedResponse throws"
+    body @entry(%raw: json) {
+      %response = core.call @openai_normalize_embed_response(%raw)
+      core.return %response
+    }
+  }
+
+  op ax.ai.semantic @normalize_token_usage {
+    attr core_kind = "func"
+    attr emit_module = "ai"
+    tag "token-usage-core-helper"
+    type signature = "(json) -> json"
+    body @entry(%usage: json) {
+      %out = core.map
+      %input_tokens = core.get %usage["input_tokens"] default 0
+      %prompt_tokens_snake = core.get %usage["prompt_tokens"] default %input_tokens
+      %prompt_tokens = core.get %usage["promptTokens"] default %prompt_tokens_snake
+      %output_tokens = core.get %usage["output_tokens"] default 0
+      %completion_tokens_snake = core.get %usage["completion_tokens"] default %output_tokens
+      %completion_tokens = core.get %usage["completionTokens"] default %completion_tokens_snake
+      %computed_total_tokens = core.call intrinsic.add(%prompt_tokens, %completion_tokens)
+      %total_tokens_snake = core.get %usage["total_tokens"] default %computed_total_tokens
+      %total_tokens = core.get %usage["totalTokens"] default %total_tokens_snake
+      core.set %out["prompt_tokens"] = %prompt_tokens
+      core.set %out["completion_tokens"] = %completion_tokens
+      core.set %out["total_tokens"] = %total_tokens
+      %thoughts_tokens_snake = core.get %usage["thoughts_tokens"]
+      %thoughts_tokens = core.get %usage["thoughtsTokens"] default %thoughts_tokens_snake
+      %has_thoughts = core.call intrinsic.is_not_none(%thoughts_tokens)
+      core.if %has_thoughts {
+        core.set %out["thoughts_tokens"] = %thoughts_tokens
+      }
+      %reasoning_tokens_snake = core.get %usage["reasoning_tokens"]
+      %reasoning_tokens = core.get %usage["reasoningTokens"] default %reasoning_tokens_snake
+      %has_reasoning = core.call intrinsic.is_not_none(%reasoning_tokens)
+      core.if %has_reasoning {
+        core.set %out["reasoning_tokens"] = %reasoning_tokens
+      }
+      %cache_read_tokens_snake = core.get %usage["cache_read_tokens"]
+      %cache_read_tokens = core.get %usage["cacheReadTokens"] default %cache_read_tokens_snake
+      %has_cache_read = core.call intrinsic.is_not_none(%cache_read_tokens)
+      core.if %has_cache_read {
+        core.set %out["cache_read_tokens"] = %cache_read_tokens
+      }
+      %cache_creation_tokens_snake = core.get %usage["cache_creation_tokens"]
+      %cache_creation_tokens = core.get %usage["cacheCreationTokens"] default %cache_creation_tokens_snake
+      %has_cache_creation = core.call intrinsic.is_not_none(%cache_creation_tokens)
+      core.if %has_cache_creation {
+        core.set %out["cache_creation_tokens"] = %cache_creation_tokens
+      }
+      %service_tier_snake = core.get %usage["service_tier"]
+      %service_tier = core.get %usage["serviceTier"] default %service_tier_snake
+      %has_service_tier = core.call intrinsic.is_not_none(%service_tier)
+      core.if %has_service_tier {
+        core.set %out["service_tier"] = %service_tier
+      }
+      %speed = core.get %usage["speed"]
+      %has_speed = core.call intrinsic.is_not_none(%speed)
+      core.if %has_speed {
+        core.set %out["speed"] = %speed
+      }
+      core.return %out
+    }
+  }
+
+  op ax.ai.semantic @merge_usage_context {
+    attr core_kind = "func"
+    attr emit_module = "ai"
+    tag "usage-context-core-helper"
+    type signature = "(json?, json?) -> json"
+    body @entry(%defaults: json, %overrides: json) {
+      %merged = core.call intrinsic.map.merge(%defaults, %overrides)
+      %default_attributes = core.get %defaults["attributes"]
+      %override_attributes = core.get %overrides["attributes"]
+      %attributes = core.call intrinsic.map.merge(%default_attributes, %override_attributes)
+      %has_attributes = core.call intrinsic.truthy(%attributes)
+      core.if %has_attributes {
+        core.set %merged["attributes"] = %attributes
+      }
+      core.return %merged
+    }
+  }
+
+  op ax.ai.semantic @build_usage_event {
+    attr core_kind = "func"
+    attr emit_module = "ai"
+    tag "usage-event-core-helper"
+    type signature = "(string, json, json?, bool) -> json"
+    body @entry(%operation: string, %response: json, %options: json, %streaming: bool) {
+      %model_usage_snake = core.get %response["model_usage"]
+      %top_model_usage = core.get %response["modelUsage"] default %model_usage_snake
+      %model_usage = core.let %top_model_usage
+      %results = core.get %response["results"]
+      core.for %result in %results {
+        %result_usage_snake = core.get %result["model_usage"]
+        %result_usage = core.get %result["modelUsage"] default %result_usage_snake
+        %has_result_usage = core.call intrinsic.truthy(%result_usage)
+        core.if %has_result_usage {
+          %model_usage = core.let %result_usage
+        }
+      }
+      %tokens = core.get %model_usage["tokens"]
+      %has_tokens = core.call intrinsic.truthy(%tokens)
+      %missing_tokens = core.call intrinsic.not(%has_tokens)
+      core.if %missing_tokens {
+        %none = core.call intrinsic.none()
+        core.return %none
+      }
+      %event = core.map
+      core.set %event["operation"] = %operation
+      %ai_name = core.get %model_usage["ai"]
+      %model = core.get %model_usage["model"]
+      %normalized_tokens = core.call @normalize_token_usage(%tokens)
+      core.set %event["ai"] = %ai_name
+      core.set %event["model"] = %model
+      core.set %event["tokens"] = %normalized_tokens
+      core.set %event["streaming"] = %streaming
+      %usage_context_snake = core.get %options["usage_context"]
+      %usage_context = core.get %options["usageContext"] default %usage_context_snake
+      %has_context = core.call intrinsic.truthy(%usage_context)
+      core.if %has_context {
+        core.set %event["context"] = %usage_context
+      }
+      %option_session_snake = core.get %options["session_id"]
+      %option_session = core.get %options["sessionId"] default %option_session_snake
+      %response_session_snake = core.get %response["session_id"]
+      %response_session = core.get %response["sessionId"] default %response_session_snake
+      %session_id = core.call intrinsic.coalesce(%response_session, %option_session)
+      %has_session_id = core.call intrinsic.is_not_none(%session_id)
+      core.if %has_session_id {
+        core.set %event["sessionId"] = %session_id
+      }
+      %remote_id_snake = core.get %response["remote_id"]
+      %remote_id = core.get %response["remoteId"] default %remote_id_snake
+      %has_remote_id = core.call intrinsic.is_not_none(%remote_id)
+      core.if %has_remote_id {
+        core.set %event["remoteId"] = %remote_id
+      }
+      %remote_request_id_snake = core.get %response["remote_request_id"]
+      %remote_request_id = core.get %response["remoteRequestId"] default %remote_request_id_snake
+      %has_remote_request_id = core.call intrinsic.is_not_none(%remote_request_id)
+      core.if %has_remote_request_id {
+        core.set %event["remoteRequestId"] = %remote_request_id
+      }
+      %remote_session_id_snake = core.get %response["remote_session_id"]
+      %remote_session_id = core.get %response["remoteSessionId"] default %remote_session_id_snake
+      %has_remote_session_id = core.call intrinsic.is_not_none(%remote_session_id)
+      core.if %has_remote_session_id {
+        core.set %event["remoteSessionId"] = %remote_session_id
+      }
+      core.return %event
+    }
+  }
+
+  op ax.ai.semantic @ai_model_usage_impl {
+    attr core_kind = "func"
+    attr emit_module = "ai"
+    attr private = true
+    tag "model-usage-core-helper"
+    type signature = "(string, string, json) -> json"
+    body @entry(%ai_name: string, %model: string, %usage: json) {
+      %has_usage = core.call intrinsic.truthy(%usage)
+      %missing_usage = core.call intrinsic.not(%has_usage)
+      core.if %missing_usage {
+        %none = core.call intrinsic.none()
+        core.return %none
+      }
+      %tokens = core.call @normalize_token_usage(%usage)
+      %out = core.map
+      core.set %out["ai"] = %ai_name
+      core.set %out["model"] = %model
+      core.set %out["tokens"] = %tokens
+      core.return %out
+    }
+  }
+
+  op ax.ai.semantic @chat_response_to_completion {
+    attr core_kind = "func"
+    attr emit_module = "ai"
+    tag "legacy-completion-compat"
+    type signature = "(AxChatResponse) -> json"
+    body @entry(%response: AxChatResponse) {
+      %empty_results = core.list
+      %results = core.get %response["results"] default %empty_results
+      %empty_result = core.map
+      %result = core.call intrinsic.list.get(%results, 0, %empty_result)
+      %content = core.get %result["content"] default ""
+      %calls = core.list
+      %empty_calls = core.list
+      %function_calls = core.get %result["function_calls"] default %empty_calls
+      core.for %call in %function_calls {
+        %fn = core.get %call["function"]
+        %id = core.get %call["id"]
+        %name = core.get %fn["name"]
+        %params = core.get %fn["params"]
+        %compat_call = core.map
+        core.set %compat_call["id"] = %id
+        core.set %compat_call["name"] = %name
+        core.set %compat_call["params"] = %params
+        core.append %calls, %compat_call
+      }
+      %model_usage = core.get %response["model_usage"]
+      %usage = core.get %model_usage["tokens"]
+      %out = core.map
+      core.set %out["content"] = %content
+      core.set %out["function_calls"] = %calls
+      core.set %out["usage"] = %usage
+      core.return %out
+    }
+  }
+
+  op ax.ai.semantic @ai_context_cache_rejection {
+    attr core_kind = "func"
+    attr emit_module = "ai"
+    tag "src/ax/ai/base.ts"
+    tag "axai-context-cache-recovery"
+    type signature = "(status:number, body_json:json) -> bool"
+    body @entry(%status: number, %body_json: json) {
+      %status_400_min = core.call intrinsic.gte(%status, 400)
+      %status_400_max = core.call intrinsic.lte(%status, 400)
+      %is_400 = core.call intrinsic.and(%status_400_min, %status_400_max)
+      %status_404_min = core.call intrinsic.gte(%status, 404)
+      %status_404_max = core.call intrinsic.lte(%status, 404)
+      %is_404 = core.call intrinsic.and(%status_404_min, %status_404_max)
+      %valid_status = core.call intrinsic.or(%is_400, %is_404)
+      %body_text = core.call intrinsic.json.stringify(%body_json)
+      %body_lower = core.call intrinsic.string.lower(%body_text)
+      %names_compact = core.call intrinsic.contains(%body_lower, "cachedcontent")
+      %names_spaced = core.call intrinsic.contains(%body_lower, "cached content")
+      %names_resource = core.call intrinsic.contains(%body_lower, "cachedcontents/")
+      %names_left = core.call intrinsic.or(%names_compact, %names_spaced)
+      %names_cache = core.call intrinsic.or(%names_left, %names_resource)
+      %has_cache = core.call intrinsic.contains(%body_lower, "cache")
+      %expired = core.call intrinsic.contains(%body_lower, "expired")
+      %not_found = core.call intrinsic.contains(%body_lower, "not found")
+      %missing = core.call intrinsic.contains(%body_lower, "does not exist")
+      %invalid = core.call intrinsic.contains(%body_lower, "invalid")
+      %invalid_left = core.call intrinsic.or(%expired, %not_found)
+      %invalid_right = core.call intrinsic.or(%missing, %invalid)
+      %invalid_reason = core.call intrinsic.or(%invalid_left, %invalid_right)
+      %invalid_cache = core.call intrinsic.and(%has_cache, %invalid_reason)
+      %cache_rejection = core.call intrinsic.or(%names_cache, %invalid_cache)
+      %out = core.call intrinsic.and(%valid_status, %cache_rejection)
+      core.return %out
+    }
+  }
+
+  op ax.ai.semantic @ai_context_cache_expiry {
+    attr core_kind = "func"
+    attr emit_module = "ai"
+    tag "src/ax/ai/base.ts"
+    tag "axai-context-cache-recovery"
+    type signature = "(provider_expire_time:json, now:number) -> number"
+    body @entry(%provider_expire_time: json, %now: number) {
+      %is_number = core.type_is %provider_expire_time type "number"
+      core.if %is_number {
+        %future = core.call intrinsic.gt(%provider_expire_time, %now)
+        core.if %future {
+          core.return %provider_expire_time
+        }
+      }
+      core.return 0
+    }
+  }
+
+  op ax.ai.semantic @ai_context_cache_plan {
+    attr core_kind = "func"
+    attr emit_module = "ai"
+    tag "src/ax/ai/base.ts"
+    tag "axai-context-cache-recovery"
+    type signature = "(configured:bool, supported:bool, explicit_name:string, existing:json, now:number, refresh_window_ms:number, create_eligible:bool) -> json"
+    body @entry(%configured: bool, %supported: bool, %explicit_name: string, %existing: json, %now: number, %refresh_window_ms: number, %create_eligible: bool) {
+      %out = core.map
+      core.set %out["action"] = "none"
+      core.set %out["managed"] = false
+      %enabled = core.call intrinsic.and(%configured, %supported)
+      %disabled = core.call intrinsic.not(%enabled)
+      core.if %disabled {
+        core.return %out
+      }
+      %explicit_length = core.call intrinsic.len(%explicit_name)
+      %has_explicit = core.call intrinsic.gt(%explicit_length, 0)
+      core.if %has_explicit {
+        core.set %out["action"] = "use"
+        core.set %out["cacheName"] = %explicit_name
+        core.return %out
+      }
+      %existing_object = core.type_is %existing type "object"
+      core.if %existing_object {
+        %cache_name = core.get %existing["cacheName"] default ""
+        %expires_at = core.get %existing["expiresAt"] default 0
+        %cache_name_length = core.call intrinsic.len(%cache_name)
+        %has_name = core.call intrinsic.gt(%cache_name_length, 0)
+        %future = core.call intrinsic.gt(%expires_at, %now)
+        %valid = core.call intrinsic.and(%has_name, %future)
+        core.if %valid {
+          %refresh_at = core.call intrinsic.add(%now, %refresh_window_ms)
+          %needs_refresh = core.call intrinsic.lt(%expires_at, %refresh_at)
+          core.set %out["managed"] = true
+          core.set %out["cacheName"] = %cache_name
+          core.if %needs_refresh {
+            core.set %out["action"] = "refresh"
+          } else {
+            core.set %out["action"] = "use"
+          }
+          core.return %out
+        }
+      }
+      core.if %create_eligible {
+        core.set %out["action"] = "create"
+        core.set %out["managed"] = true
+      }
+      core.return %out
+    }
+  }
+
+  op ax.ai.semantic @ai_context_cache_recovery {
+    attr core_kind = "func"
+    attr emit_module = "ai"
+    tag "src/ax/ai/base.ts"
+    tag "axai-context-cache-recovery"
+    type signature = "(current_entry:json, cache_name:string, external_registry:bool) -> json"
+    body @entry(%current_entry: json, %cache_name: string, %external_registry: bool) {
+      %out = core.map
+      core.set %out["invalidated"] = false
+      core.set %out["deleteInMemory"] = false
+      %entry_object = core.type_is %current_entry type "object"
+      core.if %entry_object {
+        %current_name = core.get %current_entry["cacheName"] default ""
+        %matches = core.call intrinsic.eq(%current_name, %cache_name)
+        core.if %matches {
+          core.set %out["invalidated"] = true
+          core.if %external_registry {
+            %empty = core.map
+            %tombstone = core.call intrinsic.map.merge(%current_entry, %empty)
+            core.set %tombstone["expiresAt"] = 0
+            core.set %out["externalEntry"] = %tombstone
+          } else {
+            core.set %out["deleteInMemory"] = true
+          }
+        }
+      }
+      core.return %out
+    }
+  }
+
+  op ax.ai.semantic @ai_gemini_cache_ops {
+    attr core_kind = "func"
+    attr emit_module = "ai"
+    tag "src/ax/ai/google-gemini/api.ts"
+    tag "axai-context-cache-recovery"
+    type signature = "(cache_name:string, ttl_seconds:number, api_key:string, model:string, create_body:json) -> json"
+    body @entry(%cache_name: string, %ttl_seconds: number, %api_key: string, %model: string, %create_body: json) {
+      %ttl = core.call intrinsic.string.format("{}s", %ttl_seconds)
+      %api_key_length = core.call intrinsic.len(%api_key)
+      %has_key = core.call intrinsic.gt(%api_key_length, 0)
+      %create_path = core.let "/cachedContents"
+      %update_path = core.call intrinsic.string.format("/{}?updateMask=ttl", %cache_name)
+      %delete_path = core.call intrinsic.string.format("/{}", %cache_name)
+      core.if %has_key {
+        %create_with_key = core.call intrinsic.string.format("/cachedContents?key={}", %api_key)
+        %update_with_key = core.call intrinsic.string.format("/{}?updateMask=ttl&key={}", %cache_name, %api_key)
+        %delete_with_key = core.call intrinsic.string.format("/{}?key={}", %cache_name, %api_key)
+        %create_path = core.let %create_with_key
+        %update_path = core.let %update_with_key
+        %delete_path = core.let %delete_with_key
+      }
+      %create_request = core.map
+      %create_is_object = core.type_is %create_body type "object"
+      core.if %create_is_object {
+        %empty = core.map
+        %create_copy = core.call intrinsic.map.merge(%create_body, %empty)
+        %create_request = core.let %create_copy
+      }
+      %model_resource = core.call intrinsic.string.format("models/{}", %model)
+      core.set %create_request["model"] = %model_resource
+      core.set %create_request["ttl"] = %ttl
+      %update_request = core.map
+      core.set %update_request["ttl"] = %ttl
+      %empty_request = core.map
+      %create = core.map
+      core.set %create["method"] = "POST"
+      core.set %create["path"] = %create_path
+      core.set %create["request"] = %create_request
+      %update = core.map
+      core.set %update["method"] = "PATCH"
+      core.set %update["path"] = %update_path
+      core.set %update["request"] = %update_request
+      %delete_op = core.map
+      core.set %delete_op["method"] = "DELETE"
+      core.set %delete_op["path"] = %delete_path
+      core.set %delete_op["request"] = %empty_request
+      %out = core.map
+      core.set %out["create"] = %create
+      core.set %out["update"] = %update
+      core.set %out["delete"] = %delete_op
+      core.return %out
+    }
+  }
+
+  op ax.ai.semantic @record_ai_metrics {
+    attr core_kind = "func"
+    tag "src/ax/ai/base.ts"
+    type signature = "(AxAIService, kind:string, durationMs:f64, error?:json) -> void"
+  }
+}

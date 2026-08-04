@@ -1,0 +1,937 @@
+/**
+ * RLM (Recursive Language Model) interfaces and prompt builder.
+ *
+ * Pluggable interpreter interface — anyone can implement for any runtime.
+ * No Node.js-specific imports; browser-safe.
+ */
+
+import type { AxFunctionJSONSchema } from '../ai/types.js';
+import { toFieldType } from '../dsp/prompt.js';
+import type { AxIField } from '../dsp/sig.js';
+import type { AxProgramForwardOptions } from '../dsp/types.js';
+import type { AxAgentActorTurnCallback } from './agentInternal/agentStateTypes.js';
+import type { AxAgentOnContextEvent } from './contextEvents.js';
+import {
+  axRuntimePrimitives,
+  renderPrimitivesList,
+} from './runtimePrimitives.js';
+import { renderPromptTemplate } from './templateEngine.js';
+
+// ----- Helpers for rendering function/agent signatures in the actor prompt -----
+
+type AgentIdentityPrompt = Readonly<{
+  name: string;
+  description: string;
+}>;
+
+function renderAgentIdentity(
+  identity: AgentIdentityPrompt | undefined
+): string {
+  if (!identity) return '';
+
+  return [
+    `- Name: ${identity.name}`,
+    `- Description: ${identity.description}`,
+  ].join('\n');
+}
+
+function normalizeSchemaTypes(schema: AxFunctionJSONSchema): string[] {
+  const rawType = (schema as { type?: unknown }).type;
+
+  if (Array.isArray(rawType)) {
+    return rawType.filter((t): t is string => typeof t === 'string');
+  }
+
+  if (typeof rawType === 'string') {
+    if (rawType.includes(',')) {
+      return rawType
+        .split(',')
+        .map((part) => part.trim())
+        .filter(Boolean);
+    }
+    return [rawType];
+  }
+
+  return [];
+}
+
+function isJsonAnyTypeUnion(types: readonly string[]): boolean {
+  const normalized = new Set(types);
+  return (
+    normalized.has('object') &&
+    normalized.has('array') &&
+    normalized.has('string') &&
+    normalized.has('number') &&
+    normalized.has('boolean') &&
+    normalized.has('null')
+  );
+}
+
+function schemaTypeToShortString(schema: AxFunctionJSONSchema): string {
+  if (schema.enum) return schema.enum.map((e) => `"${e}"`).join(' | ');
+
+  const types = normalizeSchemaTypes(schema);
+  if (types.length === 0) return 'unknown';
+
+  if (isJsonAnyTypeUnion(types)) return 'any';
+
+  const rendered = [...new Set(types)].map((type) => {
+    if (type === 'array') {
+      const itemType = schema.items
+        ? schemaTypeToShortString(schema.items)
+        : 'unknown';
+      return itemType.includes(' | ') ? `(${itemType})[]` : `${itemType}[]`;
+    }
+    if (type === 'object') {
+      if (schema.properties && Object.keys(schema.properties).length > 0) {
+        return renderObjectType(schema);
+      }
+      return 'object';
+    }
+    return type;
+  });
+
+  return rendered.length > 1
+    ? rendered.join(' | ')
+    : (rendered[0] ?? 'unknown');
+}
+
+function renderObjectType(
+  schema: AxFunctionJSONSchema | undefined,
+  options?: Readonly<{ respectRequired?: boolean }>
+): string {
+  if (!schema) {
+    return '{}';
+  }
+  const hasProperties =
+    !!schema.properties && Object.keys(schema.properties).length > 0;
+  const supportsExtraProps = schema.additionalProperties === true;
+
+  if (!hasProperties) {
+    return supportsExtraProps ? '{ [key: string]: unknown }' : '{}';
+  }
+  const required = new Set(schema.required ?? []);
+  const respectRequired = options?.respectRequired ?? false;
+  const parts = Object.entries(schema.properties!).map(([key, prop]) => {
+    const typeStr = schemaTypeToShortString(prop);
+    const optionalMarker = respectRequired && !required.has(key) ? '?' : '';
+    return `${key}${optionalMarker}: ${typeStr}`;
+  });
+  if (schema?.additionalProperties === true) {
+    parts.push('[key: string]: unknown');
+  }
+  return `{ ${parts.join(', ')} }`;
+}
+
+function renderReturnsSummary(
+  schema: AxFunctionJSONSchema | undefined
+): string {
+  if (!schema) {
+    return 'unknown';
+  }
+  return schemaTypeToShortString(schema);
+}
+
+export type AxRuntimeCallableFormatArgs = Readonly<{
+  qualifiedName: string;
+  description?: string;
+  parameters?: AxFunctionJSONSchema;
+  returns?: AxFunctionJSONSchema;
+}>;
+
+export type AxRuntimePrimitiveOverrideMap =
+  | ReadonlyMap<string, readonly string[]>
+  | Readonly<Record<string, readonly string[]>>;
+
+export type AxRuntimeLanguageInfo = Readonly<{
+  languageName: string;
+  codeFieldName: string;
+  codeFieldTitle: string;
+  codeFenceLanguage: string;
+  isJavaScript: boolean;
+}>;
+
+const DEFAULT_RUNTIME_LANGUAGE = 'JavaScript';
+const JAVASCRIPT_LANGUAGE_ALIASES = new Set(['javascript', 'js', 'ecmascript']);
+
+function runtimeLanguageTokens(language: string): string[] {
+  return language
+    .trim()
+    .replace(/#/g, ' Sharp ')
+    .replace(/\+/g, ' Plus ')
+    .split(/[^A-Za-z0-9]+/)
+    .filter(Boolean);
+}
+
+function lowerCamelFromTokens(tokens: readonly string[]): string {
+  if (tokens.length === 0) return '';
+  const [first, ...rest] = tokens;
+  return [
+    first!.toLowerCase(),
+    ...rest.map((token) => {
+      const lower = token.toLowerCase();
+      return `${lower.charAt(0).toUpperCase()}${lower.slice(1)}`;
+    }),
+  ].join('');
+}
+
+function titleFromFieldName(fieldName: string): string {
+  const words = fieldName
+    .replace(/Code$/, ' Code')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .trim();
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
+export function normalizeRuntimeLanguageName(language: unknown): string {
+  if (typeof language !== 'string') return DEFAULT_RUNTIME_LANGUAGE;
+  const trimmed = language.trim();
+  return trimmed || DEFAULT_RUNTIME_LANGUAGE;
+}
+
+export function isJavaScriptRuntimeLanguage(language: unknown): boolean {
+  const languageName = normalizeRuntimeLanguageName(language);
+  const aliasKey = runtimeLanguageTokens(languageName).join('').toLowerCase();
+  return JAVASCRIPT_LANGUAGE_ALIASES.has(aliasKey);
+}
+
+export function runtimeLanguageToCodeFieldName(language: unknown): string {
+  const languageName = normalizeRuntimeLanguageName(language);
+  const tokens = runtimeLanguageTokens(languageName);
+  const aliasKey = tokens.join('').toLowerCase();
+  if (JAVASCRIPT_LANGUAGE_ALIASES.has(aliasKey)) {
+    return 'javascriptCode';
+  }
+
+  const prefix = lowerCamelFromTokens(tokens);
+  return prefix ? `${prefix}Code` : 'runtimeCode';
+}
+
+export function runtimeLanguageToCodeFenceLanguage(language: unknown): string {
+  const languageName = normalizeRuntimeLanguageName(language);
+  if (isJavaScriptRuntimeLanguage(languageName)) return 'js';
+  const tokens = runtimeLanguageTokens(languageName);
+  return tokens.length > 0 ? tokens.join('').toLowerCase() : 'text';
+}
+
+export function getRuntimeLanguageInfo(
+  runtime?: Readonly<{ language?: string }>
+): AxRuntimeLanguageInfo {
+  const languageName = normalizeRuntimeLanguageName(runtime?.language);
+  const codeFieldName = runtimeLanguageToCodeFieldName(languageName);
+  return {
+    languageName,
+    codeFieldName,
+    codeFieldTitle: titleFromFieldName(codeFieldName),
+    codeFenceLanguage: runtimeLanguageToCodeFenceLanguage(languageName),
+    isJavaScript: isJavaScriptRuntimeLanguage(languageName),
+  };
+}
+
+function coercePrimitiveOverrideMap(
+  overrides: AxRuntimePrimitiveOverrideMap | undefined
+): Map<string, readonly string[]> {
+  const out = new Map<string, readonly string[]>();
+  if (!overrides) return out;
+
+  const entries =
+    overrides instanceof Map ? overrides.entries() : Object.entries(overrides);
+  for (const [key, value] of entries) {
+    if (typeof key !== 'string' || !Array.isArray(value)) continue;
+    const lines = value
+      .map((line) => String(line).trim())
+      .filter((line) => line.length > 0);
+    if (lines.length > 0) {
+      out.set(key, lines);
+    }
+  }
+  return out;
+}
+
+function genericPrimitiveOverridesForRuntime(
+  languageName: string
+): Map<string, readonly string[]> {
+  const out = new Map<string, readonly string[]>();
+  for (const primitive of axRuntimePrimitives) {
+    out.set(primitive.id, [
+      [
+        primitive.description,
+        `Use the ${languageName} runtime call syntax described in the runtime usage instructions for \`${primitive.id}\`.`,
+      ].join('\n'),
+    ]);
+  }
+  return out;
+}
+
+export function getRuntimePrimitiveOverrides(
+  runtime: Readonly<Pick<AxCodeRuntime, 'language' | 'getPrimitiveOverrides'>>,
+  localOverrides?: ReadonlyMap<string, readonly string[]>
+): ReadonlyMap<string, readonly string[]> | undefined {
+  const info = getRuntimeLanguageInfo(runtime);
+  const merged = info.isJavaScript
+    ? new Map<string, readonly string[]>()
+    : genericPrimitiveOverridesForRuntime(info.languageName);
+
+  for (const [key, value] of coercePrimitiveOverrideMap(
+    runtime.getPrimitiveOverrides?.()
+  )) {
+    merged.set(key, value);
+  }
+
+  for (const [key, value] of localOverrides ?? []) {
+    merged.set(key, value);
+  }
+
+  return merged.size > 0 ? merged : undefined;
+}
+
+function renderJavaScriptCallableBlock(args: AxRuntimeCallableFormatArgs) {
+  const paramType = renderObjectType(args.parameters, {
+    respectRequired: true,
+  });
+  const returnType = args.returns
+    ? `: Promise<${renderReturnsSummary(args.returns)}>`
+    : '';
+  const signature = `\`${args.qualifiedName}(args: ${paramType})${returnType}\``;
+  const description = args.description?.trim();
+  return description ? `${description}\n${signature}` : signature;
+}
+
+function renderGenericCallableBlock(
+  args: AxRuntimeCallableFormatArgs,
+  languageName: string
+): string {
+  const parts: string[] = [];
+  const description = args.description?.trim();
+  if (description) {
+    parts.push(description);
+  }
+  parts.push(`Callable: \`${args.qualifiedName}\``);
+  parts.push(
+    `Arguments schema: \`${renderObjectType(args.parameters, {
+      respectRequired: true,
+    })}\``
+  );
+  if (args.returns) {
+    parts.push(`Returns: \`${renderReturnsSummary(args.returns)}\``);
+  }
+  parts.push(
+    `Use the ${languageName} runtime's tool-call syntax for this callable.`
+  );
+  return parts.join('\n');
+}
+
+function renderCallableBlock(
+  args: AxRuntimeCallableFormatArgs &
+    Readonly<{
+      languageName: string;
+      isJavaScriptRuntime: boolean;
+      formatCallable?: AxCodeRuntime['formatCallable'];
+    }>
+): string {
+  if (args.formatCallable) {
+    return args.formatCallable({
+      qualifiedName: args.qualifiedName,
+      description: args.description,
+      parameters: args.parameters,
+      returns: args.returns,
+    });
+  }
+
+  if (args.isJavaScriptRuntime) {
+    return renderJavaScriptCallableBlock(args);
+  }
+
+  return renderGenericCallableBlock(args, args.languageName);
+}
+
+/**
+ * A code runtime that can create persistent sessions.
+ * Implement this interface for your target runtime (Node.js, browser, WASM, etc.).
+ */
+export interface AxCodeRuntime {
+  /**
+   * Human-readable language name for generated actor code.
+   * Defaults to JavaScript when omitted for backwards compatibility.
+   */
+  readonly language?: string;
+  createSession(
+    globals?: Record<string, unknown>,
+    options?: { shouldBubbleError?: (err: unknown) => boolean }
+  ): AxCodeSession;
+  /**
+   * Optional runtime-specific usage guidance injected into the RLM system prompt.
+   * Use this for execution semantics that differ by runtime/language.
+   */
+  getUsageInstructions(): string;
+  /**
+   * Optional language-native prompt text for built-in actor primitives such as
+   * final, askClarification, discover, and recall.
+   */
+  getPrimitiveOverrides?(): AxRuntimePrimitiveOverrideMap | undefined;
+  /**
+   * Optional language-native formatter for callable tools exposed in the
+   * runtime. Execution still happens inside the runtime session.
+   */
+  formatCallable?(args: AxRuntimeCallableFormatArgs): string;
+}
+
+export type AxCodeSessionSnapshotEntry = {
+  name: string;
+  type: string;
+  ctor?: string;
+  size?: string;
+  preview?: string;
+  restorable?: boolean;
+};
+
+export type AxCodeSessionSnapshot = {
+  version: 1;
+  entries: AxCodeSessionSnapshotEntry[];
+  bindings: Record<string, unknown>;
+};
+
+/**
+ * A persistent code execution session. Variables persist across `execute()` calls.
+ */
+export interface AxCodeSession {
+  execute(
+    code: string,
+    options?: { signal?: AbortSignal; reservedNames?: readonly string[] }
+  ): Promise<unknown>;
+  inspectGlobals?(options?: {
+    signal?: AbortSignal;
+    reservedNames?: readonly string[];
+  }): Promise<string>;
+  snapshotGlobals?(options?: {
+    signal?: AbortSignal;
+    reservedNames?: readonly string[];
+  }): Promise<AxCodeSessionSnapshot>;
+  patchGlobals(
+    globals: Record<string, unknown>,
+    options?: { signal?: AbortSignal }
+  ): Promise<void>;
+  close(): void;
+}
+
+/**
+ * Opinionated context replay presets for the Actor loop.
+ *
+ * - `full`: Keep prior actions fully replayed with minimal compression.
+ *   Best for debugging or short tasks where the actor should reread exact old code/output.
+ * - `adaptive`: Keep live runtime state visible, preserve recent or dependency-relevant
+ *   actions in full, keep discovery docs available by default, and collapse older successful work
+ *   into checkpoint summaries as context grows. Reliability-first defaults favor
+ *   summaries before deletion. Best default for long multi-turn tasks.
+ * - `lean`: Most aggressive compression. Keep live runtime state visible, checkpoint
+ *   older successful work, and summarize replay-pruned successful turns instead of
+ *   replaying their full code blocks. Reliability-first
+ *   defaults still preserve recent evidence before deleting older low-value steps.
+ *   Best when character-based prompt pressure matters more than raw replay detail.
+ * - `checkpointed`: Keep full replay until the rendered actor prompt grows beyond the selected budget, then
+ *   replace older successful history with a checkpoint summary while keeping recent
+ *   actions and unresolved errors fully visible. Best when you want conservative,
+ *   debugging-friendly replay until prompt pressure becomes real.
+ */
+export type AxContextPolicyPreset =
+  | 'full'
+  | 'adaptive'
+  | 'lean'
+  | 'checkpointed';
+
+export type AxContextPolicyBudget = 'compact' | 'balanced' | 'expanded';
+
+/**
+ * Public context policy for the Actor loop.
+ * Users choose replay style via `preset` and overall prompt budget via `budget`.
+ */
+export interface AxContextPolicyConfig {
+  /**
+   * Opinionated preset for how the agent should replay and compress context.
+   *
+   * - `full`: prefer raw replay of earlier actions
+   * - `adaptive`: balance replay detail with checkpoint compression while keeping more recent evidence visible
+   * - `lean`: prefer live state + compact summaries over raw replay detail
+   * - `checkpointed`: keep full replay until the rendered actor prompt grows beyond the selected budget, then replace older successful turns with a checkpoint summary
+   */
+  preset?: AxContextPolicyPreset;
+  /** Overall prompt budget and compression aggressiveness. */
+  budget?: AxContextPolicyBudget;
+}
+
+/**
+ * RLM configuration for AxAgent.
+ */
+export interface AxRLMConfig {
+  /** Input fields holding long context (will be removed from the LLM prompt). */
+  contextFields: string[];
+  /** Actor prompt verbosity and scaffolding level (default: 'default'). */
+  promptLevel?: 'default' | 'detailed';
+  /** Code runtime for the REPL loop (default: AxJSRuntime). */
+  runtime?: AxCodeRuntime;
+  /** Global cap on recursive sub-agent calls across all descendants (default: 100). */
+  maxSubAgentCalls?: number;
+  /** Maximum parallel llmQuery calls in batched mode (default: 8). */
+  maxBatchedLlmQueryConcurrency?: number;
+  /** Maximum Actor turns before forcing Responder (default: 10). */
+  maxTurns?: number;
+  /** Maximum characters to keep from runtime output and console/log replay (default: 3000). */
+  maxRuntimeChars?: number;
+  /**
+   * Maximum serialized characters for a `final(task, evidence)` evidence
+   * object crossing the host boundary (default: 50000). Oversized evidence
+   * throws inside the actor turn so the model narrows and retries; in-worker
+   * evidence handoffs in shared-session mode are exempt.
+   */
+  maxEvidenceChars?: number;
+  /** Context replay, checkpointing, and runtime-state policy. */
+  contextPolicy?: AxContextPolicyConfig;
+  /** Default options for the internal checkpoint summarizer. */
+  summarizerOptions?: Omit<AxProgramForwardOptions<string>, 'functions'>;
+  /**
+   * Called after each Actor turn is recorded with both raw runtime output and
+   * the formatted action-log output.
+   */
+  actorTurnCallback?: AxAgentActorTurnCallback;
+  /**
+   * Called when AxAgent measures context pressure or changes compacted context state.
+   * Intended for observability; callback failures are ignored.
+   */
+  onContextEvent?: AxAgentOnContextEvent;
+  /**
+   * Called when the actor signals task progress via `reportSuccess(message)` or `reportFailure(message)`.
+   */
+  agentStatusCallback?: (
+    message: string,
+    status: 'success' | 'failed'
+  ) => void | Promise<void>;
+}
+
+/**
+ * Builds the context-understanding actor system prompt (the distiller).
+ * The distiller is the pipeline's reconnaissance phase: it explores
+ * long-context inputs AND the executor's capability surface (function
+ * schemas, module catalog, skills index, discovery) so its evidence is shaped
+ * to what the executor's tools will actually consume. It cannot execute
+ * tools — its callables are throwing stubs.
+ */
+export function axBuildDistillerDefinition(
+  baseDefinition: string | undefined,
+  contextFields: readonly AxIField[],
+  options: Readonly<{
+    runtimeUsageInstructions?: string;
+    runtimeLanguageName?: string;
+    runtimeCodeFieldTitle?: string;
+    runtimeCodeFenceLanguage?: string;
+    isJavaScriptRuntime?: boolean;
+    formatCallable?: AxCodeRuntime['formatCallable'];
+    promptLevel?: 'default' | 'detailed';
+    hasInspectRuntime?: boolean;
+    hasLiveRuntimeState?: boolean;
+    hasCompressedActionReplay?: boolean;
+    /** Enables tool discovery (`discover`) in the prompt. */
+    discoveryMode?: boolean;
+    /** Enables `discover({ skills })` runtime overload in the prompt. */
+    skillsMode?: boolean;
+    /** Static skill catalog rendered as an `### Available Skills` index. */
+    skillsCatalog?: ReadonlyArray<{
+      id: string;
+      name: string;
+      description?: string;
+    }>;
+    /** Enables `recall` runtime primitive in the prompt. */
+    memoriesMode?: boolean;
+    /** Enables the generic `used` runtime primitive in the prompt. */
+    usageTrackingMode?: boolean;
+    /** Enables actor-declared memory usage instructions. */
+    memoryUsageMode?: boolean;
+    /** Enables actor-declared skill usage instructions. */
+    skillUsageMode?: boolean;
+    /**
+     * Dynamic direct-respond: offers `respond(task, evidence)` alongside
+     * `final` under the conservative direct-response covenant.
+     */
+    directRespondMode?: boolean;
+    /**
+     * Static direct-respond (agent has no functions/child agents): `respond`
+     * replaces `final` as the completion primitive and the prompt drops the
+     * executor-forwarding covenant. Mutually exclusive with
+     * `directRespondMode`.
+     */
+    directRespondOnly?: boolean;
+    /** Optional prompt-resident orientation cache for recurring long context. */
+    contextMapText?: string;
+    availableModules?: ReadonlyArray<{
+      namespace: string;
+      selectionCriteria?: string;
+    }>;
+    agentFunctions?: ReadonlyArray<{
+      name: string;
+      description?: string;
+      parameters?: AxFunctionJSONSchema;
+      returns?: AxFunctionJSONSchema;
+      namespace: string;
+      alwaysInclude?: boolean;
+    }>;
+    /** Optional override for the `rlm/distiller.md` template source. */
+    templateOverride?: string;
+    /** Optional per-primitive override map keyed by primitive id. */
+    primitiveOverrides?: ReadonlyMap<string, readonly string[]>;
+  }>
+): string {
+  const runtimeInfo = {
+    languageName: options.runtimeLanguageName ?? DEFAULT_RUNTIME_LANGUAGE,
+    codeFieldTitle: options.runtimeCodeFieldTitle ?? 'Javascript Code',
+    codeFenceLanguage: options.runtimeCodeFenceLanguage ?? 'js',
+    isJavaScript: options.isJavaScriptRuntime ?? true,
+  };
+  const contextVarList =
+    contextFields.length > 0
+      ? contextFields
+          .map((f) => `- \`${f.name}\` -> \`inputs.${f.name}\``)
+          .join('\n')
+      : '(none)';
+
+  const sortedAgentFunctions = [...(options.agentFunctions ?? [])].sort(
+    (a, b) => {
+      if (a.namespace !== b.namespace) {
+        return a.namespace.localeCompare(b.namespace);
+      }
+      return a.name.localeCompare(b.name);
+    }
+  );
+  const discoveryMode = Boolean(options.discoveryMode);
+  const inlineAgentFunctions = discoveryMode
+    ? sortedAgentFunctions.filter((fn) => fn.alwaysInclude)
+    : sortedAgentFunctions;
+  const availableModules = options.availableModules
+    ? [...options.availableModules].sort((a, b) =>
+        a.namespace.localeCompare(b.namespace)
+      )
+    : [...new Set(sortedAgentFunctions.map((fn) => fn.namespace))]
+        .sort((a, b) => a.localeCompare(b))
+        .map((namespace) => ({
+          namespace,
+          selectionCriteria: undefined as string | undefined,
+        }));
+
+  const actorBody = renderPromptTemplate(
+    'rlm/distiller.md',
+    {
+      contextVarList,
+      promptLevel: options.promptLevel ?? 'default',
+      hasInspectRuntime: Boolean(options.hasInspectRuntime),
+      hasLiveRuntimeState: Boolean(options.hasLiveRuntimeState),
+      hasCompressedActionReplay: Boolean(options.hasCompressedActionReplay),
+      primitivesList: renderPrimitivesList(
+        'distiller',
+        {
+          hasInspectRuntime: Boolean(options.hasInspectRuntime),
+          discoveryMode,
+          skillsMode: Boolean(options.skillsMode),
+          memoriesMode: Boolean(options.memoriesMode),
+          usageTrackingMode: Boolean(options.usageTrackingMode),
+          directRespondMode: Boolean(options.directRespondMode),
+          directRespondOnly: Boolean(options.directRespondOnly),
+        },
+        options.primitiveOverrides
+      ),
+      directRespondMode: Boolean(options.directRespondMode),
+      directRespondOnly: Boolean(options.directRespondOnly),
+      hasExecutorFunctions: inlineAgentFunctions.length > 0,
+      functionsList:
+        inlineAgentFunctions.length > 0
+          ? inlineAgentFunctions
+              .map((fn) =>
+                renderCallableBlock({
+                  qualifiedName: `${fn.namespace}.${fn.name}`,
+                  description: fn.description,
+                  parameters: fn.parameters,
+                  returns: fn.returns,
+                  languageName: runtimeInfo.languageName,
+                  isJavaScriptRuntime: runtimeInfo.isJavaScript,
+                  formatCallable: options.formatCallable,
+                })
+              )
+              .join('\n\n')
+          : '',
+      discoveryMode,
+      hasModules: discoveryMode && availableModules.length > 0,
+      modulesList: availableModules
+        .map((module) =>
+          module.selectionCriteria?.trim()
+            ? `- \`${module.namespace}\` - ${module.selectionCriteria.trim()}`
+            : `- \`${module.namespace}\``
+        )
+        .join('\n'),
+      hasDiscoveredDocs: discoveryMode,
+      hasSkills: Boolean(options.skillsMode),
+      hasSkillsCatalog:
+        Boolean(options.skillsMode) && (options.skillsCatalog?.length ?? 0) > 0,
+      skillsCatalogList: [...(options.skillsCatalog ?? [])]
+        .sort((a, b) => a.id.localeCompare(b.id))
+        .map(
+          (skill) =>
+            `- \`${skill.id}\` — ${skill.name}${
+              skill.description ? ` — ${skill.description}` : ''
+            }`
+        )
+        .join('\n'),
+      skillUsageMode: Boolean(options.skillUsageMode),
+      runtimeLanguageName: runtimeInfo.languageName,
+      runtimeCodeFieldTitle: runtimeInfo.codeFieldTitle,
+      runtimeCodeFenceLanguage: runtimeInfo.codeFenceLanguage,
+      isJavaScriptRuntime: runtimeInfo.isJavaScript,
+      memoriesMode: Boolean(options.memoriesMode),
+      memoryUsageMode: Boolean(options.memoryUsageMode),
+      usageTrackingMode: Boolean(options.usageTrackingMode),
+      hasContextMap: Boolean(options.contextMapText?.trim()),
+      contextMapText: String(options.contextMapText ?? ''),
+      runtimeUsageInstructions: String(options.runtimeUsageInstructions ?? ''),
+    },
+    options.templateOverride
+  )
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  return baseDefinition ? `${actorBody}\n\n${baseDefinition}` : actorBody;
+}
+
+/**
+ * Builds the executor system prompt. The executor consumes
+ * `inputs.executorRequest` and `inputs.distilledContext` from the prior
+ * distiller stage and runs tools / discovery to complete the task.
+ */
+export function axBuildExecutorDefinition(
+  baseDefinition: string | undefined,
+  contextFields: readonly AxIField[],
+  responderOutputFields: readonly AxIField[],
+  options: Readonly<{
+    runtimeUsageInstructions?: string;
+    runtimeLanguageName?: string;
+    runtimeCodeFieldTitle?: string;
+    runtimeCodeFenceLanguage?: string;
+    isJavaScriptRuntime?: boolean;
+    formatCallable?: AxCodeRuntime['formatCallable'];
+    promptLevel?: 'default' | 'detailed';
+    hasInspectRuntime?: boolean;
+    hasLiveRuntimeState?: boolean;
+    hasCompressedActionReplay?: boolean;
+    llmQueryPromptMode?: 'simple';
+    enforceIncrementalConsoleTurns?: boolean;
+    hasAgentStatusCallback?: boolean;
+    discoveryMode?: boolean;
+    /** Renders the advisory "Likely Relevant" instruction section. */
+    relevanceHintsMode?: boolean;
+    /** Enables `discover({ skills })` runtime overload in the prompt. */
+    skillsMode?: boolean;
+    /**
+     * Static skill catalog rendered as an `### Available Skills` index so
+     * skill discovery is targeted instead of blind. Construction-stable, so
+     * it is safe inside the cached system prompt.
+     */
+    skillsCatalog?: ReadonlyArray<{
+      id: string;
+      name: string;
+      description?: string;
+    }>;
+    /** Enables `recall` runtime primitive in the prompt. */
+    memoriesMode?: boolean;
+    /** Enables the generic `used` runtime primitive in the prompt. */
+    usageTrackingMode?: boolean;
+    /** Enables actor-declared memory usage instructions. */
+    memoryUsageMode?: boolean;
+    /** Enables actor-declared skill usage instructions. */
+    skillUsageMode?: boolean;
+    /** Distiller-prompt concern (dynamic direct-respond); ignored here. */
+    directRespondMode?: boolean;
+    /** Distiller-prompt concern (static direct-respond); ignored here. */
+    directRespondOnly?: boolean;
+    /** Optional prompt-resident orientation cache for recurring long context. */
+    contextMapText?: string;
+    availableModules?: ReadonlyArray<{
+      namespace: string;
+      selectionCriteria?: string;
+    }>;
+    discoveredDocsMarkdown?: string;
+    /** Skill bodies accumulated during the current run (sorted by id). */
+    skillsMarkdown?: string;
+    agentFunctions?: ReadonlyArray<{
+      name: string;
+      description?: string;
+      parameters?: AxFunctionJSONSchema;
+      returns?: AxFunctionJSONSchema;
+      namespace: string;
+      alwaysInclude?: boolean;
+    }>;
+    /** Optional override for the `rlm/executor.md` template source. */
+    templateOverride?: string;
+    /** Optional per-primitive override map keyed by primitive id. */
+    primitiveOverrides?: ReadonlyMap<string, readonly string[]>;
+  }>
+): string {
+  const runtimeInfo = {
+    languageName: options.runtimeLanguageName ?? DEFAULT_RUNTIME_LANGUAGE,
+    codeFieldTitle: options.runtimeCodeFieldTitle ?? 'Javascript Code',
+    codeFenceLanguage: options.runtimeCodeFenceLanguage ?? 'js',
+    isJavaScript: options.isJavaScriptRuntime ?? true,
+  };
+  type AvailableModule = { namespace: string; selectionCriteria?: string };
+
+  const contextVarList =
+    contextFields.length > 0
+      ? contextFields
+          .map((f) => `- \`${f.name}\` -> \`inputs.${f.name}\``)
+          .join('\n')
+      : '(none)';
+
+  const responderOutputFieldTitles = responderOutputFields
+    .map((f) => `\`${f.name}\``)
+    .join(', ');
+
+  const sortedAgentFunctions = [...(options.agentFunctions ?? [])].sort(
+    (a, b) => {
+      if (a.namespace !== b.namespace) {
+        return a.namespace.localeCompare(b.namespace);
+      }
+      return a.name.localeCompare(b.name);
+    }
+  );
+  const discoveryMode = Boolean(options.discoveryMode);
+  const inlineAgentFunctions = discoveryMode
+    ? sortedAgentFunctions.filter((fn) => fn.alwaysInclude)
+    : sortedAgentFunctions;
+  const availableModules: AvailableModule[] = options.availableModules
+    ? [...options.availableModules].sort((a, b) =>
+        a.namespace.localeCompare(b.namespace)
+      )
+    : [...new Set(sortedAgentFunctions.map((fn) => fn.namespace))]
+        .sort((a, b) => a.localeCompare(b))
+        .map((namespace) => ({ namespace }));
+
+  const actorBody = renderPromptTemplate(
+    'rlm/executor.md',
+    {
+      contextVarList,
+      responderOutputFieldTitles,
+      promptLevel: options.promptLevel ?? 'default',
+      llmQueryPromptMode: options.llmQueryPromptMode ?? 'simple',
+      discoveryMode,
+      hasInspectRuntime: Boolean(options.hasInspectRuntime),
+      primitivesList: renderPrimitivesList(
+        'executor',
+        {
+          hasInspectRuntime: Boolean(options.hasInspectRuntime),
+          hasAgentStatusCallback: Boolean(options.hasAgentStatusCallback),
+          discoveryMode,
+          skillsMode: Boolean(options.skillsMode),
+          memoriesMode: Boolean(options.memoriesMode),
+          usageTrackingMode: Boolean(options.usageTrackingMode),
+        },
+        options.primitiveOverrides
+      ),
+      functionsList:
+        inlineAgentFunctions.length > 0
+          ? inlineAgentFunctions
+              .map((fn) =>
+                renderCallableBlock({
+                  qualifiedName: `${fn.namespace}.${fn.name}`,
+                  description: fn.description,
+                  parameters: fn.parameters,
+                  returns: fn.returns,
+                  languageName: runtimeInfo.languageName,
+                  isJavaScriptRuntime: runtimeInfo.isJavaScript,
+                  formatCallable: options.formatCallable,
+                })
+              )
+              .join('\n\n')
+          : '',
+      hasModules: discoveryMode && availableModules.length > 0,
+      modulesList: availableModules
+        .map((module) =>
+          module.selectionCriteria?.trim()
+            ? `- \`${module.namespace}\` - ${module.selectionCriteria.trim()}`
+            : `- \`${module.namespace}\``
+        )
+        .join('\n'),
+      runtimeUsageInstructions: String(options.runtimeUsageInstructions ?? ''),
+      runtimeLanguageName: runtimeInfo.languageName,
+      runtimeCodeFieldTitle: runtimeInfo.codeFieldTitle,
+      runtimeCodeFenceLanguage: runtimeInfo.codeFenceLanguage,
+      isJavaScriptRuntime: runtimeInfo.isJavaScript,
+      hasRelevanceHints: Boolean(options.relevanceHintsMode),
+      hasDiscoveredDocs: discoveryMode,
+      discoveredDocsMarkdown: '',
+      hasSkills: Boolean(options.skillsMode),
+      hasSkillsCatalog:
+        Boolean(options.skillsMode) && (options.skillsCatalog?.length ?? 0) > 0,
+      skillsCatalogList: [...(options.skillsCatalog ?? [])]
+        .sort((a, b) => a.id.localeCompare(b.id))
+        .map(
+          (skill) =>
+            `- \`${skill.id}\` — ${skill.name}${
+              skill.description ? ` — ${skill.description}` : ''
+            }`
+        )
+        .join('\n'),
+      skillsMarkdown: '',
+      memoriesMode: Boolean(options.memoriesMode),
+      memoryUsageMode: Boolean(options.memoryUsageMode),
+      skillUsageMode: Boolean(options.skillUsageMode),
+      usageTrackingMode: Boolean(options.usageTrackingMode),
+      enforceIncrementalConsoleTurns: Boolean(
+        options.enforceIncrementalConsoleTurns
+      ),
+      hasLiveRuntimeState: Boolean(options.hasLiveRuntimeState),
+      hasCompressedActionReplay: Boolean(options.hasCompressedActionReplay),
+      hasAgentStatusCallback: Boolean(options.hasAgentStatusCallback),
+    },
+    options.templateOverride
+  )
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  return baseDefinition ? `${actorBody}\n\n${baseDefinition}` : actorBody;
+}
+
+/**
+ * Builds the Responder system prompt. The Responder synthesizes a final answer
+ * from the action log produced by the Actor. It NEVER generates code.
+ */
+export function axBuildResponderDefinition(
+  baseDefinition: string | undefined,
+  contextFields: readonly AxIField[],
+  options?: Readonly<{
+    /** User-facing agent identity from `agentIdentity`. */
+    agentIdentity?: AgentIdentityPrompt;
+    /** Optional override for the `rlm/responder.md` template source. */
+    templateOverride?: string;
+  }>
+): string {
+  const contextVarSummary =
+    contextFields.length > 0
+      ? contextFields
+          .map((f) => {
+            const typeStr = toFieldType(f.type);
+            const optionality = f.isOptional ? 'optional' : 'required';
+            return `- \`${f.name}\` (${typeStr}, ${optionality})`;
+          })
+          .join('\n')
+      : '(none)';
+
+  const agentIdentityText = renderAgentIdentity(options?.agentIdentity);
+
+  const body = renderPromptTemplate(
+    'rlm/responder.md',
+    {
+      contextVarSummary,
+      hasAgentIdentity: agentIdentityText.length > 0,
+      agentIdentityText,
+    },
+    options?.templateOverride
+  )
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  return baseDefinition ? `${body}\n\n${baseDefinition}` : body;
+}

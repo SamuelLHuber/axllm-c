@@ -1,0 +1,2331 @@
+from __future__ import annotations
+import os
+
+from abc import ABC, abstractmethod
+import copy
+import json
+import math
+import re
+from typing import Any
+
+from .gen import (
+    AxGen,
+    _core_ai_complete_once,
+    _ace_apply_curator_operations,
+    _ace_dedupe_playbook,
+    _ace_empty_playbook,
+    _ace_normalize_curator_operations,
+    _ace_normalize_reflection_bullet_tags,
+    _ace_render_playbook,
+    _ace_resolve_curator_operation_targets,
+    _ace_update_bullet_feedback,
+    _adjust_optimization_score_for_actions,
+    _build_optimization_eval_result,
+    _build_optimization_eval_row,
+    _deserialize_optimized_artifact,
+    _normalize_optimization_dataset,
+    _normalize_optimization_metric_scores,
+    _normalize_optimizer_engine_response,
+    _optimization_component_current_map,
+    _prepare_optimizer_run,
+    _scalarize_optimization_scores,
+    _validate_optimization_component_map,
+    _validate_optimized_artifact,
+)
+from .mcp import resolve_execution_context
+from .signature import AxSignature, parse_signature
+# AXIR_CORE_IMPORTS
+
+
+class AxAgentClarificationError(RuntimeError):
+    def __init__(self, clarification: Any, *, state: Any = None, payload: Any = None):
+        if isinstance(clarification, dict):
+            message = str(clarification.get("question") or clarification.get("message") or clarification)
+        else:
+            message = str(clarification)
+        super().__init__(message)
+        self.clarification = clarification
+        self.state = state
+        self.payload = payload
+
+
+class AxCodeSession(ABC):
+    @abstractmethod
+    def execute(self, code: str, options: dict[str, Any] | None = None) -> Any:
+        ...
+
+    def inspect_globals(self, options: dict[str, Any] | None = None) -> Any:
+        return "[runtime state inspection unavailable: runtime session does not implement inspect_globals()]"
+
+    def snapshot_globals(self, options: dict[str, Any] | None = None) -> Any:
+        raise RuntimeError("AxCodeSession.snapshot_globals() is required to export AxAgent state")
+
+    def patch_globals(self, globals: dict[str, Any], options: dict[str, Any] | None = None) -> Any:
+        raise RuntimeError("AxCodeSession.patch_globals() is required to restore AxAgent state")
+
+    def export_state(self, options: dict[str, Any] | None = None) -> Any:
+        return self.snapshot_globals(options or {})
+
+    def restore_state(self, snapshot: Any, options: dict[str, Any] | None = None) -> Any:
+        return self.patch_globals(snapshot or {}, options or {})
+
+    def close(self) -> Any:
+        return {"closed": True}
+
+
+class AxCodeRuntime(ABC):
+    language = "JavaScript"
+
+    def get_usage_instructions(self) -> str:
+        return ""
+
+    @abstractmethod
+    def create_session(self, globals: dict[str, Any], options: dict[str, Any] | None = None) -> AxCodeSession:
+        ...
+
+
+class OptimizerEngine(ABC):
+    name = "host"
+    version = "host"
+
+    @abstractmethod
+    def optimize(self, request: dict[str, Any], evaluator: "OptimizerEvaluator | None" = None) -> dict[str, Any]:
+        ...
+
+
+class OptimizerEvaluator(ABC):
+    @abstractmethod
+    def evaluate(self, candidate_map: dict[str, Any], options: dict[str, Any] | None = None) -> dict[str, Any]:
+        ...
+
+
+def _call_optimizer_engine(engine: OptimizerEngine, request: dict[str, Any], evaluator: OptimizerEvaluator | None):
+    try:
+        return engine.optimize(request, evaluator)
+    except TypeError as exc:
+        if evaluator is None:
+            raise
+        try:
+            return engine.optimize(request)
+        except TypeError:
+            raise exc
+
+
+def _gepa_num(value, default=0.0):
+    return float(value) if isinstance(value, (int, float)) and math.isfinite(float(value)) else float(default)
+
+
+def _gepa_int(value, default=0, minimum=None, maximum=None):
+    out = int(math.floor(_gepa_num(value, default)))
+    if minimum is not None:
+        out = max(int(minimum), out)
+    if maximum is not None:
+        out = min(int(maximum), out)
+    return out
+
+
+def _gepa_current_map(components):
+    return {
+        str(component.get("id")): str(component.get("current", ""))
+        for component in (components or [])
+        if isinstance(component, dict) and component.get("id") is not None and isinstance(component.get("current", ""), str)
+    }
+
+
+def _gepa_avg_vec(rows):
+    sums, counts = {}, {}
+    for row in rows or []:
+        for key, value in (row.get("scores") or {}).items():
+            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                sums[key] = sums.get(key, 0.0) + float(value)
+                counts[key] = counts.get(key, 0) + 1
+    return {key: sums[key] / max(counts.get(key, 1), 1) for key in sorted(sums)}
+
+
+def _gepa_scalar(scores, options):
+    key = (options or {}).get("paretoMetricKey") or (options or {}).get("pareto_metric_key")
+    if key and isinstance(scores, dict):
+        return _gepa_num(scores.get(key), 0)
+    vals = [float(v) for v in (scores or {}).values() if isinstance(v, (int, float)) and math.isfinite(float(v))]
+    return sum(vals) / len(vals) if vals else 0.0
+
+
+def _gepa_dominates(a, b, eps=0.0):
+    keys = set((a or {}).keys()) | set((b or {}).keys())
+    at_least = True
+    strict = False
+    for key in keys:
+        av = _gepa_num((a or {}).get(key), 0)
+        bv = _gepa_num((b or {}).get(key), 0)
+        if av + eps < bv:
+            at_least = False
+            break
+        if av > bv + eps:
+            strict = True
+    return at_least and strict
+
+
+def _gepa_pareto_front(candidates, eps=0.0):
+    front = []
+    for i, item in enumerate(candidates):
+        dominated = False
+        dominated_count = 0
+        for j, other in enumerate(candidates):
+            if i == j:
+                continue
+            if _gepa_dominates(other.get("scores") or {}, item.get("scores") or {}, eps):
+                dominated = True
+                break
+            if _gepa_dominates(item.get("scores") or {}, other.get("scores") or {}, eps):
+                dominated_count += 1
+        if not dominated:
+            front.append({"idx": i, "scores": copy.deepcopy(item.get("scores") or {}), "dominated": dominated_count})
+    return front
+
+
+def _gepa_hypervolume_2d(front_scores):
+    if not front_scores:
+        return None
+    keys = list((front_scores[0] or {}).keys())
+    if len(keys) != 2:
+        return None
+    k1, k2 = keys
+    hv = 0.0
+    prev_y = 0.0
+    for point in sorted(front_scores, key=lambda item: _gepa_num(item.get(k1), 0), reverse=True):
+        x = _gepa_num(point.get(k1), 0)
+        y = _gepa_num(point.get(k2), 0)
+        dy = max(y - prev_y, 0)
+        hv += x * dy
+        prev_y = max(prev_y, y)
+    return hv
+
+
+def _gepa_extract_text(response):
+    if isinstance(response, dict):
+        results = response.get("results") or []
+        if results and isinstance(results[0], dict):
+            content = results[0].get("content")
+            if isinstance(content, str):
+                text = content.strip()
+                if text.startswith("New Value:"):
+                    return text.split(":", 1)[1].strip()
+                fence = "\x60\x60\x60"
+                start = text.find(fence)
+                end = text.rfind(fence)
+                if start >= 0 and end > start:
+                    inner = text[start + 3 : end].strip()
+                    if "\n" in inner and inner.split("\n", 1)[0].strip().isidentifier():
+                        inner = inner.split("\n", 1)[1]
+                    return inner.strip()
+                return text
+    return ""
+
+
+def _gepa_validate_component_value(component, value):
+    if not isinstance(value, str) or not value.strip():
+        return "component value must be a non-empty string"
+    fmt = (component or {}).get("format")
+    if fmt == "snake_case":
+        import re
+
+        if not re.match(r"^[a-z_][a-z0-9_]*$", value):
+            return "must be snake_case"
+    max_len = (component or {}).get("maxLength")
+    if isinstance(max_len, (int, float)) and len(value) > int(max_len):
+        return f"must be at most {int(max_len)} characters"
+    for literal in (component or {}).get("preserve") or []:
+        if str(literal) not in value:
+            return f"must preserve {literal}"
+    return True
+
+
+def _gepa_option(options, *keys, default=None):
+    for key in keys:
+        if key in options and options.get(key) is not None:
+            return options.get(key)
+    return default
+
+
+class AxBootstrapFewShot(OptimizerEngine):
+    name = "BootstrapFewShot"
+    version = "axir-bootstrap-fewshot-v1"
+
+    def __init__(self, **options):
+        self.options = dict(options or {})
+
+    def optimize(self, request: dict[str, Any], evaluator: OptimizerEvaluator | None = None) -> dict[str, Any]:
+        if evaluator is None:
+            raise RuntimeError("AxBootstrapFewShot requires an OptimizerEvaluator")
+        options = {**self.options, **((request or {}).get("options") or {})}
+        components = [copy.deepcopy(c) for c in ((request or {}).get("components") or []) if isinstance(c, dict) and isinstance(c.get("current", ""), str)]
+        dataset = (request or {}).get("dataset") or {}
+        train = list(dataset.get("train") or [])
+        threshold = _gepa_num(_gepa_option(options, "qualityThreshold", "quality_threshold", default=0.5), 0.5)
+        max_rounds = _gepa_int(_gepa_option(options, "maxRounds", "max_rounds", default=3), 3, 1)
+        max_examples = _gepa_int(_gepa_option(options, "maxExamples", "max_examples", default=16), 16, 1)
+        max_demos = _gepa_int(_gepa_option(options, "maxDemos", "max_demos", default=4), 4, 1)
+        batch_size = _gepa_int(_gepa_option(options, "batchSize", "batch_size", default=1), 1, 1)
+        base_cfg = _gepa_current_map(components)
+        demos = []
+        accepted = set()
+        total_calls = 0
+        sampled = train[:max_examples]
+        for round_index in range(max_rounds):
+            if len(demos) >= max_demos:
+                break
+            for offset in range(0, len(sampled), batch_size):
+                if len(demos) >= max_demos:
+                    break
+                for example in sampled[offset : offset + batch_size]:
+                    if len(demos) >= max_demos:
+                        break
+                    example_key = json.dumps(example, sort_keys=True, default=str)
+                    if example_key in accepted:
+                        continue
+                    result = evaluator.evaluate(dict(base_cfg), {"dataset": {"train": [example], "validation": []}, "phase": "bootstrap", "round": round_index})
+                    rows = list((result or {}).get("rows") or [])
+                    total_calls += int((result or {}).get("count", len(rows) or 1))
+                    if not rows:
+                        continue
+                    row = rows[0]
+                    if _gepa_num(row.get("scalar"), 0) >= threshold:
+                        accepted.add(example_key)
+                        demos.append({"programId": "root", "traces": [copy.deepcopy(row.get("prediction", row.get("input", {})))]})
+        return {
+            "artifactVersion": "axir-optimized-artifact-v1",
+            "optimizerName": self.name,
+            "optimizerVersion": self.version,
+            "componentMap": {},
+            "demos": demos,
+            "metadata": {
+                "optimizer": self.name,
+                "qualityThreshold": threshold,
+                "totalMetricCalls": total_calls,
+                "demosGenerated": len(demos),
+            },
+            "evidence": {"count": total_calls},
+            "provenance": {"sourceProgramKind": (request or {}).get("programKind", "unknown")},
+        }
+
+
+class AxGEPA(OptimizerEngine):
+    name = "GEPA"
+    version = "axir-gepa-v1"
+
+    def __init__(self, reflection_client=None, **options):
+        self.reflection_client = reflection_client
+        self.options = dict(options or {})
+        self.rng_state = _gepa_int(self.options.get("seed"), 123456789) or 123456789
+        self.selector_state = {}
+        self.feedback_memory = []
+
+    def _rand(self):
+        self.rng_state ^= (self.rng_state << 13) & 0xFFFFFFFF
+        self.rng_state ^= (self.rng_state >> 17) & 0xFFFFFFFF
+        self.rng_state ^= (self.rng_state << 5) & 0xFFFFFFFF
+        self.rng_state &= 0xFFFFFFFF
+        return self.rng_state / 4294967296.0
+
+    def _selector_init(self, components, initial=None):
+        self.selector_state = {}
+        initial = initial or {}
+        for component in components:
+            cid = component.get("id")
+            old = initial.get(cid) if isinstance(initial, dict) else {}
+            self.selector_state[cid] = {
+                "proposals": max(0, int(old.get("proposals", 0) if isinstance(old, dict) else 0)),
+                "accepts": max(0, int(old.get("accepts", 0) if isinstance(old, dict) else 0)),
+                "lastAcceptIter": int(old.get("lastAcceptIter", -1) if isinstance(old, dict) else -1),
+                "stagnation": max(0, int(old.get("stagnation", 0) if isinstance(old, dict) else 0)),
+            }
+
+    def _pick_component(self, components, iteration):
+        if len(components) == 1:
+            return components[0]
+        if self._rand() < 0.1:
+            return components[min(len(components) - 1, int(self._rand() * len(components)))]
+        total_props = max(1, sum(state["proposals"] for state in self.selector_state.values()))
+        weights = []
+        for component in components:
+            state = self.selector_state[component["id"]]
+            accept_rate = 0 if state["proposals"] == 0 else state["accepts"] / state["proposals"]
+            pressure = state["proposals"] / total_props
+            stale = min(iteration + 1, 10) if state["lastAcceptIter"] < 0 else min(iteration - state["lastAcceptIter"], 10)
+            weights.append(1.4 * (1 - accept_rate) + 0.8 * state["stagnation"] + 0.2 * stale - 0.7 * pressure)
+        max_w = max(weights)
+        exp = [math.exp(w - max_w) for w in weights]
+        threshold = self._rand() * sum(exp)
+        for component, weight in zip(components, exp):
+            threshold -= weight
+            if threshold <= 0:
+                return component
+        return components[-1]
+
+    def _record_proposal(self, cid):
+        if cid in self.selector_state:
+            self.selector_state[cid]["proposals"] += 1
+
+    def _record_result(self, cid, accepted, iteration):
+        if cid not in self.selector_state:
+            return
+        state = self.selector_state[cid]
+        if accepted:
+            state["accepts"] += 1
+            state["lastAcceptIter"] = iteration
+            state["stagnation"] = 0
+        else:
+            state["stagnation"] += 1
+
+    def _component_group(self, component, components):
+        by_id = {item.get("id"): item for item in components}
+        out = []
+        seen = set()
+
+        def visit(cid):
+            if cid in seen or cid not in by_id:
+                return
+            seen.add(cid)
+            item = by_id[cid]
+            out.append(item)
+            for dep in item.get("dependsOn") or item.get("depends_on") or []:
+                visit(dep)
+
+        visit(component.get("id"))
+        return out
+
+    def _dataset_for(self, examples):
+        return {"train": list(examples or []), "validation": []}
+
+    def _evaluate(self, evaluator, cfg, examples, phase, max_calls, total_calls, throw=False, capture_traces=False):
+        needed = len(examples or [])
+        if total_calls + needed > max_calls:
+            if throw:
+                raise RuntimeError(f"AxGEPA: options.maxMetricCalls={max_calls} is too small to evaluate the initial Pareto set; need at least {needed} metric calls")
+            return None, total_calls
+        result = evaluator.evaluate(dict(cfg), {"dataset": self._dataset_for(examples), "phase": phase, "captureTraces": capture_traces})
+        rows = list((result or {}).get("rows") or [])
+        scalars = [_gepa_num(row.get("scalar"), 0) for row in rows]
+        out = {
+            "rows": rows,
+            "avgScores": _gepa_avg_vec(rows),
+            "avg": _gepa_num((result or {}).get("avg"), sum(scalars) / len(scalars) if scalars else 0),
+            "sum": _gepa_num((result or {}).get("sum"), sum(scalars)),
+            "count": int((result or {}).get("count", len(rows))),
+            "scalars": scalars,
+            "candidateMap": dict(cfg),
+        }
+        return out, total_calls + out["count"]
+
+    def _reflect(self, component, current, tuples, trace_dataset, options):
+        if self.reflection_client is None:
+            raise RuntimeError("AxGEPA requires a reflection_client for reflective trials")
+        attempts = max(1, _gepa_int(_gepa_option(options, "maxReflectionAttempts", "max_reflection_attempts", default=2), 2))
+        previous_error = None
+        for _ in range(attempts):
+            prompt = {
+                "chatPrompt": [
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "componentKey": component.get("id"),
+                                "componentKind": component.get("kind"),
+                                "currentValue": current,
+                                "previousValidationError": previous_error,
+                                "minibatch": tuples,
+                                "traceDataset": trace_dataset,
+                            },
+                            sort_keys=True,
+                        ),
+                    }
+                ],
+                "model": _gepa_option(options, "reflectionModel", "reflection_model"),
+            }
+            response = self.reflection_client.chat(prompt, {"stream": False})
+            candidate = _gepa_extract_text(response).strip()
+            validation = _gepa_validate_component_value(component, candidate)
+            if validation is True:
+                return candidate
+            previous_error = validation
+        return current
+
+    def _next_minibatch(self, train, iteration, size):
+        if not train:
+            return []
+        if size <= 0 or size >= len(train):
+            return list(train)
+        start = (iteration * size) % len(train)
+        out = []
+        for i in range(size):
+            out.append(train[(start + i) % len(train)])
+        return out
+
+    def _bootstrap(self, evaluator, base_cfg, train, options, total_calls, max_calls):
+        raw = options.get("bootstrap")
+        if not raw:
+            return [], total_calls
+        opts = raw if isinstance(raw, dict) else {}
+        threshold = _gepa_num(_gepa_option(opts, "scoreThreshold", "score_threshold", default=0.8), 0.8)
+        max_demos = _gepa_int(_gepa_option(opts, "maxBootstrapDemos", "max_bootstrap_demos", default=4), 4, 1)
+        max_boot_calls = _gepa_int(_gepa_option(opts, "maxBootstrapMetricCalls", "max_bootstrap_metric_calls", default=min(len(train), 8) or 1), min(len(train), 8) or 1, 1)
+        demos = []
+        calls = 0
+        for example in train:
+            if calls >= max_boot_calls or len(demos) >= max_demos:
+                break
+            result, total_calls = self._evaluate(evaluator, base_cfg, [example], "bootstrap", max_calls, total_calls)
+            calls += 1
+            if not result or not result["rows"]:
+                continue
+            row = result["rows"][0]
+            if _gepa_num(row.get("scalar"), 0) >= threshold:
+                demos.append({"programId": "root", "traces": [copy.deepcopy(row.get("prediction", row.get("input", {})))]})
+        return demos, total_calls
+
+    def optimize(self, request: dict[str, Any], evaluator: OptimizerEvaluator | None = None) -> dict[str, Any]:
+        if evaluator is None:
+            raise RuntimeError("AxGEPA requires an OptimizerEvaluator")
+        options = {**self.options, **((request or {}).get("options") or {})}
+        components = [copy.deepcopy(c) for c in ((request or {}).get("components") or []) if isinstance(c, dict) and isinstance(c.get("current", ""), str)]
+        if not components:
+            raise RuntimeError("AxGEPA: program exposes no optimizable components")
+        dataset = (request or {}).get("dataset") or {}
+        train = list(dataset.get("train") or [])
+        validation = list(dataset.get("validation") or []) or train
+        max_calls = _gepa_int(_gepa_option(options, "maxMetricCalls", "max_metric_calls", default=0), 0)
+        if max_calls <= 0:
+            raise RuntimeError("AxGEPA: options.maxMetricCalls must be set to a positive integer")
+        num_trials = _gepa_int(_gepa_option(options, "numTrials", "num_trials", default=30), 30, 0)
+        minibatch = options.get("minibatch", True) is not False
+        minibatch_size = _gepa_int(_gepa_option(options, "minibatchSize", "minibatch_size", default=20), 20, 1)
+        early_stop = _gepa_int(_gepa_option(options, "earlyStoppingTrials", "early_stopping_trials", default=5), 5, 1)
+        min_improvement = _gepa_num(_gepa_option(options, "minImprovementThreshold", "min_improvement_threshold", default=0), 0)
+        pareto_size = _gepa_int(_gepa_option(options, "paretoSetSize", "pareto_set_size", default=max(10, min(200, minibatch_size * 3))), max(10, min(200, minibatch_size * 3)), 1, 1000)
+        tie_eps = _gepa_num(_gepa_option(options, "tieEpsilon", "tie_epsilon", default=0), 0)
+        base_cfg = _gepa_current_map(components)
+        pareto_set = validation[:pareto_size]
+        self._selector_init(components, _gepa_option(options, "selectorState", "selector_state"))
+        total_calls = 0
+        demos, total_calls = self._bootstrap(evaluator, base_cfg, train, options, total_calls, max_calls)
+        base_eval, total_calls = self._evaluate(evaluator, base_cfg, pareto_set, "initial Pareto evaluation", max_calls, total_calls, True)
+        candidates = [{"cfg": dict(base_cfg), "scores": base_eval["avgScores"] or {"score": base_eval["avg"]}, "parent": None}]
+        per_instance = [base_eval["scalars"]]
+        stagnation = 0
+        for iteration in range(num_trials):
+            if total_calls >= max_calls:
+                break
+            parent_idx = max(range(len(candidates)), key=lambda idx: sum(per_instance[idx]) / max(len(per_instance[idx]), 1))
+            mini = self._next_minibatch(train, iteration, minibatch_size) if minibatch else train
+            parent_eval, total_calls = self._evaluate(evaluator, candidates[parent_idx]["cfg"], mini, "parent minibatch", max_calls, total_calls, False, True)
+            if parent_eval is None:
+                break
+            perfect = _gepa_num(_gepa_option(options, "perfectScore", "perfect_score", default=1), 1)
+            if _gepa_option(options, "skipPerfectScore", "skip_perfect_score", default=True) is not False and parent_eval["scalars"] and all(score >= perfect for score in parent_eval["scalars"]):
+                continue
+            target = self._pick_component(components, iteration)
+            group = self._component_group(target, components)
+            proposed = dict(candidates[parent_idx]["cfg"])
+            rows = parent_eval["rows"]
+            tuples = [{"input": row.get("input"), "prediction": row.get("prediction"), "score": row.get("scalar", 0)} for row in rows]
+            for component in group:
+                self._record_proposal(component["id"])
+                current = proposed.get(component["id"], "")
+                trace_dataset = [{"score": row.get("scalar", 0), "trace": row.get("trace"), "output": row.get("prediction")} for row in rows]
+                proposed[component["id"]] = self._reflect(component, current, tuples, trace_dataset, options)
+            child_mini, total_calls = self._evaluate(evaluator, proposed, mini, "child minibatch", max_calls, total_calls)
+            if child_mini is None:
+                break
+            accepted = child_mini["sum"] > parent_eval["sum"] + min_improvement
+            for component in group:
+                self._record_result(component["id"], accepted, iteration)
+            if not accepted:
+                stagnation += 1
+                if stagnation >= early_stop:
+                    break
+                continue
+            child_eval, total_calls = self._evaluate(evaluator, proposed, pareto_set, "validation evaluation", max_calls, total_calls)
+            if child_eval is None:
+                break
+            candidates.append({"cfg": dict(proposed), "scores": child_eval["avgScores"] or {"score": child_eval["avg"]}, "parent": parent_idx})
+            per_instance.append(child_eval["scalars"])
+            stagnation = 0
+        front = _gepa_pareto_front(candidates, tie_eps)
+        best_idx = front[0]["idx"] if front else 0
+        best_score = -1e100
+        for item in front:
+            score = _gepa_scalar(item["scores"], options)
+            if score > best_score or (score == best_score and item["idx"] > best_idx):
+                best_score = score
+                best_idx = item["idx"]
+        best_cfg = dict(candidates[best_idx]["cfg"])
+        owners = {component["id"]: component.get("owner", component.get("id", "").split("::", 1)[0]) for component in components}
+        pareto_meta = [
+            {"candidate": item["idx"], "scores": item["scores"], "dominatedSolutions": item["dominated"], "componentMap": candidates[item["idx"]]["cfg"]}
+            for item in front
+        ]
+        hv = _gepa_hypervolume_2d([item["scores"] for item in front])
+        return {
+            "artifactVersion": "axir-optimized-artifact-v1",
+            "optimizerName": "GEPA",
+            "optimizerVersion": self.version,
+            "componentMap": best_cfg,
+            "demos": demos,
+            "metadata": {
+                "optimizer": "GEPA",
+                "selectorState": copy.deepcopy(self.selector_state),
+                "paretoFront": pareto_meta,
+                "bestScore": 0 if best_score == -1e100 else best_score,
+                "totalMetricCalls": total_calls,
+                "candidatesExplored": len(candidates),
+                "report": {
+                    "summary": "GEPA Multi-Objective Optimization Complete",
+                    "statistics": {"totalEvaluations": total_calls, "candidatesExplored": len(candidates), "converged": True},
+                    "paretoFrontier": {"solutionCount": len(front), "hypervolume": hv or 0},
+                },
+            },
+            "evidence": {"avg": 0 if best_score == -1e100 else best_score, "count": len(pareto_set), "totalMetricCalls": total_calls},
+            "provenance": {"sourceProgramKind": (request or {}).get("programKind", "unknown"), "componentOwners": owners},
+        }
+
+
+_ACE_DEFAULT_CONFIG = {
+    "maxEpochs": 1,
+    "maxReflectorRounds": 2,
+    "maxSectionSize": 25,
+    "maxSerializedFieldChars": 2000,
+    "similarityThreshold": 0.95,
+    "allowDynamicSections": True,
+}
+
+
+def _ace_clone(value):
+    return copy.deepcopy(value)
+
+
+def _ace_option(options, *keys, default=None):
+    for key in keys:
+        if isinstance(options, dict) and key in options and options.get(key) is not None:
+            return options.get(key)
+    return default
+
+
+class AxACE:
+    """Agentic Context Engineering optimizer (Generator -> Reflector -> Curator).
+
+    The deterministic playbook mutations reuse the Core-owned `_ace_*` ops; the
+    LLM-orchestrated reflect/curate steps are delegated to injected callables so
+    the loop is reproducible under conformance with scripted responses (mirrors
+    how AxGEPA accepts a reflection_client)."""
+
+    name = "ACE"
+    version = "axir-ace-v1"
+
+    def __init__(self, reflector=None, curator=None, generator=None, **options):
+        self.reflector = reflector
+        self.curator = curator
+        self.generator = generator
+        self.options = dict(options or {})
+        self.config = dict(_ACE_DEFAULT_CONFIG)
+        for key in _ACE_DEFAULT_CONFIG:
+            value = _ace_option(self.options, key, default=None)
+            if value is not None:
+                self.config[key] = value
+        self.initial_playbook = self.options.get("initialPlaybook") or self.options.get("initial_playbook")
+        self.student_ai = _ace_option(self.options, "studentAI", "student_ai", "student", "client", "ai")
+        self.teacher_ai = _ace_option(self.options, "teacherAI", "teacher_ai", "teacher", default=self.student_ai)
+        self.metric_fn = _ace_option(self.options, "metricFn", "metric_fn", "metric")
+        self.program = None
+        self.base_instruction = None
+        self.generator_history = []
+        self.delta_history = []
+        self.playbook = (
+            _ace_clone(self.initial_playbook)
+            if self.initial_playbook is not None
+            else _ace_empty_playbook(None, self._now())
+        )
+
+    def _now(self):
+        return self.options.get("now") or "1970-01-01T00:00:00.000Z"
+
+    def reset(self):
+        self.playbook = (
+            _ace_clone(self.initial_playbook)
+            if self.initial_playbook is not None
+            else _ace_empty_playbook(None, self._now())
+        )
+        self.base_instruction = None
+        self.generator_history = []
+        self.delta_history = []
+
+    def configure_auto(self, level):
+        if level == "light":
+            self.config["maxEpochs"] = 1
+            self.config["maxReflectorRounds"] = 1
+        elif level == "medium":
+            self.config["maxEpochs"] = 2
+            self.config["maxReflectorRounds"] = 2
+        elif level == "heavy":
+            self.config["maxEpochs"] = 3
+            self.config["maxReflectorRounds"] = 3
+
+    def hydrate(self, program, state=None):
+        state = state or {}
+        self.program = program
+        self.base_instruction = state.get("baseInstruction")
+        if self.base_instruction is None and program is not None and hasattr(program, "get_signature"):
+            try:
+                self.base_instruction = program.get_signature().get_description()
+            except Exception:
+                self.base_instruction = None
+        playbook = state.get("playbook")
+        if playbook is not None:
+            self.playbook = _ace_clone(playbook)
+        elif self.initial_playbook is not None:
+            self.playbook = _ace_clone(self.initial_playbook)
+        else:
+            self.playbook = _ace_empty_playbook(None, self._now())
+        artifact = state.get("artifact") or {}
+        self.generator_history = _ace_clone(artifact.get("feedback") or [])
+        self.delta_history = _ace_clone(artifact.get("history") or [])
+
+    def get_playbook(self):
+        return _ace_clone(self.playbook)
+
+    def get_base_instruction(self):
+        return self.base_instruction
+
+    def get_artifact(self):
+        return self._create_artifact()
+
+    def create_artifact(self):
+        return self._create_artifact()
+
+    def _create_artifact(self):
+        return {
+            "playbook": _ace_clone(self.playbook),
+            "feedback": _ace_clone(self.generator_history),
+            "history": _ace_clone(self.delta_history),
+        }
+
+    def _render_playbook(self):
+        return _ace_render_playbook(_ace_clone(self.playbook))
+
+    def _generator_output(self, prediction, example):
+        reasoning = ""
+        bullet_ids = []
+        if isinstance(prediction, dict):
+            thought = prediction.get("thought")
+            if thought is not None:
+                reasoning = str(thought)
+            ids = prediction.get("bullet_ids")
+            if isinstance(ids, list):
+                bullet_ids = list(ids)
+        return {
+            "reasoning": reasoning,
+            "answer": prediction,
+            "bulletIds": bullet_ids,
+        }
+
+    def _run_generator(self, program, example):
+        if self.generator is not None:
+            return self.generator(example)
+        if program is not None and hasattr(program, "forward"):
+            return program.forward(self.student_ai, example)
+        return {}
+
+    def _run_metric(self, metric_fn, prediction, example):
+        fn = metric_fn or self.metric_fn
+        if fn is None:
+            return 0
+        return fn({"prediction": prediction, "example": example})
+
+    def _run_reflection_rounds(self, example, generator_output, feedback):
+        rounds = max(int(self.config.get("maxReflectorRounds", 1) or 1), 1)
+        previous = None
+        for _ in range(rounds):
+            reflection = self._run_reflector(example, generator_output, feedback, previous)
+            if not reflection:
+                break
+            reflection = dict(reflection)
+            reflection["bulletTags"] = _ace_normalize_reflection_bullet_tags(reflection)
+            previous = reflection
+            error_text = str(reflection.get("errorIdentification") or "").lower().strip()
+            metadata = reflection.get("metadata") if isinstance(reflection, dict) else None
+            resolved = metadata.get("resolved") if isinstance(metadata, dict) else None
+            if resolved is True or error_text == "" or error_text.startswith("no error") or error_text.startswith("resolved"):
+                break
+        return previous
+
+    def _run_reflector(self, example, generator_output, feedback, previous_reflection):
+        if self.reflector is None:
+            return None
+        payload = {
+            "question": example,
+            "generator_answer": generator_output.get("answer"),
+            "generator_reasoning": generator_output.get("reasoning"),
+            "playbook": self._render_playbook(),
+            "feedback": feedback,
+            "previous_reflection": previous_reflection,
+        }
+        return self.reflector(payload)
+
+    def _run_curator(self, example, reflection):
+        if reflection is None:
+            return None
+        if self.curator is None:
+            return None
+        payload = {
+            "playbook": self._render_playbook(),
+            "reflection": reflection,
+            "question_context": example,
+            "token_budget": 1024,
+        }
+        return self.curator(payload)
+
+    def _collect_protected_ids(self, operations):
+        protected = []
+        for op in operations:
+            if op.get("type") == "UPDATE" and op.get("bulletId"):
+                protected.append(op.get("bulletId"))
+        return protected
+
+    def _process_example(self, program, example, score, source, epoch, index):
+        prediction = self._last_prediction
+        generator_output = self._generator_output(prediction, example)
+        reflection = self._run_reflection_rounds(example, generator_output, self._metric_feedback(score))
+        raw_curator = self._run_curator(example, reflection)
+        operations = _ace_normalize_curator_operations(
+            raw_curator.get("operations") if isinstance(raw_curator, dict) else None
+        )
+        resolved = _ace_resolve_curator_operation_targets(operations, self.playbook, reflection, generator_output)
+        curator_result = None
+        if raw_curator is not None or resolved:
+            curator_result = dict(raw_curator or {})
+            curator_result["operations"] = resolved
+        applied_ids = []
+        if resolved:
+            protected = self._collect_protected_ids(resolved)
+            result = _ace_apply_curator_operations(
+                self.playbook,
+                resolved,
+                {
+                    "maxSectionSize": self.config.get("maxSectionSize"),
+                    "allowDynamicSections": self.config.get("allowDynamicSections"),
+                    "enableAutoPrune": True,
+                    "protectedBulletIds": protected,
+                },
+                self._now(),
+            )
+            self.playbook = result.get("playbook")
+            applied_ids = result.get("updatedBulletIds") or []
+            auto_removed = result.get("autoRemoved") or []
+            if auto_removed:
+                resolved = list(resolved) + list(auto_removed)
+                if curator_result is not None:
+                    curator_result["operations"] = resolved
+        if isinstance(reflection, dict):
+            for tag in _ace_normalize_reflection_bullet_tags(reflection):
+                tag = tag if isinstance(tag, dict) else {}
+                self.playbook = _ace_update_bullet_feedback(self.playbook, tag.get("id"), tag.get("tag"), self._now())
+        if resolved and applied_ids:
+            self.playbook = _ace_dedupe_playbook(self.playbook)
+        feedback_event = {
+            "example": example,
+            "prediction": prediction,
+            "score": score if isinstance(score, (int, float)) else 0,
+            "generatorOutput": generator_output,
+            "reflection": reflection,
+            "curator": curator_result,
+            "timestamp": self._now(),
+        }
+        self.generator_history.append(feedback_event)
+        if applied_ids and curator_result and curator_result.get("operations"):
+            self.delta_history.append({
+                "source": source,
+                "epoch": epoch,
+                "exampleIndex": index,
+                "operations": curator_result.get("operations"),
+                "updatedBulletIds": list(applied_ids),
+            })
+        return curator_result, applied_ids
+
+    def _metric_feedback(self, score):
+        if not isinstance(score, (int, float)):
+            return None
+        return "Metric score: " + str(score)
+
+    def compile(self, program, examples, metric_fn=None, options=None):
+        options = dict(options or {})
+        ace_options = options.get("aceOptions") or options.get("ace_options")
+        if isinstance(ace_options, dict):
+            for key in _ACE_DEFAULT_CONFIG:
+                if ace_options.get(key) is not None:
+                    self.config[key] = ace_options.get(key)
+            if ace_options.get("initialPlaybook") is not None:
+                self.initial_playbook = ace_options.get("initialPlaybook")
+        self.reset()
+        self.program = program
+        if program is not None and hasattr(program, "get_signature"):
+            try:
+                self.base_instruction = program.get_signature().get_description()
+            except Exception:
+                self.base_instruction = None
+        examples = list(examples or [])
+        epochs = max(int(self.config.get("maxEpochs", 1) or 1), 1)
+        best_score = None
+        for epoch in range(epochs):
+            for index, example in enumerate(examples):
+                prediction = self._run_generator(program, example)
+                self._last_prediction = prediction
+                score = self._run_metric(metric_fn, prediction, example)
+                if isinstance(score, (int, float)):
+                    best_score = score if best_score is None else max(best_score, score)
+                self._process_example(program, example, score, "compile", epoch, index)
+        artifact = self._create_artifact()
+        return {
+            "playbook": _ace_clone(self.playbook),
+            "artifact": artifact,
+            "bestScore": best_score if isinstance(best_score, (int, float)) else 0,
+            "finalConfiguration": {"strategy": "ace", "epochs": epochs},
+        }
+
+    def apply_online_update(self, args):
+        args = dict(args or {})
+        if self.program is None and self.generator is None:
+            raise RuntimeError("AxACE: compile must run before apply_online_update")
+        example = args.get("example")
+        prediction = args.get("prediction")
+        self._last_prediction = prediction
+        generator_output = self._generator_output(prediction, example)
+        reflection = self._run_reflection_rounds(example, generator_output, args.get("feedback"))
+        raw_curator = self._run_curator(example, reflection)
+        operations = _ace_normalize_curator_operations(
+            raw_curator.get("operations") if isinstance(raw_curator, dict) else None
+        )
+        resolved = _ace_resolve_curator_operation_targets(operations, self.playbook, reflection, generator_output)
+        curator_result = None
+        if raw_curator is not None or resolved:
+            curator_result = dict(raw_curator or {})
+            curator_result["operations"] = resolved
+        if isinstance(reflection, dict):
+            for tag in _ace_normalize_reflection_bullet_tags(reflection):
+                tag = tag if isinstance(tag, dict) else {}
+                self.playbook = _ace_update_bullet_feedback(self.playbook, tag.get("id"), tag.get("tag"), self._now())
+        applied_ids = []
+        if resolved:
+            protected = self._collect_protected_ids(resolved)
+            result = _ace_apply_curator_operations(
+                self.playbook,
+                resolved,
+                {
+                    "maxSectionSize": self.config.get("maxSectionSize"),
+                    "allowDynamicSections": self.config.get("allowDynamicSections"),
+                    "enableAutoPrune": True,
+                    "protectedBulletIds": protected,
+                },
+                self._now(),
+            )
+            self.playbook = result.get("playbook")
+            applied_ids = result.get("updatedBulletIds") or []
+            auto_removed = result.get("autoRemoved") or []
+            if auto_removed:
+                resolved = list(resolved) + list(auto_removed)
+                if curator_result is not None:
+                    curator_result["operations"] = resolved
+            self.playbook = _ace_dedupe_playbook(self.playbook)
+        feedback_event = {
+            "example": example,
+            "prediction": prediction,
+            "score": 0,
+            "generatorOutput": generator_output,
+            "reflection": reflection,
+            "curator": curator_result,
+            "timestamp": self._now(),
+        }
+        self.generator_history.append(feedback_event)
+        if applied_ids and curator_result and curator_result.get("operations"):
+            self.delta_history.append({
+                "source": "online",
+                "epoch": -1,
+                "exampleIndex": len(self.generator_history) - 1,
+                "operations": curator_result.get("operations"),
+                "updatedBulletIds": list(applied_ids),
+            })
+        return curator_result
+
+
+_ACE_REFLECTOR_SIGNATURE = (
+    'question:string "Original task input serialized as JSON", '
+    'generator_answer:string "Generator output serialized as JSON", '
+    'generator_reasoning?:string "Generator reasoning trace", '
+    'playbook:string "Current context playbook rendered as markdown", '
+    'expected_answer?:string "Expected output when ground truth is available", '
+    'feedback?:string "External feedback or reward signal", '
+    'previous_reflection?:string "Most recent reflection JSON when running multi-round refinement" '
+    '-> reasoning:string "Step-by-step analysis of generator performance", '
+    'errorIdentification:string "Specific mistakes detected", '
+    'rootCauseAnalysis:string "Underlying cause of the error", '
+    'correctApproach:string "What the generator should do differently", '
+    'keyInsight:string "Reusable insight to remember", '
+    'bulletTags:json "Array of {id, tag} entries referencing playbook bullets"'
+)
+
+_ACE_CURATOR_SIGNATURE = (
+    'playbook:string "Current playbook serialized as JSON", '
+    'reflection:string "Latest reflection output serialized as JSON", '
+    'question_context:string "Original task input serialized as JSON", '
+    'token_budget?:number "Approximate token budget for curator response" '
+    '-> reasoning:string "Justification for the proposed updates", '
+    'operations:json "List of operations with type/section/content fields"'
+)
+
+_AGENT_PLAYBOOK_WEAKNESS_MINER_SIGNATURE = (
+    'clusterSignature:string "Shared error signature of the cluster", '
+    'taskSummaries:string "One line per failing task", '
+    'actionLogExcerpts:string "Excerpts of the failing runs, centered on the failure", '
+    'functionCallSummary?:string "Digest of runtime/tool calls in the failing runs", '
+    'toolErrors?:string "Tool errors observed", '
+    'currentPlaybook?:string "The failure-avoidance playbook currently applied" '
+    '-> weaknessDescription:string "The recurring weakness, one sentence", '
+    'rootCause:string "Why the runs fail, mechanically", '
+    'proposedGuidance:string "One concise imperative avoidance rule", '
+    'evidenceQuotes:json "Verbatim substrings copied from actionLogExcerpts", '
+    'configRecommendations?:json "Setup suggestions no prompt text can fix"'
+)
+
+
+def _playbook_option(options, *keys, default=None):
+    for key in keys:
+        if isinstance(options, dict) and key in options and options.get(key) is not None:
+            return options.get(key)
+    return default
+
+
+def _playbook_stringify(value):
+    try:
+        return _core_json_stringify(value)
+    except Exception:
+        return json.dumps(str(value))
+
+
+def _playbook_compose_instruction(base, rendered):
+    parts = [str(base or "").strip(), "", str(rendered or "")]
+    return "\n\n".join(part for part in parts if part and part.strip())
+
+
+class AxPlaybook:
+    """A live, evolving context playbook bound to a program.
+
+    Mirrors the TypeScript ``AxPlaybook``: grow it offline from examples
+    (``evolve``), keep it growing online from live feedback (``update``), render
+    it into the program context (``apply_to``), and persist/restore it
+    (``to_json``/``load``). The evolution engine (ACE) is hidden behind this
+    surface, just as ``optimize()`` hides GEPA."""
+
+    def __init__(self, program, options: dict[str, Any] | None = None):
+        opts = dict(options or {})
+        self.program = program
+        self.student_ai = _playbook_option(opts, "studentAI", "student_ai", "student", "client", "ai")
+        self.teacher_ai = _playbook_option(opts, "teacherAI", "teacher_ai", "teacher", default=self.student_ai)
+        if self.student_ai is None:
+            raise ValueError("playbook() requires studentAI or client")
+        self.verbose = bool(opts.get("verbose"))
+        self._reflector_program = None
+        self._curator_program = None
+        engine_options = {
+            "now": opts.get("now"),
+            "maxEpochs": _playbook_option(opts, "maxEpochs", "max_epochs"),
+            "maxReflectorRounds": _playbook_option(opts, "maxReflectorRounds", "max_reflector_rounds"),
+            "maxSectionSize": _playbook_option(opts, "maxSectionSize", "max_section_size"),
+            "allowDynamicSections": _playbook_option(opts, "allowDynamicSections", "allow_dynamic_sections"),
+            "initialPlaybook": _playbook_option(opts, "initialPlaybook", "initial_playbook"),
+        }
+        engine_options = {key: value for key, value in engine_options.items() if value is not None}
+        self.engine = AxACE(
+            reflector=self._run_reflector,
+            curator=self._run_curator,
+            generator=self._run_generator,
+            **engine_options,
+        )
+        auto = opts.get("auto")
+        if auto:
+            self.engine.configure_auto(auto)
+        self.base_instruction = None
+        if program is not None and hasattr(program, "signature") and hasattr(program.signature, "get_description"):
+            self.base_instruction = program.signature.get_description()
+        self.started = False
+        self._apply_hook = None
+
+    # The real LLM generator: run the bound program with the student client.
+    def _run_generator(self, example):
+        if self.program is None or not hasattr(self.program, "forward"):
+            return {}
+        self._inject()
+        return self.program.forward(self.student_ai, example)
+
+    def _get_reflector_program(self):
+        if self._reflector_program is None:
+            self._reflector_program = AxGen(_ACE_REFLECTOR_SIGNATURE, {"validation_retries": 1, "id": "ace.reflector"})
+        return self._reflector_program
+
+    def _get_curator_program(self):
+        if self._curator_program is None:
+            self._curator_program = AxGen(_ACE_CURATOR_SIGNATURE, {"validation_retries": 1, "id": "ace.curator"})
+        return self._curator_program
+
+    # The real LLM reflector: a focused AxGen sub-program driven by the teacher.
+    def _run_reflector(self, payload):
+        payload = dict(payload or {})
+        reflector = self._get_reflector_program()
+        reflector_ai = self.teacher_ai or self.student_ai
+        request = {
+            "question": _playbook_stringify(payload.get("question")),
+            "generator_answer": _playbook_stringify(payload.get("generator_answer")),
+            "generator_reasoning": payload.get("generator_reasoning"),
+            "playbook": payload.get("playbook"),
+            "feedback": payload.get("feedback"),
+            "previous_reflection": (
+                _playbook_stringify(payload.get("previous_reflection"))
+                if payload.get("previous_reflection") is not None
+                else None
+            ),
+        }
+        request = {key: value for key, value in request.items() if value is not None}
+        try:
+            return reflector.forward(reflector_ai, request)
+        except Exception as exc:
+            if self.verbose:
+                print("[AxPlaybook] reflector error:", exc)
+            return None
+
+    # The real LLM curator: a focused AxGen sub-program driven by the teacher.
+    def _run_curator(self, payload):
+        payload = dict(payload or {})
+        curator = self._get_curator_program()
+        curator_ai = self.teacher_ai or self.student_ai
+        request = {
+            "playbook": payload.get("playbook"),
+            "reflection": _playbook_stringify(payload.get("reflection")),
+            "question_context": _playbook_stringify(payload.get("question_context")),
+            "token_budget": payload.get("token_budget", 1024),
+        }
+        request = {key: value for key, value in request.items() if value is not None}
+        try:
+            return curator.forward(curator_ai, request)
+        except Exception as exc:
+            if self.verbose:
+                print("[AxPlaybook] curator error:", exc)
+            return None
+
+    def evolve(self, examples, metric_fn, options: dict[str, Any] | None = None):
+        opts = dict(options or {})
+        if opts.get("auto"):
+            self.engine.configure_auto(opts.get("auto"))
+        ace_options = {}
+        if _playbook_option(opts, "maxEpochs", "max_epochs") is not None:
+            ace_options["maxEpochs"] = _playbook_option(opts, "maxEpochs", "max_epochs")
+        result = self.engine.compile(self.program, list(examples or []), metric_fn, {"aceOptions": ace_options})
+        self.started = True
+        self._inject()
+        return {"bestScore": result.get("bestScore"), "playbook": result.get("playbook")}
+
+    def update(self, args: dict[str, Any]):
+        if not self.started:
+            self.engine.hydrate(self.program, {
+                "baseInstruction": self.base_instruction,
+                "playbook": self.engine.get_playbook(),
+            })
+            self.started = True
+        result = self.engine.apply_online_update(args or {})
+        self._inject()
+        return result
+
+    def apply_to(self, program=None):
+        if program is not None and program is not self.program:
+            base = None
+            if hasattr(program, "signature") and hasattr(program.signature, "get_description"):
+                base = program.signature.get_description()
+            composed = _playbook_compose_instruction(base, self.render())
+            if hasattr(program, "signature"):
+                program.signature.description = composed
+            return
+        self._inject()
+
+    def render(self):
+        return _ace_render_playbook(self.engine.get_playbook())
+
+    def get_state(self):
+        return {"playbook": self.engine.get_playbook(), "artifact": self.engine.get_artifact()}
+
+    def to_json(self):
+        return self.get_state()
+
+    def load(self, snapshot: dict[str, Any]):
+        snapshot = dict(snapshot or {})
+        self.engine.hydrate(self.program, {
+            "baseInstruction": self.base_instruction,
+            "playbook": snapshot.get("playbook"),
+            "artifact": snapshot.get("artifact"),
+        })
+        self.started = True
+        self._inject()
+        return self
+
+    def configure_auto(self, level):
+        self.engine.configure_auto(level)
+
+    def reset(self):
+        self.engine.reset()
+        self.started = False
+
+    # Used by agent.playbook() to redirect injection into a pipeline stage.
+    def _set_apply_hook(self, hook):
+        self._apply_hook = hook
+
+    def _inject(self):
+        rendered = self.render()
+        if self._apply_hook is not None:
+            self._apply_hook(rendered)
+            return
+        if self.program is not None and hasattr(self.program, "signature"):
+            base = self.base_instruction
+            if base is None and hasattr(self.program.signature, "get_description"):
+                base = self.program.signature.get_description()
+            self.program.signature.description = _playbook_compose_instruction(base, rendered)
+
+
+def playbook(program, options: dict[str, Any] | None = None) -> AxPlaybook:
+    return AxPlaybook(program, options)
+
+
+def _optimize_option(options, *keys, default=None):
+    for key in keys:
+        if key in options and options.get(key) is not None:
+            return options.get(key)
+    return default
+
+
+def optimize(program, examples, options: dict[str, Any] | None = None):
+    opts = dict(options or {})
+    student = _optimize_option(opts, "studentAI", "student_ai", "student", "client", "ai")
+    if student is None:
+        raise ValueError("optimize() requires studentAI or client")
+    teacher = _optimize_option(opts, "teacherAI", "teacher_ai", "teacher", "reflectionAI", "reflection_ai", "reflection_client", default=student)
+    max_metric_calls = _gepa_int(_optimize_option(opts, "maxMetricCalls", "max_metric_calls", default=100), 100, 1)
+    bootstrap_setting = opts.get("bootstrap") if "bootstrap" in opts else (len(examples or []) <= 8)
+    demos = []
+    if bootstrap_setting is not False:
+        bootstrap_options = dict(opts)
+        if isinstance(bootstrap_setting, dict):
+            bootstrap_options.update(bootstrap_setting)
+        bootstrap_options["client"] = teacher or student
+        bootstrap_options["apply"] = False
+        bootstrap = AxBootstrapFewShot(**bootstrap_options)
+        bootstrap_artifact = program.optimize_with(bootstrap, examples or [], bootstrap_options)
+        demos = list((bootstrap_artifact or {}).get("demos") or [])
+        if demos and hasattr(program, "set_demos"):
+            program.set_demos(demos)
+    gepa_options = dict(opts)
+    gepa_options["bootstrap"] = False
+    gepa_options["maxMetricCalls"] = max_metric_calls
+    gepa_options["client"] = student
+    gepa_options["apply"] = False
+    engine = AxGEPA(teacher, **gepa_options)
+    artifact = program.optimize_with(engine, examples or [], gepa_options)
+    if demos:
+        artifact["demos"] = demos
+    return artifact
+
+
+def _score_optimization_prediction(task, prediction, options):
+    opts = options or {}
+    if "metric_score" in task:
+        raw_scores = task.get("metric_score")
+    elif "scores" in task:
+        raw_scores = task.get("scores")
+    elif "score" in task:
+        raw_scores = task.get("score")
+    elif _core_get(prediction, "completionType") == "error":
+        raw_scores = 0
+    else:
+        raw_scores = 1
+    scores = _normalize_optimization_metric_scores(raw_scores)
+    scalar = _scalarize_optimization_scores(scores, opts)
+    scalar = _adjust_optimization_score_for_actions(scalar, task or {}, prediction or {})
+    return scores, scalar
+
+
+class AxAgentPlaybook:
+    """Agent-bound playbook with continuous updates and verified batch evolve."""
+
+    def __init__(self, agent, handle):
+        self.agent = agent
+        self.inner = handle
+
+    def update(self, args):
+        return self.inner.update(args)
+
+    def render(self):
+        return self.inner.render()
+
+    def get_state(self):
+        return self.inner.get_state()
+
+    def to_json(self):
+        return self.inner.to_json()
+
+    def load(self, snapshot):
+        self.inner.load(snapshot)
+        return self
+
+    def reset(self):
+        return self.inner.reset()
+
+    def configure_auto(self, level):
+        return self.inner.configure_auto(level)
+
+    def evolve(self, dataset, options: dict[str, Any] | None = None):
+        # Preserve the original stage-playbook overload: agent.playbook().evolve(
+        # examples, metric). Agent datasets use a mapping for the second argument.
+        if callable(options):
+            return self.inner.evolve(dataset, options)
+        opts = dict(options or {})
+        normalized = _normalize_optimization_dataset(dataset or [])
+        train = list(normalized.get("train") or [])
+        validation = list(normalized.get("validation") or [])
+        if not train:
+            raise ValueError("AxAgent.playbook().evolve(): at least one training task is required.")
+        client = _playbook_option(opts, "studentAI", "student_ai", "client", "ai") or self.inner.student_ai
+        teacher = _playbook_option(opts, "teacherAI", "teacher_ai", "teacher") or self.inner.teacher_ai or client
+        metric = opts.get("metric")
+        score_threshold = float(opts.get("scoreThreshold", opts.get("score_threshold", 0.7)))
+        min_gain = float(opts.get("minHeldInGain", opts.get("min_held_in_gain", 0.05)))
+        epsilon = float(opts.get("epsilon", 0.01))
+        verify = opts.get("verify", True) is not False
+        max_proposals = max(1, int(opts.get("maxProposals", opts.get("max_proposals", 4))))
+        runs_per_task = max(1, int(opts.get("runsPerTask", opts.get("runs_per_task", 1))))
+        dataset_size = (len(train) + len(validation)) * runs_per_task
+        max_metric_calls = max(1, int(opts.get(
+            "maxMetricCalls",
+            opts.get("max_metric_calls", max(100, (max_proposals + 1) * dataset_size)),
+        )))
+        remaining = [max_metric_calls]
+
+        def progress(phase, message):
+            callback = opts.get("onProgress") or opts.get("on_progress")
+            event = {"phase": phase, "message": message, "metricCallsUsed": max_metric_calls - remaining[0]}
+            if callable(callback):
+                callback(event)
+            if opts.get("verbose"):
+                print(f"[playbook.evolve] {phase}: {message}")
+
+        def run(tasks):
+            records = []
+            exhausted = False
+            for index, task in enumerate(tasks):
+                task = task if isinstance(task, dict) else {"input": task}
+                scores = []
+                prediction = None
+                error = None
+                for _ in range(runs_per_task):
+                    if remaining[0] <= 0:
+                        exhausted = True
+                        break
+                    remaining[0] -= 1
+                    try:
+                        prediction = self.agent.evaluate_optimization_task(client, task, opts)
+                        if callable(metric):
+                            score = float(metric({"example": task, "task": task, "prediction": prediction}))
+                        else:
+                            _, score = _score_optimization_prediction(task, prediction, opts)
+                    except Exception as exc:
+                        score = 0.0
+                        error = str(exc)
+                    scores.append(score if math.isfinite(score) else 0.0)
+                if not scores:
+                    break
+                score = sum(scores) / len(scores)
+                record = {"task": task, "score": score, "index": index, "passed": score >= score_threshold and (prediction or {}).get("completionType") == "final"}
+                if prediction is not None:
+                    record["prediction"] = prediction
+                elif error:
+                    record["error"] = error
+                records.append(record)
+                if len(scores) < runs_per_task:
+                    exhausted = True
+                    break
+            weight_sum = sum(float(record["task"].get("weight", 1)) for record in records)
+            mean = sum(float(record["task"].get("weight", 1)) * record["score"] for record in records) / weight_sum if weight_sum else 0.0
+            exhausted = exhausted or len(records) < len(tasks)
+            return records, mean, exhausted
+
+        def error_signature(value):
+            text = str(value or "")
+            match = re.search(r"^(\w+Error:\s*.{0,60})", text, re.MULTILINE)
+            return match.group(1) if match else text[:80]
+
+        def record_signature(record):
+            prediction = record.get("prediction") or {}
+            counts = {}
+            for signal in prediction.get("failureSignals") or []:
+                signature = str(signal.get("signature") or "behavioral:no_error")
+                counts[signature] = counts.get(signature, 0) + int(signal.get("occurrences") or 1)
+            if counts:
+                return max(counts, key=counts.get)
+            tool_errors = prediction.get("toolErrors") or []
+            if tool_errors:
+                return str(tool_errors[0]).split("\n", 1)[0][:100]
+            if record.get("error"):
+                return error_signature(record.get("error"))
+            action_log = str(prediction.get("actionLog") or "")
+            match = re.search(r"^\s*(\w+Error:\s*.{0,60})", action_log, re.MULTILINE)
+            return error_signature(match.group(1)) if match else "behavioral:no_error"
+
+        def failure_excerpt(record, signature):
+            if record.get("error"):
+                return f"Run threw: {record['error']}"
+            action_log = str((record.get("prediction") or {}).get("actionLog") or "")
+            if len(action_log) <= 2000:
+                return action_log
+            hit = action_log.find(signature[:40])
+            if hit < 0:
+                return action_log[-2000:]
+            start = max(0, hit - 1000)
+            return action_log[start : start + 2000]
+
+        def collapse(value):
+            return re.sub(r"\s+", " ", str(value or "")).strip()
+
+        def mine_weakness(signature, records, proposal_index):
+            selected = records[:4]
+            bodies = [failure_excerpt(record, signature) for record in selected]
+            excerpts = "\n\n".join(
+                f"--- run {index + 1} ---\n{body}" for index, body in enumerate(bodies)
+            )
+            if not any(collapse(body) for body in bodies):
+                return None
+            task_summaries = "\n".join(
+                f"- {record.get('task', {}).get('id') or f'#{index + 1}'} "
+                f"(score {float(record.get('score', 0)):.2f}): "
+                f"{json.dumps(record.get('task', {}).get('input'), sort_keys=True, default=str)[:240]}"
+                for index, record in enumerate(selected)
+            )
+            function_calls = [
+                call
+                for record in selected
+                for call in ((record.get("prediction") or {}).get("functionCalls") or [])
+            ][:20]
+            tool_errors = [
+                str(error)
+                for record in selected
+                for error in ((record.get("prediction") or {}).get("toolErrors") or [])
+            ][:10]
+            request = {
+                "clusterSignature": signature,
+                "taskSummaries": task_summaries,
+                "actionLogExcerpts": excerpts,
+                "functionCallSummary": "\n".join(json.dumps(call, sort_keys=True, default=str) for call in function_calls) or None,
+                "toolErrors": "\n".join(tool_errors) or None,
+                "currentPlaybook": self.inner.render() or None,
+            }
+            request = {key: value for key, value in request.items() if value is not None}
+            miner = AxGen(
+                _AGENT_PLAYBOOK_WEAKNESS_MINER_SIGNATURE,
+                {
+                    "id": "agent.playbook.weakness-miner",
+                    "instruction": (
+                        "Identify one recurring weakness and one narrow durable avoidance rule. "
+                        "Every evidence quote must be copied verbatim from actionLogExcerpts."
+                    ),
+                },
+            )
+            mined = miner.forward(teacher, request)
+            raw_quotes = mined.get("evidenceQuotes")
+            candidates = raw_quotes if isinstance(raw_quotes, list) else ([] if raw_quotes is None else [raw_quotes])
+            haystack = collapse(excerpts)
+            evidence = [str(quote) for quote in candidates if collapse(quote) and collapse(quote) in haystack]
+            if not evidence:
+                return None
+            raw_recommendations = mined.get("configRecommendations")
+            recommendations = raw_recommendations if isinstance(raw_recommendations, list) else ([] if raw_recommendations is None else [raw_recommendations])
+            return {
+                "id": f"weakness-{proposal_index + 1}",
+                "clusterSignature": signature,
+                "description": str(mined.get("weaknessDescription") or ""),
+                "rootCause": str(mined.get("rootCause") or ""),
+                "proposedGuidance": str(mined.get("proposedGuidance") or ""),
+                "evidenceQuotes": evidence,
+                "taskIds": [
+                    record.get("task", {}).get("id") or f"task-{record.get('index', index)}"
+                    for index, record in enumerate(records)
+                ],
+                "configRecommendations": [str(value) for value in recommendations],
+            }
+
+        progress("baseline", f"evaluating {len(train)} train tasks")
+        baseline_records, held_in, _ = run(train)
+        if validation:
+            progress("baseline", f"evaluating {len(validation)} validation tasks")
+            _, held_out, _ = run(validation)
+        else:
+            held_out = None
+        baseline = {"heldIn": held_in, **({"heldOut": held_out} if held_out is not None else {})}
+        clusters = {}
+        for record in baseline_records:
+            prediction = record.get("prediction") or {}
+            failed = bool(record.get("error")) or prediction.get("completionType") != "final" or record["score"] < score_threshold
+            if not failed:
+                continue
+            signature = record_signature(record)
+            clusters.setdefault(signature, []).append(record)
+        ranked = sorted(clusters.items(), key=lambda item: -sum(1.0 - row["score"] for row in item[1]))[:max_proposals]
+        progress("mining", f"{len(ranked)} failure cluster(s) from {len(baseline_records)} records")
+        outcomes = []
+        weaknesses = []
+        initial_state = copy.deepcopy(self.inner.get_state())
+        for proposal_index, (signature, records) in enumerate(ranked):
+            try:
+                weakness = mine_weakness(signature, records, proposal_index)
+            except Exception as exc:
+                progress("mining", f"cluster [{signature}] miner failed: {exc}")
+                continue
+            if weakness is None:
+                progress("mining", f"cluster [{signature}] discarded (no grounded evidence)")
+                continue
+            evidence = weakness["evidenceQuotes"][:3]
+            weaknesses.append(weakness)
+            proposal = {"weaknessId": weakness["id"], "clusterSignature": signature, "feedback": ""}
+            required_calls = (len(train) + len(validation)) * runs_per_task
+            if verify and remaining[0] < required_calls:
+                outcomes.append({"proposal": proposal, "accepted": False, "reason": "metric_budget exhausted before validation", "heldIn": {"before": held_in, "after": held_in}})
+                progress("validation", f"{weakness['id']}: budget exhausted, skipped")
+                continue
+            before = copy.deepcopy(self.inner.get_state())
+            feedback = (
+                "A recurring agent weakness was diagnosed from real failed runs.\n\n"
+                f"Weakness: {weakness['description']}\n"
+                f"Root cause: {weakness['rootCause']}\n"
+                f"Error signature: [{signature}]\nGrounding excerpts:\n"
+                + "\n".join(f"- {quote}" for quote in evidence)
+                + "\n\nCurate ONE durable rule into the playbook "
+                f"(suggested section: \"failures_to_avoid\"): {weakness['proposedGuidance']}\n"
+                "UPDATE an existing bullet if one already covers this failure mode."
+            )
+            proposal["feedback"] = feedback
+            progress("proposal", f"{weakness['id']}: applying playbook proposal")
+            try:
+                self.inner.update({
+                    "example": {"task": "playbook.evolve(): repair a diagnosed agent weakness", "failureSignatures": [signature]},
+                    "prediction": {},
+                    "feedback": feedback,
+                })
+            except Exception as exc:
+                outcomes.append({
+                    "proposal": proposal,
+                    "accepted": False,
+                    "reason": f"apply failed: {exc}",
+                    "heldIn": {"before": held_in, "after": held_in},
+                })
+                continue
+            if not verify:
+                outcomes.append({"proposal": proposal, "accepted": True, "reason": "applied without verification (verify: false)", "heldIn": {"before": held_in, "after": held_in}})
+                continue
+            _, next_in, train_exhausted = run(train)
+            if validation:
+                _, next_out, validation_exhausted = run(validation)
+            else:
+                next_out, validation_exhausted = None, False
+            complete = not train_exhausted and not validation_exhausted
+            gain_ok = complete and next_in - held_in >= min_gain
+            held_out_ok = next_out is None or held_out is None or next_out - held_out >= -epsilon
+            accepted = complete and gain_ok and held_out_ok
+            outcomes.append({
+                "proposal": proposal,
+                "accepted": accepted,
+                "reason": "metric_budget exhausted during re-evaluation" if not complete else ("held-in improved, held-out non-regressing" if accepted and held_out is not None else ("held-in improved (no held-out set provided — consider one)" if accepted else (f"held-in gain {next_in - held_in:.3f} below {min_gain}" if not gain_ok else f"held-out regressed {(next_out or 0) - (held_out or 0):.3f}"))),
+                "heldIn": {"before": held_in, "after": next_in},
+                **({"heldOut": {"before": held_out, "after": next_out}} if next_out is not None and held_out is not None else {}),
+            })
+            if accepted:
+                held_in, held_out = next_in, next_out
+            else:
+                self.inner.load(before)
+        snapshot = self.inner.get_state() if any(item.get("accepted") for item in outcomes) else None
+        if opts.get("apply") is False and snapshot is not None:
+            # Return the learned snapshot but restore the live agent exactly.
+            self.inner.load(initial_state)
+        progress("done", f"{sum(1 for item in outcomes if item.get('accepted'))}/{len(outcomes)} proposals accepted; held-in {baseline['heldIn']:.3f} -> {held_in:.3f}")
+        return {
+            "baseline": baseline,
+            "final": {"heldIn": held_in, **({"heldOut": held_out} if held_out is not None else {})},
+            "weaknesses": weaknesses,
+            "outcomes": outcomes,
+            "recommendations": [
+                recommendation
+                for weakness in weaknesses
+                for recommendation in weakness.get("configRecommendations", [])
+            ],
+            **({"playbookSnapshot": snapshot} if snapshot is not None else {}),
+            "metricCallsUsed": max_metric_calls - remaining[0],
+            "records": baseline_records,
+        }
+
+
+class AxAgent:
+    def __init__(self, signature, options: dict[str, Any] | None = None):
+        self.options = dict(options or {})
+        self.execution_context = resolve_execution_context(self.options)
+        if self.execution_context:
+            existing = list(self.options.get("functions") or [])
+            self.options["functions"] = existing + self.execution_context.runtime_modules()
+            self.options["executionContext"] = self.execution_context
+        self._playbook_handle = None
+        self._agent_playbook = None
+        self._playbook_config = self.options.get("playbook")
+        self._rebuild_from_signature(signature)
+        if self._playbook_config not in (None, False):
+            self._attach_configured_playbook()
+
+    def _rebuild_from_signature(self, signature):
+        self.state = _agent_factory(signature, self.options)
+        self.signature = _core_get(self.state, "signature")
+        child_context = {"executionContext": self.execution_context} if self.execution_context else {}
+        self.distiller = AxGen(_core_get(self.state, "distiller_signature"), {"validation_retries": 0, "id": "ctx.root.actor", "instruction": _core_get(self.state, "distiller_description", ""), **child_context})
+        self.executor = AxGen(_core_get(self.state, "executor_signature"), {"validation_retries": 0, "id": "task.root.actor", "instruction": _core_get(self.state, "executor_description", ""), **child_context})
+        self.responder = AxGen(_core_get(self.state, "responder_signature", self.signature), {"validation_retries": self.options.get("validation_retries", 2), "id": "task.root.responder", "instruction": _core_get(self.state, "responder_description", ""), **child_context})
+        self.llm_query = AxGen(_core_get(self.state, "llm_query_signature", "task:string, context:json -> answer:string"), {"validation_retries": 1, "id": "rlm.llmquery", "instruction": _core_get(self.state, "llm_query_description", ""), **child_context})
+
+    def set_signature(self, signature):
+        self._rebuild_from_signature(signature)
+        return self
+
+    def get_instruction(self):
+        return _core_get(self.state, "stage_instruction", "") or ""
+
+    def set_instruction(self, instruction: str):
+        composed = _agent_set_instruction(self.state, str(instruction or ""))
+        self.options["instruction"] = _core_get(self.state, "stage_instruction", "")
+        self.executor.set_instruction(composed)
+        return self
+
+    def add_actor_instruction(self, addendum: str):
+        composed = _agent_add_actor_instruction(self.state, str(addendum or ""))
+        self.options["instructionAddenda"] = list(_core_get(self.state, "instruction_addenda", []) or [])
+        self.executor.set_instruction(composed)
+        return self
+
+    def forward(self, client, values: dict[str, Any], options: dict[str, Any] | None = None):
+        options = dict(options or {})
+        call_context = resolve_execution_context(options, self.execution_context)
+        if call_context:
+            options["executionContext"] = call_context
+            options["functions"] = list(options.get("functions") or []) + call_context.runtime_modules()
+        runtime = options.get("runtime")
+        if runtime is None:
+            runtime = self.options.get("runtime")
+        # Wire the built-in llmQuery primitive: a focused sub-query the model can
+        # await inside the runtime. The logic lives in the AxIR-generated helper;
+        # this wrapper only registers the host callable that closes over this client.
+        if runtime is not None and hasattr(runtime, "register_callable"):
+            runtime.register_callable("llmQuery", lambda params: _agent_run_llm_query(self.llm_query, client, params))
+        output = _agent_forward(
+            self.state,
+            self.distiller,
+            self.executor,
+            self.responder,
+            client,
+            values or {},
+            options,
+        )
+        citations = self.options.get("citations")
+        citation_callback = citations.get("onCitations") or citations.get("on_citations") if isinstance(citations, dict) else None
+        if callable(citation_callback):
+            try:
+                citation_callback(list(_core_get(self.state, "last_citations", []) or []))
+            except Exception:
+                pass
+        self._learn_playbook_failures(output)
+        return output
+
+    def test(self, runtime: AxCodeRuntime, code: str, context_field_values: dict[str, Any] | None = None, options: dict[str, Any] | None = None):
+        return _agent_runtime_test(
+            self.state,
+            runtime,
+            code,
+            context_field_values or {},
+            options or {},
+        )
+
+    def execute_actor_step(self, runtime: AxCodeRuntime, code: str, values: dict[str, Any] | None = None, options: dict[str, Any] | None = None):
+        _agent_runtime_build_globals(self.state, values or {})
+        session = _core_get(self.state, "runtime_session")
+        return _agent_runtime_execute_step(self.state, runtime, session, code, options or {})
+
+    def inspect_runtime(self, options: dict[str, Any] | None = None):
+        return _agent_runtime_inspect_state(self.state, _core_get(self.state, "runtime_session"), options or {})
+
+    def export_session_state(self, options: dict[str, Any] | None = None):
+        return _agent_runtime_export_session_state(self.state, _core_get(self.state, "runtime_session"), options or {})
+
+    def restore_session_state(self, snapshot: Any, options: dict[str, Any] | None = None):
+        return _agent_runtime_restore_session_state(self.state, _core_get(self.state, "runtime_session"), snapshot or {}, options or {})
+
+    def close_runtime_session(self):
+        return _agent_runtime_close_session(self.state, _core_get(self.state, "runtime_session"))
+
+    def get_state(self):
+        return _agent_get_state(self.state)
+
+    def set_state(self, state):
+        return _agent_set_state(self.state, state or {})
+
+    def get_chat_log(self):
+        return list(_core_get(self.state, "chat_log", []) or [])
+
+    def get_action_log(self):
+        return list(_core_get(self.state, "action_log", []) or [])
+
+    def get_trace(self):
+        return _agent_export_trace(self.state)
+
+    def export_trace(self):
+        return _agent_export_trace(self.state)
+
+    def replay_trace(self, trace, fixtures: dict[str, Any] | None = None):
+        return _agent_replay_trace(trace or {}, fixtures or {})
+
+    def get_usage(self):
+        return dict(_core_get(self.state, "usage", {}) or {})
+
+    def get_runtime_contract(self):
+        return dict(_core_get(self.state, "runtime_contract", {}) or {})
+
+    def get_policy(self):
+        return dict(_core_get(self.state, "policy", {}) or {})
+
+    def get_policy_registry(self):
+        return dict(_core_get(self.state, "policy_registry", {}) or {})
+
+    def get_callable_inventory(self):
+        return list(_core_get(self.state, "callable_inventory", []) or [])
+
+    def get_discovery_catalog(self):
+        return list(_core_get(self.state, "discovery_catalog", []) or [])
+
+    def discover(self, request):
+        return _agent_discover(self.state, request or {})
+
+    def recall(self, request):
+        return _agent_recall(self.state, request or [])
+
+    def used(self, id, reason: str | None = None, stage: str = "executor"):
+        return _agent_used(self.state, {"id": id, "reason": reason or "", "stage": stage}, stage)
+
+    def invoke_callable(self, qualified_name: str, args: dict[str, Any] | None = None, options: dict[str, Any] | None = None):
+        return _agent_execute_callable(self.state, {"qualified_name": qualified_name, "args": args or {}}, options or {})
+
+    def export_runtime_state(self):
+        return _agent_export_runtime_state(self.state)
+
+    def restore_runtime_state(self, snapshot):
+        return _agent_restore_runtime_state(self.state, snapshot or {})
+
+    def get_optimizer_metadata(self):
+        return _agent_optimizer_metadata(self.state)
+
+    def get_optimizable_components(self):
+        child_components = []
+        child_components.extend(self.distiller.get_optimizable_components())
+        child_components.extend(self.executor.get_optimizable_components())
+        child_components.extend(self.responder.get_optimizable_components())
+        return _agent_get_optimizable_components(self.state, child_components)
+
+    def apply_optimized_components(self, component_map: dict[str, Any]):
+        updates = dict(component_map or {})
+        _validate_optimization_component_map(self.get_optimizable_components(), updates)
+        self.distiller.apply_optimized_components(updates)
+        self.executor.apply_optimized_components(updates)
+        self.responder.apply_optimized_components(updates)
+        composed = _agent_apply_optimized_components(self.state, updates)
+        self.options.update(_core_get(self.state, "options", {}) or {})
+        self.executor.set_instruction(composed)
+        return self
+
+    def apply_optimization(self, artifact):
+        components = self.get_optimizable_components()
+        if isinstance(artifact, str):
+            artifact = _deserialize_optimized_artifact(artifact, components)
+        else:
+            artifact = _validate_optimized_artifact(artifact or {}, components)
+        if "demos" in artifact and hasattr(self, "set_demos"):
+            self.set_demos(artifact.get("demos") or [])
+        return self.apply_optimized_components(artifact.get("componentMap") or {})
+
+    def evaluate_optimization_task(self, client, task: dict[str, Any], options: dict[str, Any] | None = None):
+        opts = options or {}
+        try:
+            output = self.forward(client, task.get("input") or task, opts.get("forward_options") or {})
+            return _build_agent_eval_prediction(output, self.get_action_log(), self.get_usage(), self.export_trace())
+        except AxAgentClarificationError as exc:
+            return {
+                "completionType": "askClarification",
+                "clarification": exc.clarification,
+                "actionLog": self.get_action_log(),
+                "functionCalls": _core_get(self.state, "function_call_traces", []) or [],
+                "toolErrors": [],
+                "turnCount": 0,
+                "usage": self.get_usage(),
+                "trace": self.export_trace(),
+            }
+        except Exception as exc:
+            return {
+                "completionType": "error",
+                "error": {"message": str(exc)},
+                "actionLog": self.get_action_log(),
+                "functionCalls": _core_get(self.state, "function_call_traces", []) or [],
+                "toolErrors": [str(exc)],
+                "turnCount": 0,
+                "usage": self.get_usage(),
+                "trace": self.export_trace(),
+            }
+
+    def evaluate_optimization(self, client, dataset, candidate_map: dict[str, Any] | None = None, options: dict[str, Any] | None = None):
+        opts = options or {}
+        normalized = _normalize_optimization_dataset(dataset or [])
+        rows = []
+        original = _optimization_component_current_map(self.get_optimizable_components())
+        candidate = dict(candidate_map or {})
+        phase = opts.get("phase", "train")
+        max_metric_calls = int(opts.get("maxMetricCalls", opts.get("max_metric_calls", 10**9)))
+        calls = 0
+        try:
+            if candidate:
+                self.apply_optimized_components(candidate)
+            for task in normalized.get("train", []) or []:
+                if calls >= max_metric_calls:
+                    raise RuntimeError(f"max metric calls exceeded: {max_metric_calls}")
+                calls += 1
+                prediction = self.evaluate_optimization_task(client, task if isinstance(task, dict) else {"input": task}, opts)
+                error = prediction.get("error") if isinstance(prediction, dict) else None
+                scores, scalar = _score_optimization_prediction(task if isinstance(task, dict) else {}, prediction, opts)
+                rows.append(_build_optimization_eval_row(task, prediction, scores, scalar, prediction.get("trace"), error))
+            return _build_optimization_eval_result(rows, candidate, phase)
+        finally:
+            self.apply_optimized_components(original)
+
+    def optimize_with(self, engine: OptimizerEngine, dataset, options: dict[str, Any] | None = None):
+        opts = options or {}
+        components = self.get_optimizable_components()
+        client = opts.get("client") or opts.get("ai")
+        run = _prepare_optimizer_run("axagent", components, dataset or [], opts, self.export_trace(), client is not None)
+        request = run.get("request") or {}
+        evaluator = None
+        if client is not None:
+            outer = self
+
+            class _Evaluator:
+                def evaluate(self, candidate_map, options=None):
+                    merged = {**opts, **(options or {})}
+                    eval_dataset = merged.pop("dataset", None) or merged.pop("_dataset", None) or dataset or []
+                    return outer.evaluate_optimization(client, eval_dataset, candidate_map or {}, merged)
+
+            evaluator = _Evaluator()
+        response = _call_optimizer_engine(engine, request, evaluator)
+        artifact = _normalize_optimizer_engine_response(
+            response,
+            getattr(engine, "name", engine.__class__.__name__),
+            getattr(engine, "version", "host"),
+            components,
+        )
+        if opts.get("apply", True) is not False:
+            self.apply_optimization(artifact)
+        return artifact
+
+    def optimize(self, dataset=None, options: dict[str, Any] | None = None):
+        opts = options or {}
+        engine = opts.get("engine") or opts.get("optimizer")
+        if engine is None:
+            raise ValueError("options.engine must implement OptimizerEngine for optimize()")
+        return self.optimize_with(engine, dataset or [], opts)
+
+    def _attach_configured_playbook(self):
+        raw = self._playbook_config
+        config = dict(raw) if isinstance(raw, dict) else {}
+        config.setdefault("maxReflectorRounds", 1)
+        seed = config.get("seed")
+        if seed is None and ("playbook" in config or "artifact" in config):
+            seed = config
+        self.playbook(config)
+        if seed is not None:
+            if isinstance(seed, dict) and "playbook" in seed:
+                self._playbook_handle.load(seed)
+            elif isinstance(seed, dict):
+                self._playbook_handle.load({"playbook": seed})
+
+    def _learn_playbook_failures(self, output):
+        if self._playbook_handle is None or self._playbook_config in (None, False):
+            return
+        config = dict(self._playbook_config) if isinstance(self._playbook_config, dict) else {}
+        learn = config.get("learn", True)
+        if learn is False:
+            return
+        learn_config = dict(learn) if isinstance(learn, dict) else {}
+        try:
+            signals = list(_core_get(self.state, "failure_signals", []) or [])
+            if len(signals) < int(learn_config.get("minSignals", learn_config.get("min_signals", 1))):
+                return
+            covered = set(_agent_collect_covered_failure_signatures(self._playbook_handle.get_state()))
+            if learn_config.get("dedupe", True) is not False:
+                signals = [signal for signal in signals if str(signal.get("signature")) not in covered]
+            if not signals:
+                return
+            # Match TS: dedupe the full report before capping the curator
+            # digest, otherwise fresh overflow signatures can be starved by
+            # already-covered entries in the first twelve positions.
+            signals = signals[:12]
+            feedback = "Agent run failures to avoid:\n" + "\n".join(
+                f"- [{signal.get('kind')}] {signal.get('signature')}: {signal.get('detail')}"
+                for signal in signals
+            ) + "\nCurate ONE bounded avoidance rule into failures_to_avoid."
+            before = json.dumps(self._playbook_handle.get_state().get("playbook"), sort_keys=True, default=str)
+            result = self._playbook_handle.update({
+                "example": {"task": self.options.get("instruction", "agent run"), "failureSignatures": [signal.get("signature") for signal in signals]},
+                "prediction": output or {},
+                "feedback": feedback,
+            })
+            callback = config.get("onUpdate") or config.get("on_update")
+            if callable(callback):
+                snapshot = self._playbook_handle.get_state()
+                status = "unchanged" if json.dumps(snapshot.get("playbook"), sort_keys=True, default=str) == before else "updated"
+                callback({"status": status, "signals": signals, "feedback": feedback, "snapshot": snapshot, "result": result})
+        except Exception:
+            return
+
+    def playbook(self, options: dict[str, Any] | None = None) -> "AxAgentPlaybook":
+        opts = dict(options or {})
+        if self._playbook_handle is not None:
+            if opts:
+                raise ValueError("AxAgent.playbook(): this agent already has a playbook; call playbook() without options to use it.")
+            return self._agent_playbook
+        target = opts.get("target", "actor")
+        student = _playbook_option(opts, "studentAI", "student_ai", "student", "client", "ai")
+        if student is None:
+            student = self.options.get("ai") or self.options.get("client")
+        if student is None:
+            raise ValueError("AxAgent.playbook(): studentAI is required when the agent has no default ai.")
+        stage = self.responder if target == "responder" else self.executor
+        handle_options = dict(opts)
+        handle_options["studentAI"] = student
+        handle = AxPlaybook(stage, handle_options)
+        if opts.get("apply") is False:
+            handle._set_apply_hook(lambda _rendered: None)
+        base = stage.signature.get_description() if hasattr(stage.signature, "get_description") else None
+
+        def _apply(rendered):
+            stage.signature.description = _playbook_compose_instruction(base, rendered)
+
+        if opts.get("apply") is not False:
+            handle._set_apply_hook(_apply)
+        self._playbook_handle = handle
+        self._agent_playbook = AxAgentPlaybook(self, handle)
+        return self._agent_playbook
+
+    def get_playbook(self):
+        return self._agent_playbook
+
+
+def agent(signature, config: dict[str, Any] | None = None) -> AxAgent:
+    return AxAgent(signature, config)
+
+
+def _parse_signature(signature):
+    return AxSignature(signature)
+
+
+def _core_not(value): return not value
+def _core_and(left, right): return bool(left and right)
+def _core_or(left, right): return bool(left or right)
+def _core_truthy(value): return bool(value)
+def _core_eq(left, right): return left == right
+def _core_ne(left, right): return left != right
+def _core_lt(left, right): return left < right
+def _core_lte(left, right): return left <= right
+def _core_gt(left, right): return left > right
+def _core_gte(left, right): return left >= right
+def _core_add(left, right): return left + right
+def _core_mul(left, right): return float(left or 0) * float(right or 0)
+def _core_div(left, right): return float(left or 0) / float(right or 1)
+def _core_len(value): return len(value or [])
+def _core_contains(container, item): return False if container is None else item in container
+def _core_is_none(value): return value is None
+def _core_is_not_none(value): return value is not None
+def _core_none(): return None
+
+
+def _core_coverage_mark(name):
+    path = os.environ.get("AXIR_COVERAGE_FILE")
+    if not path or name in _CORE_COVERAGE_SEEN:
+        return
+    _CORE_COVERAGE_SEEN.add(name)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(name + "\n")
+
+
+_CORE_COVERAGE_SEEN: set[str] = set()
+
+
+def _core_get(target, key, default=None):
+    if target is None:
+        return default
+    if isinstance(target, dict):
+        return target.get(key, default)
+    if isinstance(target, (list, tuple)) and isinstance(key, int):
+        return target[key] if 0 <= key < len(target) else default
+    return getattr(target, key, default)
+
+
+def _core_type_is(value, type_name):
+    if type_name == "string":
+        return isinstance(value, str)
+    if type_name == "object":
+        return isinstance(value, dict)
+    if type_name == "list":
+        return isinstance(value, list)
+    if type_name == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if type_name == "boolean":
+        return isinstance(value, bool)
+    if type_name == "null":
+        return value is None
+    if type_name == "json":
+        return value is None or isinstance(value, (dict, list, str, int, float, bool))
+    return False
+
+
+def _core_map_merge(left, right):
+    out = dict(left or {})
+    out.update(right or {})
+    return out
+
+
+def _core_map_delete(target, key):
+    if isinstance(target, dict):
+        target.pop(key, None)
+    return target
+
+
+def _core_map_contains(target, key):
+    return isinstance(target, dict) and key in target
+
+
+def _core_map_keys(values):
+    if values is None:
+        return []
+    if isinstance(values, dict):
+        return list(values.keys())
+    return []
+
+
+def _core_map_values(values):
+    if values is None:
+        return []
+    if isinstance(values, dict):
+        return list(values.values())
+    return []
+
+
+def _core_list_get(values, index, default=None):
+    return values[index] if isinstance(values, list) and 0 <= int(index) < len(values) else default
+
+
+def _core_json_stringify(value):
+    import json
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _core_json_stable_stringify(value):
+    import json
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _core_json_parse(value):
+    return json.loads(value)
+
+
+def _core_string_format(template, *args):
+    return str(template).format(*args)
+
+
+def _core_string_slice(value, start, end=None):
+    text = str(value)
+    s = max(0, min(len(text), int(start)))
+    if end is None:
+        return text[s:]
+    e = max(s, min(len(text), int(end)))
+    return text[s:e]
+
+
+def _core_math_log(value):
+    return math.log(float(value))
+
+
+def _core_sorted_strings(values):
+    return sorted(str(value) for value in (values or []))
+
+
+def _core_regex_replace(pattern, repl, value):
+    return re.sub(str(pattern), str(repl), str(value))
+
+
+def _core_regex_match(pattern, value):
+    return isinstance(value, str) and re.search(str(pattern), value) is not None
+
+
+def _core_string_words(value):
+    return str(value).split()
+
+
+def _core_string_join(sep, values):
+    return str(sep).join(str(item) for item in (values or []))
+
+
+def _core_string_split_trim_nonempty(value, sep):
+    return [part.strip() for part in str(value).split(str(sep)) if part.strip()]
+
+
+def _core_string_replace(value, old, new):
+    return str(value).replace(str(old), str(new))
+
+
+def _core_string_split(value, sep):
+    return str(value).split(str(sep))
+
+
+def _core_string_split_once(value, sep):
+    text = str(value)
+    if sep in text:
+        left, right = text.split(sep, 1)
+        return {"left": left, "right": right, "found": True}
+    return {"left": text, "right": "", "found": False}
+
+
+def _core_string_starts_with(value, prefix):
+    return str(value).startswith(str(prefix))
+
+
+def _core_string_ends_with(value, suffix):
+    return str(value).endswith(str(suffix))
+
+
+def _core_string_lower(value):
+    return str(value).lower()
+
+
+def _core_string_lower_camel(words):
+    items = [str(item) for item in (words or []) if str(item)]
+    if not items:
+        return ""
+    first, rest = items[0].lower(), items[1:]
+    return first + "".join(item.lower().capitalize() for item in rest)
+
+
+def _core_string_title_from_camel(value):
+    text = re.sub(r"Code$", " Code", str(value))
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text).strip()
+    return text[:1].upper() + text[1:]
+
+
+def _core_runtime_error(message):
+    return RuntimeError(str(message))
+
+
+def _core_json_pretty(value):
+    return json.dumps(value, indent=2)
+
+
+def _core_agent_stage_forward(stage, client, values, options):
+    return stage.forward(client, values or {}, options or {})
+
+
+def _core_agent_stage_chat_log(stage):
+    if hasattr(stage, "get_chat_log"):
+        return stage.get_chat_log()
+    return []
+
+
+def _core_agent_stage_usage(stage):
+    if hasattr(stage, "get_usage"):
+        usage = stage.get_usage()
+        if usage:
+            return usage
+    if hasattr(stage, "get_chat_log"):
+        items = []
+        for entry in stage.get_chat_log() or []:
+            usage = _core_get(entry, "usage")
+            if usage:
+                items.append(usage)
+        return items
+    return []
+
+
+def _core_agent_stage_traces(stage):
+    if hasattr(stage, "get_traces"):
+        return stage.get_traces()
+    return []
+
+
+def _core_agent_clarification_error(payload, state):
+    args = _core_get(payload, "args", []) or []
+    clarification = args[0] if args else payload
+    return AxAgentClarificationError(
+        clarification,
+        state=_core_get(state, "runtime_state", {}),
+        payload=payload,
+    )
+
+
+def _core_agent_runtime_create_session(runtime, globals_, options):
+    if not hasattr(runtime, "create_session"):
+        raise RuntimeError("agent runtime does not implement AxCodeRuntime")
+    session = runtime.create_session(globals_ or {}, options or {})
+    if session is None:
+        raise RuntimeError("agent runtime returned no session")
+    return session
+
+
+def _core_agent_runtime_execute(session, code, options):
+    if not hasattr(session, "execute"):
+        raise RuntimeError("agent code session is not active")
+    return session.execute(str(code), options or {})
+
+
+def _core_agent_runtime_inspect(session, options):
+    if hasattr(session, "inspect_globals"):
+        return session.inspect_globals(options or {})
+    if hasattr(session, "inspect"):
+        return session.inspect(options or {})
+    return "[runtime state inspection unavailable: runtime session does not implement inspect_globals()]"
+
+
+def _core_agent_runtime_export_state(session, options):
+    if hasattr(session, "snapshot_globals") and type(session).snapshot_globals is not AxCodeSession.snapshot_globals:
+        return session.snapshot_globals(options or {})
+    if hasattr(session, "export_state") and type(session).export_state is not AxCodeSession.export_state:
+        return session.export_state(options or {})
+    raise RuntimeError("AxCodeSession.snapshot_globals() is required to export AxAgent state")
+
+
+def _core_agent_runtime_restore_state(session, snapshot, options):
+    if hasattr(session, "patch_globals") and type(session).patch_globals is not AxCodeSession.patch_globals:
+        return session.patch_globals(snapshot or {}, options or {})
+    if hasattr(session, "restore_state") and type(session).restore_state is not AxCodeSession.restore_state:
+        return session.restore_state(snapshot or {}, options or {})
+    raise RuntimeError("AxCodeSession.patch_globals() is required to restore AxAgent state")
+
+
+def _core_agent_runtime_close(session):
+    if hasattr(session, "close"):
+        result = session.close()
+        return {"closed": True} if result is None else result
+    return {"closed": True}
+
+
+def _core_agent_memory_search(state, searches, already_loaded):
+    options = _core_get(state, "options", {}) or {}
+    callback = options.get("on_memories_search") or options.get("onMemoriesSearch")
+    if callable(callback):
+        return callback(list(searches or []), list(already_loaded or [])) or []
+    scripted = options.get("memory_search_results") or options.get("memorySearchResults") or {}
+    if isinstance(scripted, dict):
+        joined = "|".join(str(item) for item in (searches or []))
+        if joined in scripted:
+            return copy.deepcopy(scripted[joined])
+        for item in searches or []:
+            if str(item) in scripted:
+                return copy.deepcopy(scripted[str(item)])
+        return copy.deepcopy(scripted.get("*", []))
+    if isinstance(scripted, list):
+        return copy.deepcopy(scripted)
+    return []
+
+
+def _core_agent_transcribe(client, request, options):
+    # Backs intrinsic.agent.transcribe: call the AI client's transcribe so audio inputs become
+    # text before the agent loop. Any client exposing transcribe satisfies it (real providers +
+    # the scripted conformance client), mirroring the other host AI boundary calls.
+    if client is None or not hasattr(client, "transcribe"):
+        return {"text": ""}
+    return client.transcribe(request, options or {})
+
+
+def _core_agent_skill_search(state, searches):
+    options = _core_get(state, "options", {}) or {}
+    callback = options.get("on_skills_search") or options.get("onSkillsSearch")
+    if callable(callback):
+        return callback(list(searches or [])) or []
+    scripted = options.get("skill_search_results") or options.get("skillSearchResults") or {}
+    if isinstance(scripted, dict):
+        joined = "|".join(str(item) for item in (searches or []))
+        if joined in scripted:
+            return copy.deepcopy(scripted[joined])
+        out = []
+        for item in searches or []:
+            out.extend(copy.deepcopy(scripted.get(str(item), [])))
+        if out:
+            return out
+        return copy.deepcopy(scripted.get("*", []))
+    if isinstance(scripted, list):
+        return copy.deepcopy(scripted)
+    return []
+
+
+def _core_agent_observer_notify(state, forward_options, kind, payload):
+    constructor_options = _core_get(state, "options", {}) or {}
+    forward_options = forward_options or {}
+    names = {
+        "loaded_memories": ("on_loaded_memories", "onLoadedMemories"),
+        "loaded_skills": ("on_loaded_skills", "onLoadedSkills"),
+        "used_memories": ("on_used_memories", "onUsedMemories"),
+        "used_skills": ("on_used_skills", "onUsedSkills"),
+    }
+    snake, camel = names.get(str(kind), ("", ""))
+    if not snake:
+        return None
+    callback = None
+    if str(kind).startswith("used_"):
+        callback = forward_options.get(snake) or forward_options.get(camel)
+    callback = callback or constructor_options.get(snake) or constructor_options.get(camel)
+    if callable(callback):
+        try:
+            callback(copy.deepcopy(payload or []))
+        except Exception:
+            pass
+    return None
+
+
+def _core_agent_callable_invoke(state, request, options):
+    agent_options = _core_get(state, "options", {}) or {}
+    qualified = _core_get(request, "qualified_name", _core_get(request, "name", ""))
+    args = _core_get(request, "args", {})
+    for group in _core_get(state, "callable_inventory", []) or []:
+        for callable_meta in _core_get(group, "callables", []) or []:
+            if _core_get(callable_meta, "qualified_name") == qualified:
+                handler = _core_get(callable_meta, "handler")
+                if callable(handler):
+                    return {"status": "ok", "value": handler(args)}
+    scripted = agent_options.get("callable_results") or agent_options.get("callableResults") or {}
+    if isinstance(scripted, dict):
+        result = scripted.get(qualified, scripted.get(_core_get(request, "name", ""), scripted.get("*")))
+        if result is not None:
+            copied = copy.deepcopy(result)
+            if isinstance(copied, dict) and copied.get("error"):
+                return {"status": "error", "error": copied.get("error")}
+            if isinstance(copied, dict):
+                copied.setdefault("status", "ok")
+                return copied
+            return {"status": "ok", "value": copied}
+    return {"status": "error", "error": f"unknown callable: {qualified}"}
+
+
+# AXIR_CORE_AGENT_FUNCTIONS

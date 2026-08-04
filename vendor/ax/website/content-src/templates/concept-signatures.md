@@ -1,0 +1,189 @@
+# Signatures
+
+Signatures are the contract between your application and the model. They name the inputs, name the outputs, define field types, attach field descriptions, and give Ax enough structure to generate prompts, parse results, validate values, retry failures, expose tools, trace usage, and optimize examples.
+
+```{{fence}}
+{{signatureCode}}
+```
+
+```mermaid
+flowchart LR
+  A[Signature string or builder] --> B[Prompt contract]
+  A --> C[JSON schema]
+  A --> D[Parser]
+  D --> E[Validation]
+  E -->|valid| F[Typed output]
+  E -->|invalid| G[Correction feedback]
+  G --> B
+```
+
+## Grammar
+
+The compact form is:
+
+```text
+inputField:type, optionalField?:type -> outputField:type, listField:type[]
+```
+
+Everything before `->` is input. Everything after `->` is output. Field descriptions can be attached as quoted text, and narrow `class` fields make enum-style output explicit.
+
+Types accept an optional modifier bag in parentheses, and objects can declare
+structured fields inline — the string form expresses everything the fluent
+API can (except Standard Schema fields):
+
+```text
+userAge:number(min 0, max 120),
+contactEmail:string(format email, cache),
+codeSnippet:code(python)
+->
+userName:string(pattern "^[a-z_]+$" "lowercase name"),
+tagList:string(item "a short tag")[] "all tags",
+profileList:object{ fullName:string, userAge?:number(min 0) }[] "matched profiles"
+```
+
+Modifiers that don't apply to a type are hard errors — the string API is the
+strict surface, whereas the fluent API silently ignores a `.min()` on a
+boolean.
+
+{{signatureStringExample}}
+
+## Field Types
+
+| Type | Example | Notes |
+| --- | --- | --- |
+| `string` | `question:string` | General text |
+| `number` | `score:number` | Parsed numeric value |
+| `boolean` | `approved:boolean` | True/false |
+| `json` | `metadata:json` | Structured object |
+| `date` / `datetime` | `dueDate:date` | Strict date-like values |
+| `dateRange` / `datetimeRange` | `window:dateRange` | `{ start, end }` range values |
+| `url` / `code` | `site:url`, `script:code` | Specialized strings |
+| `class` | `priority:class "high, normal, low"` | Output class with known choices |
+| `image` / `audio` / `file` | `photo:image` | Media fields where provider/language supports them |
+| `type[]` | `tags:string[]` | Arrays |
+| `object{ ... }` | `profile:object{ name:string, age?:number }` | Nested structured fields, recursively; also `object{ ... }[]` |
+| `type(modifiers)` | `score:number(min 0, max 10)` | Constraint/metadata bag, see below |
+
+Modifier bag entries (comma-separated, order-free):
+
+| Modifier | Applies to | Effect |
+| --- | --- | --- |
+| `min N` / `max N` | `string`, `number` | Length constraints on strings, value bounds on numbers |
+| `format email\|uri\|date\|date-time` | `string` | Format validation |
+| `pattern "regex" ["description"]` | `string` | Regex validation with an optional human-readable description |
+| `cache` | top-level inputs | Marks the field for provider context caching |
+| `item "description"` | arrays | Per-item description, e.g. `tags:string(item "a short tag")[]` |
+| `<language>` | `code` | Programming language, e.g. `snippet:code(python)` |
+
+Good signatures use domain names: `customerEmail`, `policyQuestion`, `riskScore`. Avoid `input`, `data`, `output`, and other names that force the model to infer intent from prose.
+
+## Fluent API
+
+The fluent builder is the best option when a signature needs constraints, descriptions, cache hints, internal fields, or programmatic composition. In TypeScript this is the `f()` builder. Generated language packages expose the AxIR-supported signature surface available in that package.
+
+{{signatureFluentExample}}
+
+Chainable field modifiers are deliberately simple:
+
+| Modifier | Use |
+| --- | --- |
+| `.optional()` / `?` | Field can be absent |
+| `.array()` / `[]` | Field is a list |
+| `.internal()` / `!` | Output scratch field, stripped from final output |
+| `.cache()` | Stable input prefix suitable for provider caching |
+
+## Validation And Retries
+
+A signature is not just documentation. Ax validates parsed field values and can retry with correction feedback when the model returns malformed JSON, an invalid class value, a bad email, a reversed date range, or a value that violates schema constraints.
+
+{{signatureValidationExample}}
+
+Validation happens after parsing complete fields. For streaming generation, streaming assertions can fail fast at field boundaries and feed correction feedback into the next attempt.
+
+{{standardSchemaSection}}
+
+## Media, Cache, And Internal Fields
+
+Media fields let a program receive images, audio, or files when the provider supports them. In agent flows, audio inputs are usually transcribed before planner/executor/responder stages; direct `ax(...)` programs can pass native media to compatible providers.
+
+Cache hints mark stable context so provider prefix caching can reuse expensive prompt regions. Internal fields let a program ask the model to produce private scratch structure without exposing it in the final typed output.
+
+## Reuse And Composition
+
+Start with a string signature, then graduate to parsed or fluent signatures when you need reuse.
+
+{{signatureHybridExample}}
+
+## Signatures As Flow Diagrams
+
+Because the string grammar is text-complete, a whole workflow of signatures can live in one mermaid flowchart — each node's contract travels in a `%%ax` comment directive:
+
+```text
+flowchart TD
+  %%ax summarize: documentText:string -> summaryText:string(max 500)
+  %%ax format: summaryText:string -> finalReport:string
+  summarize --> format
+```
+
+In TypeScript, passing the diagram to `flow()` compiles it into a runnable flow, and `String(flow)` renders any flow back — so the diagram and the program stay in sync.
+
+## Signature Gallery
+
+Real-world contracts, one line each — every entry parses as written:
+
+```text
+# Support triage: several class outputs plus a capped reply draft
+ticketText:string -> priorityClass:class "p0, p1, p2", sentimentClass:class "angry, neutral, happy", replyDraft:string(max 500)
+
+# Invoice extraction: regex-validated id, bounded totals, structured line items
+invoiceText:string -> invoiceNumber:string(pattern "^INV-\\d+$" "INV- then digits"), totalAmount:number(min 0), lineItems:object{ description:string, quantity:number(min 1), unitPrice:number }[]
+
+# RAG: cached corpus input plus per-item described citations
+corpusText:string(cache), userQuestion:string -> answerText:string, citedChunks:string(item "verbatim quote")[]
+
+# Resume parsing: nested objects inside nested arrays
+resumeText:string -> candidateProfile:object{ fullName:string, yearsExperience:number(min 0), skillList:string[], education:object{ schoolName:string, degreeName?:string }[] }
+
+# Code generation: language-tagged code outputs
+taskBrief:string -> pythonScript:code(python), testCases:code(python), riskNotes?:string
+
+# Lead scoring: signature-level description, bounded score, class next step
+"Score sales leads" leadNotes:string -> fitScore:number(min 0, max 100) "0-100 fit", nextStep:class "call, email, drop"
+
+# Contact enrichment: optional format-validated outputs
+bioText:string -> contactEmail?:string(format email), websiteUrl?:string(format uri), birthDate?:string(format date)
+
+# Chain of thought: internal reasoning stripped from the result
+problemText:string -> reasoning!:string, solutionText:string
+
+# Multimodal: top-level image input with an optional question
+productPhoto:image, question?:string -> productDescription:string, detectedObjects:string[]
+
+# Meeting audio: audio input, capped summary, per-item action list
+meetingAudio:audio -> meetingSummary:string(max 1000), actionItems:string(item "one action item")[]
+
+# Moderation: class verdict plus structured flagged spans
+postText:string -> moderationVerdict:class "allow, review, block", flaggedSpans:object{ spanText:string, reasonNote:string }[]
+
+# Text-to-SQL: cached schema plus SQL-tagged output
+schemaText:string(cache), questionText:string -> sqlQuery:code(sql), queryNotes?:string(max 200)
+
+# Calendar extraction: datetime fields and an optional end
+emailText:string -> eventTitle:string, startsAt:datetime, endsAt?:datetime, attendeeNames:string[]
+
+# Claims gate: cached policy, bounded confidence, and optional citation
+claimText:string, policyText:string(cache) -> isCovered:boolean, confidenceScore:number(min 0, max 1), citedClause?:string
+
+# Earnings extraction: structured period data plus a class outlook
+filingText:string(cache) -> revenueByPeriod:object{ periodLabel:string, amountUsd:number }[], guidanceTone:class "raise, hold, cut"
+```
+
+## Production Notes
+
+- Keep fields small and typed. Split unrelated jobs into separate signatures or a flow.
+- Use `class` or schema validation for narrow domains instead of prose-only instructions.
+- Put stable context in cacheable inputs rather than repeating it in every field description.
+- Use internal outputs for model scratch fields that should not become API response data.
+- Treat generated JSON schema as a public contract when tools, SDKs, or external callers rely on it.
+
+See [Tools]({{langRoot}}/concepts/tools/), [s() signatures]({{langRoot}}/subsystems/s/), and [s() API]({{langRoot}}/api/s/).

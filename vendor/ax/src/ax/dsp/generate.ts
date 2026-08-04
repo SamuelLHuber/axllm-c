@@ -1,0 +1,3157 @@
+// ReadableStream is available globally in modern browsers and Node.js 16+
+
+import {
+  type Context,
+  context,
+  type Meter,
+  type Span,
+  SpanKind,
+  SpanStatusCode,
+  trace,
+} from '@opentelemetry/api';
+
+import { logResultPickerUsed } from '../ai/debug.js';
+import {
+  type AxPromptMetrics,
+  countChatPromptContentChars,
+} from '../ai/promptMetrics.js';
+import type {
+  AxAIService,
+  AxChatRequest,
+  AxChatResponse,
+  AxChatResponseResult,
+  AxFunction,
+} from '../ai/types.js';
+import { axMergeUsageContexts } from '../ai/usage.js';
+import { axResolveMCPExecutionContext } from '../mcp/execution.js';
+import { AxMemory } from '../mem/memory.js';
+import type { AxAIMemory } from '../mem/types.js';
+import { mergeAbortSignals } from '../util/abort.js';
+import {
+  AxAIRefusalError,
+  AxAIServiceAbortedError,
+  AxAIServiceNetworkError,
+  AxAIServiceStatusError,
+  AxAIServiceStreamTerminatedError,
+  AxAIServiceTimeoutError,
+} from '../util/apicall.js';
+import { createHash } from '../util/crypto.js';
+import {
+  type AxAssertion,
+  AxAssertionError,
+  type AxStreamingAssertion,
+  AxStreamingAssertionError,
+  assertAssertions,
+} from './asserts.js';
+import { renderAudioOutputArtifacts } from './audioArtifacts.js';
+import {
+  type HandleErrorForGenerateArgs,
+  handleRefusalErrorForGenerate,
+  handleValidationErrorForGenerate,
+  ValidationError,
+} from './errors.js';
+import { validateStructuredOutputValues } from './extract.js';
+import {
+  type AxFieldProcessor,
+  processFieldProcessors,
+} from './fieldProcessor.js';
+import {
+  type AxChatResponseFunctionCall,
+  AxStopFunctionCallException,
+  createFunctionConfig,
+  parseFunctions,
+} from './functions.js';
+import { axGlobals } from './globals.js';
+import { toJsonSchema } from './jsonSchema.js';
+import {
+  type AxGenMetricsInstruments,
+  getOrCreateGenMetricsInstruments,
+  mergeCustomLabels,
+  recordErrorCorrectionMetric,
+  recordFieldProcessingMetric,
+  recordFunctionCallingMetric,
+  recordGenerationMetric,
+  recordMultiStepMetric,
+  recordPerformanceMetric,
+  recordSamplesMetric,
+  recordSignatureComplexityMetrics,
+  recordStreamingMetric,
+} from './metrics.js';
+import {
+  type AxOptimizableComponent,
+  axOptimizableValidators,
+} from './optimizable.js';
+import {
+  processResponse,
+  processStreamingResponse,
+  shouldContinueSteps,
+} from './processResponse.js';
+import { AxProgram } from './program.js';
+import { AxPromptTemplate, type AxRenderedPrompt } from './prompt.js';
+import { areValuesEqual } from './response/structuredDelta.js';
+import type { InternalAxGenState } from './response/types.js';
+import { selectFromSamples, selectFromSamplesInMemory } from './samples.js';
+import { createSelfTuningFunction } from './selfTuning.js';
+import { type AxIField, AxSignature, type AxSignatureConfig } from './sig.js';
+import { SignatureToolCallingManager } from './signatureToolCalling.js';
+import { AxStepContextImpl } from './stepContext.js';
+import type {
+  AsyncGenDeltaOut,
+  AxChatLogEntry,
+  AxChatLogMessage,
+  AxGenDeltaOut,
+  AxGenOut,
+  AxGenStreamingOut,
+  AxProgramExamples,
+  AxProgramForwardOptions,
+  AxProgramForwardOptionsWithModels,
+  AxProgrammable,
+  AxProgramStreamingForwardOptionsWithModels,
+  AxResultPickerFunction,
+  AxSelfTuningConfig,
+  AxSetExamplesOptions,
+} from './types.js';
+import { mergeDeltas } from './util.js';
+import {
+  validateNumberConstraints,
+  validateStringConstraints,
+  validateURL,
+} from './validators.js';
+
+const STRUCTURED_OUTPUT_FUNCTION_NAME = '__finalResult';
+
+export type {
+  AxResponseHandlerArgs,
+  InternalAxGenState,
+} from './response/types.js';
+
+export type AxGenerateResult<OUT> = OUT & {
+  thought?: string;
+};
+
+export interface AxStreamingEvent<T> {
+  event: 'delta' | 'done' | 'error';
+  data: {
+    contentDelta?: string;
+    partialValues?: Partial<T>;
+    error?: string;
+    functions?: AxChatResponseFunctionCall[];
+  };
+}
+
+type AxChatResponseLogMetadata = Pick<
+  AxChatResponse,
+  | 'sessionId'
+  | 'remoteId'
+  | 'remoteRequestId'
+  | 'remoteSessionId'
+  | 'providerMetadata'
+>;
+
+export class AxGen<IN = any, OUT extends AxGenOut = any>
+  extends AxProgram<IN, OUT>
+  implements AxProgrammable<IN, OUT>
+{
+  public clone = (): AxGen<IN, OUT> => {
+    const cloned = new AxGen(
+      this.signature as AxSignature<IN & Record<string, any>, OUT>,
+      this.options
+    );
+    cloned.asserts = [...this.asserts];
+    cloned.streamingAsserts = [...this.streamingAsserts];
+    cloned.fieldProcessors = [...this.fieldProcessors];
+    cloned.streamingFieldProcessors = [...this.streamingFieldProcessors];
+    return cloned;
+  };
+  private promptTemplate: AxPromptTemplate;
+  private asserts: AxAssertion<OUT>[];
+  private streamingAsserts: AxStreamingAssertion[];
+  private options?: Omit<AxProgramForwardOptions<any>, 'functions'>;
+  private functions: AxFunction[];
+  private functionComponentIds = new WeakMap<AxFunction, string>();
+  private fieldProcessors: AxFieldProcessor[] = [];
+  private streamingFieldProcessors: AxFieldProcessor[] = [];
+  private excludeContentFromTrace = false;
+  private thoughtFieldName: string;
+  private signatureToolCallingManager?: SignatureToolCallingManager;
+  private structuredOutputFunctionFallback = false;
+  private activeAbortControllers = new Set<AbortController>();
+  private _stopRequested = false;
+  private chatLog: AxChatLogEntry[] = [];
+
+  constructor(
+    signature:
+      | string
+      | Readonly<AxSignatureConfig>
+      | Readonly<AxSignature<IN & Record<string, any>, OUT>>,
+    options?: Readonly<AxProgramForwardOptions<any>>
+  ) {
+    super(signature, {
+      description: options?.description,
+      traceLabel: options?.traceLabel,
+    });
+
+    this.options = options;
+    this.thoughtFieldName = options?.thoughtFieldName ?? 'thought';
+    const promptTemplateOptions = {
+      functions: options?.functions,
+      thoughtFieldName: this.thoughtFieldName,
+      customTemplate: options?.customTemplate,
+      includeOptionalInputFieldsInSystemPrompt:
+        options?.includeOptionalInputFieldsInSystemPrompt,
+    };
+    this.promptTemplate = new (options?.promptTemplate ?? AxPromptTemplate)(
+      this.signature,
+      promptTemplateOptions
+    );
+    this.asserts = [...(options?.asserts ?? [])] as AxAssertion<OUT>[];
+    this.streamingAsserts = [...(options?.streamingAsserts ?? [])];
+    this.excludeContentFromTrace = options?.excludeContentFromTrace ?? false;
+    this.functions = options?.functions
+      ? parseFunctions(options.functions)
+      : [];
+    this.ensureFunctionComponentIds();
+    this.usage = [];
+  }
+
+  /**
+   * Stops an in-flight generation. Causes `forward()` / `streamingForward()`
+   * to throw `AxAIServiceAbortedError`.
+   */
+  public stop(): void {
+    this._stopRequested = true;
+    // Abort all in-flight executions started by this AxGen instance.
+    for (const controller of this.activeAbortControllers) {
+      controller.abort('Stopped by user');
+    }
+  }
+
+  public setInstruction(instruction: string): void {
+    this.promptTemplate.setInstruction(instruction);
+  }
+
+  public getInstruction(): string | undefined {
+    return this.promptTemplate.getInstruction();
+  }
+
+  public clearInstruction(): void {
+    this.promptTemplate.clearInstruction();
+  }
+
+  private static stableFunctionComponentBase(name: string): string {
+    const normalized = name
+      .trim()
+      .replace(/[^a-zA-Z0-9]+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .toLowerCase();
+    return normalized || 'tool';
+  }
+
+  private ensureFunctionComponentIds(): void {
+    const used = new Set<string>();
+    for (const fn of this.functions) {
+      const existing = this.functionComponentIds.get(fn);
+      if (existing) {
+        fn.componentId = existing;
+        used.add(existing);
+        continue;
+      }
+
+      const base = AxGen.stableFunctionComponentBase(fn.name);
+      let id = base;
+      let suffix = 2;
+      while (used.has(id)) {
+        id = `${base}_${suffix++}`;
+      }
+      used.add(id);
+      this.functionComponentIds.set(fn, id);
+      fn.componentId = id;
+    }
+  }
+
+  private validateFunctionNameCandidate(
+    fn: AxFunction,
+    value: string
+  ): true | string {
+    const shape = axOptimizableValidators.snakeCaseIdentifier(32)(value);
+    if (shape !== true) return shape;
+    const trimmed = value.trim();
+    const collides = this.functions.some(
+      (other) => other !== fn && other.name === trimmed
+    );
+    return collides ? 'identifier must be distinct from sibling tools' : true;
+  }
+
+  protected override localOptimizableComponents(): readonly AxOptimizableComponent[] {
+    const out: AxOptimizableComponent[] = [
+      ...super.localOptimizableComponents(),
+    ];
+    const id = this.getId();
+    this.ensureFunctionComponentIds();
+    for (const fn of this.functions) {
+      const functionId = this.functionComponentIds.get(fn)!;
+      out.push({
+        key: `${id}::fn:${functionId}:desc`,
+        kind: 'fn-desc',
+        current: fn.description ?? '',
+        traceId: functionId,
+        description: `Tool description shown to caller LLM to decide WHEN to invoke \`${fn.name}\`.`,
+        constraints:
+          'Concise; describe the tool’s purpose and inputs in one or two sentences.',
+        preserve: [],
+        maxLength: 320,
+        validate: axOptimizableValidators.nonEmpty(),
+      });
+      out.push({
+        key: `${id}::fn:${functionId}:name`,
+        kind: 'fn-name',
+        current: fn.name,
+        traceId: functionId,
+        description: `Identifier the LLM uses to invoke this tool. Renaming changes how the model addresses it.`,
+        constraints:
+          'snake_case identifier, ≤32 chars, distinct from siblings.',
+        maxLength: 32,
+        format: 'snake_case',
+        validate: (value) => this.validateFunctionNameCandidate(fn, value),
+      });
+    }
+    return out;
+  }
+
+  protected override applyLocalOptimizedComponents(
+    updates: Readonly<Record<string, string>>
+  ): void {
+    super.applyLocalOptimizedComponents(updates);
+
+    const id = this.getId();
+    this.ensureFunctionComponentIds();
+    const renames: Array<{ from: string; to: string }> = [];
+
+    for (const fn of this.functions) {
+      const functionId = this.functionComponentIds.get(fn)!;
+      const descKey = `${id}::fn:${functionId}:desc`;
+      if (typeof updates[descKey] === 'string') {
+        fn.description = updates[descKey]!;
+      }
+    }
+
+    const proposedNames = new Map<AxFunction, string>();
+    for (const fn of this.functions) {
+      const functionId = this.functionComponentIds.get(fn)!;
+      const nameKey = `${id}::fn:${functionId}:name`;
+      const proposed = updates[nameKey];
+      if (typeof proposed !== 'string' || proposed === fn.name) continue;
+
+      const trimmed = proposed.trim();
+      const valid = axOptimizableValidators.snakeCaseIdentifier(32)(trimmed);
+      if (valid !== true) continue;
+      proposedNames.set(fn, trimmed);
+    }
+
+    if (proposedNames.size > 0) {
+      const finalNames = this.functions.map(
+        (fn) => proposedNames.get(fn) ?? fn.name
+      );
+      if (new Set(finalNames).size === finalNames.length) {
+        for (const [fn, proposed] of proposedNames.entries()) {
+          renames.push({ from: fn.name, to: proposed });
+          fn.name = proposed;
+        }
+      }
+    }
+
+    if (renames.length > 0) {
+      // Strip stale demo entries — function-call traces under the old name
+      // would mislead the LLM if the underlying tool now has a different
+      // identifier. Cheaper to drop than to rewrite ambiguously.
+      this.demos = [];
+    }
+  }
+
+  private getEffectiveContextCache(
+    ai: Readonly<AxAIService>,
+    options?: Readonly<Partial<AxProgramForwardOptions<any>>>
+  ): AxProgramForwardOptions<any>['contextCache'] | undefined {
+    return (
+      options?.contextCache ??
+      this.options?.contextCache ??
+      ai.getOptions().contextCache
+    );
+  }
+
+  private async renderPromptWithMetricsForInternalUse(
+    ai: Readonly<AxAIService>,
+    values: IN,
+    options?: Readonly<
+      Partial<Omit<AxProgramForwardOptions<any>, 'functions'>>
+    >,
+    functionsOverride?: AxFunction[]
+  ): Promise<{
+    prompt: AxChatRequest['chatPrompt'];
+    promptMetrics?: AxPromptMetrics;
+  }> {
+    const promptTemplateClass =
+      options?.promptTemplate ??
+      this.options?.promptTemplate ??
+      AxPromptTemplate;
+    const mutableFunctions = [...(functionsOverride ?? this.functions)];
+    const functionCallMode =
+      options?.functionCallMode ?? this.options?.functionCallMode ?? 'auto';
+    const hasFunctions = mutableFunctions.length > 0;
+    let signatureToolCallingManager: SignatureToolCallingManager | undefined;
+
+    if (hasFunctions && functionCallMode === 'prompt') {
+      signatureToolCallingManager = new SignatureToolCallingManager(
+        mutableFunctions
+      );
+    }
+
+    if (
+      hasFunctions &&
+      functionCallMode === 'auto' &&
+      !ai.getFeatures(options?.model).functions
+    ) {
+      signatureToolCallingManager = new SignatureToolCallingManager(
+        mutableFunctions
+      );
+    }
+
+    let signature = AxSignature.from(this.signature);
+    if (signatureToolCallingManager) {
+      signature = signatureToolCallingManager.processSignature(signature);
+    }
+
+    const hasComplexFields = signature.hasComplexFields();
+    const features = ai.getFeatures?.(options?.model);
+    const structuredOutputMode =
+      options?.structuredOutputMode ??
+      this.options?.structuredOutputMode ??
+      'auto';
+    const structuredOutputFunctionFallback =
+      hasComplexFields &&
+      (structuredOutputMode === 'function' ||
+        (structuredOutputMode === 'auto' && !features?.structuredOutputs));
+    if (structuredOutputFunctionFallback) {
+      const syntheticFunction: AxFunction = {
+        name: STRUCTURED_OUTPUT_FUNCTION_NAME,
+        description:
+          'Return the final result. Call this function with the complete output data.',
+        parameters: toJsonSchema(signature.getOutputFields()),
+        func: async () => 'done',
+      };
+      mutableFunctions.push(syntheticFunction);
+    }
+    const providerIgnoreBreakpoints =
+      ai.getFeatures?.(options?.model)?.caching?.cacheBreakpoints === false;
+    const contextCache = this.getEffectiveContextCache(ai, options);
+    const promptTemplate = new promptTemplateClass(signature, {
+      functions: signatureToolCallingManager ? [] : mutableFunctions,
+      thoughtFieldName: this.thoughtFieldName,
+      contextCache,
+      ignoreBreakpoints: providerIgnoreBreakpoints,
+      includeOptionalInputFieldsInSystemPrompt:
+        options?.includeOptionalInputFieldsInSystemPrompt ??
+        this.options?.includeOptionalInputFieldsInSystemPrompt,
+      structuredOutputFunctionName: structuredOutputFunctionFallback
+        ? STRUCTURED_OUTPUT_FUNCTION_NAME
+        : undefined,
+      customTemplate: options?.customTemplate ?? this.options?.customTemplate,
+    });
+    const instruction = this.getInstruction();
+    if (instruction !== undefined && instruction.trim().length > 0) {
+      promptTemplate.setInstruction(instruction);
+    }
+    const renderedPrompt:
+      | AxRenderedPrompt
+      | { chatPrompt: AxChatRequest['chatPrompt'] } =
+      'renderWithMetrics' in promptTemplate &&
+      typeof promptTemplate.renderWithMetrics === 'function'
+        ? promptTemplate.renderWithMetrics(values as any, {
+            examples: this.examples as any,
+            demos: this.demos as any,
+          })
+        : {
+            chatPrompt: promptTemplate.render(values as any, {
+              examples: this.examples as any,
+              demos: this.demos as any,
+            }),
+          };
+
+    const prompt = renderedPrompt.chatPrompt;
+    const renderedPromptMetrics =
+      'promptMetrics' in renderedPrompt
+        ? renderedPrompt.promptMetrics
+        : undefined;
+
+    const mem = options?.mem ?? this.options?.mem;
+    if (!mem) {
+      return {
+        prompt,
+        promptMetrics: renderedPromptMetrics ?? {
+          systemPromptCharacters: countChatPromptContentChars(
+            prompt.filter((msg) => msg.role === 'system')
+          ),
+          exampleChatContextCharacters: 0,
+          mutableChatContextCharacters: countChatPromptContentChars(
+            prompt.filter((msg) => msg.role !== 'system')
+          ),
+          chatContextCharacters: countChatPromptContentChars(
+            prompt.filter((msg) => msg.role !== 'system')
+          ),
+          totalPromptCharacters: countChatPromptContentChars(prompt),
+        },
+      };
+    }
+
+    const selectedIndex = await selectFromSamplesInMemory(
+      mem,
+      options?.sessionId,
+      {
+        resultPicker: options?.resultPicker as
+          | AxResultPickerFunction<OUT>
+          | undefined,
+      }
+    );
+
+    const memHistory = mem.history(selectedIndex, options?.sessionId);
+    const memPrompt = [...memHistory, ...prompt];
+    const memoryChars = countChatPromptContentChars(memHistory);
+    return {
+      prompt: memPrompt,
+      promptMetrics:
+        renderedPromptMetrics !== undefined
+          ? {
+              ...renderedPromptMetrics,
+              mutableChatContextCharacters:
+                renderedPromptMetrics.mutableChatContextCharacters +
+                memoryChars,
+              chatContextCharacters:
+                renderedPromptMetrics.chatContextCharacters + memoryChars,
+              totalPromptCharacters:
+                renderedPromptMetrics.totalPromptCharacters + memoryChars,
+            }
+          : {
+              systemPromptCharacters: countChatPromptContentChars(
+                memPrompt.filter((msg) => msg.role === 'system')
+              ),
+              exampleChatContextCharacters: 0,
+              mutableChatContextCharacters: countChatPromptContentChars(
+                memPrompt.filter((msg) => msg.role !== 'system')
+              ),
+              chatContextCharacters: countChatPromptContentChars(
+                memPrompt.filter((msg) => msg.role !== 'system')
+              ),
+              totalPromptCharacters: countChatPromptContentChars(memPrompt),
+            },
+    };
+  }
+
+  private async renderPromptForInternalUse(
+    ai: Readonly<AxAIService>,
+    values: IN,
+    options?: Readonly<Partial<Omit<AxProgramForwardOptions<any>, 'functions'>>>
+  ): Promise<AxChatRequest['chatPrompt']> {
+    return (
+      await this.renderPromptWithMetricsForInternalUse(ai, values, options)
+    ).prompt;
+  }
+
+  /** @internal */
+  public async _measurePromptCharsForInternalUse(
+    ai: Readonly<AxAIService>,
+    values: IN,
+    options?: Readonly<Partial<Omit<AxProgramForwardOptions<any>, 'functions'>>>
+  ): Promise<AxPromptMetrics> {
+    const { promptMetrics } = await this.renderPromptWithMetricsForInternalUse(
+      ai,
+      values,
+      options
+    );
+    return promptMetrics!;
+  }
+
+  private getSignatureName(): string {
+    return this.signature.getDescription() || 'unknown_signature';
+  }
+
+  private getMetricsInstruments(): AxGenMetricsInstruments | undefined {
+    return getOrCreateGenMetricsInstruments();
+  }
+
+  // Helper to get merged custom labels from globals, AI service, and options
+  private getMergedCustomLabels(
+    ai?: Readonly<AxAIService>,
+    options?: Readonly<{ customLabels?: Record<string, string> }>
+  ): Record<string, string> {
+    return mergeCustomLabels(
+      axGlobals.customLabels,
+      ai?.getOptions?.()?.customLabels,
+      options?.customLabels
+    );
+  }
+
+  public updateMeter(meter?: Meter): void {
+    // This now just updates the global singleton, no need to store locally
+    getOrCreateGenMetricsInstruments(meter);
+  }
+
+  private createStates(n: number) {
+    return Array.from({ length: n }, (_, index) => ({
+      index,
+      functionCalls: [],
+      values: {},
+      content: '',
+      functionsExecuted: new Set<string>(),
+      xstate: {
+        extractedFields: [],
+        streamedIndex: {},
+        s: -1,
+      },
+    }));
+  }
+
+  public addAssert(fn: AxAssertion<OUT>['fn'], message?: string) {
+    this.asserts.push({ fn, message });
+  }
+
+  public addStreamingAssert(
+    fieldName: keyof OUT,
+    fn: AxStreamingAssertion['fn'],
+    message?: string
+  ) {
+    // Validate that the field name exists in the output signature
+    const outputField = this.signature
+      .getOutputFields()
+      .find((f) => f.name === fieldName);
+
+    if (!outputField) {
+      throw new Error(
+        `addStreamingAssert: field ${String(fieldName)} not found in output signature`
+      );
+    }
+
+    // Ensure the field is a string field for streaming assertions
+    const ft = outputField.type?.name;
+    const isStringField = !ft || ft === 'string' || ft === 'code';
+
+    if (!isStringField) {
+      throw new Error(
+        `addStreamingAssert: field ${String(fieldName)} must be a string field for streaming assertions`
+      );
+    }
+
+    this.streamingAsserts.push({ fieldName: String(fieldName), fn, message });
+  }
+
+  private addFieldProcessorInternal(
+    fieldName: string,
+    fn: AxFieldProcessor['process'],
+    streaming = false
+  ) {
+    const field = this.signature
+      .getOutputFields()
+      .find((f) => f.name === fieldName);
+
+    if (!field) {
+      throw new Error(`addFieldProcessor: field ${fieldName} not found`);
+    }
+
+    if (streaming) {
+      const ft = field.type?.name;
+      const isText = !ft || ft === 'string' || ft === 'code';
+
+      if (!isText) {
+        throw new Error(
+          `addFieldProcessor: field ${fieldName} must be a text field`
+        );
+      }
+      this.streamingFieldProcessors.push({ field, process: fn });
+    } else {
+      this.fieldProcessors.push({ field, process: fn });
+    }
+  }
+
+  public addStreamingFieldProcessor<K extends keyof OUT>(
+    fieldName: K,
+    fn: (
+      value: string,
+      context?: { values?: OUT; sessionId?: string; done?: boolean }
+    ) => unknown | Promise<unknown>
+  ) {
+    this.addFieldProcessorInternal(
+      String(fieldName),
+      fn as AxFieldProcessor['process'],
+      true
+    );
+  }
+
+  public addFieldProcessor<K extends keyof OUT>(
+    fieldName: K,
+    fn: (
+      value: OUT[K],
+      context?: { values?: OUT; sessionId?: string; done?: boolean }
+    ) => unknown | Promise<unknown>
+  ) {
+    this.addFieldProcessorInternal(
+      String(fieldName),
+      fn as AxFieldProcessor['process'],
+      false
+    );
+  }
+
+  /**
+   * Get the normalized chat log from the last forward() call.
+   * One entry per AI chat round-trip, with roles normalized to
+   * system/user/assistant/tool and inline XML for thinking and tool calls.
+   */
+  public getChatLog(): readonly AxChatLogEntry[] {
+    return this.chatLog;
+  }
+
+  private captureChatResponseLogMetadata(
+    metadata: AxChatResponseLogMetadata,
+    res: Readonly<AxChatResponse>
+  ): void {
+    metadata.sessionId = res.sessionId ?? metadata.sessionId;
+    metadata.remoteId = res.remoteId ?? metadata.remoteId;
+    metadata.remoteRequestId = res.remoteRequestId ?? metadata.remoteRequestId;
+    metadata.remoteSessionId = res.remoteSessionId ?? metadata.remoteSessionId;
+    if (res.providerMetadata) {
+      metadata.providerMetadata = {
+        ...(metadata.providerMetadata ?? {}),
+      };
+      for (const [provider, providerMetadata] of Object.entries(
+        res.providerMetadata
+      )) {
+        metadata.providerMetadata[provider] = {
+          ...(metadata.providerMetadata[provider] ?? {}),
+          ...providerMetadata,
+        };
+      }
+    }
+  }
+
+  private applyChatResponseLogMetadata(
+    entry: AxChatLogEntry,
+    metadata: Readonly<AxChatResponseLogMetadata>
+  ): void {
+    if (metadata.sessionId) entry.sessionId = metadata.sessionId;
+    if (metadata.remoteId) entry.remoteId = metadata.remoteId;
+    if (metadata.remoteRequestId) {
+      entry.remoteRequestId = metadata.remoteRequestId;
+    }
+    if (metadata.remoteSessionId) {
+      entry.remoteSessionId = metadata.remoteSessionId;
+    }
+    if (metadata.providerMetadata) {
+      entry.providerMetadata = metadata.providerMetadata;
+    }
+  }
+
+  /**
+   * Normalize internal chatPrompt messages to standard training format.
+   * If functions are provided, appends a <tools> JSON block to the system prompt.
+   */
+  private normalizeChatMessages(
+    chatPrompt: AxChatRequest['chatPrompt'],
+    functions?: AxFunction[]
+  ): AxChatLogMessage[] {
+    const messages: AxChatLogMessage[] = [];
+
+    const toolsBlock =
+      functions && functions.length > 0
+        ? `\n<tools>\n${JSON.stringify(
+            functions.map((fn) => ({
+              type: 'function',
+              function: {
+                name: fn.name,
+                description: fn.description,
+                ...(fn.parameters ? { parameters: fn.parameters } : {}),
+              },
+            }))
+          )}\n</tools>`
+        : '';
+
+    for (const msg of chatPrompt) {
+      switch (msg.role) {
+        case 'system':
+          messages.push({
+            role: 'system',
+            content: msg.content + toolsBlock,
+          });
+          break;
+
+        case 'user': {
+          let content: string;
+          if (typeof msg.content === 'string') {
+            content = msg.content;
+          } else {
+            content = msg.content
+              .map((part) => {
+                switch (part.type) {
+                  case 'text':
+                    return part.text;
+                  case 'image':
+                    return '[image]';
+                  case 'audio':
+                    return '[audio]';
+                  case 'file':
+                    return '[file]';
+                  case 'url':
+                    return '[url]';
+                  default:
+                    return '';
+                }
+              })
+              .join('\n');
+          }
+          messages.push({ role: 'user', content });
+          break;
+        }
+
+        case 'assistant': {
+          let content = '';
+          if (msg.thought) {
+            content += `<think>${msg.thought}</think>\n`;
+          }
+          if (msg.content) {
+            content += msg.content;
+          }
+          if (msg.functionCalls?.length) {
+            for (const fc of msg.functionCalls) {
+              const callObj = {
+                name: fc.function.name,
+                arguments: fc.function.params ?? {},
+              };
+              content += `\n<tool_call>\n${JSON.stringify(callObj)}\n</tool_call>`;
+            }
+          }
+          messages.push({ role: 'assistant', content: content.trim() });
+          break;
+        }
+
+        case 'function': {
+          // Look up function name from preceding assistant message's functionCalls
+          let name = 'unknown';
+          for (let i = messages.length - 1; i >= 0; i--) {
+            const prev = chatPrompt[i];
+            if (prev && prev.role === 'assistant' && prev.functionCalls) {
+              const match = prev.functionCalls.find(
+                (fc) => fc.id === msg.functionId
+              );
+              if (match) {
+                name = match.function.name;
+                break;
+              }
+            }
+          }
+          messages.push({ role: 'tool', name, content: msg.result });
+          break;
+        }
+      }
+    }
+
+    return messages;
+  }
+
+  /**
+   * Build an assistant AxChatLogMessage from a response result.
+   */
+  private buildAssistantLogMessage(
+    result: Readonly<AxChatResponseResult>
+  ): AxChatLogMessage {
+    let content = '';
+    if (result.thought) {
+      content += `<think>${result.thought}</think>\n`;
+    }
+    if (result.content) {
+      content += result.content;
+    }
+    if (result.functionCalls?.length) {
+      for (const fc of result.functionCalls) {
+        const callObj = {
+          name: fc.function.name,
+          arguments: fc.function.params ?? {},
+        };
+        content += `\n<tool_call>\n${JSON.stringify(callObj)}\n</tool_call>`;
+      }
+    }
+    return { role: 'assistant' as const, content: content.trim() };
+  }
+
+  private async forwardSendRequest({
+    ai,
+    values,
+    mem,
+    options,
+    traceContext,
+    functions,
+    functionCall,
+    stepIndex,
+    preRenderedPrompt,
+  }: Readonly<{
+    ai: Readonly<AxAIService>;
+    values: IN;
+    mem: AxAIMemory;
+    options?: Omit<AxProgramForwardOptions<any>, 'ai' | 'mem'>;
+    traceContext?: Context;
+    functions: AxFunction[];
+    functionCall: AxChatRequest['functionCall'] | undefined;
+    stepIndex?: number;
+    preRenderedPrompt?: {
+      prompt: AxChatRequest['chatPrompt'];
+      promptMetrics?: AxPromptMetrics;
+    };
+  }>) {
+    const {
+      sessionId,
+      model,
+      rateLimiter,
+      stream,
+      thinkingTokenBudget,
+      showThoughts,
+    } = options ?? {};
+
+    // Use selectFromSamplesInMemory to choose the best sample before getting history
+    const selectedIndex = await selectFromSamplesInMemory(mem, sessionId, {
+      resultPicker: options?.resultPicker as
+        | AxResultPickerFunction<OUT>
+        | undefined,
+    });
+
+    const { prompt: basePrompt, promptMetrics: basePromptMetrics } =
+      preRenderedPrompt ??
+      (await this.renderPromptWithMetricsForInternalUse(
+        ai,
+        values as any,
+        {
+          ...options,
+          sessionId,
+        },
+        functions
+      ));
+    const chatPrompt = mem?.history(selectedIndex, sessionId) ?? basePrompt;
+
+    // Replace the system message in memory history with the freshly rendered one.
+    // This ensures that dynamically added functions (via ctx.addFunctions()) are
+    // reflected in the <available_functions> section of the system prompt, not just
+    // in the API tool definitions.
+    if (
+      chatPrompt !== basePrompt &&
+      chatPrompt.length > 0 &&
+      basePrompt.length > 0
+    ) {
+      const freshSystemMsg = basePrompt.find((m) => m.role === 'system');
+      if (freshSystemMsg) {
+        const systemIdx = chatPrompt.findIndex((m) => m.role === 'system');
+        if (systemIdx !== -1) {
+          chatPrompt[systemIdx] = freshSystemMsg;
+        }
+      }
+    }
+
+    // History transformation for prompt-mode is handled centrally in base.ts
+
+    if (chatPrompt.length === 0) {
+      throw new Error('No chat prompt found');
+    }
+    const modelConfig = {
+      ...options?.modelConfig,
+      ...(options?.sampleCount ? { n: options.sampleCount } : {}),
+      ...(options?.sampleCount && options?.modelConfig?.temperature === 1
+        ? { temperature: 0.8 }
+        : {}),
+    };
+
+    const debug = this.isDebug(ai, options);
+    const firstStep = stepIndex === 0;
+    const logger = this.getLogger(ai, options);
+    const debugPromptMetrics = debug
+      ? (() => {
+          if (!basePromptMetrics) {
+            const chatContextCharacters = countChatPromptContentChars(
+              chatPrompt.filter((msg) => msg.role !== 'system')
+            );
+            return {
+              systemPromptCharacters: countChatPromptContentChars(
+                chatPrompt.filter((msg) => msg.role === 'system')
+              ),
+              exampleChatContextCharacters: 0,
+              mutableChatContextCharacters: chatContextCharacters,
+              chatContextCharacters,
+              totalPromptCharacters: countChatPromptContentChars(chatPrompt),
+            };
+          }
+
+          const extraHistoryMessages = chatPrompt.slice(basePrompt.length);
+          const extraHistoryCharacters =
+            countChatPromptContentChars(extraHistoryMessages);
+          const mutableChatContextCharacters =
+            basePromptMetrics.mutableChatContextCharacters +
+            extraHistoryCharacters;
+          const chatContextCharacters =
+            basePromptMetrics.exampleChatContextCharacters +
+            mutableChatContextCharacters;
+
+          return {
+            systemPromptCharacters: basePromptMetrics.systemPromptCharacters,
+            exampleChatContextCharacters:
+              basePromptMetrics.exampleChatContextCharacters,
+            mutableChatContextCharacters,
+            chatContextCharacters,
+            totalPromptCharacters:
+              basePromptMetrics.systemPromptCharacters + chatContextCharacters,
+          };
+        })()
+      : undefined;
+
+    const responseMetadata: AxChatResponseLogMetadata = {};
+
+    // Save original functions for chat log before zeroing out for prompt mode.
+    // Filter out internal synthetic functions (e.g. __finalResult).
+    const logFunctions = functions.filter(
+      (fn) => fn.name !== STRUCTURED_OUTPUT_FUNCTION_NAME
+    );
+
+    // Do not send native functions to the provider when emulating via prompt mode
+    functions = this.signatureToolCallingManager ? [] : functions;
+
+    let responseFormat: AxChatRequest['responseFormat'];
+
+    const outputFields = this.signature.getOutputFields();
+    const hasComplexFields = this.signature.hasComplexFields();
+
+    // Auto-detect structured output requirement
+    // If we have object types in output or array of objects, we use structured outputs
+    // When structuredOutputFunctionFallback is true, responseFormat stays undefined
+    // — the synthetic function handles structured output instead
+    if (hasComplexFields && !this.structuredOutputFunctionFallback) {
+      // Check if the provider/model supports structured outputs
+      const features = ai.getFeatures(model);
+      if (!features?.structuredOutputs) {
+        throw new Error(
+          `Complex structured outputs (object/array types) require a provider that supports structured outputs. ` +
+            `Current provider/model (${model}) does not support this feature. ` +
+            `Supported providers: OpenAI (GPT-4o, GPT-4.1+), Google Gemini, Anthropic (Sonnet/Opus).`
+        );
+      }
+
+      // Use the signature-to-schema converter we implemented
+      const schema = toJsonSchema(outputFields, 'Schema', {
+        flexibleJsonFieldsAsString: true,
+        strictStructuredOutputs: true,
+      });
+
+      responseFormat = {
+        type: 'json_schema',
+        schema: {
+          name: 'output',
+          strict: true,
+          schema,
+        },
+      };
+    }
+
+    // Mark last function for caching (creates breakpoint after tools)
+    // Cache if cacheBreakpoint is 'after-functions' or 'after-examples', or ignoreBreakpoints is true
+    const contextCache = this.getEffectiveContextCache(ai, options);
+    const cacheBreakpoint = contextCache?.cacheBreakpoint ?? 'after-examples';
+    const ignoreBreakpoints =
+      ai.getFeatures?.(model)?.caching?.cacheBreakpoints === false;
+    const shouldAlwaysCacheGeminiTools =
+      Boolean(contextCache) &&
+      ai.getName() === 'GoogleGeminiAI' &&
+      ai.getFeatures?.(model)?.caching?.supported === true;
+    const shouldCacheFunctions =
+      contextCache &&
+      (shouldAlwaysCacheGeminiTools ||
+        ignoreBreakpoints ||
+        cacheBreakpoint === 'after-functions' ||
+        cacheBreakpoint === 'after-examples');
+    const functionsWithCache =
+      functions?.length && shouldCacheFunctions
+        ? functions.map((fn, i) => ({
+            ...fn,
+            cache: i === functions.length - 1,
+          }))
+        : functions;
+
+    let res = await ai.chat(
+      {
+        chatPrompt,
+        // Do not send native functions to the provider when emulating via prompt mode
+        functions: functionsWithCache,
+        functionCall,
+        modelConfig,
+        model,
+        responseFormat,
+      },
+      {
+        sessionId,
+        rateLimiter,
+        stream,
+        debug,
+        // Hide system prompt in debug logging for steps > 0 to reduce noise in multi-step workflows
+        debugHideSystemPrompt:
+          options?.debugHideSystemPrompt ??
+          this.options?.debugHideSystemPrompt ??
+          !firstStep,
+        thinkingTokenBudget,
+        showThoughts,
+        traceContext,
+        abortSignal: mergeAbortSignals(
+          options?.abortSignal,
+          axGlobals.abortSignal
+        ),
+        stepIndex,
+        logger,
+        functionCallMode:
+          options?.functionCallMode ?? this.options?.functionCallMode ?? 'auto',
+        contextCache,
+        retry: options?.retry ?? this.options?.retry,
+        customLabels: options?.customLabels,
+        usageContext: axMergeUsageContexts(
+          this.options?.usageContext,
+          options?.usageContext
+        ),
+      }
+    );
+
+    if (res instanceof ReadableStream) {
+      const source = res;
+      res = source.pipeThrough(
+        new TransformStream<AxChatResponse, AxChatResponse>({
+          transform: (chunk, controller) => {
+            this.captureChatResponseLogMetadata(responseMetadata, chunk);
+            controller.enqueue(chunk);
+          },
+        })
+      );
+    } else {
+      this.captureChatResponseLogMetadata(responseMetadata, res);
+    }
+
+    // Capture chat log entry
+    const logMessages = this.normalizeChatMessages(chatPrompt, logFunctions);
+    const modelStr = String(model ?? ai.getLastUsedChatModel?.() ?? '');
+
+    if (!(res instanceof ReadableStream)) {
+      // Non-streaming: capture full response immediately
+      for (const result of res.results) {
+        logMessages.push(this.buildAssistantLogMessage(result));
+      }
+      this.chatLog.push({
+        model: modelStr,
+        messages: logMessages,
+        ...responseMetadata,
+        modelUsage: res.modelUsage,
+      });
+    } else {
+      // Streaming: push partial entry, response filled after stream completes
+      this.chatLog.push({
+        model: modelStr,
+        messages: logMessages,
+        ...responseMetadata,
+      });
+    }
+
+    return { res, debugPromptMetrics, responseMetadata };
+  }
+
+  private async *forwardCore({
+    ai,
+    values,
+    mem,
+    options,
+    stepIndex,
+    span,
+    traceContext,
+    states,
+    stopFunctionNames,
+    stepContext,
+    preRenderedPrompt,
+  }: Readonly<{
+    ai: Readonly<AxAIService>;
+    values: IN;
+    mem: AxAIMemory;
+    options: Omit<AxProgramForwardOptions<any>, 'ai' | 'mem'>;
+    stepIndex?: number;
+    span?: Span;
+    traceContext?: Context;
+    states: InternalAxGenState[];
+    stopFunctionNames?: readonly string[];
+    stepContext?: AxStepContextImpl;
+    preRenderedPrompt?: {
+      prompt: AxChatRequest['chatPrompt'];
+      promptMetrics?: AxPromptMetrics;
+    };
+  }>): AsyncGenDeltaOut<OUT> {
+    const { sessionId, functions: functionList } = options ?? {};
+
+    const functionResultFormatter =
+      options?.functionResultFormatter ?? this.options?.functionResultFormatter;
+
+    const definedFunctionCall =
+      options?.functionCall ?? this.options?.functionCall;
+
+    const signatureToolCallingManager = this.signatureToolCallingManager;
+
+    const strictMode = options?.strictMode ?? false;
+    const model = options.model;
+    const usage = this.usage;
+    const firstStep = stepIndex === 0;
+
+    const debug = this.isDebug(ai, options);
+    const logger = this.getLogger(ai, options);
+    const activeTracer =
+      options?.tracer ??
+      this.options?.tracer ??
+      ai.getOptions().tracer ??
+      axGlobals.tracer;
+
+    // Pass the function call mode directly to createFunctionConfig
+    let { functions, functionCall } = createFunctionConfig(
+      functionList,
+      definedFunctionCall,
+      firstStep,
+      options
+    );
+
+    // When using function-call fallback for structured output,
+    // force the AI to call the structured output function
+    // only when there are no user-defined functions.
+    if (this.structuredOutputFunctionFallback) {
+      const userFunctionCount = functions.filter(
+        (f) => f.name !== STRUCTURED_OUTPUT_FUNCTION_NAME
+      ).length;
+      if (userFunctionCount === 0) {
+        functionCall = {
+          type: 'function',
+          function: { name: STRUCTURED_OUTPUT_FUNCTION_NAME },
+        };
+      }
+    }
+
+    const { res, debugPromptMetrics, responseMetadata } =
+      await this.forwardSendRequest({
+        ai,
+        values,
+        mem,
+        options,
+        traceContext,
+        functions,
+        functionCall,
+        stepIndex,
+        preRenderedPrompt,
+      });
+
+    if (res instanceof ReadableStream) {
+      yield* processStreamingResponse<OUT>({
+        ai,
+        model,
+        res,
+        mem,
+        sessionId,
+        traceId: span ? (span as any).spanContext?.().traceId : undefined,
+        traceContext,
+        tracer: activeTracer,
+        functions,
+        strictMode,
+        span,
+        states,
+        usage,
+        streamingAsserts: this.streamingAsserts,
+        asserts: this.asserts,
+        fieldProcessors: this.fieldProcessors,
+        streamingFieldProcessors: this.streamingFieldProcessors,
+        thoughtFieldName: this.thoughtFieldName,
+        excludeContentFromTrace: this.excludeContentFromTrace,
+        signature: this.signature,
+        parseJsonStringFields:
+          this.signature.hasComplexFields() &&
+          !this.structuredOutputFunctionFallback,
+        logger,
+        debugPromptMetrics,
+        onFunctionCall: options.onFunctionCall,
+        mcpExecutionContext: options._mcpExecutionContext,
+        eventContext: options.eventContext,
+        debug,
+        functionResultFormatter,
+        signatureToolCallingManager,
+        stopFunctionNames,
+        disableMemoryCleanup: options.disableMemoryCleanup,
+        stepContext,
+        abortSignal: options.abortSignal,
+      });
+
+      // Update the streaming chat log entry with accumulated response.
+      // For streaming, state.content is the raw LLM output. We don't extract
+      // thought separately here because state.values[thoughtFieldName] is a DSP
+      // output field (not native extended thinking) and would be duplicated.
+      const lastLogEntry = this.chatLog[this.chatLog.length - 1];
+      if (lastLogEntry) {
+        this.applyChatResponseLogMetadata(lastLogEntry, responseMetadata);
+        for (const state of states) {
+          lastLogEntry.messages.push(
+            this.buildAssistantLogMessage({
+              index: state.index,
+              content: state.content || undefined,
+              functionCalls:
+                state.functionCalls.length > 0
+                  ? state.functionCalls
+                  : undefined,
+            })
+          );
+        }
+        // Attach usage if available
+        if (this.usage.length > 0) {
+          lastLogEntry.modelUsage = this.usage[this.usage.length - 1];
+        }
+      }
+    } else {
+      yield* processResponse<OUT>({
+        ai,
+        model,
+        res,
+        mem,
+        sessionId,
+        traceId: span ? (span as any).spanContext?.().traceId : undefined,
+        traceContext,
+        tracer: activeTracer,
+        functions,
+        span,
+        strictMode,
+        states,
+        usage,
+        asserts: this.asserts,
+        fieldProcessors: this.fieldProcessors,
+        thoughtFieldName: this.thoughtFieldName,
+        excludeContentFromTrace: this.excludeContentFromTrace,
+        signature: this.signature,
+        parseJsonStringFields:
+          this.signature.hasComplexFields() &&
+          !this.structuredOutputFunctionFallback,
+        logger,
+        debugPromptMetrics,
+        onFunctionCall: options.onFunctionCall,
+        mcpExecutionContext: options._mcpExecutionContext,
+        eventContext: options.eventContext,
+        debug,
+        functionResultFormatter,
+        signatureToolCallingManager,
+        stopFunctionNames,
+        disableMemoryCleanup: options.disableMemoryCleanup,
+        stepContext,
+        abortSignal: options.abortSignal,
+      });
+    }
+  }
+
+  private async *_forward2(
+    ai: Readonly<AxAIService>,
+    values: IN,
+    states: InternalAxGenState[],
+    options: Readonly<AxProgramForwardOptions<any>>,
+    span?: Span,
+    traceContext?: Context
+  ): AxGenStreamingOut<OUT> {
+    // Reset per-call state so previous calls do not leak.
+    this.signatureToolCallingManager = undefined;
+    this.chatLog = [];
+
+    const rawStop = options?.stopFunction ?? this.options?.stopFunction;
+    let stopFunctionNames = Array.isArray(rawStop)
+      ? rawStop.map((s) => s.toLowerCase())
+      : rawStop
+        ? [rawStop.toLowerCase()]
+        : undefined;
+
+    const maxRetries = options.maxRetries ?? this.options?.maxRetries ?? 3;
+    const maxSteps = options.maxSteps ?? this.options?.maxSteps ?? 25;
+
+    const mem = options.mem ?? this.options?.mem ?? new AxMemory();
+
+    const mutableFunctions = options.functions
+      ? parseFunctions(options.functions)
+      : [...this.functions];
+    let mcpCatalogRevision = options._mcpExecutionContext?.getCatalogRevision();
+
+    // Create step context for programmatic loop control
+    const stepContext = new AxStepContextImpl(maxSteps);
+
+    // Inject self-tuning function if enabled
+    let selfTuningConfig: AxSelfTuningConfig | undefined;
+
+    if (options.selfTuning) {
+      selfTuningConfig =
+        options.selfTuning === true
+          ? { model: true, thinkingBudget: true }
+          : options.selfTuning;
+
+      // Validate: model selection requires a models list with 2+ chat models
+      if (selfTuningConfig.model !== false) {
+        const modelList = ai.getModelList();
+        const chatModels = modelList?.filter((entry) => 'model' in entry);
+        if (!chatModels || chatModels.length < 2) {
+          throw new Error(
+            'Self-tuning with model selection requires the AI service to have a `models` list with at least 2 chat models. ' +
+              'Either configure models on your AI service or disable model selection with `selfTuning: { model: false }`.'
+          );
+        }
+      }
+
+      const tuningFn = createSelfTuningFunction(
+        ai,
+        selfTuningConfig,
+        options.model ? String(options.model) : undefined
+      );
+      mutableFunctions.push(tuningFn);
+    }
+
+    // Mutable options that can be changed by step context mutations
+    let mutableOptions = { ...options };
+
+    const stepHooks = options.stepHooks;
+
+    const hasFunctions = mutableFunctions && mutableFunctions.length > 0;
+
+    const functionCallMode =
+      options.functionCallMode ?? this.options?.functionCallMode ?? 'auto';
+
+    // Handle prompt mode
+    if (hasFunctions && functionCallMode === 'prompt') {
+      this.signatureToolCallingManager = new SignatureToolCallingManager(
+        mutableFunctions
+      );
+    }
+
+    // Handle auto mode
+    if (
+      hasFunctions &&
+      functionCallMode === 'auto' &&
+      !ai.getFeatures(options.model).functions
+    )
+      this.signatureToolCallingManager = new SignatureToolCallingManager(
+        mutableFunctions
+      );
+
+    let err:
+      | ValidationError
+      | AxAssertionError
+      | AxStreamingAssertionError
+      | undefined;
+    let lastError: Error | undefined;
+
+    const promptTemplateClass =
+      this.options?.promptTemplate ?? AxPromptTemplate;
+
+    // Use SignatureToolCallingManager to process signature if in prompt mode
+    if (this.signatureToolCallingManager) {
+      this.signature = this.signatureToolCallingManager.processSignature(
+        this.signature
+      );
+      this.setSignature(this.signature);
+    }
+
+    // Detect structured output function-call fallback condition
+    const hasComplexFields = this.signature.hasComplexFields();
+    const features = ai.getFeatures?.(options.model);
+    const structuredOutputMode =
+      options.structuredOutputMode ??
+      this.options?.structuredOutputMode ??
+      'auto';
+
+    this.structuredOutputFunctionFallback =
+      hasComplexFields &&
+      (structuredOutputMode === 'function' ||
+        (structuredOutputMode === 'auto' && !features?.structuredOutputs));
+
+    // When fallback is active, create synthetic function and add to stop functions
+    if (this.structuredOutputFunctionFallback) {
+      const syntheticFunction: AxFunction = {
+        name: STRUCTURED_OUTPUT_FUNCTION_NAME,
+        description:
+          'Return the final result. Call this function with the complete output data.',
+        parameters: toJsonSchema(this.signature.getOutputFields()),
+        func: async () => 'done',
+      };
+      mutableFunctions.push(syntheticFunction);
+
+      stopFunctionNames = [
+        ...(stopFunctionNames ?? []),
+        STRUCTURED_OUTPUT_FUNCTION_NAME.toLowerCase(),
+      ];
+    }
+
+    // Check if provider has automatic cache lookback (e.g., Anthropic)
+    const providerIgnoreBreakpoints =
+      ai.getFeatures?.(options.model)?.caching?.cacheBreakpoints === false;
+    const contextCache = this.getEffectiveContextCache(ai, options);
+
+    const currentPromptTemplateOptions = {
+      // Prefer per-call functions; fall back to parsed functions from constructor
+      functions: this.signatureToolCallingManager ? [] : mutableFunctions,
+      thoughtFieldName: this.thoughtFieldName,
+      contextCache, // Pass through for system prompt caching
+      ignoreBreakpoints: providerIgnoreBreakpoints,
+      includeOptionalInputFieldsInSystemPrompt:
+        options.includeOptionalInputFieldsInSystemPrompt ??
+        this.options?.includeOptionalInputFieldsInSystemPrompt,
+      structuredOutputFunctionName: this.structuredOutputFunctionFallback
+        ? STRUCTURED_OUTPUT_FUNCTION_NAME
+        : undefined,
+      customTemplate: options.customTemplate ?? this.options?.customTemplate,
+    };
+
+    const instruction = this.getInstruction();
+    this.promptTemplate = new promptTemplateClass(
+      this.signature,
+      currentPromptTemplateOptions
+    );
+    if (instruction !== undefined && instruction.trim().length > 0) {
+      this.promptTemplate.setInstruction(instruction);
+    }
+
+    // Track prompt rendering performance
+    const promptRenderStart = performance.now();
+
+    const renderedInitialPrompt:
+      | AxRenderedPrompt
+      | { chatPrompt: AxChatRequest['chatPrompt'] } =
+      'renderWithMetrics' in this.promptTemplate &&
+      typeof this.promptTemplate.renderWithMetrics === 'function'
+        ? this.promptTemplate.renderWithMetrics(values as any, {
+            examples: this.examples as any,
+            demos: this.demos as any,
+          })
+        : {
+            chatPrompt: this.promptTemplate.render(values as any, {
+              examples: this.examples as any,
+              demos: this.demos as any,
+            }),
+          };
+
+    const basePrompt = renderedInitialPrompt.chatPrompt;
+    const firstNonSystem = basePrompt.findIndex(
+      (message) => message.role !== 'system'
+    );
+    const contextInsertionIndex =
+      firstNonSystem === -1 ? basePrompt.length : firstNonSystem;
+    const prompt = options._mcpContextPrompt?.length
+      ? [
+          ...basePrompt.slice(0, contextInsertionIndex),
+          ...options._mcpContextPrompt,
+          ...basePrompt.slice(contextInsertionIndex),
+        ]
+      : basePrompt;
+    const promptMetrics =
+      'promptMetrics' in renderedInitialPrompt
+        ? renderedInitialPrompt.promptMetrics
+        : undefined;
+
+    const promptRenderDuration = performance.now() - promptRenderStart;
+
+    // Record prompt render performance metric
+    const metricsInstruments = this.getMetricsInstruments();
+    const customLabels = this.getMergedCustomLabels(ai, options);
+    if (metricsInstruments) {
+      recordPerformanceMetric(
+        metricsInstruments,
+        'prompt_render',
+        promptRenderDuration,
+        this.getSignatureName(),
+        customLabels
+      );
+    }
+
+    // Track memory update performance
+    const memoryUpdateStart = performance.now();
+    mem.addRequest(prompt, options.sessionId);
+    const memoryUpdateDuration = performance.now() - memoryUpdateStart;
+
+    // Record memory update performance metric
+    if (metricsInstruments) {
+      recordPerformanceMetric(
+        metricsInstruments,
+        'memory_update',
+        memoryUpdateDuration,
+        this.getSignatureName(),
+        customLabels
+      );
+    }
+
+    // Track committed values across retries to prevent duplication
+    const committedValues = new Map<number, Record<string, any>>();
+    states.forEach((s) => {
+      committedValues.set(s.index, {});
+    });
+
+    // Helper to apply pending step context mutations to mutableOptions/mutableFunctions
+    const applyStepContextMutations = () => {
+      const pendingOpts = stepContext._consumePendingOptions();
+      if (pendingOpts) {
+        const { modelConfig: pendingModelConfig, ...restOpts } = pendingOpts;
+        mutableOptions = { ...mutableOptions, ...restOpts };
+        if (pendingModelConfig) {
+          mutableOptions.modelConfig = {
+            ...mutableOptions.modelConfig,
+            ...pendingModelConfig,
+          };
+        }
+      }
+
+      const toAdd = stepContext._consumeFunctionsToAdd();
+      if (toAdd) {
+        const parsed = parseFunctions(toAdd);
+        for (const fn of parsed) {
+          if (!mutableFunctions.some((f) => f.name === fn.name)) {
+            mutableFunctions.push(fn);
+          }
+        }
+      }
+
+      const toRemove = stepContext._consumeFunctionsToRemove();
+      if (toRemove) {
+        const removeSet = new Set(toRemove.map((n) => n.toLowerCase()));
+        for (let i = mutableFunctions.length - 1; i >= 0; i--) {
+          if (removeSet.has(mutableFunctions[i]!.name.toLowerCase())) {
+            mutableFunctions.splice(i, 1);
+          }
+        }
+      }
+    };
+
+    // Resolve the effective abort signal once at method start
+    const effectiveAbortSignal = mergeAbortSignals(
+      options?.abortSignal,
+      axGlobals.abortSignal
+    );
+
+    multiStepLoop: for (let n = 0; n < maxSteps; n++) {
+      // Begin new step on the context
+      stepContext._beginStep(n);
+
+      // Apply pending mutations from previous step (or from selfTuning/hooks)
+      applyStepContextMutations();
+
+      const nextMcpCatalogRevision =
+        options._mcpExecutionContext?.getCatalogRevision();
+      if (
+        nextMcpCatalogRevision !== undefined &&
+        nextMcpCatalogRevision !== mcpCatalogRevision
+      ) {
+        for (let i = mutableFunctions.length - 1; i >= 0; i--) {
+          if (mutableFunctions[i]?.componentId?.startsWith('mcp:')) {
+            mutableFunctions.splice(i, 1);
+          }
+        }
+        mutableFunctions.push(
+          ...options._mcpExecutionContext!.getToolBindings()
+        );
+        mcpCatalogRevision = nextMcpCatalogRevision;
+      }
+
+      // Update self-tuning function schema if model changed
+      if (selfTuningConfig && selfTuningConfig.model !== false) {
+        const idx = mutableFunctions.findIndex(
+          (f) => f.name === 'adjustGeneration'
+        );
+        if (idx !== -1) {
+          const currentModel = mutableOptions.model
+            ? String(mutableOptions.model)
+            : undefined;
+          mutableFunctions[idx] = createSelfTuningFunction(
+            ai,
+            selfTuningConfig,
+            currentModel
+          );
+        }
+      }
+
+      // Check if stop was requested by a previous step's function/hook
+      if (stepContext._isStopRequested) {
+        break;
+      }
+
+      // Check if abort was signalled between steps
+      if (effectiveAbortSignal?.aborted) {
+        throw new AxAIServiceAbortedError(
+          'between-steps',
+          effectiveAbortSignal.reason ?? 'Aborted between steps'
+        );
+      }
+
+      // Call beforeStep hook
+      if (stepHooks?.beforeStep) {
+        await stepHooks.beforeStep(stepContext);
+        applyStepContextMutations();
+        if (stepContext._isStopRequested) {
+          break;
+        }
+      }
+
+      // Infrastructure error retry configuration
+      // Use the same maxRetries for infrastructure errors (default 3)
+      const infraMaxRetries = maxRetries;
+
+      // Infrastructure retry loop (outer loop for 5xx, network, timeout, stream termination errors)
+      for (
+        let infraRetryCount = 0;
+        infraRetryCount <= infraMaxRetries;
+        infraRetryCount++
+      ) {
+        try {
+          // Validation error retry loop (inner loop).
+          // `maxRetries` means extra attempts after the initial one.
+          const validationAttemptCount = maxRetries + 1;
+          for (
+            let errCount = 0;
+            errCount < validationAttemptCount;
+            errCount++
+          ) {
+            // Reset states for new attempt
+            states.forEach((s) => {
+              s.content = '';
+              s.values = {};
+              s.functionCalls = [];
+              s.functionsExecuted = new Set<string>();
+              s.xstate = { extractedFields: [], streamedIndex: {}, s: -1 };
+              s.structuredAccumulator = undefined;
+            });
+
+            // Reset committed values on retry so all values are re-emitted in new version
+            if (errCount > 0) {
+              committedValues.forEach((_, index) => {
+                committedValues.set(index, {});
+              });
+            }
+
+            // Track values for the current attempt to calculate deltas relative to committed values
+            const currentAttemptValues = new Map<number, Record<string, any>>();
+            states.forEach((s) => {
+              currentAttemptValues.set(s.index, {});
+            });
+
+            try {
+              const generator = this.forwardCore({
+                options: { ...mutableOptions, functions: mutableFunctions },
+                ai,
+                values,
+                mem,
+                stepIndex: n,
+                span,
+                traceContext,
+                states,
+                stopFunctionNames,
+                stepContext,
+                preRenderedPrompt:
+                  n === 0 && errCount === 0 && !stepHooks?.beforeStep
+                    ? { prompt, promptMetrics }
+                    : undefined,
+              });
+
+              let stopFunctionTriggered = false;
+              try {
+                for await (const result of generator) {
+                  if (result !== undefined) {
+                    const index = result.index;
+                    const delta = result.delta;
+
+                    // Update current attempt values and calculate effective delta against committed values
+                    const currentValues = currentAttemptValues.get(index) ?? {};
+                    const committed = committedValues.get(index) ?? {};
+                    const effectiveDelta: Partial<OUT> = {};
+                    let hasEffectiveDelta = false;
+
+                    for (const key of Object.keys(delta)) {
+                      const dVal = (delta as any)[key];
+                      const curVal = currentValues[key];
+
+                      // Merge into currentValues
+                      let newVal: any;
+                      if (
+                        typeof dVal === 'string' &&
+                        (typeof curVal === 'string' || curVal === undefined)
+                      ) {
+                        newVal = (curVal ?? '') + dVal;
+                      } else if (
+                        Array.isArray(dVal) &&
+                        (Array.isArray(curVal) || curVal === undefined)
+                      ) {
+                        newVal = [...(curVal ?? []), ...dVal];
+                      } else {
+                        newVal = dVal;
+                      }
+                      currentValues[key] = newVal;
+
+                      // Now compare with committed
+                      const val = newVal;
+                      const committedVal = committed[key];
+
+                      if (
+                        typeof val === 'string' &&
+                        typeof committedVal === 'string'
+                      ) {
+                        if (val.startsWith(committedVal)) {
+                          const diff = val.slice(committedVal.length);
+                          if (diff) {
+                            (effectiveDelta as any)[key] = diff;
+                            hasEffectiveDelta = true;
+                            committed[key] = val; // Update committed value
+                          }
+                        } else if (committedVal.startsWith(val)) {
+                          // Replay of previously yielded value - suppress
+                        } else {
+                          // Divergence or new value, assume overwrite/append
+                          if (val !== committedVal) {
+                            (effectiveDelta as any)[key] = val;
+                            hasEffectiveDelta = true;
+                            committed[key] = val;
+                          }
+                        }
+                      } else if (
+                        Array.isArray(val) &&
+                        Array.isArray(committedVal)
+                      ) {
+                        // For arrays, if val is superset of committed
+                        if (val.length > committedVal.length) {
+                          // Check if it's a pure extension
+                          // Simple check: compare JSON of prefix
+                          // Or just slice and trust?
+                          // For streaming arrays, we usually just append items.
+                          const diff = val.slice(committedVal.length);
+                          (effectiveDelta as any)[key] = diff;
+                          hasEffectiveDelta = true;
+                          committed[key] = val;
+                        }
+                        // If val is subset of committed (replay), do nothing.
+                      } else {
+                        // Other types (boolean, number, object), yield if changed
+                        if (!areValuesEqual(val, committedVal)) {
+                          (effectiveDelta as any)[key] = val;
+                          hasEffectiveDelta = true;
+                          committed[key] = val;
+                        }
+                      }
+                    }
+
+                    if (hasEffectiveDelta) {
+                      yield {
+                        version: errCount,
+                        index: result.index,
+                        delta: effectiveDelta,
+                      };
+                    }
+                  }
+                }
+              } catch (e) {
+                if (e instanceof AxStopFunctionCallException) {
+                  stopFunctionTriggered = true;
+
+                  // Extract structured output values from the synthetic function call
+                  if (this.structuredOutputFunctionFallback) {
+                    const structuredCall = e.calls.find(
+                      (c) => c.func.name === STRUCTURED_OUTPUT_FUNCTION_NAME
+                    );
+                    if (structuredCall?.args) {
+                      const args = structuredCall.args as Record<
+                        string,
+                        unknown
+                      >;
+
+                      // Validate against field constraints (same as native structured output path)
+                      validateStructuredOutputValues(this.signature, args);
+
+                      const outputFields = this.signature.getOutputFields();
+                      for (const state of states) {
+                        for (const field of outputFields) {
+                          if (field.name in args) {
+                            state.values[field.name] = args[field.name];
+                          }
+                        }
+                      }
+
+                      // Run field processors (same as native structured output path)
+                      if (this.fieldProcessors.length > 0) {
+                        for (const state of states) {
+                          await processFieldProcessors(
+                            this.fieldProcessors,
+                            state.values as OUT,
+                            mem,
+                            options.sessionId
+                          );
+                        }
+                      }
+
+                      // Run assertions (same as native structured output path)
+                      for (const state of states) {
+                        await assertAssertions(
+                          this.asserts,
+                          state.values as OUT
+                        );
+                      }
+
+                      for (const state of states) {
+                        const delta: Record<string, unknown> = {};
+                        for (const field of outputFields) {
+                          if (field.name in state.values && !field.isInternal) {
+                            delta[field.name] = state.values[field.name];
+                          }
+                        }
+                        yield {
+                          version: errCount,
+                          index: state.index,
+                          delta: delta as Partial<OUT>,
+                        };
+                      }
+                    }
+                  }
+                } else {
+                  throw e;
+                }
+              }
+
+              // Accumulate usage on step context from this step's usage data
+              if (this.usage.length > 0) {
+                const lastUsage = this.usage[this.usage.length - 1];
+                if (lastUsage?.tokens) {
+                  stepContext._addUsage(
+                    lastUsage.tokens.promptTokens ?? 0,
+                    lastUsage.tokens.completionTokens ?? 0,
+                    lastUsage.tokens.totalTokens ?? 0
+                  );
+                }
+              }
+
+              // Check if any functions were executed (for afterFunctionExecution hook)
+              const functionsRan = states.some(
+                (s) => s.functionsExecuted.size > 0
+              );
+
+              // Call afterFunctionExecution hook if functions ran
+              if (functionsRan && stepHooks?.afterFunctionExecution) {
+                await stepHooks.afterFunctionExecution(stepContext);
+                applyStepContextMutations();
+              }
+
+              const shouldContinue =
+                stopFunctionTriggered || stepContext._isStopRequested
+                  ? false
+                  : shouldContinueSteps(
+                      mem,
+                      stopFunctionNames,
+                      states,
+                      mutableOptions?.sessionId
+                    );
+
+              // Call afterStep hook
+              if (stepHooks?.afterStep) {
+                await stepHooks.afterStep(stepContext);
+                applyStepContextMutations();
+              }
+
+              if (
+                shouldContinue &&
+                !stepContext._isStopRequested &&
+                !effectiveAbortSignal?.aborted
+              ) {
+                // Record multi-step generation metric
+                const metricsInstruments = this.getMetricsInstruments();
+                if (metricsInstruments) {
+                  recordMultiStepMetric(
+                    metricsInstruments,
+                    n + 1,
+                    maxSteps,
+                    this.getSignatureName(),
+                    customLabels
+                  );
+                }
+                continue multiStepLoop;
+              }
+
+              // If we stopped because of an abort signal, throw
+              if (effectiveAbortSignal?.aborted) {
+                throw new AxAIServiceAbortedError(
+                  'mid-step',
+                  effectiveAbortSignal.reason ?? 'Aborted'
+                );
+              }
+
+              // On success, clean up any error-related tags from memory to keep context clean
+              if (!options?.disableMemoryCleanup) {
+                mem.removeByTag('invalid-assistant', options.sessionId);
+                mem.removeByTag('correction', options.sessionId);
+                mem.removeByTag('error', options.sessionId);
+              }
+
+              // Record successful completion metrics
+              const metricsInstruments = this.getMetricsInstruments();
+              if (metricsInstruments) {
+                recordMultiStepMetric(
+                  metricsInstruments,
+                  n + 1,
+                  maxSteps,
+                  this.getSignatureName(),
+                  customLabels
+                );
+
+                // Count unique functions executed across all states
+                const allFunctionsExecuted = new Set<string>();
+                states.forEach((state) => {
+                  state.functionsExecuted.forEach((func) =>
+                    allFunctionsExecuted.add(func)
+                  );
+                });
+
+                // Record function metrics if functions were used
+                if (allFunctionsExecuted.size > 0) {
+                  recordFunctionCallingMetric(
+                    metricsInstruments,
+                    true,
+                    allFunctionsExecuted.size,
+                    true,
+                    false,
+                    this.getSignatureName(),
+                    customLabels
+                  );
+                }
+
+                // Record field processing metrics
+                recordFieldProcessingMetric(
+                  metricsInstruments,
+                  this.fieldProcessors.length,
+                  this.streamingFieldProcessors.length,
+                  this.getSignatureName(),
+                  customLabels
+                );
+              }
+
+              return;
+            } catch (e) {
+              // Re-throw abort errors immediately — never retry or wrap them
+              if (e instanceof AxAIServiceAbortedError) {
+                throw e;
+              }
+
+              lastError = e as Error;
+              let errorFields: AxIField[] | undefined;
+              const debug = this.isDebug(ai, options);
+              const logger = this.getLogger(ai, options);
+              const metricsInstruments = this.getMetricsInstruments();
+              const signatureName = this.getSignatureName();
+
+              const args: HandleErrorForGenerateArgs<Error> = {
+                error: e as Error,
+                errCount,
+                logger,
+                metricsInstruments,
+                signatureName,
+                span,
+                debug,
+                customLabels,
+              };
+
+              span?.recordException(e as Error);
+
+              if (e instanceof ValidationError) {
+                errorFields = handleValidationErrorForGenerate(
+                  args as HandleErrorForGenerateArgs<ValidationError>
+                );
+                err = e;
+              } else if (e instanceof AxAssertionError) {
+                errorFields = handleValidationErrorForGenerate(
+                  args as HandleErrorForGenerateArgs<AxAssertionError>
+                );
+                err = e;
+              } else if (e instanceof AxStreamingAssertionError) {
+                errorFields = handleValidationErrorForGenerate(
+                  args as HandleErrorForGenerateArgs<AxStreamingAssertionError>
+                );
+                err = e;
+              } else if (e instanceof AxAIRefusalError) {
+                handleRefusalErrorForGenerate(
+                  args as HandleErrorForGenerateArgs<AxAIRefusalError>
+                );
+              } else if (e instanceof AxAIServiceStreamTerminatedError) {
+                // Route stream termination to infrastructure retry logic
+                throw e;
+              } else {
+                // Check if this is a retryable infrastructure error
+                // If so, let it bubble up to the infrastructure retry loop
+                const error = e as Error;
+                const isInfraError =
+                  error instanceof AxAIServiceStatusError &&
+                  (error as AxAIServiceStatusError).status >= 500 &&
+                  (error as AxAIServiceStatusError).status < 600;
+
+                const isNetworkError = error instanceof AxAIServiceNetworkError;
+                const isTimeoutError = error instanceof AxAIServiceTimeoutError;
+
+                if (isInfraError || isNetworkError || isTimeoutError) {
+                  // Let infrastructure errors bubble up to outer catch
+                  throw e;
+                }
+
+                // Not an infrastructure error, enhance and throw
+                throw enhanceError(e, ai, this.signature);
+              }
+
+              if (errorFields) {
+                mem.addTag('error', options.sessionId);
+                mem.addRequest(
+                  [
+                    {
+                      role: 'user' as const,
+                      content:
+                        this.promptTemplate.renderExtraFields(errorFields),
+                    },
+                  ],
+                  options.sessionId
+                );
+                mem.addTag('correction', options.sessionId);
+
+                // When using structured outputs (JSON mode), we need to reset the state content
+                // to avoid concatenating JSON objects from previous retry attempts
+                const hasComplexFields = this.signature.hasComplexFields();
+                if (hasComplexFields) {
+                  for (const state of states) {
+                    state.content = '';
+                    state.values = {};
+                    state.xstate = {
+                      extractedFields: [],
+                      streamedIndex: {},
+                      s: -1,
+                    };
+                    state.structuredAccumulator = undefined;
+                  }
+                }
+              }
+            }
+          }
+
+          // Record max retries reached for validation errors
+          const metricsInstruments = this.getMetricsInstruments();
+          if (metricsInstruments) {
+            recordErrorCorrectionMetric(
+              metricsInstruments,
+              maxRetries,
+              false, // failed
+              maxRetries,
+              this.getSignatureName(),
+              customLabels
+            );
+          }
+
+          if (err instanceof AxStreamingAssertionError) {
+            throw enhanceError(err, ai, this.signature);
+          }
+
+          throw enhanceError(
+            new Error(
+              `Unable to fix validation error: ${
+                (err ?? lastError)?.message ??
+                (err ?? lastError)?.toString() ??
+                'unknown error'
+              }\n\nLLM Output:\n${states.map((s) => s.content).join('\n---\n')}`
+            ),
+            ai,
+            this.signature
+          );
+        } catch (e) {
+          // Infrastructure error handling
+          const error = e as Error;
+          const isInfraError =
+            error instanceof AxAIServiceStatusError &&
+            (error as AxAIServiceStatusError).status >= 500 &&
+            (error as AxAIServiceStatusError).status < 600;
+
+          const isNetworkError = error instanceof AxAIServiceNetworkError;
+          const isTimeoutError = error instanceof AxAIServiceTimeoutError;
+          const isStreamTerminated =
+            error instanceof AxAIServiceStreamTerminatedError;
+
+          const shouldRetryInfra =
+            (isInfraError ||
+              isNetworkError ||
+              isTimeoutError ||
+              isStreamTerminated) &&
+            infraRetryCount < infraMaxRetries;
+
+          if (shouldRetryInfra) {
+            const debug = this.isDebug(ai, options);
+            const logger = this.getLogger(ai, options);
+
+            // Calculate exponential backoff delay
+            const baseDelay = 1000; // 1 second
+            const maxDelay = 60000; // 60 seconds
+            const delay = Math.min(
+              maxDelay,
+              baseDelay * Math.pow(2, infraRetryCount)
+            );
+
+            if (debug && logger) {
+              logger({
+                name: 'Notification',
+                id: 'infrastructure-retry',
+                value: `Infrastructure error (attempt ${infraRetryCount + 1}/${infraMaxRetries + 1}): ${error.message}. Retrying in ${delay}ms...`,
+              });
+            }
+
+            span?.addEvent('infrastructure.retry', {
+              attempt: infraRetryCount + 1,
+              maxRetries: infraMaxRetries,
+              delay,
+              errorType:
+                error instanceof AxAIServiceStatusError
+                  ? 'status_error'
+                  : error instanceof AxAIServiceNetworkError
+                    ? 'network_error'
+                    : error instanceof AxAIServiceTimeoutError
+                      ? 'timeout_error'
+                      : 'stream_terminated',
+              errorMessage: error.message,
+            });
+
+            // Wait before retrying
+            await new Promise<void>((resolve, reject) => {
+              let settled = false;
+              let onAbort: (() => void) | undefined;
+              const cleanup = () => {
+                if (effectiveAbortSignal && onAbort) {
+                  effectiveAbortSignal.removeEventListener('abort', onAbort);
+                }
+              };
+              const onResolve = () => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                resolve();
+              };
+              const timer = setTimeout(onResolve, delay);
+
+              // Allow stop/abort to interrupt long backoff sleeps
+              if (!effectiveAbortSignal) {
+                return;
+              }
+
+              onAbort = () => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                cleanup();
+                reject(
+                  new AxAIServiceAbortedError(
+                    'infrastructure-retry-backoff',
+                    effectiveAbortSignal.reason
+                      ? String(effectiveAbortSignal.reason)
+                      : 'Aborted during retry backoff'
+                  )
+                );
+              };
+
+              if (effectiveAbortSignal.aborted) {
+                onAbort();
+                return;
+              }
+
+              effectiveAbortSignal.addEventListener('abort', onAbort, {
+                once: true,
+              });
+            });
+            continue; // Retry infrastructure call
+          }
+
+          // Not a retryable infrastructure error, or max retries exhausted
+          throw e;
+        }
+      }
+    }
+
+    // Record max steps reached
+    if (metricsInstruments) {
+      recordMultiStepMetric(
+        metricsInstruments,
+        maxSteps,
+        maxSteps,
+        this.getSignatureName(),
+        customLabels
+      );
+    }
+
+    throw enhanceError(
+      new Error(`Max steps reached: ${maxSteps}`),
+      ai,
+      this.signature
+    );
+  }
+
+  /**
+   * Validate input values against field constraints
+   * @throws ValidationError if any input value fails validation
+   */
+  private validateInputs(values: IN): void {
+    const inputFields = this.signature.getInputFields();
+
+    for (const field of inputFields) {
+      if (field.isInternal) continue;
+
+      const value = values[field.name as keyof IN];
+
+      // Skip validation for optional fields with undefined values
+      if (field.isOptional && value === undefined) {
+        continue;
+      }
+
+      const type = field.type;
+      if (!type) continue;
+
+      // Validate based on field type
+      if (type.name === 'url') {
+        validateURL(value, field);
+      }
+
+      if (type.name === 'date') {
+        // Date validation is already handled by existing parseLLMFriendlyDate
+        // which is called during extraction - we'll rely on that
+      }
+
+      if (type.name === 'datetime') {
+        // DateTime validation is already handled by existing parseLLMFriendlyDateTime
+        // which is called during extraction - we'll rely on that
+      }
+
+      if (type.name === 'string' || type.name === 'code') {
+        validateStringConstraints(value, field);
+      }
+
+      if (type.name === 'number') {
+        validateNumberConstraints(value, field);
+      }
+
+      // Recursively validate object fields
+      if (
+        type.name === 'object' &&
+        type.fields &&
+        typeof value === 'object' &&
+        value !== null
+      ) {
+        this.validateObjectFields(
+          value as Record<string, unknown>,
+          type.fields,
+          field.name
+        );
+      }
+
+      // Validate array elements
+      if (type.isArray && Array.isArray(value)) {
+        for (let i = 0; i < value.length; i++) {
+          const item = value[i];
+
+          if (type.name === 'string' || type.name === 'code') {
+            validateStringConstraints(item, field);
+          } else if (type.name === 'number') {
+            validateNumberConstraints(item, field);
+          } else if (type.fields && typeof item === 'object' && item !== null) {
+            this.validateObjectFields(
+              item as Record<string, unknown>,
+              type.fields,
+              `${field.name}[${i}]`
+            );
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Recursively validate object field values
+   */
+  private validateObjectFields(
+    obj: Record<string, unknown>,
+    fields: Record<string, import('./sig.js').AxFieldType>,
+    parentFieldName: string
+  ): void {
+    for (const [fieldName, fieldType] of Object.entries(fields)) {
+      const value = obj[fieldName];
+
+      // Skip optional fields with undefined values
+      if (fieldType.isOptional && value === undefined) {
+        continue;
+      }
+
+      const syntheticField: import('./sig.js').AxField = {
+        name: `${parentFieldName}.${fieldName}`,
+        type: {
+          name: fieldType.type,
+          isArray: fieldType.isArray,
+          options: fieldType.options ? [...fieldType.options] : undefined,
+          fields: fieldType.fields,
+          minLength: fieldType.minLength,
+          maxLength: fieldType.maxLength,
+          minimum: fieldType.minimum,
+          maximum: fieldType.maximum,
+          pattern: fieldType.pattern,
+          format: fieldType.format,
+        },
+        description: fieldType.description,
+        isOptional: fieldType.isOptional,
+      };
+
+      if (fieldType.type === 'string' || fieldType.type === 'code') {
+        validateStringConstraints(value, syntheticField);
+      } else if (fieldType.type === 'number') {
+        validateNumberConstraints(value, syntheticField);
+      } else if (
+        fieldType.type === 'object' &&
+        fieldType.fields &&
+        typeof value === 'object' &&
+        value !== null
+      ) {
+        this.validateObjectFields(
+          value as Record<string, unknown>,
+          fieldType.fields,
+          syntheticField.name
+        );
+      }
+
+      // Validate arrays
+      if (fieldType.isArray && Array.isArray(value)) {
+        for (let i = 0; i < value.length; i++) {
+          const item = value[i];
+
+          if (fieldType.type === 'string' || fieldType.type === 'code') {
+            validateStringConstraints(item, syntheticField);
+          } else if (fieldType.type === 'number') {
+            validateNumberConstraints(item, syntheticField);
+          } else if (
+            fieldType.fields &&
+            typeof item === 'object' &&
+            item !== null
+          ) {
+            this.validateObjectFields(
+              item as Record<string, unknown>,
+              fieldType.fields,
+              `${syntheticField.name}[${i}]`
+            );
+          }
+        }
+      }
+    }
+  }
+
+  public async *_forward1(
+    ai: Readonly<AxAIService>,
+    values: IN,
+    options: Readonly<AxProgramForwardOptions<any>>
+  ): AxGenStreamingOut<OUT> {
+    this.validateInputs(values);
+
+    // Create internal abort controller and merge with any user-provided signal
+    const abortController = new AbortController();
+    this.activeAbortControllers.add(abortController);
+    if (this._stopRequested) {
+      abortController.abort('Stopped by user (pre-forward)');
+    }
+    const effectiveAbortSignal = mergeAbortSignals(
+      abortController.signal,
+      mergeAbortSignals(options?.abortSignal, axGlobals.abortSignal)
+    );
+    const effectiveOptions = effectiveAbortSignal
+      ? { ...options, abortSignal: effectiveAbortSignal }
+      : options;
+
+    try {
+      // Track state creation performance
+      const stateCreationStart = performance.now();
+      const states = this.createStates(options.sampleCount ?? 1);
+      const stateCreationDuration = performance.now() - stateCreationStart;
+
+      // Record state creation performance metric
+      const metricsInstruments = this.getMetricsInstruments();
+      const customLabels = this.getMergedCustomLabels(ai, options);
+      if (metricsInstruments) {
+        recordPerformanceMetric(
+          metricsInstruments,
+          'state_creation',
+          stateCreationDuration,
+          this.getSignatureName(),
+          customLabels
+        );
+      }
+
+      const tracer =
+        options?.tracer ??
+        this.options?.tracer ??
+        ai.getOptions().tracer ??
+        axGlobals.tracer;
+
+      let functions: AxFunction[] | undefined = this.functions;
+
+      if (options?.functions) {
+        functions = parseFunctions(options.functions, this.functions);
+      }
+
+      const mcpExecutionContext = await axResolveMCPExecutionContext(
+        options,
+        this.options
+      );
+      if (mcpExecutionContext) {
+        functions = [
+          ...(functions ?? []),
+          ...mcpExecutionContext.getToolBindings(),
+        ];
+      }
+      const mcpContextPrompt = mcpExecutionContext
+        ? await mcpExecutionContext.resolveContextPrompt(
+            options.mcpContext ?? this.options?.mcpContext
+          )
+        : undefined;
+      const executionOptions = mcpExecutionContext
+        ? {
+            ...effectiveOptions,
+            _mcpExecutionContext: mcpExecutionContext,
+            ...(mcpContextPrompt?.length
+              ? { _mcpContextPrompt: mcpContextPrompt }
+              : {}),
+          }
+        : effectiveOptions;
+
+      if (!tracer) {
+        yield* this._forward2(ai, values, states, {
+          ...executionOptions,
+          functions,
+        });
+        return;
+      }
+
+      const funcNames = functions?.map((f) => f.name).join(',');
+
+      const attributes = {
+        signature: JSON.stringify(this.signature.toJSON(), null, 2),
+        ...(this.examples
+          ? { examples: JSON.stringify(this.examples, null, 2) }
+          : {}),
+        ...(funcNames ? { provided_functions: funcNames } : {}),
+        ...(options?.model ? { model: options.model } : {}),
+        ...(options?.thinkingTokenBudget
+          ? { thinking_token_budget: options.thinkingTokenBudget }
+          : {}),
+        ...(options?.showThoughts
+          ? { show_thoughts: options.showThoughts }
+          : {}),
+        ...(options?.maxSteps ? { max_steps: options.maxSteps } : {}),
+        ...(options?.maxRetries ? { max_retries: options.maxRetries } : {}),
+      };
+
+      const traceLabel =
+        this.traceLabel && options.traceLabel
+          ? `${this.traceLabel} > ${options.traceLabel}`
+          : (options.traceLabel ?? this.traceLabel);
+      const spanName = traceLabel ? `AxGen > ${traceLabel}` : 'AxGen';
+
+      const span = tracer.startSpan(spanName, {
+        kind: SpanKind.SERVER,
+        attributes,
+      });
+
+      const currentContext = context.active();
+      const traceContext = trace.setSpan(currentContext, span);
+
+      try {
+        if (!this.excludeContentFromTrace) {
+          span.addEvent('input', { content: JSON.stringify(values, null, 2) });
+        }
+
+        yield* this._forward2(
+          ai,
+          values,
+          states,
+          {
+            ...executionOptions,
+            functions,
+          },
+          span,
+          traceContext
+        );
+
+        if (!this.excludeContentFromTrace) {
+          const valuesList = states.map((s) => s.values);
+          const values = valuesList.length === 1 ? valuesList[0] : valuesList;
+          span.addEvent('output', {
+            content: JSON.stringify(values, null, 2),
+          });
+        }
+      } catch (error) {
+        const err = error instanceof Error ? error : new Error(String(error));
+        span.recordException(err);
+        span.setStatus({
+          code: SpanStatusCode.ERROR,
+          message: err.message,
+        });
+        throw error;
+      } finally {
+        span.end();
+      }
+    } finally {
+      this.activeAbortControllers.delete(abortController);
+      this._stopRequested = false;
+    }
+  }
+
+  /**
+   * Executes the generator with the given AI service and input values.
+   *
+   * This is the main entry point for running an AI generation. The execution pipeline:
+   * 1. **Validate** - Check input values match the signature
+   * 2. **Render** - Build the prompt from signature, examples, and inputs
+   * 3. **Call** - Send the request to the AI service
+   * 4. **Parse** - Extract structured outputs from the response
+   * 5. **Validate** - Validate parsed outputs and retry with error correction if needed
+   *
+   * @param ai - The AI service instance to use (created via `ai()` factory)
+   * @param values - Input values matching the signature's input fields
+   * @param options - Optional execution configuration
+   *
+   * @param options.model - Override the default model for this request
+   * @param options.maxTokens - Maximum tokens in the response. Rule of thumb: ~750 tokens ≈ 1 page
+   *   of English text. Set higher for long-form content, lower for concise responses.
+   * @param options.temperature - Controls randomness in generation (0-2):
+   *   - `0` - Deterministic, always picks most likely token (best for factual tasks)
+   *   - `0.3-0.7` - Balanced creativity (good for most tasks)
+   *   - `1.0+` - High creativity (good for brainstorming, creative writing)
+   *   - `2.0` - Maximum randomness (often incoherent)
+   * @param options.thinkingTokenBudget - Enable extended thinking for complex reasoning:
+   *   - `'none'` - Disabled (default)
+   *   - `'minimal'` - ~1K tokens of thinking
+   *   - `'low'` - ~4K tokens
+   *   - `'medium'` - ~10K tokens
+   *   - `'high'` - ~20K tokens
+   *   - `'highest'` - ~32K+ tokens (provider maximum)
+   * @param options.stream - Enable streaming responses for real-time output
+   * @param options.functions - Array of function tools the AI can call
+   * @param options.functionCallMode - How to handle function calling:
+   *   - `'auto'` - Let the provider decide (default)
+   *   - `'native'` - Force native function calling (if supported)
+   *   - `'prompt'` - Simulate via prompt engineering (for models without native support)
+   * @param options.mem - Memory instance for conversation history
+   * @param options.sessionId - Session identifier for memory isolation
+   * @param options.maxRetries - Maximum error correction attempts (default: 3)
+   * @param options.maxSteps - Maximum function call iterations (default: 25)
+   * @param options.debug - Enable debug logging
+   *
+   * @returns Promise resolving to the output values matching the signature's output fields
+   *
+   * @throws {AxValidationError} When input values don't match the signature
+   * @throws {ValidationError} When output parsing/validation fails after all retries
+   * @throws {AxAIServiceError} When the AI service request fails
+   *
+   * @example Basic usage
+   * ```typescript
+   * const gen = ax('question: string -> answer: string');
+   * const result = await gen.forward(ai, { question: 'What is 2+2?' });
+   * console.log(result.answer); // "4"
+   * ```
+   *
+   * @example With configuration
+   * ```typescript
+   * const result = await gen.forward(ai, { question: 'Explain quantum computing' }, {
+   *   maxTokens: 2000,
+   *   temperature: 0.3,
+   *   stream: true
+   * });
+   * ```
+   *
+   * @example Multi-turn conversation
+   * ```typescript
+   * const mem = new AxMemory();
+   * const chat = ax('message: string -> reply: string');
+   *
+   * await chat.forward(ai, { message: 'Hi, my name is Alice' }, { mem });
+   * const result = await chat.forward(ai, { message: 'What is my name?' }, { mem });
+   * // result.reply will reference "Alice" from conversation history
+   * ```
+   *
+   * @example With function calling
+   * ```typescript
+   * const result = await gen.forward(ai, values, {
+   *   functions: [{
+   *     name: 'getWeather',
+   *     description: 'Get current weather for a city',
+   *     parameters: {
+   *       type: 'object',
+   *       properties: { city: { type: 'string', description: 'City name' } },
+   *       required: ['city']
+   *     },
+   *     func: async ({ city }) => fetchWeather(city)
+   *   }],
+   *   maxSteps: 5
+   * });
+   * ```
+   */
+  public async forward<T extends Readonly<AxAIService>>(
+    ai: T,
+    values: IN,
+    options?: Readonly<AxProgramForwardOptionsWithModels<T>>
+  ): Promise<OUT> {
+    // Caching pre-check: if cachingFunction provided and returns a value, short-circuit
+    const cachingFunction =
+      options?.cachingFunction ??
+      this.options?.cachingFunction ??
+      axGlobals.cachingFunction;
+    const cacheKey = (() => {
+      if (!cachingFunction) return undefined;
+      const inputNames = this.signature.getInputFields().map((f) => f.name);
+      return this.computeCacheKey(values, inputNames);
+    })();
+    if (cachingFunction && cacheKey) {
+      const cached = await cachingFunction(cacheKey);
+      if (cached !== undefined) {
+        return (await renderAudioOutputArtifacts(
+          ai,
+          this.signature,
+          cached as AxGenOut,
+          options
+        )) as unknown as OUT;
+      }
+    }
+
+    const startTime = performance.now();
+    const signatureName = this.getSignatureName();
+    const isStreaming = options?.stream ?? false;
+    let success = false;
+    let errorCorrectionAttempts = 0;
+    let resultPickerUsed = false;
+
+    try {
+      // Record signature complexity metrics
+      const metricsInstruments = this.getMetricsInstruments();
+      const customLabels = this.getMergedCustomLabels(ai, options);
+      if (metricsInstruments) {
+        recordSignatureComplexityMetrics(
+          metricsInstruments,
+          this.signature.getInputFields().length,
+          this.signature.getOutputFields().length,
+          this.examples?.length ?? 0,
+          this.demos?.length ?? 0,
+          signatureName,
+          customLabels
+        );
+      }
+
+      const generator = this._forward1(ai, values, options ?? {});
+
+      let buffer: AxGenDeltaOut<OUT>[] = [];
+      let currentVersion = 0;
+      let deltasEmitted = 0;
+
+      for await (const delta of generator) {
+        if (delta.version !== currentVersion) {
+          buffer = [];
+        }
+        currentVersion = delta.version;
+        buffer = mergeDeltas<OUT>(buffer, delta);
+        deltasEmitted++;
+      }
+
+      // Track error correction attempts from the version count
+      errorCorrectionAttempts = currentVersion;
+
+      // Use result picker to select from multiple samples
+      const resultPickerStart = performance.now();
+      resultPickerUsed = !!options?.resultPicker;
+
+      const selectedIndex = await selectFromSamples(
+        buffer,
+        {
+          resultPicker: options?.resultPicker as
+            | AxResultPickerFunction<OUT>
+            | undefined,
+        },
+        // Pass memory to enable function result selection
+        options?.mem,
+        options?.sessionId
+      );
+
+      const resultPickerLatency = performance.now() - resultPickerStart;
+
+      const selectedResult = buffer[selectedIndex];
+      const result = await renderAudioOutputArtifacts(
+        ai,
+        this.signature,
+        (selectedResult?.delta ?? {}) as AxGenOut,
+        options
+      );
+
+      const baseTrace = (values as unknown as Record<string, unknown>) ?? {};
+      this.trace = { ...baseTrace, ...result } as unknown as OUT;
+      // Log result picker usage if it was used and debug is enabled
+      if (resultPickerUsed && this.isDebug(ai, options)) {
+        const logger = this.getLogger(ai, options);
+        logResultPickerUsed(
+          buffer.length,
+          selectedIndex,
+          resultPickerLatency,
+          logger
+        );
+      }
+
+      success = true;
+
+      // Record samples metrics
+      if (metricsInstruments) {
+        recordSamplesMetric(
+          metricsInstruments,
+          buffer.length,
+          resultPickerUsed,
+          resultPickerUsed ? resultPickerLatency : undefined,
+          signatureName,
+          customLabels
+        );
+
+        // Record streaming metrics
+        recordStreamingMetric(
+          metricsInstruments,
+          isStreaming,
+          deltasEmitted,
+          undefined, // finalization latency not applicable here
+          signatureName,
+          customLabels
+        );
+      }
+
+      // Caching post-store: call cachingFunction again with value if provided
+      if (cachingFunction && cacheKey) {
+        try {
+          await cachingFunction(cacheKey, result);
+        } catch {}
+      }
+
+      return result as unknown as OUT;
+    } catch (error) {
+      success = false;
+      throw error;
+    } finally {
+      const duration = performance.now() - startTime;
+
+      // Record generation metrics
+      const finalMetricsInstruments = this.getMetricsInstruments();
+      const finalCustomLabels = this.getMergedCustomLabels(ai, options);
+      if (finalMetricsInstruments) {
+        recordGenerationMetric(
+          finalMetricsInstruments,
+          duration,
+          success,
+          signatureName,
+          ai.getName(),
+          options?.model ? String(options.model) : undefined,
+          finalCustomLabels
+        );
+
+        // Skip per-call function execution metric here; detailed metrics are recorded during processing
+
+        // Record error correction metrics
+        if (errorCorrectionAttempts > 0) {
+          recordErrorCorrectionMetric(
+            finalMetricsInstruments,
+            errorCorrectionAttempts,
+            success,
+            options?.maxRetries ?? this.options?.maxRetries ?? 3,
+            signatureName,
+            finalCustomLabels
+          );
+        }
+      }
+    }
+  }
+
+  async *streamingForward<T extends Readonly<AxAIService>>(
+    ai: T,
+    values: IN,
+    options?: Readonly<AxProgramStreamingForwardOptionsWithModels<T>>
+  ): AxGenStreamingOut<OUT> {
+    // Caching pre-check for streaming
+    const cachingFunction =
+      options?.cachingFunction ??
+      this.options?.cachingFunction ??
+      axGlobals.cachingFunction;
+    const cacheKey = (() => {
+      if (!cachingFunction) return undefined;
+      const inputNames = this.signature.getInputFields().map((f) => f.name);
+      return this.computeCacheKey(values, inputNames);
+    })();
+    if (cachingFunction && cacheKey) {
+      let cached: unknown;
+      try {
+        cached = await cachingFunction(cacheKey);
+      } catch {}
+      if (cached !== undefined) {
+        const renderedCached = await renderAudioOutputArtifacts(
+          ai,
+          this.signature,
+          cached as AxGenOut,
+          options
+        );
+        yield {
+          version: 0,
+          index: 0,
+          delta: renderedCached as unknown as OUT,
+        };
+        return;
+      }
+    }
+
+    // If no result picker, use normal streaming
+    if (!options?.resultPicker) {
+      yield* this._forward1(ai, values, {
+        ...options,
+        stream: true,
+      });
+      return;
+    }
+
+    // For result picker, we need to buffer all results first
+    const generator = this._forward1(ai, values, {
+      ...options,
+      stream: true,
+    });
+
+    let buffer: AxGenDeltaOut<OUT>[] = [];
+    let currentVersion = 0;
+
+    for await (const delta of generator) {
+      if (delta.version !== currentVersion) {
+        buffer = [];
+      }
+      currentVersion = delta.version;
+      buffer = mergeDeltas<OUT>(buffer, delta);
+    }
+
+    // Use result picker to select from samples
+    const selectedIndex = await selectFromSamples(
+      buffer,
+      {
+        resultPicker: options?.resultPicker as
+          | AxResultPickerFunction<OUT>
+          | undefined,
+      },
+      // Pass memory to enable function result selection
+      options?.mem,
+      options?.sessionId
+    );
+
+    // Yield the selected result
+    const selectedResult = buffer[selectedIndex];
+    if (selectedResult) {
+      const renderedDelta = await renderAudioOutputArtifacts(
+        ai,
+        this.signature,
+        selectedResult.delta as unknown as AxGenOut,
+        options
+      );
+      // Post-store cache
+      if (cachingFunction && cacheKey) {
+        try {
+          await cachingFunction(cacheKey, renderedDelta);
+        } catch {}
+      }
+      yield {
+        version: currentVersion,
+        index: selectedIndex,
+        delta: renderedDelta as unknown as OUT,
+      };
+    }
+  }
+
+  public override setExamples(
+    examples: Readonly<AxProgramExamples<IN, OUT>>,
+    options?: Readonly<AxSetExamplesOptions>
+  ) {
+    super.setExamples(examples, options);
+    // No need to update prompt template - all fields can be missing in examples
+  }
+
+  private isDebug(
+    ai: Readonly<AxAIService>,
+    options?: Readonly<AxProgramForwardOptions<any>>
+  ) {
+    return (
+      options?.debug ??
+      this.options?.debug ??
+      ai.getOptions().debug ??
+      axGlobals.debug ??
+      false
+    );
+  }
+
+  private getLogger(
+    ai: Readonly<AxAIService>,
+    options?: Readonly<AxProgramForwardOptions<any>>
+  ) {
+    return (
+      options?.logger ??
+      this.options?.logger ??
+      ai.getOptions().logger ??
+      axGlobals.logger ??
+      ai.getLogger()
+    );
+  }
+
+  private computeCacheKey(values: IN, inputNames: readonly string[]): string {
+    const hasher = createHash('sha256');
+    hasher.update(this.signature.hash() ?? '');
+
+    const updateWithValue = (v: unknown): void => {
+      const t = typeof v;
+      hasher.update(`|${t}|`);
+      if (v === null || v === undefined) {
+        hasher.update('null');
+        return;
+      }
+      if (t === 'string' || t === 'number' || t === 'boolean') {
+        hasher.update(String(v));
+        return;
+      }
+      if (Array.isArray(v)) {
+        hasher.update('[');
+        for (const item of v) updateWithValue(item);
+        hasher.update(']');
+        return;
+      }
+      if (
+        typeof v === 'object' &&
+        v !== null &&
+        'mimeType' in (v as Record<string, unknown>) &&
+        'data' in (v as Record<string, unknown>)
+      ) {
+        const mv = v as { mimeType?: string; data?: string };
+        hasher.update(mv.mimeType ?? '');
+        const dataDigest = createHash('sha256')
+          .update(mv.data ?? '')
+          .digest('hex');
+        hasher.update(dataDigest);
+        return;
+      }
+      if (typeof v === 'object') {
+        const obj = v as Record<string, unknown>;
+        const keys = Object.keys(obj).sort();
+        for (const k of keys) {
+          hasher.update(`{${k}}`);
+          updateWithValue(obj[k]);
+        }
+        return;
+      }
+      hasher.update(String(v));
+    };
+
+    const row = inputNames.map((n) => (values as any)?.[n]);
+    for (const val of row) updateWithValue(val);
+
+    return hasher.digest('hex');
+  }
+}
+
+export type AxGenerateErrorDetails = {
+  model?: string;
+  maxTokens?: number;
+  streaming: boolean;
+  signature: {
+    input: Readonly<AxIField[]>;
+    output: Readonly<AxIField[]>;
+    description?: string;
+  };
+};
+
+type ErrorOptions = { cause?: Error };
+
+export class AxGenerateError extends Error {
+  public readonly details: AxGenerateErrorDetails;
+
+  constructor(
+    message: string,
+    details: Readonly<AxGenerateErrorDetails>,
+    options?: ErrorOptions
+  ) {
+    super(message);
+    this.name = 'AxGenerateError';
+    this.details = details;
+    // Set cause property dynamically to avoid TypeScript issues
+    if (options?.cause) {
+      (this as ErrorOptions).cause = options.cause;
+    }
+  }
+
+  toJSON(): Record<string, unknown> {
+    const cause = (this as ErrorOptions).cause;
+    return {
+      name: this.name,
+      message: this.message,
+      details: this.details,
+      cause: cause
+        ? {
+            name: cause.name,
+            message: cause.message,
+            stack: cause.stack,
+          }
+        : undefined,
+      stack: this.stack,
+    };
+  }
+}
+
+function enhanceError(
+  e: unknown,
+  ai: Readonly<AxAIService>,
+  signature: Readonly<AxSignature>
+): Error {
+  const originalError = e instanceof Error ? e : new Error(String(e));
+
+  // Never wrap abort errors — preserve the specific error type
+  if (originalError instanceof AxAIServiceAbortedError) {
+    return originalError;
+  }
+
+  if (originalError instanceof AxStreamingAssertionError) {
+    return originalError;
+  }
+
+  // Don't wrap validation errors - let them propagate directly
+  const errorMsg = (originalError.message || '').toLowerCase();
+  const isValidationError =
+    errorMsg.includes('at least') ||
+    errorMsg.includes('at most') ||
+    errorMsg.includes('must match pattern') ||
+    errorMsg.includes('invalid url') ||
+    errorMsg.includes('required') ||
+    errorMsg.includes('missing') ||
+    errorMsg.includes('valid email') ||
+    errorMsg.includes('number must be') ||
+    originalError.name === 'ValidationError' ||
+    originalError.name === 'AxAssertionError';
+
+  if (isValidationError) {
+    return originalError;
+  }
+
+  const model = ai.getLastUsedChatModel() as string | undefined;
+  const modelConfig = ai.getLastUsedModelConfig();
+
+  const details = {
+    model: model,
+    maxTokens: modelConfig?.maxTokens,
+    streaming: modelConfig?.stream ?? false,
+    signature: {
+      input: signature.getInputFields(),
+      output: signature.getOutputFields(),
+      description: signature.getDescription(),
+    },
+  };
+
+  // Return custom error with short message and details as object property
+  return new AxGenerateError(
+    `Generate failed: ${originalError.message}`,
+    details,
+    {
+      cause: originalError,
+    }
+  );
+}

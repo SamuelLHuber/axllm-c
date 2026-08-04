@@ -1,0 +1,511 @@
+#!/usr/bin/env tsx
+import { execSync } from 'node:child_process';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+
+import * as ts from 'typescript';
+
+/**
+ * Represents an exported symbol from a TypeScript file
+ */
+interface ExportInfo {
+  /** Original name of the exported symbol */
+  originalName: string;
+  /** Name with prefix (same as originalName currently) */
+  prefixedName: string;
+  /** Whether this is a type or value export */
+  kind: 'type' | 'value';
+  /** Whether this is a default export */
+  isDefault?: boolean;
+}
+
+/**
+ * Checks if a symbol name starts with the expected prefixes (ax or Ax) or is a special case
+ */
+const internalExportNames = new Set([
+  'AxAIOpenAIReasoningEffort',
+  'AxAIOpenAIResponsesImpl',
+  'AxAgentInternalCompletionPayload',
+  'AxAppliedProposal',
+  'AxFlowDependencyAnalyzer',
+  'AxFlowExecutionPlanner',
+  'AxFlowBlockLabel',
+  'AxFlowExecutionContext',
+  'AxFlowExecuteStepFactory',
+  'AxFlowExecuteStepsOptions',
+  'AxFlowNodeExecutionArgs',
+  'AxFlowNodeExecutionRecorder',
+  'AxFlowMermaidCompileHost',
+  'AxFlowStep',
+  'AxFlowStepDecision',
+  'AxFlowStepKind',
+  'AxFlowStepMeta',
+  'AxFlowStepRunner',
+  'AxFlowSubContextImpl',
+  'AxFlowTypedSubContextImpl',
+  'AxInstanceRegistry',
+  'AxInternalChatRequest',
+  'AxInternalEmbedRequest',
+  'AxInternalSpeechRequest',
+  'AxInternalTranscriptionRequest',
+  'AxMutableDiscoveryPromptState',
+  'AxMutableSkillsPromptState',
+  'AxNormalizedAgentEvalDataset',
+  'AxPreparedChatRequest',
+  'AxPreparedRestoredState',
+  'AxResponseHandlerArgs',
+  'AxStepContextImpl',
+  'axResolveOpenAIReasoningEffort',
+]);
+
+function hasValidPrefix(name: string): boolean {
+  return (
+    !internalExportNames.has(name) &&
+    (name.startsWith('ax') ||
+      name.startsWith('Ax') ||
+      name === 'f' ||
+      name === 'fn' ||
+      name === 's' ||
+      name === 'ai' ||
+      name === 'agent' ||
+      name === 'flow' ||
+      name === 'eventRuntime' ||
+      name === 'eventInput' ||
+      name === 'eventPath' ||
+      name === 'eventRoute' ||
+      name === 'eventTarget' ||
+      name === 'runAxEventStoreConformance' ||
+      name === 'optimize' ||
+      name === 'bestOfN' ||
+      name === 'refine' ||
+      name === 'playbook')
+  );
+}
+
+/**
+ * Processes an export declaration node to extract exports with valid prefixes
+ */
+function processExportDeclaration(node: ts.ExportDeclaration): ExportInfo[] {
+  const exportsMap = new Map<string, ExportInfo>();
+
+  if (node.exportClause && ts.isNamedExports(node.exportClause)) {
+    for (const element of node.exportClause.elements) {
+      const originalName = element.name.text;
+      if (hasValidPrefix(originalName)) {
+        const isTypeOnly = node.isTypeOnly || element.isTypeOnly;
+        // Only add if not already present
+        const key = `${originalName}:${isTypeOnly ? 'type' : 'value'}`;
+        if (!exportsMap.has(key)) {
+          exportsMap.set(key, {
+            originalName,
+            prefixedName: originalName,
+            kind: isTypeOnly ? 'type' : 'value',
+          });
+        }
+      }
+    }
+  }
+
+  return Array.from(exportsMap.values());
+}
+
+/**
+ * Processes an export assignment (default export) node
+ */
+function processExportAssignment(node: ts.ExportAssignment): ExportInfo[] {
+  const exports: ExportInfo[] = [];
+
+  if (ts.isIdentifier(node.expression)) {
+    const originalName = node.expression.text;
+    if (hasValidPrefix(originalName)) {
+      exports.push({
+        originalName,
+        prefixedName: originalName,
+        kind: 'value',
+        isDefault: true,
+      });
+    }
+  }
+
+  return exports;
+}
+
+/**
+ * Processes a declaration node (class, interface, or type alias)
+ */
+function processDeclaration(
+  node:
+    | ts.ClassDeclaration
+    | ts.InterfaceDeclaration
+    | ts.TypeAliasDeclaration
+    | ts.EnumDeclaration
+    | ts.FunctionDeclaration
+): ExportInfo[] {
+  const exports: ExportInfo[] = [];
+
+  if (
+    node.name &&
+    node.modifiers?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword)
+  ) {
+    const originalName = node.name.text;
+    if (hasValidPrefix(originalName)) {
+      const isTypeNode =
+        ts.isInterfaceDeclaration(node) || ts.isTypeAliasDeclaration(node);
+      exports.push({
+        originalName,
+        prefixedName: originalName,
+        kind: isTypeNode ? 'type' : 'value',
+      });
+    }
+  }
+
+  return exports;
+}
+
+/**
+ * Processes a variable statement node to extract exported variables with valid prefixes
+ */
+function processVariableStatement(node: ts.VariableStatement): ExportInfo[] {
+  const exports: ExportInfo[] = [];
+  // Check if the variable statement has an export modifier
+  if (
+    !node.modifiers ||
+    !node.modifiers.some((m) => m.kind === ts.SyntaxKind.ExportKeyword)
+  ) {
+    return exports;
+  }
+
+  for (const declaration of node.declarationList.declarations) {
+    if (ts.isIdentifier(declaration.name)) {
+      const originalName = declaration.name.text;
+      if (hasValidPrefix(originalName)) {
+        exports.push({
+          originalName,
+          prefixedName: originalName,
+          kind: 'value',
+        });
+      }
+    }
+  }
+  return exports;
+}
+
+/**
+ * Processes a TypeScript source file to extract all exports with valid prefixes
+ */
+function processFile(
+  filePath: string,
+  rootDir: string,
+  exportMap: Map<string, ExportInfo[]>
+): void {
+  const sourceFile = ts.createSourceFile(
+    filePath,
+    fs.readFileSync(filePath, 'utf-8'),
+    ts.ScriptTarget.Latest,
+    true
+  );
+
+  const exports: ExportInfo[] = [];
+
+  function visit(node: ts.Node) {
+    if (ts.isExportDeclaration(node)) {
+      exports.push(...processExportDeclaration(node));
+    } else if (ts.isExportAssignment(node)) {
+      exports.push(...processExportAssignment(node));
+    } else if (ts.isVariableStatement(node)) {
+      exports.push(...processVariableStatement(node));
+    } else if (
+      ts.isClassDeclaration(node) ||
+      ts.isInterfaceDeclaration(node) ||
+      ts.isTypeAliasDeclaration(node) ||
+      ts.isEnumDeclaration(node) ||
+      ts.isFunctionDeclaration(node)
+    ) {
+      exports.push(...processDeclaration(node));
+    }
+
+    ts.forEachChild(node, visit);
+  }
+
+  visit(sourceFile);
+
+  if (exports.length > 0) {
+    const relativePath = path.relative(rootDir, filePath).replace(/\.ts$/, '');
+
+    // Deduplicate exports based on originalName and kind
+    const uniqueExports = exports.reduce((acc: ExportInfo[], curr) => {
+      const exists = acc.some(
+        (exp) =>
+          exp.originalName === curr.originalName && exp.kind === curr.kind
+      );
+      if (!exists) {
+        acc.push(curr);
+      }
+      return acc;
+    }, []);
+
+    exportMap.set(relativePath, uniqueExports);
+  }
+}
+
+/**
+ * Recursively finds all TypeScript files in a directory
+ */
+function findTsFiles(dir: string): string[] {
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  return entries.flatMap((entry) => {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      return findTsFiles(fullPath);
+    }
+    if (isTargetTsFile(entry.name)) {
+      return [fullPath];
+    }
+    return [];
+  });
+}
+
+/**
+ * Checks if a filename matches our target TypeScript files
+ */
+function isTargetTsFile(filename: string): boolean {
+  return (
+    filename.endsWith('.ts') &&
+    !filename.endsWith('.test.ts') &&
+    !filename.endsWith('.d.ts') &&
+    filename !== 'index.ts'
+  );
+}
+
+/**
+ * Formats import items for better readability with line breaks
+ */
+function formatImportItems(imports: string[]): string {
+  if (imports.length <= 1) {
+    return imports.join(', ');
+  }
+
+  return `\n  ${imports.join(',\n  ')}\n`;
+}
+
+/**
+ * Generates an import statement for a file's exports
+ */
+function generateImportStatement(
+  filePath: string,
+  exports: ExportInfo[]
+): string {
+  // Deduplicate value exports by name
+  const uniqueValues = [
+    ...new Set(
+      exports
+        .filter((exp) => exp.kind === 'value')
+        .map((exp) => exp.originalName)
+    ),
+  ].sort();
+
+  // Deduplicate type exports by name
+  const uniqueTypes = [
+    ...new Set(
+      exports
+        .filter((exp) => exp.kind === 'type')
+        .map((exp) => exp.originalName)
+    ),
+  ]
+    .map((name) => `type ${name}`)
+    .sort();
+
+  const allImports = [...uniqueValues, ...uniqueTypes];
+
+  if (allImports.length === 0) {
+    return '';
+  }
+
+  return `import {${formatImportItems(allImports)}} from './${filePath}.js';`;
+}
+
+/**
+ * Generates export statements for the collected exports
+ */
+function generateExportStatements(exportMap: Map<string, ExportInfo[]>): {
+  valueExports: string[];
+  typeExports: string[];
+} {
+  const valueExports: string[] = [];
+  const typeExports: string[] = [];
+
+  for (const [, exports] of exportMap) {
+    for (const exp of exports) {
+      if (exp.kind === 'type') {
+        typeExports.push(`export type { ${exp.originalName} };`);
+      } else {
+        const exportLine = exp.isDefault
+          ? `export { ${exp.originalName} as default };`
+          : `export { ${exp.originalName} };`;
+        valueExports.push(exportLine);
+      }
+    }
+  }
+
+  return {
+    valueExports: valueExports.sort(),
+    typeExports: typeExports.sort(),
+  };
+}
+
+/**
+ * Generates the content for the index.ts file
+ */
+function generateIndexContent(exportMap: Map<string, ExportInfo[]>): string {
+  let content =
+    '/* eslint import/order: 0 sort-imports: 0 */\n// Auto-generated index file - Do not edit\n\n';
+
+  const canonicalSources = new Map<string, string>([
+    ['type:AxOptimizedProgram', 'dsp/optimizer'],
+    ['type:AxIField', 'dsp/sig'],
+    ['type:AxFieldValue', 'dsp/types'],
+    ['type:AxAgentUsage', 'dsp/types'],
+    ['type:AxChatLogEntry', 'dsp/types'],
+  ]);
+
+  const sourcePriority = (filePath: string, exp: ExportInfo): number => {
+    const canonical = canonicalSources.get(`${exp.kind}:${exp.originalName}`);
+    if (canonical && filePath === canonical) return -100;
+    if (filePath === 'dsp/types') return -10;
+    return 0;
+  };
+
+  // Deduplicate exports across files by name+kind, preferring canonical sources.
+  const used = new Set<string>();
+  const selectedByFile = new Map<string, ExportInfo[]>();
+
+  const entries = Array.from(exportMap.entries()).sort(([a], [b]) => {
+    return a.localeCompare(b);
+  });
+
+  const flat = entries.flatMap(([filePath, exports]) =>
+    exports.map((exp) => ({ filePath, exp }))
+  );
+  flat.sort((a, b) => {
+    const keyA = `${a.exp.kind}:${a.exp.originalName}`;
+    const keyB = `${b.exp.kind}:${b.exp.originalName}`;
+    if (keyA !== keyB) return keyA.localeCompare(keyB);
+    const priorityDelta =
+      sourcePriority(a.filePath, a.exp) - sourcePriority(b.filePath, b.exp);
+    if (priorityDelta !== 0) return priorityDelta;
+    return a.filePath.localeCompare(b.filePath);
+  });
+
+  for (const { filePath, exp } of flat) {
+    const key = `${exp.kind}:${exp.originalName}`;
+    if (used.has(key)) continue;
+    used.add(key);
+    const arr = selectedByFile.get(filePath) || [];
+    arr.push(exp);
+    selectedByFile.set(filePath, arr);
+  }
+
+  for (const [filePath, exports] of selectedByFile.entries()) {
+    selectedByFile.set(
+      filePath,
+      exports.sort((a, b) => a.originalName.localeCompare(b.originalName))
+    );
+  }
+
+  /*
+   * A class naturally has both a value and a type side. Avoid importing a
+   * separate type-only re-export with the same local name when the value export
+   * already provides the type side.
+   */
+  const valueNames = new Set<string>();
+  for (const exports of selectedByFile.values()) {
+    for (const exp of exports) {
+      if (exp.kind === 'value') valueNames.add(exp.originalName);
+    }
+  }
+  for (const [filePath, exports] of selectedByFile.entries()) {
+    selectedByFile.set(
+      filePath,
+      exports.filter(
+        (exp) => exp.kind !== 'type' || !valueNames.has(exp.originalName)
+      )
+    );
+  }
+
+  // Generate and sort imports from selected exports only
+  const imports = Array.from(selectedByFile.entries())
+    .map(([filePath, exports]) => generateImportStatement(filePath, exports))
+    .filter(Boolean)
+    .sort();
+  content = `${content}${imports.join('\n')}\n\n`;
+
+  // Generate exports from selected set
+  const selectedMap = new Map<string, ExportInfo[]>(selectedByFile);
+  const { valueExports, typeExports } = generateExportStatements(selectedMap);
+
+  if (valueExports.length > 0) {
+    content = `${content}// Value exports\n${valueExports.join('\n')}\n\n`;
+  }
+
+  if (typeExports.length > 0) {
+    content = `${content}// Type exports\n${typeExports.join('\n')}\n`;
+  }
+
+  return content;
+}
+
+/**
+ * Runs biome lint and format fix on the generated index.ts file
+ */
+function fixGeneratedFile(filePath: string): void {
+  try {
+    console.log('Running biome lint and format fix on generated file...');
+
+    // Run biome check with write flag to fix both linting and formatting issues
+    execSync(`npx biome check --write "${filePath}"`, {
+      stdio: 'inherit',
+      cwd: path.dirname(filePath),
+    });
+
+    console.log('Biome fixes applied successfully!');
+  } catch (error) {
+    console.warn('Warning: Failed to run biome fixes:', error);
+    // Don't fail the entire process if biome fix fails
+  }
+}
+
+/**
+ * Main function to generate the index.ts file
+ */
+function generateIndex(): void {
+  const currentDir = process.cwd();
+  const exportMap = new Map<string, ExportInfo[]>();
+
+  // Find and process all TypeScript files
+  const tsFiles = findTsFiles(currentDir);
+  for (const file of tsFiles) {
+    processFile(file, currentDir, exportMap);
+  }
+
+  if (exportMap.size === 0) {
+    console.log('No ax/Ax exports found');
+    return;
+  }
+
+  // Generate and write index.ts
+  const indexContent = generateIndexContent(exportMap);
+  const indexPath = path.join(currentDir, 'index.ts');
+  fs.writeFileSync(indexPath, indexContent);
+  console.log(`Generated ${indexPath} successfully!`);
+
+  // Apply biome fixes to the generated file
+  fixGeneratedFile(indexPath);
+}
+
+// Run the script
+try {
+  generateIndex();
+} catch (error) {
+  console.error('Failed to generate index:', error);
+  process.exit(1);
+}

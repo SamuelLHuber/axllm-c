@@ -1,0 +1,1211 @@
+import { describe, expect, it } from 'vitest';
+
+import { extractValues } from './extract.js';
+import { parseSignature } from './parser.js';
+import { type AxField, AxSignature, f } from './sig.js';
+
+describe('signature parsing', () => {
+  it('parses signature correctly', () => {
+    const sig = parseSignature(
+      `"hello world" contextInfo?:string "some context", queryText:string 'some query' -> reasoningSteps!?:string, answerList:string[], messageType:class "reminder, follow-up"`
+    );
+
+    expect(sig.desc).toBe('hello world');
+
+    expect(sig.inputs[0]).toEqual({
+      desc: 'some context',
+      name: 'contextInfo',
+      type: { name: 'string', isArray: false },
+      isOptional: true,
+    });
+
+    expect(sig.inputs[1]).toEqual({
+      desc: 'some query',
+      name: 'queryText',
+      type: { name: 'string', isArray: false },
+      isOptional: undefined,
+    });
+
+    expect(sig.outputs[0]).toEqual({
+      desc: undefined,
+      name: 'reasoningSteps',
+      type: { name: 'string', isArray: false },
+      isOptional: true,
+      isInternal: true,
+    });
+
+    expect(sig.outputs[1]).toEqual({
+      desc: undefined,
+      name: 'answerList',
+      type: { name: 'string', isArray: true },
+      isOptional: false,
+      isInternal: false,
+    });
+
+    expect(sig.outputs[2]).toEqual({
+      desc: undefined,
+      isInternal: false,
+      isOptional: false,
+      name: 'messageType',
+      type: {
+        name: 'class',
+        isArray: false,
+        options: ['reminder', 'follow-up'],
+      },
+    });
+  });
+
+  it('throws descriptive error for invalid signature', () => {
+    expect(() =>
+      parseSignature(
+        'contextInfo?:string, queryText:boom -> testField:image, answerList:string[]'
+      )
+    ).toThrow('Invalid type "boom"');
+  });
+
+  it('throws error for empty signature', () => {
+    expect(() => parseSignature('')).toThrow('Empty signature provided');
+  });
+
+  it('throws error for missing arrow', () => {
+    expect(() => parseSignature('userInput:string')).toThrow(
+      'Missing output section'
+    );
+  });
+
+  it('throws error for missing output fields', () => {
+    expect(() => parseSignature('userInput:string ->')).toThrow(
+      'No output fields specified after "->"'
+    );
+  });
+
+  it('throws error for generic field names', () => {
+    expect(() => parseSignature('text:string -> response:string')).toThrow(
+      'too generic'
+    );
+  });
+
+  it('throws error for duplicate field names', () => {
+    expect(() =>
+      parseSignature(
+        'userInput:string, userInput:number -> responseText:string'
+      )
+    ).toThrow('Duplicate input field name');
+  });
+
+  it('throws error for field names in both input and output', () => {
+    expect(() =>
+      parseSignature('userInput:string -> userInput:string')
+    ).toThrow('appears in both inputs and outputs');
+  });
+
+  it('throws error for class type in input', () => {
+    expect(() =>
+      parseSignature('categoryType:class "a, b" -> responseText:string')
+    ).toThrow('cannot use the "class" type');
+  });
+
+  it('throws error for internal marker in input', () => {
+    expect(() =>
+      parseSignature('userInput!:string -> responseText:string')
+    ).toThrow('cannot use the internal marker');
+  });
+
+  it('throws error for image type in output', () => {
+    expect(() =>
+      parseSignature('userInput:string -> outputImage:image')
+    ).toThrow('Image type is not supported in output fields');
+  });
+
+  it('allows audio type in output', () => {
+    expect(() =>
+      parseSignature('userInput:string -> speech:audio, summary:string')
+    ).not.toThrow();
+  });
+
+  it('throws error for audio array type in output', () => {
+    expect(() => parseSignature('userInput:string -> clips:audio[]')).toThrow(
+      'Arrays of audio are not supported'
+    );
+  });
+
+  it('allows single class option', () => {
+    expect(() =>
+      parseSignature('userInput:string -> categoryType:class "only-one"')
+    ).not.toThrow();
+  });
+
+  it('throws error for empty class options', () => {
+    expect(() =>
+      parseSignature('userInput:string -> categoryType:class ""')
+    ).toThrow('Missing class options after "class" type');
+  });
+
+  it('allows any class option names including numbers', () => {
+    expect(() =>
+      parseSignature(
+        'userInput:string -> categoryType:class "valid, 123invalid, option-with-dash"'
+      )
+    ).not.toThrow();
+  });
+
+  it('supports both comma and pipe separators for class options', () => {
+    // Test comma separator
+    const sig1 = parseSignature(
+      'userInput:string -> categoryType:class "positive, negative, neutral"'
+    );
+    expect(sig1.outputs[0]?.type?.options).toEqual([
+      'positive',
+      'negative',
+      'neutral',
+    ]);
+
+    // Test pipe separator
+    const sig2 = parseSignature(
+      'userInput:string -> categoryType:class "positive | negative | neutral"'
+    );
+    expect(sig2.outputs[0]?.type?.options).toEqual([
+      'positive',
+      'negative',
+      'neutral',
+    ]);
+
+    // Test mixed separators
+    const sig3 = parseSignature(
+      'userInput:string -> categoryType:class "positive, negative | neutral"'
+    );
+    expect(sig3.outputs[0]?.type?.options).toEqual([
+      'positive',
+      'negative',
+      'neutral',
+    ]);
+  });
+
+  it('supports class options with mixed separators and spacing', () => {
+    expect(() =>
+      parseSignature(
+        'userInput:string -> categoryType:class "valid, option,with,comma"'
+      )
+    ).not.toThrow();
+
+    expect(() =>
+      parseSignature(
+        'userInput:string -> categoryType:class "valid | option|with|pipe"'
+      )
+    ).not.toThrow();
+
+    const sig1 = parseSignature(
+      'userInput:string -> categoryType:class "valid, option,with,comma"'
+    );
+    const output1 = sig1.outputs[0]?.type;
+    if (output1?.name === 'class') {
+      expect(output1.options).toEqual(['valid', 'option', 'with', 'comma']);
+    }
+
+    const sig2 = parseSignature(
+      'userInput:string -> categoryType:class "valid | option|with|pipe"'
+    );
+    const output2 = sig2.outputs[0]?.type;
+    if (output2?.name === 'class') {
+      expect(output2.options).toEqual(['valid', 'option', 'with', 'pipe']);
+    }
+  });
+
+  it('throws error for field names that are too short', () => {
+    expect(() => parseSignature('a:string -> b:string')).toThrow('too short');
+  });
+
+  it('throws error for field names starting with numbers', () => {
+    expect(() =>
+      parseSignature('1invalid:string -> responseText:string')
+    ).toThrow('cannot start with a number');
+  });
+
+  it('throws error for invalid field name characters', () => {
+    expect(() =>
+      parseSignature('user-input:string -> responseText:string')
+    ).toThrow('Expected "->"');
+  });
+
+  it('provides type suggestions for common mistakes', () => {
+    expect(() =>
+      parseSignature('userInput:str -> responseText:string')
+    ).toThrow('Did you mean "string"?');
+    expect(() =>
+      parseSignature('userInput:int -> responseText:string')
+    ).toThrow('Did you mean "number"?');
+    expect(() =>
+      parseSignature('userInput:bool -> responseText:string')
+    ).toThrow('Did you mean "boolean"?');
+  });
+
+  it('throws error for unterminated strings', () => {
+    expect(() =>
+      parseSignature('userInput:string "unterminated -> responseText:string')
+    ).toThrow('Unterminated string');
+  });
+
+  it('throws error for unexpected content after signature', () => {
+    expect(() =>
+      parseSignature('userInput:string -> responseText:string extra content')
+    ).toThrow('Unexpected content after signature');
+  });
+
+  it('allows array constraints for image and audio types', () => {
+    expect(() =>
+      parseSignature('userImages:image[] -> responseText:string')
+    ).not.toThrow();
+    expect(() =>
+      parseSignature('userAudios:audio[] -> responseText:string')
+    ).not.toThrow();
+  });
+
+  it('allows valid descriptive field names', () => {
+    expect(() =>
+      parseSignature('userQuestion:string -> analysisResult:string')
+    ).not.toThrow();
+    expect(() =>
+      parseSignature('documentContent:string -> summaryText:string')
+    ).not.toThrow();
+    expect(() =>
+      parseSignature(
+        'customer_feedback:string -> sentiment_category:class "positive, negative, neutral"'
+      )
+    ).not.toThrow();
+  });
+});
+
+describe('AxSignature class validation', () => {
+  it('throws error when adding invalid input field', () => {
+    const sig = AxSignature.from();
+    expect(() =>
+      sig.addInputField({
+        name: 'text',
+        type: { name: 'string', isArray: false },
+      })
+    ).toThrow('too generic');
+  });
+
+  it('throws error when adding invalid output field', () => {
+    const sig = AxSignature.from();
+    expect(() =>
+      sig.addOutputField({
+        name: 'outputImage',
+        type: { name: 'image', isArray: false },
+      })
+    ).toThrow('image type is not supported in output fields');
+  });
+
+  it('allows adding a single audio output field', () => {
+    const sig = AxSignature.from('prompt:string -> answer:string');
+    expect(() =>
+      sig.appendOutputField('speech', { type: 'audio' })
+    ).not.toThrow();
+  });
+
+  it('throws error when setting non-array input fields', () => {
+    const sig = AxSignature.from();
+    expect(() =>
+      sig.setInputFields('not an array' as unknown as readonly AxField[])
+    ).toThrow('Input fields must be an array');
+  });
+
+  it('throws error when setting non-array output fields', () => {
+    const sig = AxSignature.from();
+    expect(() =>
+      sig.setOutputFields('not an array' as unknown as readonly AxField[])
+    ).toThrow('Output fields must be an array');
+  });
+
+  it('throws error when setting non-string description', () => {
+    const sig = AxSignature.from();
+    expect(() => sig.setDescription(123 as unknown as string)).toThrow(
+      'Description must be a string'
+    );
+  });
+
+  it('validates class options for duplicates', () => {
+    expect(() =>
+      AxSignature.from(
+        'userInput:string -> categoryType:class "positive, negative, positive"'
+      )
+    ).toThrow('Duplicate class options found');
+  });
+
+  it('validates minimum signature requirements', () => {
+    const sig = AxSignature.from();
+
+    // Setting fields individually should not trigger full validation
+    sig.setOutputFields([
+      { name: 'responseText', type: { name: 'string', isArray: false } },
+    ]);
+
+    // But explicit validation should fail because there's no input field
+    expect(() => sig.validate()).toThrow('must have at least one input field');
+
+    sig.setInputFields([
+      { name: 'userInput', type: { name: 'string', isArray: false } },
+    ]);
+
+    // Setting empty output fields should work during construction
+    sig.setOutputFields([]);
+
+    // But explicit validation should fail because there's no output field
+    expect(() => sig.validate()).toThrow('must have at least one output field');
+  });
+
+  it('provides helpful suggestions in error messages', () => {
+    try {
+      AxSignature.from('text:string -> response:string');
+    } catch (error) {
+      expect((error as Error).message).toContain('too generic');
+      // The error should have some suggestion, let's check it's informative
+      expect(error).toHaveProperty('suggestion');
+    }
+  });
+});
+
+describe('extract values with signatures', () => {
+  it('should extract simple answer value', () => {
+    const sig = AxSignature.from('userQuestion:string -> responseText:string');
+    const v1 = {};
+    extractValues(sig, v1, `Response Text: "hello world"`);
+
+    expect(v1).toEqual({ responseText: '"hello world"' });
+  });
+
+  it('should not extract value with no prefix and single output', () => {
+    const sig = AxSignature.from('userQuestion:string -> responseText:string');
+    const v1 = {};
+    extractValues(sig, v1, 'hello world');
+
+    expect(v1).toEqual({ responseText: 'hello world' });
+  });
+
+  it('should extract and parse JSON values', () => {
+    const sig = AxSignature.from('userQuestion:string -> analysisResult:json');
+
+    const v1 = {};
+    extractValues(sig, v1, 'Analysis Result: ```json\n{"hello": "world"}\n```');
+
+    expect(v1).toEqual({ analysisResult: { hello: 'world' } });
+  });
+
+  it('should extract multiple text values', () => {
+    const sig = AxSignature.from(
+      'documentText:string -> titleText:string, keyPoints:string, descriptionText:string'
+    );
+    const v1 = {};
+    extractValues(
+      sig,
+      v1,
+      'Title Text: Coastal Ecosystem Restoration\nKey Points: Coastal regions prone to natural disasters, Selection criteria based on vulnerability indices and population density, Climate risk assessments conducted for sea-level rise and extreme weather events, Targeted ecosystems include mangrove forests, coral reefs, wetlands\nDescription Text: The project focuses on coastal regions vulnerable to natural disasters like hurricanes and flooding. Selection criteria included vulnerability indices, population density, and proximity to critical infrastructure. Climate risk assessments identified risks related to sea-level rise, storm surges, and extreme weather events. Targeted ecosystems encompass mangrove forests, coral reefs, and wetlands that provide coastal protection, biodiversity support, and livelihood opportunities for local communities.'
+    );
+
+    expect(v1).toEqual({
+      titleText: 'Coastal Ecosystem Restoration',
+      keyPoints:
+        'Coastal regions prone to natural disasters, Selection criteria based on vulnerability indices and population density, Climate risk assessments conducted for sea-level rise and extreme weather events, Targeted ecosystems include mangrove forests, coral reefs, wetlands',
+      descriptionText:
+        'The project focuses on coastal regions vulnerable to natural disasters like hurricanes and flooding. Selection criteria included vulnerability indices, population density, and proximity to critical infrastructure. Climate risk assessments identified risks related to sea-level rise, storm surges, and extreme weather events. Targeted ecosystems encompass mangrove forests, coral reefs, and wetlands that provide coastal protection, biodiversity support, and livelihood opportunities for local communities.',
+    });
+  });
+});
+
+describe('AxSignature', () => {
+  it('should create from a valid signature string', () => {
+    const sig = AxSignature.from(
+      'userQuestion:string -> modelAnswer:string, certaintyValue:number'
+    );
+    expect(sig.getInputFields()).toHaveLength(1);
+    expect(sig.getOutputFields()).toHaveLength(2);
+    expect(sig.toString()).toBe(
+      'userQuestion:string -> modelAnswer:string, certaintyValue:number'
+    );
+  });
+
+  it('should create from another AxSignature instance', () => {
+    const original = AxSignature.from(
+      'userQuestion:string -> modelAnswer:string, certaintyValue:number'
+    );
+    const clone = AxSignature.from(original);
+    expect(clone.toString()).toBe(original.toString());
+    expect(clone.hash()).toBe(original.hash());
+  });
+
+  it('should throw AxSignatureValidationError for invalid string', () => {
+    expect(() => AxSignature.from('invalid-signature')).toThrow(
+      'Invalid Signature'
+    );
+  });
+
+  it('should set and get description', () => {
+    const sig = AxSignature.from('userQuestion:string -> modelAnswer:string');
+    sig.setDescription('This is a Q&A signature.');
+    expect(sig.getDescription()).toBe('This is a Q&A signature.');
+    expect(sig.toString()).toContain('"This is a Q&A signature."');
+  });
+
+  it('should add input and output fields', () => {
+    const sig = AxSignature.from('userQuestion:string -> modelAnswer:string');
+    sig.addInputField({
+      name: 'userEmail',
+      type: { name: 'string', isArray: false },
+      description: 'User email address',
+    });
+    sig.addOutputField({
+      name: 'userResponse',
+      type: { name: 'string', isArray: false },
+      description: 'User response',
+    });
+
+    expect(sig.getInputFields().length).toBe(2);
+    expect(sig.getOutputFields().length).toBe(2);
+  });
+
+  it('should prevent adding fields with reserved names', () => {
+    const sig = AxSignature.from();
+    expect(() =>
+      sig.addInputField({
+        name: 'string',
+        type: { name: 'string', isArray: false },
+      })
+    ).toThrow('too generic');
+    expect(() =>
+      sig.addOutputField({
+        name: 'response',
+        type: { name: 'string', isArray: false },
+      })
+    ).toThrow('too generic');
+  });
+
+  it('should set input and output fields', () => {
+    const sig = AxSignature.from('userQuestion:string -> modelAnswer:string');
+    sig.setInputFields([
+      {
+        name: 'userEmail',
+        type: { name: 'string', isArray: false },
+        description: 'User email',
+      },
+    ]);
+    sig.setOutputFields([
+      {
+        name: 'userResponse',
+        type: { name: 'string', isArray: false },
+        description: 'User response',
+      },
+    ]);
+
+    expect(sig.getInputFields().length).toBe(1);
+    expect(sig.getOutputFields().length).toBe(1);
+  });
+
+  it('should handle complex field definitions', () => {
+    const sig = AxSignature.from('userQuestion:string -> modelAnswer:string');
+    sig.addInputField({
+      name: 'contextInfo',
+      type: { name: 'string', isArray: false },
+      description: 'Context information',
+    });
+    sig.addOutputField({
+      name: 'confidenceScore',
+      type: { name: 'number', isArray: false },
+      description: 'Confidence score',
+      isOptional: true,
+    });
+
+    expect(sig.getInputFields().length).toBe(2);
+    expect(sig.getOutputFields().length).toBe(2);
+  });
+
+  it('should generate a consistent hash', () => {
+    const sig1 = AxSignature.from(
+      'userQuestion:string -> modelAnswer:string, certaintyValue:number'
+    );
+    const sig2 = AxSignature.from(
+      'userQuestion:string -> modelAnswer:string, certaintyValue:number'
+    );
+    const sig3 = AxSignature.from('userQuestion:string -> modelAnswer:string');
+
+    expect(sig1.hash()).toBe(sig2.hash());
+    expect(sig1.hash()).not.toBe(sig3.hash());
+  });
+
+  it('should update hash when modified', () => {
+    const sig = AxSignature.from('userQuestion:string -> modelAnswer:string');
+    const initialHash = sig.hash();
+    sig.addOutputField({
+      name: 'certaintyValue',
+      type: { name: 'number', isArray: false },
+    });
+    const modifiedHash = sig.hash();
+
+    expect(initialHash).not.toBe(modifiedHash);
+  });
+
+  it('should return a JSON representation', () => {
+    const sig = AxSignature.from(
+      '"Q&A" userQuestion:string -> modelAnswer:string, certaintyValue:number'
+    );
+    const json = sig.toJSON();
+
+    expect(json.id).toBe(sig.hash());
+    expect(json.description).toBe('Q&A');
+    expect(json.inputFields).toHaveLength(1);
+    expect(json.outputFields).toHaveLength(2);
+  });
+});
+
+describe('extractValues with AxSignature', () => {
+  it('should extract values based on a signature', () => {
+    const sig = AxSignature.from('userQuestion:string -> modelAnswer:string');
+    const result: Record<string, unknown> = {};
+    const content = 'Model Answer: The answer is 42.';
+
+    extractValues(sig, result, content);
+
+    expect(result).toEqual({ modelAnswer: 'The answer is 42.' });
+  });
+
+  it('should handle missing optional fields', () => {
+    const sig = AxSignature.from(
+      'userQuestion:string -> modelAnswer:string, memoText?:string'
+    );
+    const content = 'Model Answer: The answer is 42.';
+    const result = {};
+    extractValues(sig, result, content);
+
+    expect(result).toEqual({ modelAnswer: 'The answer is 42.' });
+  });
+
+  it('should not return internal fields', () => {
+    const sig2 = AxSignature.from(
+      'userQuestion:string -> modelAnswer:string, thoughtProcess!:string'
+    );
+    const result: Record<string, unknown> = {};
+    const content = `Model Answer: The answer is 42.
+Thought Process: I am thinking.`;
+
+    extractValues(sig2, result, content);
+
+    expect(result).toEqual({ modelAnswer: 'The answer is 42.' });
+  });
+
+  it('should create signature with mixed input fields and output field', () => {
+    // Create a new empty AxSignature
+    const sig = AxSignature.from();
+
+    // Add first input field (required)
+    sig.addInputField({
+      name: 'userQuestion',
+      type: { name: 'string', isArray: false },
+      description: 'User question input',
+    });
+
+    // Add second input field (optional)
+    sig.addInputField({
+      name: 'contextInfo',
+      type: { name: 'string', isArray: false },
+      description: 'Optional context information',
+      isOptional: true,
+    });
+
+    // Add output field with descriptive name (not "response" which is too generic)
+    sig.addOutputField({
+      name: 'answerText',
+      type: { name: 'string', isArray: false },
+      description: 'Generated answer text',
+    });
+
+    // Verify the signature was created correctly
+    expect(sig.getInputFields()).toHaveLength(2);
+    expect(sig.getOutputFields()).toHaveLength(1);
+
+    // Check input fields
+    const inputFields = sig.getInputFields();
+    expect(inputFields[0]?.name).toBe('userQuestion');
+    expect(inputFields[0]?.isOptional).toBeUndefined();
+    expect(inputFields[1]?.name).toBe('contextInfo');
+    expect(inputFields[1]?.isOptional).toBe(true);
+
+    // Check output field
+    const outputFields = sig.getOutputFields();
+    expect(outputFields[0]?.name).toBe('answerText');
+
+    // Verify signature string representation includes descriptions
+    expect(sig.toString()).toBe(
+      'userQuestion:string "User question input", contextInfo?:string "Optional context information" -> answerText:string "Generated answer text"'
+    );
+
+    // Verify we can generate a hash
+    expect(sig.hash()).toBeTruthy();
+  });
+
+  it('should fail when using generic field name "response"', () => {
+    const sig = AxSignature.from();
+
+    // This should throw an error because "response" is too generic
+    expect(() =>
+      sig.addOutputField({
+        name: 'response',
+        type: { name: 'string', isArray: false },
+      })
+    ).toThrow('too generic');
+  });
+
+  it('should validate full signature consistency when explicitly called', () => {
+    const sig = AxSignature.from();
+
+    // Add only input field - should work without throwing
+    sig.addInputField({
+      name: 'userQuestion',
+      type: { name: 'string', isArray: false },
+    });
+
+    // Full validation should fail because there's no output field
+    expect(() => sig.validate()).toThrow('must have at least one output field');
+
+    // Add output field
+    sig.addOutputField({
+      name: 'answerText',
+      type: { name: 'string', isArray: false },
+    });
+
+    // Now full validation should pass
+    expect(() => sig.validate()).not.toThrow();
+  });
+
+  it('should cache validation results and avoid redundant validation', () => {
+    const sig = AxSignature.from();
+    sig.addInputField({
+      name: 'userInput',
+      type: { name: 'string', isArray: false },
+    });
+    sig.addOutputField({
+      name: 'responseText',
+      type: { name: 'string', isArray: false },
+    });
+
+    // First validation should pass and cache the result
+    const result1 = sig.validate();
+    expect(result1).toBe(true);
+
+    // Second validation should return cached result (true) without re-validating
+    const result2 = sig.validate();
+    expect(result2).toBe(true);
+
+    // Modify signature - this should invalidate cache
+    sig.addInputField({
+      name: 'contextInfo',
+      type: { name: 'string', isArray: false },
+    });
+
+    // Validation should run again and pass
+    const result3 = sig.validate();
+    expect(result3).toBe(true);
+
+    // Another call should use cached result
+    const result4 = sig.validate();
+    expect(result4).toBe(true);
+  });
+});
+
+describe('AxSignature hasComplexFields', () => {
+  it('should return false for simple signature', () => {
+    const sig = f().input('in', f.string()).output('out', f.string()).build();
+    expect(sig.hasComplexFields()).toBe(false);
+  });
+
+  it('should return true for complex output', () => {
+    const sig = f()
+      .input('in', f.string())
+      .output('out', f.object({ field: f.string() }))
+      .build();
+    expect(sig.hasComplexFields()).toBe(true);
+  });
+
+  it('should return false for complex input (only output fields are checked)', () => {
+    const sig = f()
+      .input('in', f.object({ field: f.string() }))
+      .output('out', f.string())
+      .build();
+    expect(sig.hasComplexFields()).toBe(false);
+  });
+
+  it('should return false for array of objects in input (only output fields are checked)', () => {
+    const sig = f()
+      .input('in', f.object({ field: f.string() }).array())
+      .output('out', f.string())
+      .build();
+    expect(sig.hasComplexFields()).toBe(false);
+  });
+
+  it('should return true for array of objects in output', () => {
+    const sig = f()
+      .input('in', f.string())
+      .output('out', f.object({ field: f.string() }).array())
+      .build();
+    expect(sig.hasComplexFields()).toBe(true);
+  });
+});
+
+describe('Type-safe field addition methods', () => {
+  it('should append input field with type safety', () => {
+    const baseSig = AxSignature.create(
+      'userInput:string -> responseText:string'
+    );
+    const enhanced = baseSig.appendInputField('contextInfo', {
+      type: 'string',
+      description: 'Additional context',
+      isOptional: true,
+    });
+
+    expect(enhanced.getInputFields()).toHaveLength(2);
+    expect(enhanced.getInputFields()[1]?.name).toBe('contextInfo');
+    expect(enhanced.getInputFields()[1]?.isOptional).toBe(true);
+    expect(enhanced.toString()).toContain(
+      'contextInfo?:string "Additional context"'
+    );
+  });
+
+  it('should prepend input field with type safety', () => {
+    const baseSig = AxSignature.create(
+      'userInput:string -> responseText:string'
+    );
+    const enhanced = baseSig.prependInputField('sessionId', {
+      type: 'string',
+      description: 'Session identifier',
+    });
+
+    expect(enhanced.getInputFields()).toHaveLength(2);
+    expect(enhanced.getInputFields()[0]?.name).toBe('sessionId');
+    expect(enhanced.getInputFields()[1]?.name).toBe('userInput');
+    expect(enhanced.toString()).toContain(
+      'sessionId:string "Session identifier", userInput:string'
+    );
+  });
+
+  it('should append output field with type safety', () => {
+    const baseSig = AxSignature.create(
+      'userInput:string -> responseText:string'
+    );
+    const enhanced = baseSig.appendOutputField('confidence', {
+      type: 'number',
+      description: 'Confidence score',
+    });
+
+    expect(enhanced.getOutputFields()).toHaveLength(2);
+    expect(enhanced.getOutputFields()[1]?.name).toBe('confidence');
+    expect(enhanced.toString()).toContain(
+      'responseText:string, confidence:number "Confidence score"'
+    );
+  });
+
+  it('should prepend output field with type safety', () => {
+    const baseSig = AxSignature.create(
+      'userInput:string -> responseText:string'
+    );
+    const enhanced = baseSig.prependOutputField('category', {
+      type: 'class',
+      options: ['question', 'request', 'complaint'],
+      description: 'Input category',
+    });
+
+    expect(enhanced.getOutputFields()).toHaveLength(2);
+    expect(enhanced.getOutputFields()[0]?.name).toBe('category');
+    expect(enhanced.getOutputFields()[1]?.name).toBe('responseText');
+    expect(enhanced.toString()).toContain(
+      'category:class "question | request | complaint"'
+    );
+  });
+
+  it('should support chaining multiple field additions', () => {
+    const baseSig = AxSignature.create(
+      'userInput:string -> responseText:string'
+    );
+    const enhanced = baseSig
+      .prependInputField('sessionId', {
+        type: 'string',
+        description: 'Session ID',
+      })
+      .appendInputField('metadata', { type: 'json', isOptional: true })
+      .prependOutputField('status', {
+        type: 'class',
+        options: ['success', 'error'],
+      })
+      .appendOutputField('timestamp', { type: 'datetime' });
+
+    expect(enhanced.getInputFields()).toHaveLength(3);
+    expect(enhanced.getOutputFields()).toHaveLength(3);
+
+    const inputNames = enhanced.getInputFields().map((f) => f.name);
+    expect(inputNames).toEqual(['sessionId', 'userInput', 'metadata']);
+
+    const outputNames = enhanced.getOutputFields().map((f) => f.name);
+    expect(outputNames).toEqual(['status', 'responseText', 'timestamp']);
+  });
+
+  it('should handle array field types correctly', () => {
+    const baseSig = AxSignature.create(
+      'userInput:string -> responseText:string'
+    );
+    const enhanced = baseSig
+      .appendInputField('tags', {
+        type: 'string',
+        isArray: true,
+        description: 'Tag list',
+      })
+      .appendOutputField('suggestions', { type: 'string', isArray: true });
+
+    expect(enhanced.toString()).toContain('tags:string[] "Tag list"');
+    expect(enhanced.toString()).toContain('suggestions:string[]');
+  });
+
+  it('should prevent duplicate field names in type-safe methods', () => {
+    const baseSig = AxSignature.create(
+      'userInput:string -> responseText:string'
+    );
+
+    expect(() =>
+      baseSig.appendInputField('userInput', { type: 'string' })
+    ).toThrow('Duplicate input field name: "userInput"');
+
+    expect(() =>
+      baseSig.appendOutputField('responseText', { type: 'string' })
+    ).toThrow('Duplicate output field name: "responseText"');
+  });
+
+  it('should prevent field names appearing in both input and output', () => {
+    const baseSig = AxSignature.create(
+      'userInput:string -> responseText:string'
+    );
+
+    expect(() =>
+      baseSig.appendOutputField('userInput', { type: 'string' })
+    ).toThrow('Field name "userInput" appears in both inputs and outputs');
+
+    expect(() =>
+      baseSig.appendInputField('responseText', { type: 'string' })
+    ).toThrow('Field name "responseText" appears in both inputs and outputs');
+  });
+
+  it('should validate field types according to input/output rules', () => {
+    const baseSig = AxSignature.create(
+      'userInput:string -> responseText:string'
+    );
+
+    // Class types not allowed in input
+    expect(() =>
+      baseSig.appendInputField('category', {
+        type: 'class',
+        options: ['a', 'b'],
+      })
+    ).toThrow('Class type is not supported in input fields');
+
+    // Image types not allowed in output
+    expect(() =>
+      baseSig.appendOutputField('outputImage', { type: 'image' })
+    ).toThrow('image type is not supported in output fields');
+  });
+
+  it('should return immutable new instances', () => {
+    const baseSig = AxSignature.create(
+      'userInput:string -> responseText:string'
+    );
+    const enhanced = baseSig.appendInputField('contextInfo', {
+      type: 'string',
+    });
+
+    // Original signature should be unchanged
+    expect(baseSig.getInputFields()).toHaveLength(1);
+    expect(baseSig.toString()).toBe('userInput:string -> responseText:string');
+
+    // Enhanced signature should have the new field
+    expect(enhanced.getInputFields()).toHaveLength(2);
+    expect(enhanced.toString()).toContain('contextInfo:string');
+
+    // They should have different hashes
+    expect(baseSig.hash()).not.toBe(enhanced.hash());
+  });
+
+  it('should handle multiline signatures with proper whitespace trimming in type inference', () => {
+    // Test the specific case that was reported - field names should not include whitespace
+    const sig = AxSignature.create(`searchQuery:string -> 
+    relevantContext:string,
+    sources:string[]`);
+
+    const outputFields = sig.getOutputFields();
+    expect(outputFields).toHaveLength(2);
+
+    // Field names should be properly trimmed without newlines or extra spaces
+    expect(outputFields[0].name).toBe('relevantContext');
+    expect(outputFields[1].name).toBe('sources');
+
+    // Verify no whitespace characters in field names
+    expect(outputFields[0].name).not.toMatch(/[\s\n\t\r]/);
+    expect(outputFields[1].name).not.toMatch(/[\s\n\t\r]/);
+  });
+});
+
+describe('File type union support', () => {
+  it('should support file type with data field', () => {
+    const sig = AxSignature.from('fileInput:file -> responseText:string');
+    const inputFields = sig.getInputFields();
+    expect(inputFields).toHaveLength(1);
+    expect(inputFields[0].name).toBe('fileInput');
+    expect(inputFields[0].type?.name).toBe('file');
+  });
+
+  it('should support file type with fileUri field', () => {
+    const sig = AxSignature.from('fileInput:file -> responseText:string');
+    const inputFields = sig.getInputFields();
+    expect(inputFields).toHaveLength(1);
+    expect(inputFields[0].name).toBe('fileInput');
+    expect(inputFields[0].type?.name).toBe('file');
+  });
+
+  it('should support array of files with mixed formats', () => {
+    const sig = AxSignature.from('fileInputs:file[] -> responseText:string');
+    const inputFields = sig.getInputFields();
+    expect(inputFields).toHaveLength(1);
+    expect(inputFields[0].name).toBe('fileInputs');
+    expect(inputFields[0].type?.name).toBe('file');
+    expect(inputFields[0].type?.isArray).toBe(true);
+  });
+});
+
+describe('Media type restrictions', () => {
+  describe('Runtime validation', () => {
+    it('should throw error for image type in nested object output', () => {
+      expect(() => {
+        f()
+          .output(
+            'user',
+            f.object({
+              photo: f.image('Profile photo'),
+            })
+          )
+          .build();
+      }).toThrow(/image type is not allowed in nested object fields/);
+    });
+
+    it('should throw error for audio type in nested object output', () => {
+      expect(() => {
+        f()
+          .output(
+            'audioData',
+            f.object({
+              recording: f.audio('Voice recording'),
+            })
+          )
+          .build();
+      }).toThrow(/audio type is not allowed in nested object fields/);
+    });
+
+    it('should throw error for file type in nested object output', () => {
+      expect(() => {
+        f()
+          .output(
+            'document',
+            f.object({
+              attachment: f.file('Attached file'),
+            })
+          )
+          .build();
+      }).toThrow(/file type is not allowed in nested object fields/);
+    });
+
+    it('should throw error for media types in deeply nested objects', () => {
+      expect(() => {
+        f()
+          .output(
+            'profile',
+            f.object({
+              details: f.object({
+                avatar: f.image('User avatar'),
+              }),
+            })
+          )
+          .build();
+      }).toThrow(/image type is not allowed in nested object fields/);
+    });
+
+    it('should throw error for media types in array of objects', () => {
+      expect(() => {
+        f()
+          .output(
+            'gallery',
+            f
+              .object({
+                photo: f.image('Gallery photo'),
+              })
+              .array()
+          )
+          .build();
+      }).toThrow(/image type is not allowed in nested object fields/);
+    });
+
+    it('should allow media types as top-level input fields', () => {
+      expect(() => {
+        f()
+          .input('photo', f.image('User photo'))
+          .input('recording', f.audio('Voice recording'))
+          .input('document', f.file('Uploaded file'))
+          .output('analysis', f.string())
+          .build();
+      }).not.toThrow();
+    });
+
+    it('should throw error for image and file media types as output fields', () => {
+      // The error is thrown during build, not toJSONSchema
+      expect(() => {
+        f()
+          .input('prompt', f.string())
+          .output('generatedImage', f.image('Generated image'))
+          .build();
+      }).toThrow(/image type is not supported in output fields/);
+    });
+
+    it('should allow audio as a top-level output field', () => {
+      const sig = f()
+        .input('prompt', f.string())
+        .output('speech', f.audio('Generated spoken response'))
+        .build();
+
+      expect(sig.getOutputFields()[0].type?.name).toBe('audio');
+    });
+
+    it('should include helpful error message for nested media types', () => {
+      try {
+        f()
+          .output(
+            'userData',
+            f.object({
+              profilePicture: f.image('Profile picture'),
+            })
+          )
+          .build();
+        throw new Error('Should have thrown');
+      } catch (error) {
+        const message = (error as Error).message;
+        expect(message).toContain('image');
+        expect(message).toContain('nested object fields');
+      }
+    });
+  });
+
+  describe('Valid media type usage', () => {
+    it('should allow image as top-level input', () => {
+      const sig = f()
+        .input('photo', f.image('User photo'))
+        .output('description', f.string())
+        .build();
+
+      expect(sig.getInputFields()[0].type?.name).toBe('image');
+    });
+
+    it('should allow audio as top-level input', () => {
+      const sig = f()
+        .input('recording', f.audio('Audio recording'))
+        .output('transcription', f.string())
+        .build();
+
+      expect(sig.getInputFields()[0].type?.name).toBe('audio');
+    });
+
+    it('should allow file as top-level input', () => {
+      const sig = f()
+        .input('document', f.file('Document file'))
+        .output('summary', f.string())
+        .build();
+
+      expect(sig.getInputFields()[0].type?.name).toBe('file');
+    });
+
+    it('should allow multiple media types as top-level inputs', () => {
+      const sig = f()
+        .input('photo', f.image())
+        .input('audio', f.audio())
+        .input('file', f.file())
+        .output('analysis', f.string())
+        .build();
+
+      const inputFields = sig.getInputFields();
+      expect(inputFields).toHaveLength(3);
+      expect(inputFields[0].type?.name).toBe('image');
+      expect(inputFields[1].type?.name).toBe('audio');
+      expect(inputFields[2].type?.name).toBe('file');
+    });
+  });
+
+  describe('String-based signature validation', () => {
+    it('should allow media types in string-based input signatures', () => {
+      expect(() => {
+        AxSignature.from(
+          'photo:image, recording:audio -> analysisResult:string'
+        );
+      }).not.toThrow();
+    });
+
+    it('should handle media types correctly in toJSONSchema for string-based sigs', () => {
+      const sig = AxSignature.from('photo:image -> analysis:string');
+      const schema = sig.toJSONSchema();
+
+      // Image input should not be in schema (media types are handled separately)
+      expect(schema.properties?.analysis).toBeDefined();
+    });
+  });
+});
+
+// ----- toInputJSONSchema tests -----
+
+describe('AxSignature.toInputJSONSchema', () => {
+  it('should include only input fields, not output fields', () => {
+    const sig = AxSignature.from('question:string -> answer:string');
+    const schema = sig.toInputJSONSchema();
+    expect(schema.properties?.question).toBeDefined();
+    expect(schema.properties?.answer).toBeUndefined();
+  });
+
+  it('should include all input fields when there are multiple', () => {
+    const sig = AxSignature.from(
+      'query:string, topic:string -> analysisText:string'
+    );
+    const schema = sig.toInputJSONSchema();
+    expect(schema.properties?.query).toBeDefined();
+    expect(schema.properties?.topic).toBeDefined();
+    expect(schema.properties?.analysisText).toBeUndefined();
+  });
+
+  it('should mark required input fields in the required array', () => {
+    const sig = f()
+      .input('query', f.string())
+      .input('pageLimit', f.number().optional())
+      .output('analysisText', f.string())
+      .build();
+    const schema = sig.toInputJSONSchema();
+    expect(schema.required).toContain('query');
+    expect(schema.required).not.toContain('pageLimit');
+    expect(schema.required).not.toContain('analysisText');
+  });
+
+  it('should return only input field properties when there is one input and multiple outputs', () => {
+    const sig = AxSignature.from(
+      'query:string -> outputA:string, outputB:string'
+    );
+    const schema = sig.toInputJSONSchema();
+    expect(Object.keys(schema.properties ?? {})).toHaveLength(1);
+    expect(schema.properties?.query).toBeDefined();
+  });
+
+  it('should not include output-only fields in required', () => {
+    const sig = AxSignature.from(
+      'inputA:string, inputB:string -> outputA:string, outputB:string'
+    );
+    const schema = sig.toInputJSONSchema();
+    expect(schema.required).toContain('inputA');
+    expect(schema.required).toContain('inputB');
+    expect(schema.required).not.toContain('outputA');
+    expect(schema.required).not.toContain('outputB');
+  });
+});

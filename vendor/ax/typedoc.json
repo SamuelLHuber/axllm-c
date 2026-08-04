@@ -1,0 +1,44 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "plugin": [
+    "typedoc-plugin-markdown",
+    "typedoc-plugin-frontmatter",
+    "./scripts/customFrontmatter.mjs"
+  ],
+  "pretty": true,
+  "cleanOutputDir": true,
+  "hidePageTitle": true,
+  "hideGroupHeadings": true,
+  "parametersFormat": "table",
+  "typeDeclarationVisibility": "compact",
+  "hidePageHeader": true,
+  "hideBreadcrumbs": true,
+  "useHTMLAnchors": true,
+  "preserveAnchorCasing": true,
+  "excludePrivate": true,
+  "excludeProtected": true,
+  "flattenOutputFiles": true,
+  "mergeReadme": false,
+  "interfacePropertiesFormat": "table",
+  "classPropertiesFormat": "table",
+  "enumMembersFormat": "table",
+  "typeDeclarationFormat": "table",
+  "indexFormat": "table",
+  "expandParameters": true,
+  "useCodeBlocks": true,
+  "blockTagsPreserveOrder": ["@example", "@remarks", "@deprecated", "@see"],
+  "tableColumnSettings": {
+    "hideDefaults": false,
+    "hideInherited": false,
+    "hideModifiers": false,
+    "hideOverrides": false,
+    "hideSources": true,
+    "hideValues": false,
+    "leftAlignHeaders": true
+  },
+  "pageTitleTemplates": {
+    "index": "{projectName} API Documentation",
+    "module": "{name}",
+    "member": "{kind}: {name}"
+  }
+}

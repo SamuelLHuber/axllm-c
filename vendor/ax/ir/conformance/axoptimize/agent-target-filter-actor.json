@@ -1,0 +1,9 @@
+{
+  "expected_component_ids": ["root::instruction"],
+  "kind": "optimize",
+  "name": "agent-target-filter-actor",
+  "operation": "filter",
+  "program": "agent",
+  "signature": "question:string -> answer:string",
+  "target": "actor"
+}

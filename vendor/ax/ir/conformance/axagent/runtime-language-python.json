@@ -1,0 +1,17 @@
+{
+  "expected_runtime_contract_subset": {
+    "code_fence_language": "python",
+    "code_field_name": "pythonCode",
+    "code_field_title": "Python Code",
+    "is_javascript": false,
+    "language": "Python"
+  },
+  "kind": "agent_runtime_policy",
+  "name": "runtime-language-python",
+  "options": {
+    "runtime": {
+      "language": "Python"
+    }
+  },
+  "signature": "question:string -> answer:string"
+}

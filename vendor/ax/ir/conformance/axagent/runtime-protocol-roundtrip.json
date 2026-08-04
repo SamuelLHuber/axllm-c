@@ -1,0 +1,73 @@
+{
+  "create_globals": {
+    "inputs": {
+      "question": "adapter"
+    }
+  },
+  "create_options": {
+    "reservedNames": ["inputs", "final", "respond"],
+    "timeoutMs": 123
+  },
+  "execute_code": "final()",
+  "execute_options": {
+    "abort": true,
+    "sessionId": "runtime-protocol-session",
+    "timeout": 7,
+    "traceId": "runtime-protocol-trace"
+  },
+  "expected_capabilities_subset": {
+    "abort": true,
+    "inspect": true,
+    "language": "JavaScript",
+    "patch": true,
+    "snapshot": true,
+    "usage_instructions": "fixture protocol runtime"
+  },
+  "expected_close_subset": {
+    "closed": true
+  },
+  "expected_execute_subset": {
+    "args": [
+      {
+        "answer": "fixture"
+      }
+    ],
+    "type": "final"
+  },
+  "expected_inspect_subset": {
+    "__create_options": {
+      "reservedNames": ["inputs", "final", "respond"],
+      "timeoutMs": 123
+    },
+    "__last_execute_options": {
+      "abort": true,
+      "sessionId": "runtime-protocol-session",
+      "timeout": 7,
+      "traceId": "runtime-protocol-trace"
+    },
+    "answer": "fixture",
+    "inputs": {
+      "question": "adapter"
+    }
+  },
+  "expected_patch_subset": {
+    "bindings": {
+      "answer": "patched",
+      "safe": true
+    }
+  },
+  "expected_snapshot_subset": {
+    "bindings": {
+      "answer": "fixture"
+    }
+  },
+  "kind": "agent_runtime_protocol",
+  "name": "runtime-protocol-roundtrip",
+  "operation": "roundtrip",
+  "patch_globals": {
+    "bindings": {
+      "answer": "patched",
+      "safe": true
+    }
+  }
+}
