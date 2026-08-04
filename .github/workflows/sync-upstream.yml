@@ -1,4 +1,4 @@
-name: Sync upstream Ax release
+name: Sync Ax
 
 on:
   schedule:
@@ -8,25 +8,20 @@ on:
       version:
         description: 'Ax release tag to sync. Empty means latest release.'
         required: false
-        type: string
+        default: ''
       force:
-        description: 'Regenerate even if .ax-upstream-version already matches.'
+        description: 'Set to true to regenerate even if already synced.'
         required: false
-        default: false
-        type: boolean
+        default: 'false'
 
 permissions:
   contents: write
-
-env:
-  UPSTREAM_REPO: ax-llm/ax
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout axllm-c
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
@@ -34,37 +29,34 @@ jobs:
         id: upstream
         env:
           GH_TOKEN: ${{ github.token }}
-          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
           set -euo pipefail
           if [ -n "${INPUT_VERSION:-}" ]; then
             version="$INPUT_VERSION"
           else
-            version="$(gh release view -R "$UPSTREAM_REPO" --json tagName --jq .tagName)"
+            version="$(gh release view -R ax-llm/ax --json tagName --jq .tagName)"
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "version=$version"
 
       - name: Check whether sync is needed
         id: need
         env:
           VERSION: ${{ steps.upstream.outputs.version }}
-          FORCE: ${{ inputs.force }}
+          FORCE: ${{ github.event.inputs.force }}
         run: |
           set -euo pipefail
           current=""
           test ! -f .ax-upstream-version || current="$(cat .ax-upstream-version)"
           if [ "$current" = "$VERSION" ] && [ "${FORCE:-false}" != "true" ]; then
             echo "sync=false" >> "$GITHUB_OUTPUT"
-            echo "already synced to $VERSION"
           else
             echo "sync=true" >> "$GITHUB_OUTPUT"
-            echo "sync needed: current=${current:-none} latest=$VERSION"
           fi
+          echo "current=${current:-none} latest=$VERSION sync=$(cat "$GITHUB_OUTPUT" | tail -1)"
 
-      - name: Setup Node
+      - uses: actions/setup-node@v4
         if: steps.need.outputs.sync == 'true'
-        uses: actions/setup-node@v4
         with:
           node-version: '22'
 
@@ -74,35 +66,27 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake g++ curl libcurl4-openssl-dev libssl-dev
 
-      - name: Sync upstream and generate C ABI package
+      - name: Sync upstream and generate package
         if: steps.need.outputs.sync == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          AXLLM_C_FORCE_UPDATE: ${{ inputs.force == true && '1' || '0' }}
+          AXLLM_C_FORCE_UPDATE: ${{ github.event.inputs.force == 'true' && '1' || '0' }}
         run: ./scripts/update-upstream.sh '${{ steps.upstream.outputs.version }}'
 
       - name: Verify generated package
         if: steps.need.outputs.sync == 'true'
         run: ./scripts/verify.sh
 
-      - name: Detect changes
+      - name: Commit and push changes
         if: steps.need.outputs.sync == 'true'
-        id: changes
-        run: |
-          set -euo pipefail
-          if [ -n "$(git status --porcelain)" ]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            git status --short
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Commit and push
-        if: steps.need.outputs.sync == 'true' && steps.changes.outputs.changed == 'true'
         env:
           VERSION: ${{ steps.upstream.outputs.version }}
         run: |
           set -euo pipefail
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "no changes"
+            exit 0
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add .
@@ -110,9 +94,4 @@ jobs:
           git push
 
       - name: Summary
-        run: |
-          if [ '${{ steps.need.outputs.sync }}' = 'true' ]; then
-            echo "Synced Ax ${{ steps.upstream.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "Already synced to Ax ${{ steps.upstream.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
-          fi
+        run: echo "Ax ${{ steps.upstream.outputs.version }} sync=${{ steps.need.outputs.sync }}" >> "$GITHUB_STEP_SUMMARY"
