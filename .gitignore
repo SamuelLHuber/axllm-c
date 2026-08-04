@@ -1,5 +1,6 @@
 vendor/ax/node_modules/
 vendor/ax/*/node_modules/
 vendor/ax/*/*/node_modules/
+lefthook.yml
 /tmp/
 .DS_Store

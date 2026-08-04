@@ -4,15 +4,48 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+  pull_request:
 
 permissions:
   contents: read
 
 jobs:
-  verify:
+  verify-dist:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: test -f dist/axllm/axllm_c.h
-      - run: bash -n scripts/update-upstream.sh scripts/verify.sh
-      - run: node --check scripts/patch-ax-codegen.mjs
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ curl libcurl4-openssl-dev libssl-dev
+      - name: Lint workflow and scripts
+        run: |
+          npm install -g actionlint
+          actionlint .github/workflows/*.yml
+          bash -n scripts/update-upstream.sh scripts/apply-overlays.sh scripts/verify.sh
+          node --check scripts/patch-ax-codegen.mjs
+      - name: Verify overlay patching
+        run: ./scripts/test-overlay.sh
+      - name: Verify committed dist package
+        run: ./scripts/verify.sh
+
+  sync-noop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Latest release should be a no-op when already synced
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          latest="$(gh release view -R ax-llm/ax --json tagName --jq .tagName)"
+          current="$(cat .ax-upstream-version)"
+          if [ "$latest" != "$current" ]; then
+            echo "upstream has a newer release: current=$current latest=$latest"
+            exit 0
+          fi
+          ./scripts/update-upstream.sh "$latest"
+          test -z "$(git status --porcelain)"
