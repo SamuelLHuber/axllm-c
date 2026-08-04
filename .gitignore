@@ -4,5 +4,6 @@ vendor/ax/*/*/node_modules/
 lefthook.yml
 __pycache__/
 *.pyc
+.release/
 /tmp/
 .DS_Store
