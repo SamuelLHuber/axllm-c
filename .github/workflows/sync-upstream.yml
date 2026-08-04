@@ -53,7 +53,8 @@ jobs:
           else
             echo "sync=true" >> "$GITHUB_OUTPUT"
           fi
-          echo "current=${current:-none} latest=$VERSION sync=$(cat "$GITHUB_OUTPUT" | tail -1)"
+          sync_state="$(tail -1 "$GITHUB_OUTPUT")"
+          echo "current=${current:-none} latest=$VERSION sync=$sync_state"
 
       - uses: actions/setup-node@v4
         if: steps.need.outputs.sync == 'true'
