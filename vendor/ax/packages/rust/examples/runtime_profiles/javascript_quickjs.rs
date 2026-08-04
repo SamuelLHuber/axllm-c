@@ -1,5 +1,5 @@
 use axllm::runtime::quickjs::QuickJsCodeRuntime;
-use axllm::{agent, AxError, AxResult, AxCodeRuntime};
+use axllm::{agent, AxCodeRuntime, AxError, AxResult};
 use serde_json::json;
 
 fn main() -> AxResult<()> {
@@ -43,24 +43,79 @@ fn main() -> AxResult<()> {
         }),
         json!({"reservedNames": ["inputs", "final"]}),
     )?;
-    assert_eq!(session.execute("askClarification('more?')", json!({}))?.payload["type"], "askClarification");
-    assert_eq!(session.execute("discover({topic: 'docs'})", json!({}))?.payload["kind"], "discover");
-    assert_eq!(session.execute("recall({query: 'state'})", json!({}))?.payload["kind"], "recall");
-    assert_eq!(session.execute("used('doc-1', 'needed')", json!({}))?.payload["kind"], "used");
-    assert_eq!(session.execute("reportSuccess('ok')", json!({}))?.payload["kind"], "status");
-    assert_eq!(session.execute("reportFailure('no')", json!({}))?.payload["kind"], "status");
-    assert_eq!(session.execute("guideAgent('try this')", json!({}))?.payload["type"], "guide_agent");
-    assert_eq!(session.execute("final(search({query: inputs.question}))", json!({}))?.payload["args"][0]["answer"], "result for host");
-    assert_eq!(session.execute("final(marker())", json!({}))?.payload["args"][0]["ok"], true);
+    assert_eq!(
+        session
+            .execute("askClarification('more?')", json!({}))?
+            .payload["type"],
+        "askClarification"
+    );
+    assert_eq!(
+        session
+            .execute("discover({topic: 'docs'})", json!({}))?
+            .payload["kind"],
+        "discover"
+    );
+    assert_eq!(
+        session
+            .execute("recall({query: 'state'})", json!({}))?
+            .payload["kind"],
+        "recall"
+    );
+    assert_eq!(
+        session
+            .execute("used('doc-1', 'needed')", json!({}))?
+            .payload["kind"],
+        "used"
+    );
+    assert_eq!(
+        session.execute("reportSuccess('ok')", json!({}))?.payload["kind"],
+        "status"
+    );
+    assert_eq!(
+        session.execute("reportFailure('no')", json!({}))?.payload["kind"],
+        "status"
+    );
+    assert_eq!(
+        session
+            .execute("guideAgent('try this')", json!({}))?
+            .payload["type"],
+        "guide_agent"
+    );
+    assert_eq!(
+        session
+            .execute("final(search({query: inputs.question}))", json!({}))?
+            .payload["args"][0]["answer"],
+        "result for host"
+    );
+    assert_eq!(
+        session.execute("final(marker())", json!({}))?.payload["args"][0]["ok"],
+        true
+    );
     let failed = session.execute("final({error: badTool({}).error})", json!({}))?;
     assert_eq!(failed.payload["args"][0]["error"], "bad tool failed");
-    assert_eq!(session.execute("throw new Error('boom')", json!({}))?.payload["error_category"], "runtime");
-    assert_eq!(session.execute("while (true) {}", json!({"timeoutMs": 1}))?.payload["error_category"], "timeout");
-    session.patch_globals(json!({"bindings": {"final": "blocked", "answer": "patched"}}), json!({}))?;
+    assert_eq!(
+        session
+            .execute("throw new Error('boom')", json!({}))?
+            .payload["error_category"],
+        "runtime"
+    );
+    assert_eq!(
+        session
+            .execute("while (true) {}", json!({"timeoutMs": 1}))?
+            .payload["error_category"],
+        "timeout"
+    );
+    session.patch_globals(
+        json!({"bindings": {"final": "blocked", "answer": "patched"}}),
+        json!({}),
+    )?;
     assert_ne!(session.inspect_globals(json!({}))?["final"], "blocked");
     assert_eq!(session.inspect_globals(json!({}))?["answer"], "patched");
     session.close()?;
-    assert_eq!(session.execute("final({})", json!({}))?.payload["error_category"], "session_closed");
+    assert_eq!(
+        session.execute("final({})", json!({}))?.payload["error_category"],
+        "session_closed"
+    );
 
     println!("rust-javascript-quickjs-profile-ok runtime-behavior-parity-ok");
     Ok(())
