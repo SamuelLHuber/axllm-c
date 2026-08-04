@@ -2,5 +2,7 @@ vendor/ax/node_modules/
 vendor/ax/*/node_modules/
 vendor/ax/*/*/node_modules/
 lefthook.yml
+__pycache__/
+*.pyc
 /tmp/
 .DS_Store
