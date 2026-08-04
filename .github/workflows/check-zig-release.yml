@@ -1,0 +1,67 @@
+name: Check Zig release
+
+on:
+  schedule:
+    - cron: '43 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update Zig pin if needed
+        id: zig
+        run: |
+          set -euo pipefail
+          current="$(grep -Eo 'ZIG_VERSION:-[0-9]+\.[0-9]+\.[0-9]+' scripts/install-zig.sh | sed 's/ZIG_VERSION:-//')"
+          latest="$(python3 scripts/update-zig-version.py)"
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          if [ "$current" = "$latest" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Zig already current: $current"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Zig update available: $current -> $latest"
+          fi
+
+      - name: Verify updated Zig installer
+        if: steps.zig.outputs.changed == 'true'
+        run: |
+          bash -n scripts/install-zig.sh
+          python3 -m py_compile scripts/update-zig-version.py
+          ./scripts/install-zig.sh
+          ./scripts/verify-zig-example.sh
+
+      - name: Open pull request
+        if: steps.zig.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT: ${{ steps.zig.outputs.current }}
+          LATEST: ${{ steps.zig.outputs.latest }}
+        run: |
+          set -euo pipefail
+          branch="automation/zig-$LATEST"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$branch"
+          git add scripts/install-zig.sh
+          git commit -m "update Zig to $LATEST"
+          git push --force-with-lease origin "$branch"
+          gh pr create \
+            --title "Update Zig to $LATEST" \
+            --body "Updates the pinned Zig installer from $CURRENT to $LATEST using checksums from ziglang.org/download/index.json.\n\nValidation run in workflow:\n- bash -n scripts/install-zig.sh\n- python3 -m py_compile scripts/update-zig-version.py\n- ./scripts/install-zig.sh\n- ./scripts/verify-zig-example.sh" \
+            --base main \
+            --head "$branch" \
+          || gh pr edit "$branch" \
+            --title "Update Zig to $LATEST" \
+            --body "Updates the pinned Zig installer from $CURRENT to $LATEST using checksums from ziglang.org/download/index.json."
+
+      - name: Summary
+        run: echo "Zig current=${{ steps.zig.outputs.current }} latest=${{ steps.zig.outputs.latest }} changed=${{ steps.zig.outputs.changed }}" >> "$GITHUB_STEP_SUMMARY"
