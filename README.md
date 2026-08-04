@@ -26,6 +26,7 @@ const ax = @cImport({
 Run the tiny Zig smoke:
 
 ```bash
+./scripts/install-zig.sh # optional when zig is already on PATH
 zig run examples/zig/hello.zig -I dist dist/axllm/axllm_c.cpp dist/axllm/axllm.cpp dist/axllm/mcp.cpp -lc++
 ```
 

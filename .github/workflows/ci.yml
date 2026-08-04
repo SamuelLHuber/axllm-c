@@ -31,7 +31,8 @@ jobs:
         run: ./scripts/test-overlay.sh
       - name: Verify committed dist package
         run: ./scripts/verify.sh
-      - uses: mlugg/setup-zig@v2
+      - name: Install Zig
+        run: ./scripts/install-zig.sh
       - name: Verify Zig example
         run: ./scripts/verify-zig-example.sh
 
