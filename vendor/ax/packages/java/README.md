@@ -10,14 +10,14 @@ Add the dependency from Maven Central:
 <dependency>
   <groupId>dev.axllm</groupId>
   <artifactId>ax</artifactId>
-  <version>23.0.10</version>
+  <version>23.0.11</version>
 </dependency>
 ```
 
 Or with Gradle:
 
 ```groovy
-implementation 'dev.axllm:ax:23.0.10'
+implementation 'dev.axllm:ax:23.0.11'
 ```
 
 Realtime audio over WebSocket uses the JDK's built-in `java.net.http` WebSocket — no extra dependency.
@@ -75,9 +75,10 @@ Shared Ax behavior is Core-owned. The generated target code stays focused on idi
 - `examples/AxMCPModernRoundtripExample.java`: modern MCP discovery, cache, task, and roots MRTR over an in-process HTTP loopback
 - `examples/ContextCacheRecoveryExample.java`: Gemini managed-context-cache recovery through a scripted transport
 
-`provider-api` examples make a real provider call and require `OPENAI_API_KEY` or `OPENAI_APIKEY`:
+`provider-api` examples make a real provider call. OpenAI examples require `OPENAI_API_KEY`; Vertex examples require `GOOGLE_VERTEX_ACCESS_TOKEN`, `GOOGLE_PROJECT_ID`, and `GOOGLE_REGION`:
 
-- `OPENAI_API_KEY=... javac -cp . dev/axllm/ax/*.java examples/AxGenOpenAIExample.java && java -cp .:examples AxGenOpenAIExample`: AxGen with a real OpenAI-compatible provider API
+- `OPENAI_API_KEY=... javac -cp . dev/axllm/ax/*.java examples/AxGenOpenAIExample.java && java -cp .:examples AxGenOpenAIExample`: GPT-5.6 prompt-cached AxGen with the OpenAI Chat API
+- `GOOGLE_VERTEX_ACCESS_TOKEN=... GOOGLE_PROJECT_ID=... GOOGLE_REGION=... javac -cp . dev/axllm/ax/*.java examples/VertexGeminiExample.java && java -cp .:examples VertexGeminiExample`: Gemini through Vertex routing
 - `OPENAI_API_KEY=... javac -cp . dev/axllm/ax/*.java examples/FlowOpenAIExample.java && java -cp .:examples FlowOpenAIExample`: AxFlow with a real OpenAI-compatible provider API
 
 ## Runtime Profiles And RLM Agents

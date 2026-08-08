@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(axllm VERSION 23.0.10 LANGUAGES CXX)
+project(axllm VERSION 23.0.11 LANGUAGES CXX)
 
 option(AX_BUILD_EXAMPLES "Build generated Ax examples" ON)
 option(AX_BUILD_CONFORMANCE "Build generated Ax conformance runner" ON)
@@ -72,6 +72,7 @@ if(AX_BUILD_EXAMPLES)
     c_signature_schema
     axgen_scripted_client_tool
     axgen_openai_api
+    vertex_gemini_api
     provider_mapping_no_key
     adaptive_balancer_no_key
     provider_stream_no_key
