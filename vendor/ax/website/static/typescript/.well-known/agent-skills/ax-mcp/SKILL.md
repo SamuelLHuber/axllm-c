@@ -1,7 +1,7 @@
 ---
 name: ax-mcp
 description: This skill helps an LLM build correct native Model Context Protocol integrations with @ax-llm/ax. Use when the user asks about AxMCPClient, MCP transports, tools, prompts, resources, subscriptions, tasks, sampling, elicitation, roots, authentication, OAuth, MCP Apps, recording/replay, or MCP integration with AxGen, AxAgent, AxFlow, chat, optimization, and AxEventRuntime.
-version: "23.0.14"
+version: "23.0.15"
 ---
 
 # Native MCP With Ax
@@ -157,6 +157,11 @@ mcp.docs.tasks.get(taskId)
 mcp.docs.tasks.cancel(taskId)
 mcp.docs.complete(...)
 ```
+
+RLM actor definitions and discovery use these exact runtime paths. MCP tools
+are callable as `mcp.<namespace>.tools.<tool>` and UCP operations as
+`ucp.<namespace>.<operation>`; neither protocol is exposed to the model as
+bare provider-native functions.
 
 Modern modules also expose task input/update behavior through the client.
 `tasks.list()` and `tasks.result()` are legacy task-draft compatibility APIs and

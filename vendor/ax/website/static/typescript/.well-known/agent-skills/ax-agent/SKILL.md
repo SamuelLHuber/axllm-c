@@ -1,7 +1,7 @@
 ---
 name: ax-agent
 description: This skill helps an LLM generate correct core AxAgent code using @ax-llm/ax. Use when the user asks about agent(), child agents, namespaced functions, discovery mode, clarification, bubbleErrors, host-side final/clarification protocol, or ordinary agent runtime behavior. For MCP clients, native runtime modules, subscriptions, tasks, or authentication use ax-mcp alongside this skill. For RLM/code-runtime work use ax-agent-rlm; for callbacks and telemetry use ax-agent-observability; for recall/memory/skill loading use ax-agent-memory-skills; for agent.optimize(...) use ax-agent-optimize.
-version: "23.0.14"
+version: "23.0.15"
 ---
 
 # AxAgent Codegen Rules (@ax-llm/ax)
@@ -49,7 +49,7 @@ Map user intent to agent shape before writing code:
 - Add child agents to the parent's `functions: [...]` list. Each child's `agentIdentity.namespace` (or `utils`, the default) determines the runtime call site, e.g. `await team.writer({...})`.
 - If discovery is enabled, call `discover(...)` before using callables whose docs are not already in the prompt.
 - `autoUpgrade` is ON by default: large tool catalogs auto-enable discovery, and oversized undeclared input values are auto-kept runtime-only with a truncated prompt preview. Explicit `functionDiscovery` and declared `contextFields` always win; set `autoUpgrade: false` to opt out.
-- `directResponse` is ON by default (`'auto'`): when a task needs no user-provided functions, the distiller ends the run with `respond(task, evidence)` and the executor stage is skipped (zero executor model calls). Function-less agents run respond-only every time; agents with functions offer `respond` under a conservative covenant (no live/fresh-state asks, no side effects, nothing a listed function/module domain covers). Set `directResponse: 'off'` to always run the executor.
+- `directResponse` is ON by default (`'auto'`): when a task needs no executor authority, the distiller ends the run with `respond(task, evidence)` and the executor stage is skipped (zero executor model calls). Static agents with no functions, child agents, or native MCP/UCP operations run respond-only every time. Agents with any of those authorities retain the executor and offer `respond` under a conservative covenant (no live/fresh-state asks, no side effects, nothing a listed function/module domain covers). Set `directResponse: 'off'` to always run the executor.
 - If a host-side `AxAgentFunction` needs to end the current actor turn, use `extra.protocol.final(...)` or `extra.protocol.askClarification(...)`.
 - In public `forward()` and `streamingForward()` flows, `askClarification(...)` throws `AxAgentClarificationError`; it does not go through the responder.
 - When resuming after clarification, prefer `error.getState()` from the thrown `AxAgentClarificationError`, then call `agent.setState(savedState)` before the next `forward(...)`.
