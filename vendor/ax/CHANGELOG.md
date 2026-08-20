@@ -1,5 +1,55 @@
 # Changelog
 
+## [24.0.0](https://github.com/ax-llm/ax/compare/23.0.15...23.0.16) (2026-08-19)
+
+### Features
+
+* add AxGen multi-sampling parity ([#582](https://github.com/ax-llm/ax/issues/582)) ([4483dd8](https://github.com/ax-llm/ax/commit/4483dd85ca2eff4f6f3c34f423c2b0ef3500e752))
+* add named AI deployment profiles ([dec44b8](https://github.com/ax-llm/ax/commit/dec44b8fdd4a8e8deb776de0d441385d974e1f27))
+* add portable structured output and renewable credentials ([1b3b597](https://github.com/ax-llm/ax/commit/1b3b5979e2a39c391c06f7018dcaef467d58cac8))
+
+### Bug Fixes
+
+* **ci:** recognize provider kwargs term ([97c1032](https://github.com/ax-llm/ax/commit/97c10320462a77f5e4b6b7b7b73b448f361078b1))
+
+## [23.0.16](https://github.com/ax-llm/ax/compare/23.0.15...23.0.16) (2026-08-17)
+
+### Bug Fixes
+
+* **agent:** document native MCP tools to the RLM actor as mcp.<ns>.tools.<name> ([#575](https://github.com/ax-llm/ax/issues/575)) ([#578](https://github.com/ax-llm/ax/issues/578)) ([d1174c1](https://github.com/ax-llm/ax/commit/d1174c10bbb3944020a423267e560cb6b9f739db))
+
+## Next major
+
+- Added named deployment profiles, `AxAIProfileId`, `AxAIProfileSummary`,
+  `axAIProfiles()`, and `axGetAIProfile()`. The deployment name now owns endpoint,
+  authentication, capabilities, and model rules; model IDs never select another
+  provider's behavior.
+- Split official `openai` behavior from conservative `openai-compatible`
+  custom endpoints and made unknown profile names an error.
+- Removed the profile-only `AxAIAzureOpenAI`, `AxAICohere`, `AxAIDeepSeek`,
+  `AxAIDeepSeekResponses`, `AxAIMistral`, `AxAIReka`, and `AxAIGrok` classes.
+  Use `ai({ name: '…' })`; existing model enum/catalog exports remain.
+- Generated Go, Python, Rust, Java, and C++ factories now resolve the canonical
+  AxIR profile manifest and expose only genuine transport clients.
+- Verified DeepSeek V4 deployment rules now default an omitted thinking level
+  to logical `max`; an explicit `none` still disables thinking where supported.
+- Added verified maximum-reasoning defaults for current Grok, Groq GPT-OSS and
+  Qwen, Cerebras GPT-OSS and Gemma, and DeepInfra DeepSeek R1 rules. Explicit
+  `none` now fails before network I/O for models whose deployment cannot disable
+  reasoning; dynamic Hugging Face Router routes remain conservative.
+- Added ordered `native`, `function`, and `json_object` structured-output modes
+  to profile/model capability resolution and direct AxGen/Agent forward options.
+  Explicit unsupported modes now fail before transport.
+- Added the exact Vertex Gemma MaaS rule for
+  `google/gemma-4-26b-a4b-it-maas`: JSON-object output without native schema,
+  maximum thinking by default, nested `enable_thinking`, and
+  `reasoning_content` extraction/replay. Unknown Vertex models stay
+  conservative.
+- Added per-request renewable credential providers across TypeScript and all
+  five generated runtimes. Fresh headers override static authentication for
+  chat, stream, embeddings, Responses, audio, and retries; completed 401/403
+  responses are not replayed automatically.
+
 ## [23.0.16](https://github.com/ax-llm/ax/compare/23.0.14...23.0.15) (2026-08-17)
 
 ### Bug Fixes

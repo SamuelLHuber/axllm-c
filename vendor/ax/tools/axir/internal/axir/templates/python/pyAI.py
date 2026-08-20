@@ -130,29 +130,17 @@ def ai(provider: str = "openai", **options):
     if not resolved.get("known"):
         raise ValueError(f"unsupported AxAI provider: {provider}")
     canonical = resolved.get("id")
-    if canonical == "openai-compatible":
-        return OpenAICompatibleClient(**options)
-    if canonical == "openai-responses":
-        return OpenAIResponsesClient(**options)
-    if canonical == "deepseek-responses":
-        return DeepSeekResponsesClient(**options)
-    if canonical == "google-gemini":
-        return GoogleGeminiClient(**options)
-    if canonical == "anthropic":
-        return AnthropicClient(**options)
-    if canonical == "azure-openai":
-        return AzureOpenAIClient(**options)
-    if canonical == "deepseek":
-        return DeepSeekClient(**options)
-    if canonical == "mistral":
-        return MistralClient(**options)
-    if canonical == "reka":
-        return RekaClient(**options)
-    if canonical == "cohere":
-        return CohereClient(**options)
-    if canonical == "grok":
-        return GrokClient(**options)
-    raise ValueError(f"unsupported AxAI provider: {provider}")
+    descriptor = provider_descriptor(canonical)
+    transport = descriptor.get("transport")
+    if transport == "openai-responses":
+        return OpenAIResponsesClient(_profile=canonical, **options)
+    if transport == "gemini-generate-content":
+        return GoogleGeminiClient(_profile=canonical, **options)
+    if transport == "anthropic-messages":
+        return AnthropicClient(_profile=canonical, **options)
+    if transport == "openai-chat":
+        return OpenAICompatibleClient(_profile=canonical, **options)
+    raise ValueError(f"profile {canonical} uses unsupported transport: {transport}")
 
 
 def default_features() -> dict[str, Any]:
@@ -533,11 +521,15 @@ class ProviderOperationClient(AxBaseAI):
         options: dict[str, Any] | None = None,
         model_config: dict[str, Any] | None = None,
         transport: Callable[[dict[str, Any]], Any] | None = None,
+        credential_provider: Callable[[dict[str, str]], dict[str, str]] | None = None,
+        credentialProvider: Callable[[dict[str, str]], dict[str, str]] | None = None,
         usage_context: AxUsageContext | None = None,
         usageContext: AxUsageContext | None = None,
         **runtime_options,
     ):
         service_options = {**(options or {}), **runtime_options}
+        if api_version is not None:
+            service_options["api_version"] = api_version
         descriptor = provider_resolve_descriptor(profile, service_options)
         context = usage_context or usageContext
         if context:
@@ -555,7 +547,12 @@ class ProviderOperationClient(AxBaseAI):
         self.descriptor = descriptor
         self.base_url = (base_url or os.environ.get("OPENAI_BASE_URL") or descriptor.get("baseUrl") or "https://api.openai.com/v1").rstrip("/")
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
-        self.api_version = api_version or descriptor.get("apiVersion")
+        self.credential_provider = credential_provider or credentialProvider
+        if self.descriptor.get("authRequired") and not self.api_key and not self.credential_provider:
+            raise AxAIServiceAuthenticationError(
+                f"{self.profile} requires api_key or credential_provider"
+            )
+        self.api_version = descriptor.get("apiVersion") or api_version
         self.timeout = timeout
         self.transport = transport
         self._context_cache_entries: dict[str, dict[str, Any]] = {}
@@ -569,6 +566,15 @@ class ProviderOperationClient(AxBaseAI):
     def get_estimated_cost(self, model_usage: dict[str, Any] | None = None) -> float:
         return float(provider_estimate_cost(model_usage or {}))
 
+    def get_features(self, model: str | None = None) -> dict[str, Any]:
+        return copy.deepcopy(
+            provider_resolve_features(
+                self.profile,
+                str(model or self.model),
+                self.options,
+            )
+        )
+
     def _chat(self, request: dict[str, Any], options: dict[str, Any]):
         realtime_model = request.get("model") or self.model
         if provider_should_use_realtime(self.profile, str(realtime_model or ""), request):
@@ -580,7 +586,8 @@ class ProviderOperationClient(AxBaseAI):
         endpoint = self._operation_path("chat", model)
         raw = self._context_cache_chat(request, payload, model, endpoint, options)
         if raw is None:
-            raw = self._request_json(endpoint, payload, stream=False, method=self._operation_method("chat"))
+            operation = "responses" if self.descriptor.get("transport") == "openai-responses" else "chat"
+            raw = self._request_json(endpoint, payload, stream=False, method=self._operation_method("chat"), operation=operation)
         return provider_normalize_chat_response(self.profile, raw, self.name, model)
 
     def _context_cache_chat(self, request, payload, model, endpoint, options):
@@ -729,7 +736,7 @@ class ProviderOperationClient(AxBaseAI):
         payload = provider_build_embed_request(self.profile, request, options)
         model = request.get("embed_model") or request.get("embedModel") or payload.get("model") or self.embed_model
         endpoint = self._operation_path("embed", model)
-        raw = self._request_json(endpoint, payload, stream=False, method=self._operation_method("embed"))
+        raw = self._request_json(endpoint, payload, stream=False, method=self._operation_method("embed"), operation="embed")
         return provider_normalize_embed_response(self.profile, raw, self.name, model)
 
     def _stream_chat(self, payload: dict[str, Any], request: dict[str, Any], options: dict[str, Any] | None = None):
@@ -747,7 +754,7 @@ class ProviderOperationClient(AxBaseAI):
             # normalize runs (so peeking has no side effects). If the provider classifies it as
             # a retryable transient status (e.g. Anthropic's HTTP-200 overloaded_error event),
             # re-issue with the same exponential backoff apiCall uses for a 529 before surfacing.
-            raw = self._request_json(endpoint, payload, stream=True, method=self._operation_method("stream_chat"))
+            raw = self._request_json(endpoint, payload, stream=True, method=self._operation_method("stream_chat"), operation="stream_chat")
             events = _iter_sse_json(raw)
             first = next(events, sentinel)
             if first is not sentinel:
@@ -770,7 +777,7 @@ class ProviderOperationClient(AxBaseAI):
         model = request.get("model") or self.model
         descriptor = provider_operation_descriptor(self.profile, "transcribe")
         body_key = "data" if descriptor.get("body") == "multipart" else "json"
-        raw = self._request_json(self._operation_path("transcribe", model), payload, stream=False, body_key=body_key, method=self._operation_method("transcribe"))
+        raw = self._request_json(self._operation_path("transcribe", model), payload, stream=False, body_key=body_key, method=self._operation_method("transcribe"), operation="transcribe")
         return provider_normalize_transcribe_response(self.profile, raw)
 
     def speak(self, request: dict[str, Any], options: dict[str, Any] | None = None):
@@ -779,7 +786,7 @@ class ProviderOperationClient(AxBaseAI):
         descriptor = provider_operation_descriptor(self.profile, "speak")
         body_key = "data" if descriptor.get("body") == "multipart" else "json"
         binary_response = descriptor.get("response") == "binary"
-        raw = self._request_json(self._operation_path("speak", model), payload, stream=False, body_key=body_key, binary_response=binary_response, method=self._operation_method("speak"))
+        raw = self._request_json(self._operation_path("speak", model), payload, stream=False, body_key=body_key, binary_response=binary_response, method=self._operation_method("speak"), operation="speak")
         return provider_normalize_speak_response(self.profile, raw, request)
 
     def realtime(self, events: Iterable[dict[str, Any]], model: str | None = None):
@@ -893,13 +900,27 @@ class ProviderOperationClient(AxBaseAI):
         descriptor = (self.descriptor.get("operations") or {}).get(operation) or provider_operation_descriptor(self.profile, operation)
         return str(descriptor.get("method") or "POST").upper()
 
-    def _request_json(self, endpoint: str, payload: dict[str, Any], *, stream: bool, body_key: str = "json", binary_response: bool = False, method: str = "POST", base_url: str | None = None):
+    def _request_json(self, endpoint: str, payload: dict[str, Any], *, stream: bool, body_key: str = "json", binary_response: bool = False, method: str = "POST", base_url: str | None = None, operation: str = "chat"):
         method = str(method or "POST").upper()
         request_base_url = (base_url or self.base_url).rstrip("/")
+        request_url = request_base_url + endpoint
+        headers = self._headers()
+        if self.credential_provider:
+            fresh = self.credential_provider({
+                "profile": self.profile,
+                "operation": operation,
+                "method": method,
+                "url": request_url,
+            })
+            if not isinstance(fresh, dict):
+                raise AxAIServiceAuthenticationError(
+                    "credential_provider must return a header dictionary"
+                )
+            headers.update({str(key): str(value) for key, value in fresh.items()})
         call = {
             "method": method,
-            "url": request_base_url + endpoint,
-            "headers": self._headers(),
+            "url": request_url,
+            "headers": headers,
             body_key: payload,
             "stream": stream,
         }
@@ -953,7 +974,7 @@ class ProviderOperationClient(AxBaseAI):
         }
         if self.descriptor.get("auth") == "bearer":
             headers["Authorization"] = "Bearer " + (self.api_key or "")
-        if self.descriptor.get("auth") == "anthropic_key":
+        if self.descriptor.get("auth") in ("anthropic_key", "x-api-key"):
             headers["x-api-key"] = self.api_key or ""
         if self.descriptor.get("auth") == "api_key_header":
             key_name = self.descriptor.get("apiKeyHeader") or "api-key"
@@ -964,50 +985,38 @@ class ProviderOperationClient(AxBaseAI):
 
 
 class OpenAICompatibleClient(ProviderOperationClient):
-    def __init__(self, **options):
+    def __init__(self, _profile="openai-compatible", **options):
+        descriptor = provider_descriptor(_profile)
         embed_model = options.pop("embed_model", None)
         if embed_model is None:
-            embed_model = options.pop("embedModel", "text-embedding-3-small")
+            embed_model = options.pop("embedModel", descriptor.get("defaultEmbedModel") or "")
         super().__init__(
-            "openai-compatible",
-            "openai",
-            model=options.pop("model", "gpt-4.1-mini"),
+            _profile,
+            _profile,
+            model=options.pop("model", descriptor.get("defaultModel") or ""),
             embed_model=embed_model,
             **options,
         )
 
 
 class OpenAIResponsesClient(ProviderOperationClient):
-    def __init__(self, **options):
+    def __init__(self, _profile="openai-responses", **options):
+        descriptor = provider_descriptor(_profile)
         embed_model = options.pop("embed_model", None)
         if embed_model is None:
-            embed_model = options.pop("embedModel", "text-embedding-ada-002")
+            embed_model = options.pop("embedModel", descriptor.get("defaultEmbedModel") or "")
         super().__init__(
-            "openai-responses",
-            "openai-responses",
-            model=options.pop("model", "gpt-4o"),
+            _profile,
+            _profile,
+            model=options.pop("model", descriptor.get("defaultModel") or ""),
             embed_model=embed_model,
             **options,
         )
 
 
-class DeepSeekResponsesClient(ProviderOperationClient):
-    def __init__(self, **options):
-        api_key = options.pop("api_key", None) or options.pop("apiKey", None) or os.environ.get("DEEPSEEK_API_KEY")
-        base_url = options.pop("base_url", None) or options.pop("baseUrl", None) or os.environ.get("DEEPSEEK_BASE_URL") or "https://api.deepseek.com"
-        super().__init__(
-            "deepseek-responses",
-            "DeepSeek Responses",
-            model=options.pop("model", "deepseek-v4-flash"),
-            embed_model=options.pop("embed_model", options.pop("embedModel", "")),
-            api_key=api_key,
-            base_url=base_url,
-            **options,
-        )
-
-
 class GoogleGeminiClient(ProviderOperationClient):
-    def __init__(self, **options):
+    def __init__(self, _profile="google-gemini", **options):
+        descriptor = provider_descriptor(_profile)
         embed_model = options.pop("embed_model", None)
         if embed_model is None:
             embed_model = options.pop("embedModel", "gemini-embedding-2")
@@ -1015,9 +1024,9 @@ class GoogleGeminiClient(ProviderOperationClient):
         api_key = options.pop("api_key", None) or options.pop("apiKey", None) or (os.environ.get("GOOGLE_VERTEX_ACCESS_TOKEN") if is_vertex else None) or os.environ.get("GOOGLE_APIKEY") or os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
         base_url = options.pop("base_url", None) or options.pop("baseUrl", None) or os.environ.get("GOOGLE_GEMINI_BASE_URL")
         super().__init__(
-            "google-gemini",
-            "GoogleGeminiAI",
-            model=options.pop("model", "gemini-2.5-flash"),
+            _profile,
+            _profile,
+            model=options.pop("model", descriptor.get("defaultModel") or ""),
             embed_model=embed_model,
             api_key=api_key,
             base_url=base_url,
@@ -1026,14 +1035,15 @@ class GoogleGeminiClient(ProviderOperationClient):
 
 
 class AnthropicClient(ProviderOperationClient):
-    def __init__(self, **options):
+    def __init__(self, _profile="anthropic", **options):
+        descriptor = provider_descriptor(_profile)
         is_vertex = bool((options.get("project_id") or options.get("projectId")) and options.get("region"))
         api_key = options.pop("api_key", None) or options.pop("apiKey", None) or (os.environ.get("GOOGLE_VERTEX_ACCESS_TOKEN") if is_vertex else None) or os.environ.get("ANTHROPIC_API_KEY")
         base_url = options.pop("base_url", None) or options.pop("baseUrl", None) or os.environ.get("ANTHROPIC_BASE_URL")
         super().__init__(
-            "anthropic",
-            "anthropic",
-            model=options.pop("model", "claude-3-7-sonnet-latest"),
+            _profile,
+            _profile,
+            model=options.pop("model", descriptor.get("defaultModel") or ""),
             embed_model=options.pop("embed_model", options.pop("embedModel", "")),
             api_key=api_key,
             base_url=base_url,
@@ -1047,105 +1057,6 @@ def _normalize_azure_api_version(version: Any) -> str:
     if marker in text:
         return text.split(marker, 1)[1].split("&", 1)[0]
     return text
-
-
-class AzureOpenAIClient(ProviderOperationClient):
-    def __init__(self, **options):
-        api_key = options.pop("api_key", None) or options.pop("apiKey", None) or os.environ.get("AZURE_OPENAI_API_KEY")
-        resource = options.pop("resource_name", None) or options.pop("resourceName", None) or os.environ.get("AZURE_OPENAI_RESOURCE_NAME")
-        deployment = options.pop("deployment_name", None) or options.pop("deploymentName", None) or os.environ.get("AZURE_OPENAI_DEPLOYMENT_NAME")
-        api_version = _normalize_azure_api_version(options.pop("api_version", None) or options.pop("apiVersion", None) or options.pop("version", None) or "2024-02-15-preview")
-        base_url = options.pop("base_url", None) or options.pop("baseUrl", None) or os.environ.get("AZURE_OPENAI_BASE_URL")
-        if not base_url and resource and deployment:
-            host = str(resource)
-            if "://" not in host:
-                host = f"https://{host}.openai.azure.com"
-            base_url = host.rstrip("/") + "/openai/deployments/" + urllib.parse.quote(str(deployment), safe="")
-        super().__init__(
-            "azure-openai",
-            "Azure OpenAI",
-            model=options.pop("model", "gpt-5-mini"),
-            embed_model=options.pop("embed_model", options.pop("embedModel", "text-embedding-3-small")),
-            api_key=api_key,
-            base_url=base_url,
-            api_version=api_version,
-            **options,
-        )
-
-
-class DeepSeekClient(ProviderOperationClient):
-    def __init__(self, **options):
-        api_key = options.pop("api_key", None) or options.pop("apiKey", None) or os.environ.get("DEEPSEEK_API_KEY")
-        base_url = options.pop("base_url", None) or options.pop("baseUrl", None) or os.environ.get("DEEPSEEK_BASE_URL") or "https://api.deepseek.com"
-        super().__init__(
-            "deepseek",
-            "DeepSeek",
-            model=options.pop("model", "deepseek-v4-flash"),
-            embed_model=options.pop("embed_model", options.pop("embedModel", "")),
-            api_key=api_key,
-            base_url=base_url,
-            **options,
-        )
-
-
-class MistralClient(ProviderOperationClient):
-    def __init__(self, **options):
-        api_key = options.pop("api_key", None) or options.pop("apiKey", None) or os.environ.get("MISTRAL_API_KEY")
-        base_url = options.pop("base_url", None) or options.pop("baseUrl", None) or os.environ.get("MISTRAL_BASE_URL") or "https://api.mistral.ai/v1"
-        super().__init__(
-            "mistral",
-            "Mistral",
-            model=options.pop("model", "mistral-small-latest"),
-            embed_model=options.pop("embed_model", options.pop("embedModel", "mistral-embed")),
-            api_key=api_key,
-            base_url=base_url,
-            **options,
-        )
-
-
-class RekaClient(ProviderOperationClient):
-    def __init__(self, **options):
-        api_key = options.pop("api_key", None) or options.pop("apiKey", None) or os.environ.get("REKA_API_KEY")
-        base_url = options.pop("base_url", None) or options.pop("baseUrl", None) or os.environ.get("REKA_BASE_URL") or "https://api.reka.ai/v1"
-        super().__init__(
-            "reka",
-            "Reka",
-            model=options.pop("model", "reka-core"),
-            embed_model=options.pop("embed_model", options.pop("embedModel", "")),
-            api_key=api_key,
-            base_url=base_url,
-            **options,
-        )
-
-
-class CohereClient(ProviderOperationClient):
-    def __init__(self, **options):
-        api_key = options.pop("api_key", None) or options.pop("apiKey", None) or os.environ.get("COHERE_API_KEY")
-        base_url = options.pop("base_url", None) or options.pop("baseUrl", None) or os.environ.get("COHERE_BASE_URL") or "https://api.cohere.ai/compatibility/v1"
-        super().__init__(
-            "cohere",
-            "Cohere",
-            model=options.pop("model", "command-r-plus"),
-            embed_model=options.pop("embed_model", options.pop("embedModel", "embed-english-v3.0")),
-            api_key=api_key,
-            base_url=base_url,
-            **options,
-        )
-
-
-class GrokClient(ProviderOperationClient):
-    def __init__(self, **options):
-        api_key = options.pop("api_key", None) or options.pop("apiKey", None) or os.environ.get("XAI_API_KEY") or os.environ.get("GROK_API_KEY")
-        base_url = options.pop("base_url", None) or options.pop("baseUrl", None) or os.environ.get("XAI_BASE_URL") or os.environ.get("GROK_BASE_URL") or "https://api.x.ai/v1"
-        super().__init__(
-            "grok",
-            "Grok",
-            model=options.pop("model", "grok-4.3"),
-            embed_model=options.pop("embed_model", options.pop("embedModel", "")),
-            api_key=api_key,
-            base_url=base_url,
-            **options,
-        )
 
 
 def get_supported_ai_models(model_type: str | None = None):
@@ -1759,8 +1670,15 @@ class AxBalancer(AxAIService):
             },
             "caching": {"supported": False, "types": []},
         }
+        structured_output_modes: list[Any] = []
+        all_modes_advertised = bool(self.services)
         for service in self.services:
             raw = service.get_features(model) or {}
+            raw_modes = raw.get("structuredOutputModes", raw.get("structured_output_modes"))
+            if raw_modes is None:
+                all_modes_advertised = False
+            else:
+                _append_unique(structured_output_modes, list(raw_modes or []))
             for key in ("functions", "streaming", "thinking", "multiTurn", "structuredOutputs", "functionCot", "hasThinkingBudget", "hasShowThoughts"):
                 if _feature_bool(raw, key):
                     features[key] = True
@@ -1784,6 +1702,8 @@ class AxBalancer(AxAIService):
             if caching.get("supported"):
                 features["caching"]["supported"] = True
             _append_unique(features["caching"]["types"], list(caching.get("types") or []))
+        if all_modes_advertised:
+            features["structured_output_modes"] = structured_output_modes
         return features
 
     def get_metrics(self) -> dict[str, Any]:
@@ -2076,6 +1996,10 @@ def _core_map_delete(target, key):
 
 def _core_map_contains(values, key):
     return isinstance(values, dict) and key in values
+
+
+def _core_map_keys(values):
+    return list(values.keys()) if isinstance(values, dict) else []
 
 
 def _core_list_get(values, index, default=None):

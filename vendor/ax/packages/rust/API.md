@@ -48,7 +48,7 @@ Parsed signature with input/output fields, descriptions, and JSON schema helpers
 
 ## AxGen
 
-Run structured generation with Core-owned prompts, tool loops, retries, streaming folds, traces, usage, examples, and field processors.
+Run structured generation with Core-owned prompts, indexed multi-sampling, result selection, tool loops, retries, streaming folds, traces, usage, examples, and field processors.
 
 ### `ax`
 
@@ -58,7 +58,7 @@ Create an AxGen program from a string or parsed signature.
 - Kind: `function`
 - Form: `ax(spec: &str)`
 - Returns: `AxResult<AxGen>`
-- Important options: functions, examples, demos, modelConfig, maxRetries, streaming assertions, field processors
+- Important options: functions, examples, demos, sample count, result picker, modelConfig, maxRetries, streaming assertions, field processors
 
 ```rust
 let qa = ax("question:string -> answer:string")?;
@@ -66,13 +66,13 @@ let qa = ax("question:string -> answer:string")?;
 
 ### `AxGen`
 
-Structured generation program with forward, streaming, optimization, trace, usage, and tool-call behavior.
+Structured generation program with indexed multi-sampling, winner selection, forward, streaming, optimization, trace, usage, and tool-call behavior.
 
 - Canonical Ax concept: `AxGen`
 - Kind: `type`
 - Form: `AxGen`
 - Returns: `program object`
-- Important options: signature, functions, examples, demos, memory, prompt template
+- Important options: signature, functions, examples, demos, sample count, result picker, memory, prompt template
 
 
 ## AxAI
@@ -81,17 +81,37 @@ Call supported providers through the shared provider descriptor registry, script
 
 ### `ai`
 
-Create a provider client from a provider name and options.
+Create a provider client from a named deployment profile and options.
 
 - Canonical Ax concept: `ai`
 - Kind: `function`
 - Form: `ai(provider, options)`
 - Returns: `AxResult<OpenAICompatibleClient>`
-- Important options: api key, model, api URL, headers, transport
+- Important options: api key or credential provider, model, api URL, headers, transport
 
 ```rust
 let client = ai("openai", json!({"apiKey": std::env::var("OPENAI_API_KEY")?}))?;
 ```
+
+### `AxCredentialRequest`
+
+Request metadata passed to a renewable credential callback for every transport attempt.
+
+- Canonical Ax concept: `AxCredentialRequest`
+- Kind: `type`
+- Form: `AxCredentialRequest`
+- Returns: `credential request`
+- Important options: profile, operation, method, URL
+
+### `AxCredentialProvider`
+
+Return fresh request headers that override static profile authentication.
+
+- Canonical Ax concept: `AxCredentialProvider`
+- Kind: `interface`
+- Form: `dyn AxCredentialProvider`
+- Returns: `header map or credential error`
+- Important options: chat, stream, embeddings, Responses, audio, retries
 
 ### `OpenAICompatibleClient`
 
@@ -112,16 +132,6 @@ OpenAI Responses provider mapping using the same Core-owned request and response
 - Form: `OpenAIResponsesClient / ai(provider, options)`
 - Returns: `provider client`
 - Important options: api key, model, audio, realtime
-
-### `DeepSeekResponsesClient`
-
-DeepSeek Responses provider mapping with stateless reasoning and function-call replay.
-
-- Canonical Ax concept: `DeepSeekResponsesClient`
-- Kind: `type`
-- Form: `DeepSeekResponsesClient / ai(provider, options)`
-- Returns: `provider client`
-- Important options: api key, model, thinking, transport
 
 ### `GoogleGeminiClient`
 

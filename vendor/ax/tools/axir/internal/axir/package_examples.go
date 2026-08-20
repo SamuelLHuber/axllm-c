@@ -124,13 +124,20 @@ func required(name string) string {
   return value
 }
 
+func vertexCredentials() ax.AxCredentialProvider {
+  return ax.AxCredentialProviderFunc(func(_ context.Context, _ ax.AxCredentialRequest) (map[string]string, error) {
+    token := os.Getenv("GOOGLE_VERTEX_ACCESS_TOKEN")
+    if token == "" { return nil, fmt.Errorf("set GOOGLE_VERTEX_ACCESS_TOKEN to run this Vertex provider API example") }
+    return map[string]string{"Authorization": "Bearer " + token}, nil
+  })
+}
+
 func main() {
   model := os.Getenv("AX_VERTEX_MODEL")
-  if model == "" { model = "gemini-3.5-flash" }
-  client := ax.NewGoogleGeminiClient(map[string]ax.Value{
-    "api_key": required("GOOGLE_VERTEX_ACCESS_TOKEN"),
-    "project_id": required("GOOGLE_PROJECT_ID"),
-    "region": required("GOOGLE_REGION"),
+  if model == "" { model = "google/gemini-3.5-flash" }
+  client := ax.NewAI("vertex-ai", map[string]ax.Value{
+    "api_url": required("VERTEX_AI_API_URL"),
+    "credential_provider": vertexCredentials(),
     "model": model,
   })
   ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -142,6 +149,81 @@ func main() {
   data, err := json.MarshalIndent(output, "", "  ")
   if err != nil { panic(err) }
   fmt.Println(string(data))
+}
+`
+
+const goVertexGemmaMaaSNoKeyExample = `package main
+
+import (
+  "context"
+  "fmt"
+
+  ax "github.com/ax-llm/ax/packages/go"
+)
+
+func values(value ax.Value) []ax.Value {
+  switch typed := value.(type) {
+  case []ax.Value:
+    return typed
+  case *ax.AxArray:
+    return typed.Items
+  default:
+    return nil
+  }
+}
+
+func main() {
+  transport := ax.NewScriptedTransport([]ax.Value{ax.Object(
+    "status", 200.0,
+    "json", ax.Object(
+      "id", "vertex-gemma",
+      "model", "google/gemma-4-26b-a4b-it-maas",
+      "choices", ax.Array(ax.Object(
+        "index", 0.0,
+        "finish_reason", "stop",
+        "message", ax.Object(
+          "role", "assistant",
+          "content", "{\"answer\":\"ok\"}",
+          "reasoning_content", "Fresh reasoning.",
+        ),
+      )),
+    ),
+  )})
+  credentials := ax.AxCredentialProviderFunc(
+    func(_ context.Context, request ax.AxCredentialRequest) (map[string]string, error) {
+      if request.Profile != "vertex-ai" || request.Operation != "chat" {
+        return nil, fmt.Errorf("unexpected credential request: %#v", request)
+      }
+      return map[string]string{"Authorization": "Bearer fresh-token"}, nil
+    },
+  )
+  client := ax.NewAI("vertex-ai", map[string]ax.Value{
+    "api_url": "https://vertex.test/v1",
+    "model": "google/gemma-4-26b-a4b-it-maas",
+    "credential_provider": credentials,
+    "transport": transport,
+  })
+  output, err := client.Chat(context.Background(), map[string]ax.Value{
+    "chat_prompt": ax.Array(
+      ax.Object("role", "assistant", "content", "Previous answer.", "thought", "Previous reasoning."),
+      ax.Object("role", "user", "content", "Return JSON."),
+    ),
+    "response_format": ax.Object("type", "json_object"),
+  }, nil)
+  if err != nil { panic(err) }
+
+  request := transport.Requests[0].(map[string]ax.Value)
+  body := request["json"].(map[string]ax.Value)
+  thinking := body["chat_template_kwargs"].(map[string]ax.Value)
+  messages := values(body["messages"])
+  replay := messages[0].(map[string]ax.Value)
+  headers := request["headers"].(map[string]ax.Value)
+  results := values(output.(map[string]ax.Value)["results"])
+  result := results[0].(map[string]ax.Value)
+  if thinking["enable_thinking"] != true || replay["reasoning_content"] != "Previous reasoning." || headers["Authorization"] != "Bearer fresh-token" || result["thought"] != "Fresh reasoning." {
+    panic(fmt.Sprintf("unexpected Vertex Gemma mapping: request=%#v output=%#v", request, output))
+  }
+  fmt.Println("go-vertex-gemma-maas-no-key-ok")
 }
 `
 
@@ -1790,10 +1872,10 @@ print("stream-http-roundtrip-ok")
 
 const pyRealtimeAudioEventsExample = `import json
 
-from axllm import GoogleGeminiClient, GrokClient
+from axllm import GoogleGeminiClient, ai
 
 
-grok = GrokClient(model="grok-voice-think-fast-1.0", api_key="test-key")
+grok = ai("grok", model="grok-voice-think-fast-1.0", api_key="test-key")
 grok_request = {
     "model": "grok-voice-think-fast-1.0",
     "chat_prompt": [
@@ -2406,8 +2488,8 @@ import java.util.*;
 
 public final class RealtimeAudioEventsExample {
   public static void main(String[] args) {
-    GrokClient grok =
-        new GrokClient(Map.of("model", "grok-voice-think-fast-1.0", "api_key", "test-key"));
+    OpenAICompatibleClient grok =
+        (OpenAICompatibleClient) Ax.ai("grok", Map.of("model", "grok-voice-think-fast-1.0", "api_key", "test-key"));
     Map<String, Object> grokRequest =
         Map.of(
             "model",
@@ -2502,8 +2584,8 @@ import java.util.*;
 // API). Exits non-zero on any mismatch so ` + "`axir verify`" + ` fails if it regresses.
 public final class RealtimeAudioTurnExample {
   public static void main(String[] args) {
-    GrokClient client =
-        new GrokClient(Map.of("model", "grok-voice-think-fast-1.0", "api_key", "test-key"));
+    OpenAICompatibleClient client =
+        (OpenAICompatibleClient) Ax.ai("grok", Map.of("model", "grok-voice-think-fast-1.0", "api_key", "test-key"));
     Map<String, Object> request =
         Map.of(
             "model", "grok-voice-think-fast-1.0",
@@ -3412,10 +3494,10 @@ const cppRealtimeAudioEventsExample = `#include "axllm/axllm.hpp"
 #include <iostream>
 
 int main() {
-  axllm::GrokClient grok(axllm::object({
+  auto grok = std::dynamic_pointer_cast<axllm::OpenAICompatibleClient>(axllm::ai("grok", axllm::object({
       {"model", "grok-voice-think-fast-1.0"},
       {"api_key", "test-key"},
-  }));
+  })));
   axllm::Value grok_request = axllm::object({
       {"model", "grok-voice-think-fast-1.0"},
       {"chat_prompt",
@@ -3491,8 +3573,8 @@ int main() {
       }),
   });
 
-  std::cout << "grok setup:\n" << axllm::stringify(grok.realtime_audio_setup(grok_request)) << "\n";
-  std::cout << "grok normalized events:\n" << axllm::stringify(axllm::Value(grok.realtime(grok_events))) << "\n";
+  std::cout << "grok setup:\n" << axllm::stringify(grok->realtime_audio_setup(grok_request)) << "\n";
+  std::cout << "grok normalized events:\n" << axllm::stringify(axllm::Value(grok->realtime(grok_events))) << "\n";
   std::cout << "gemini setup:\n" << axllm::stringify(gemini.realtime_audio_setup(gemini_request)) << "\n";
   std::cout << "gemini input messages:\n" << axllm::stringify(gemini.realtime_audio_input(gemini_request)) << "\n";
   std::cout << "gemini normalized events:\n" << axllm::stringify(axllm::Value(gemini.realtime(gemini_events))) << "\n";
@@ -3519,10 +3601,10 @@ namespace {
 }  // namespace
 
 int main() {
-  axllm::GrokClient client(axllm::object({
+  auto client = std::dynamic_pointer_cast<axllm::OpenAICompatibleClient>(axllm::ai("grok", axllm::object({
       {"model", "grok-voice-think-fast-1.0"},
       {"api_key", "test-key"},
-  }));
+  })));
   axllm::Value request = axllm::object({
       {"model", "grok-voice-think-fast-1.0"},
       {"chat_prompt",
@@ -3544,7 +3626,7 @@ int main() {
   };
 
   axllm::ScriptedRealtimeTransport transport(inbound);
-  axllm::Value final_response = client.realtime_chat(request, &transport);
+  axllm::Value final_response = client->realtime_chat(request, &transport);
 
   std::string sent;
   for (const auto& event : transport.sent) sent += axllm::stringify(axllm::Core::get(event, "type")) + " ";

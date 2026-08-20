@@ -568,9 +568,11 @@ public final class Conformance {
       case "ai_embed" -> runAIEmbed(fixture);
       case "ai_stream" -> runAIStream(fixture);
       case "ai_usage_observer" -> runAIUsageObserver(fixture);
+      case "ai_credential_wrapper" -> runAICredentialWrapper(fixture);
       case "ai_error" -> runAIError(fixture);
       case "ai_unsupported" -> runAIUnsupported(fixture);
       case "ai_provider_descriptor" -> runAIProviderDescriptor(fixture);
+      case "ai_provider_features" -> runAIProviderFeatures(fixture);
       case "ai_provider_registry" -> runAIProviderRegistry(fixture);
       case "ai_model_catalog_audit" -> runAIModelCatalogAudit(fixture);
       case "ai_model_catalog_runtime" -> runAIModelCatalogRuntime(fixture);
@@ -771,6 +773,12 @@ public final class Conformance {
       List<String> names = new ArrayList<>();
       for (Object item : Core.asList(fixture.getOrDefault("stop_functions", fixture.getOrDefault("stopFunctions", List.of())))) names.add(String.valueOf(item));
       gen.setStopFunctions(names);
+    }
+    if (fixture.containsKey("result_picker_index")) {
+      gen.setResultPicker(samples -> {
+        if (fixture.containsKey("expected_picker_samples")) assertEqual(samples, fixture.get("expected_picker_samples"), "result picker samples");
+        return Core.asInt(fixture.get("result_picker_index"));
+      });
     }
     ConformanceScriptedAI client = new ConformanceScriptedAI(Core.asList(fixture.getOrDefault("responses", List.of())), Core.asList(fixture.getOrDefault("stream_events", List.of())), Core.asMap(fixture.getOrDefault("features", Map.of())));
     Object output = expectMaybeError(() -> gen.forward(client, Core.asMap(fixture.getOrDefault("input", Map.of())), Core.asMap(fixture.getOrDefault("forward_options", Map.of()))), fixture);
@@ -2071,8 +2079,11 @@ public final class Conformance {
 
 	  static void runAIChat(Map<String, Object> fixture) {
     ClientFixture cf = openaiClient(fixture);
-    Object result;
-    try { result = cf.client.chat(Core.asMap(fixture.get("request"))); } catch (Exception e) { throw Core.asRuntime(e); }
+    Object result = expectMaybeError(() -> {
+      try { return cf.client.chat(Core.asMap(fixture.get("request"))); }
+      catch (Exception e) { throw Core.asRuntime(e); }
+    }, fixture);
+    if (fixture.containsKey("expected_error_contains")) { assertTransport(fixture, cf.transport); return; }
     if (fixture.containsKey("expected_output")) assertEqual(result, fixture.get("expected_output"), "ai chat output");
     if (fixture.containsKey("expected_request_after")) assertEqual(fixture.get("request"), fixture.get("expected_request_after"), "ai chat input mutation");
     if (fixture.containsKey("expected_estimated_cost")) {
@@ -2080,6 +2091,14 @@ public final class Conformance {
       double expectedCost = Core.asDouble(fixture.get("expected_estimated_cost"));
       if (Math.abs(actualCost - expectedCost) > 1e-12) throw new FixtureError("estimated cost mismatch: " + actualCost + " != " + expectedCost);
     }
+    assertTransport(fixture, cf.transport);
+  }
+
+  static void runAICredentialWrapper(Map<String, Object> fixture) {
+    ClientFixture cf = openaiClient(fixture);
+    AxMultiServiceRouter router = new AxMultiServiceRouter(List.of(new AxMultiServiceRouter.Entry("wrapped", cf.client, "")));
+    try { router.chat(Core.asMap(fixture.getOrDefault("request", Map.of()))); }
+    catch (Exception e) { throw Core.asRuntime(e); }
     assertTransport(fixture, cf.transport);
   }
 
@@ -2160,11 +2179,20 @@ public final class Conformance {
   }
 
   static void runAIProviderDescriptor(Map<String, Object> fixture) {
-    String provider = String.valueOf(fixture.getOrDefault("provider", "openai-compatible"));
+    String provider = String.valueOf(fixture.getOrDefault("provider", "openai"));
     Object descriptor = fixture.containsKey("options")
       ? Core.provider_resolve_descriptor(provider, fixture.get("options"))
       : Core.provider_descriptor(provider);
     if (fixture.containsKey("expected_output")) assertSubset(descriptor, fixture.get("expected_output"), "provider descriptor");
+  }
+
+  static void runAIProviderFeatures(Map<String, Object> fixture) {
+    ClientFixture cf = openaiClient(fixture);
+    assertSubset(
+      cf.client.getFeatures(String.valueOf(fixture.getOrDefault("model", ""))),
+      fixture.getOrDefault("expected_output", Map.of()),
+      "provider features"
+    );
   }
 
   static void runAIProviderRegistry(Map<String, Object> fixture) {
@@ -2540,19 +2568,15 @@ public final class Conformance {
   }
   static ClientFixture openaiClient(Map<String, Object> fixture) {
     ScriptedTransport transport = new ScriptedTransport(Core.asList(fixture.getOrDefault("transport_responses", fixture.getOrDefault("responses", List.of()))));
-    String provider = String.valueOf(Core.provider_normalize_profile(String.valueOf(fixture.getOrDefault("provider", "openai-compatible"))));
-    boolean responsesProvider = provider.equals("openai-responses") || provider.equals("deepseek-responses");
-    boolean geminiProvider = provider.equals("google-gemini");
-    boolean anthropicProvider = provider.equals("anthropic");
-    boolean azureProvider = provider.equals("azure-openai");
-    boolean deepseekProvider = provider.equals("deepseek") || provider.equals("deepseek-responses");
-    boolean mistralProvider = provider.equals("mistral");
-    boolean rekaProvider = provider.equals("reka");
-    boolean cohereProvider = provider.equals("cohere");
-    boolean grokProvider = provider.equals("grok");
+    String provider = String.valueOf(Core.provider_normalize_profile(String.valueOf(fixture.getOrDefault("provider", "openai"))));
+    Map<String, Object> descriptor = Core.asMap(Core.provider_descriptor(provider));
+    String providerTransport = String.valueOf(descriptor.get("transport"));
+    boolean responsesProvider = providerTransport.equals("openai-responses");
+    boolean geminiProvider = providerTransport.equals("gemini-generate-content");
+    boolean anthropicProvider = providerTransport.equals("anthropic-messages");
     Map<String, Object> options = new LinkedHashMap<>();
-    String defaultModel = anthropicProvider ? "claude-3-7-sonnet-latest" : geminiProvider ? "gemini-2.5-flash" : provider.equals("deepseek-responses") ? "deepseek-v4-flash" : responsesProvider ? "gpt-4o" : azureProvider ? "gpt-5-mini" : deepseekProvider ? "deepseek-v4-flash" : mistralProvider ? "mistral-small-latest" : rekaProvider ? "reka-core" : cohereProvider ? "command-r-plus" : grokProvider ? "grok-4.3" : "gpt-4.1-mini";
-    String defaultEmbedModel = anthropicProvider || deepseekProvider || rekaProvider || grokProvider ? "" : geminiProvider ? "gemini-embedding-2" : responsesProvider ? "text-embedding-ada-002" : mistralProvider ? "mistral-embed" : cohereProvider ? "embed-english-v3.0" : "text-embedding-3-small";
+    String defaultModel = String.valueOf(descriptor.getOrDefault("defaultModel", ""));
+    String defaultEmbedModel = String.valueOf(descriptor.getOrDefault("defaultEmbedModel", ""));
     options.put("model", fixture.getOrDefault("model", defaultModel));
     options.put("embed_model", fixture.getOrDefault("embed_model", defaultEmbedModel));
     options.put("api_key", "test-key");
@@ -2562,17 +2586,30 @@ public final class Conformance {
     for (String key : List.of("base_url", "baseUrl", "resource_name", "resourceName", "deployment_name", "deploymentName", "api_version", "apiVersion", "version")) {
       if (fixture.containsKey(key)) options.put(key, fixture.get(key));
     }
-    OpenAICompatibleClient client = geminiProvider ? new GoogleGeminiClient(options)
-      : anthropicProvider ? new AnthropicClient(options)
-      : provider.equals("deepseek-responses") ? new DeepSeekResponsesClient(options)
-      : responsesProvider ? new OpenAIResponsesClient(options)
-      : azureProvider ? new AzureOpenAIClient(options)
-      : deepseekProvider ? new DeepSeekClient(options)
-      : mistralProvider ? new MistralClient(options)
-      : rekaProvider ? new RekaClient(options)
-      : cohereProvider ? new CohereClient(options)
-      : grokProvider ? new GrokClient(options)
-      : new OpenAICompatibleClient(options);
+    if (fixture.containsKey("credential_provider_fixture")) {
+      Map<String, Object> credentialFixture = Core.asMap(fixture.get("credential_provider_fixture"));
+      List<Object> credentialHeaders = Core.asList(credentialFixture.getOrDefault("headers", List.of()));
+      List<Object> credentialRequests = new ArrayList<>();
+      fixture.put("__credential_requests", credentialRequests);
+      int[] credentialCalls = {0};
+      options.put("credential_provider", (OpenAICompatibleClient.CredentialProvider) request -> {
+        credentialRequests.add(new LinkedHashMap<>(Map.of(
+            "profile", request.profile(), "operation", request.operation(),
+            "method", request.method(), "url", request.url())));
+        if (credentialFixture.containsKey("error")) throw new RuntimeException(String.valueOf(credentialFixture.get("error")));
+        Map<String, String> fresh = new LinkedHashMap<>();
+        if (!credentialHeaders.isEmpty()) {
+          int index = Math.min(credentialCalls[0], credentialHeaders.size() - 1);
+          credentialCalls[0]++;
+          for (Map.Entry<String, Object> entry : Core.asMap(credentialHeaders.get(index)).entrySet()) fresh.put(entry.getKey(), String.valueOf(entry.getValue()));
+        }
+        return fresh;
+      });
+    }
+    OpenAICompatibleClient client = geminiProvider ? new GoogleGeminiClient(provider, options)
+      : anthropicProvider ? new AnthropicClient(provider, options)
+      : responsesProvider ? new OpenAIResponsesClient(provider, options)
+      : new OpenAICompatibleClient(provider, provider, options, defaultModel, defaultEmbedModel);
     return new ClientFixture(client, transport);
   }
 
@@ -2586,6 +2623,13 @@ public final class Conformance {
   }
 
   static void assertTransport(Map<String, Object> fixture, ScriptedTransport transport) {
+    if (fixture.containsKey("expected_transport_request_count")) assertEqual(transport.requests.size(), fixture.get("expected_transport_request_count"), "provider request count");
+    if (fixture.containsKey("expected_credential_requests")) assertEqual(fixture.getOrDefault("__credential_requests", List.of()), fixture.get("expected_credential_requests"), "credential requests");
+    List<Object> expectedRequests = Core.asList(fixture.getOrDefault("expected_transport_requests", List.of()));
+    for (int index = 0; index < expectedRequests.size(); index++) {
+      if (index >= transport.requests.size()) throw new FixtureError("missing provider transport request");
+      assertSubset(transport.requests.get(index), expectedRequests.get(index), "provider request " + index);
+    }
     if (!fixture.containsKey("expected_transport_request") && !fixture.containsKey("expected_transport_json_absent")) return;
     if (transport.requests.isEmpty()) throw new FixtureError("expected provider transport request but none were sent");
     if (fixture.containsKey("expected_transport_request")) assertSubset(transport.requests.get(0), fixture.get("expected_transport_request"), "provider request");

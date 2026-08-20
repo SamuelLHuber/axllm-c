@@ -129,6 +129,11 @@ static std::map<std::string, std::function<Value(Value)>>& flow_mapper_registry(
   return handlers;
 }
 
+static std::map<std::string, std::function<int(const Value&)>>& result_picker_registry() {
+  static std::map<std::string, std::function<int(const Value&)>> handlers;
+  return handlers;
+}
+
 static Value register_flow_mapper(std::string prefix, std::function<Value(Value)> mapper) {
   std::string id = std::move(prefix) + ":flow_mapper:" + std::to_string(flow_mapper_registry().size());
   flow_mapper_registry()[id] = std::move(mapper);
@@ -1058,6 +1063,11 @@ Value Core::object_call_method(Value target, Value method_name, Value arg) {
     return render_prompt(get_key(target, "signature"), arg, get_key(target, "functions", Value::array()), get_key(target, "options", Value::object()));
   }
   if (str(method_name) == "call") {
+    std::string picker_id = str(get_key(target, "__result_picker_id"));
+    auto picker = result_picker_registry().find(picker_id);
+    if (picker != result_picker_registry().end()) {
+      return Value(picker->second(get_key(arg, "results", Value::array())));
+    }
     std::string mapper_id = str(get_key(target, "__flow_mapper_id"));
     auto it = flow_mapper_registry().find(mapper_id);
     if (it != flow_mapper_registry().end()) return it->second(arg);
@@ -2492,10 +2502,10 @@ static std::string url_component(std::string value) {
   return out.str();
 }
 
-OpenAICompatibleClient::OpenAICompatibleClient(Value options, Transport* transport)
-    : OpenAICompatibleClient("openai-compatible", "openai", std::move(options), transport, "gpt-4.1-mini", "text-embedding-3-small") {}
+OpenAICompatibleClient::OpenAICompatibleClient(Value options, Transport* transport, AxCredentialProvider credential_provider)
+    : OpenAICompatibleClient("openai-compatible", "openai", std::move(options), transport, "gpt-4.1-mini", "text-embedding-3-small", std::move(credential_provider)) {}
 
-OpenAICompatibleClient::OpenAICompatibleClient(std::string profile, std::string name, Value options, Transport* transport, std::string default_model, std::string default_embed_model)
+OpenAICompatibleClient::OpenAICompatibleClient(std::string profile, std::string name, Value options, Transport* transport, std::string default_model, std::string default_embed_model, AxCredentialProvider credential_provider)
     : AxBaseAI(
           std::move(name),
           option_string(options, "model", "model", default_model),
@@ -2506,8 +2516,9 @@ OpenAICompatibleClient::OpenAICompatibleClient(std::string profile, std::string 
       descriptor_(Core::provider_resolve_descriptor(profile_, Core::map_merge(options, Core::get(options, "options", Value::object())))),
       base_url_(strip_trailing_slashes(option_string(options, "base_url", "baseUrl", env_or_default("OPENAI_BASE_URL", str(Core::get(descriptor_, "baseUrl", "https://api.openai.com/v1")))))),
       api_key_(option_string(options, "api_key", "apiKey", env_or_default("OPENAI_API_KEY", ""))),
-      api_version_(option_string(options, "api_version", "apiVersion", str(Core::get(descriptor_, "apiVersion", "")))),
+      api_version_(str(Core::get(descriptor_, "apiVersion", option_string(options, "api_version", "apiVersion", "")))),
       timeout_seconds_(Core::get(options, "timeout", 60).is_number() ? num(Core::get(options, "timeout", 60)) : 60.0),
+      credential_provider_(std::move(credential_provider)),
       transport_(transport) {
   if (transport_ == nullptr) {
     owned_transport_ = std::make_unique<HttpTransport>();
@@ -2518,109 +2529,59 @@ OpenAICompatibleClient::OpenAICompatibleClient(std::string profile, std::string 
 OpenAIResponsesClient::OpenAIResponsesClient(Value options, Transport* transport)
     : OpenAICompatibleClient("openai-responses", "openai-responses", std::move(options), transport, "gpt-4o", "text-embedding-ada-002") {}
 
-DeepSeekResponsesClient::DeepSeekResponsesClient(Value options, Transport* transport)
-    : OpenAICompatibleClient("deepseek-responses", "DeepSeek Responses", [&]() {
-        Value out = std::move(options);
-        if (Core::get(out, "api_key").is_null() && Core::get(out, "apiKey").is_null()) Core::set(out, "api_key", env_or_default("DEEPSEEK_API_KEY", ""));
-        if (Core::get(out, "base_url").is_null() && Core::get(out, "baseUrl").is_null()) Core::set(out, "base_url", env_or_default("DEEPSEEK_BASE_URL", "https://api.deepseek.com"));
-        return out;
-      }(), transport, "deepseek-v4-flash", "") {}
+OpenAIResponsesClient::OpenAIResponsesClient(std::string profile, Value options, Transport* transport)
+    : OpenAICompatibleClient(profile,
+          profile,
+          std::move(options), transport,
+          display(Core::get(Core::provider_descriptor(profile), "defaultModel", "")),
+          display(Core::get(Core::provider_descriptor(profile), "defaultEmbedModel", ""))) {}
 
 double OpenAICompatibleClient::get_estimated_cost(Value model_usage) {
   return num(Core::provider_estimate_cost(std::move(model_usage)));
 }
 
+Value OpenAICompatibleClient::get_features(Value model) {
+  std::string selected = model.is_null() || display(model).empty() ? model_ : display(model);
+  return Core::provider_resolve_features(profile_, selected, options_);
+}
+
 GoogleGeminiClient::GoogleGeminiClient(Value options, Transport* transport)
-    : OpenAICompatibleClient("google-gemini", "GoogleGeminiAI", [&]() {
+    : GoogleGeminiClient("google-gemini", std::move(options), transport) {}
+
+GoogleGeminiClient::GoogleGeminiClient(std::string profile, Value options, Transport* transport)
+    : OpenAICompatibleClient(profile, profile, [&]() {
         Value out = std::move(options);
         bool vertex = (!Core::get(out, "project_id").is_null() || !Core::get(out, "projectId").is_null()) && !Core::get(out, "region").is_null();
         if (Core::get(out, "api_key").is_null() && Core::get(out, "apiKey").is_null()) Core::set(out, "api_key", vertex ? env_or_default("GOOGLE_VERTEX_ACCESS_TOKEN", "") : env_or_default("GOOGLE_API_KEY", env_or_default("GEMINI_API_KEY", "")));
         std::string base = env_or_default("GOOGLE_GEMINI_BASE_URL", "");
         if (!base.empty() && Core::get(out, "base_url").is_null() && Core::get(out, "baseUrl").is_null()) Core::set(out, "base_url", base);
         return out;
-      }(), transport, "gemini-2.5-flash", "gemini-embedding-2") {}
+      }(), transport,
+      display(Core::get(Core::provider_descriptor(profile), "defaultModel", "")),
+      display(Core::get(Core::provider_descriptor(profile), "defaultEmbedModel", ""))) {}
 
 AnthropicClient::AnthropicClient(Value options, Transport* transport)
-    : OpenAICompatibleClient("anthropic", "anthropic", [&]() {
+    : AnthropicClient("anthropic", std::move(options), transport) {}
+
+AnthropicClient::AnthropicClient(std::string profile, Value options, Transport* transport)
+    : OpenAICompatibleClient(profile, profile, [&]() {
         Value out = std::move(options);
         bool vertex = (!Core::get(out, "project_id").is_null() || !Core::get(out, "projectId").is_null()) && !Core::get(out, "region").is_null();
         if (Core::get(out, "api_key").is_null() && Core::get(out, "apiKey").is_null()) Core::set(out, "api_key", vertex ? env_or_default("GOOGLE_VERTEX_ACCESS_TOKEN", "") : env_or_default("ANTHROPIC_API_KEY", ""));
         std::string base = env_or_default("ANTHROPIC_BASE_URL", "");
         if (!base.empty() && Core::get(out, "base_url").is_null() && Core::get(out, "baseUrl").is_null()) Core::set(out, "base_url", base);
         return out;
-      }(), transport, "claude-3-7-sonnet-latest", "") {}
-
-AzureOpenAIClient::AzureOpenAIClient(Value options, Transport* transport)
-    : OpenAICompatibleClient("azure-openai", "Azure OpenAI", [&]() {
-        Value out = std::move(options);
-        if (Core::get(out, "api_key").is_null() && Core::get(out, "apiKey").is_null()) Core::set(out, "api_key", env_or_default("AZURE_OPENAI_API_KEY", ""));
-        std::string version = option_string(out, "api_version", "apiVersion", option_string(out, "version", "version", "2024-02-15-preview"));
-        std::string marker = "api-version=";
-        auto idx = version.find(marker);
-        if (idx != std::string::npos) {
-          version = version.substr(idx + marker.size());
-          auto amp = version.find('&');
-          if (amp != std::string::npos) version = version.substr(0, amp);
-        }
-        Core::set(out, "api_version", version);
-        if (Core::get(out, "base_url").is_null() && Core::get(out, "baseUrl").is_null()) {
-          std::string env_base = env_or_default("AZURE_OPENAI_BASE_URL", "");
-          if (!env_base.empty()) {
-            Core::set(out, "base_url", env_base);
-          } else {
-            std::string resource = option_string(out, "resource_name", "resourceName", env_or_default("AZURE_OPENAI_RESOURCE_NAME", ""));
-            std::string deployment = option_string(out, "deployment_name", "deploymentName", env_or_default("AZURE_OPENAI_DEPLOYMENT_NAME", ""));
-            if (!resource.empty() && !deployment.empty()) {
-              std::string host = resource.find("://") == std::string::npos ? "https://" + resource + ".openai.azure.com" : resource;
-              Core::set(out, "base_url", strip_trailing_slashes(host) + "/openai/deployments/" + url_component(deployment));
-            }
-          }
-        }
-        return out;
-      }(), transport, "gpt-5-mini", "text-embedding-3-small") {}
-
-DeepSeekClient::DeepSeekClient(Value options, Transport* transport)
-    : OpenAICompatibleClient("deepseek", "DeepSeek", [&]() {
-        Value out = std::move(options);
-        if (Core::get(out, "api_key").is_null() && Core::get(out, "apiKey").is_null()) Core::set(out, "api_key", env_or_default("DEEPSEEK_API_KEY", ""));
-        if (Core::get(out, "base_url").is_null() && Core::get(out, "baseUrl").is_null()) Core::set(out, "base_url", env_or_default("DEEPSEEK_BASE_URL", "https://api.deepseek.com"));
-        return out;
-      }(), transport, "deepseek-v4-flash", "") {}
-
-MistralClient::MistralClient(Value options, Transport* transport)
-    : OpenAICompatibleClient("mistral", "Mistral", [&]() {
-        Value out = std::move(options);
-        if (Core::get(out, "api_key").is_null() && Core::get(out, "apiKey").is_null()) Core::set(out, "api_key", env_or_default("MISTRAL_API_KEY", ""));
-        if (Core::get(out, "base_url").is_null() && Core::get(out, "baseUrl").is_null()) Core::set(out, "base_url", env_or_default("MISTRAL_BASE_URL", "https://api.mistral.ai/v1"));
-        return out;
-      }(), transport, "mistral-small-latest", "mistral-embed") {}
-
-RekaClient::RekaClient(Value options, Transport* transport)
-    : OpenAICompatibleClient("reka", "Reka", [&]() {
-        Value out = std::move(options);
-        if (Core::get(out, "api_key").is_null() && Core::get(out, "apiKey").is_null()) Core::set(out, "api_key", env_or_default("REKA_API_KEY", ""));
-        if (Core::get(out, "base_url").is_null() && Core::get(out, "baseUrl").is_null()) Core::set(out, "base_url", env_or_default("REKA_BASE_URL", "https://api.reka.ai/v1"));
-        return out;
-      }(), transport, "reka-core", "") {}
-
-CohereClient::CohereClient(Value options, Transport* transport)
-    : OpenAICompatibleClient("cohere", "Cohere", [&]() {
-        Value out = std::move(options);
-        if (Core::get(out, "api_key").is_null() && Core::get(out, "apiKey").is_null()) Core::set(out, "api_key", env_or_default("COHERE_API_KEY", ""));
-        if (Core::get(out, "base_url").is_null() && Core::get(out, "baseUrl").is_null()) Core::set(out, "base_url", env_or_default("COHERE_BASE_URL", "https://api.cohere.ai/compatibility/v1"));
-        return out;
-      }(), transport, "command-r-plus", "embed-english-v3.0") {}
-
-GrokClient::GrokClient(Value options, Transport* transport)
-    : OpenAICompatibleClient("grok", "Grok", [&]() {
-        Value out = std::move(options);
-        if (Core::get(out, "api_key").is_null() && Core::get(out, "apiKey").is_null()) Core::set(out, "api_key", env_or_default("XAI_API_KEY", env_or_default("GROK_API_KEY", "")));
-        if (Core::get(out, "base_url").is_null() && Core::get(out, "baseUrl").is_null()) Core::set(out, "base_url", env_or_default("XAI_BASE_URL", env_or_default("GROK_BASE_URL", "https://api.x.ai/v1")));
-        return out;
-      }(), transport, "grok-4.3", "") {}
+      }(), transport,
+      display(Core::get(Core::provider_descriptor(profile), "defaultModel", "")),
+      display(Core::get(Core::provider_descriptor(profile), "defaultEmbedModel", ""))) {}
 
 OpenAICompatibleClient& OpenAICompatibleClient::context_cache_registry(AxContextCacheRegistry* registry) {
   context_cache_registry_ = registry;
+  return *this;
+}
+
+OpenAICompatibleClient& OpenAICompatibleClient::credential_provider(AxCredentialProvider provider) {
+  credential_provider_ = std::move(provider);
   return *this;
 }
 
@@ -3007,7 +2968,7 @@ Value OpenAICompatibleClient::headers() const {
   Value headers = Value::object();
   Core::set(headers, "Content-Type", "application/json");
   if (str(Core::get(descriptor_, "auth")) == "bearer") Core::set(headers, "Authorization", "Bearer " + api_key_);
-  if (str(Core::get(descriptor_, "auth")) == "anthropic_key") Core::set(headers, "x-api-key", api_key_);
+  if (str(Core::get(descriptor_, "auth")) == "anthropic_key" || str(Core::get(descriptor_, "auth")) == "x-api-key") Core::set(headers, "x-api-key", api_key_);
   if (str(Core::get(descriptor_, "auth")) == "api_key_header") Core::set(headers, str(Core::get(descriptor_, "apiKeyHeader", "api-key")), api_key_);
   for (const auto& entry : object_ref(Core::get(descriptor_, "headers", Value::object()))) {
     Core::set(headers, entry.first, str(entry.second));
@@ -3037,13 +2998,24 @@ Value OpenAICompatibleClient::request_json(const std::string& endpoint, Value pa
   Core::set(call, "method", method.empty() ? "POST" : method);
   bool absolute = endpoint.rfind("http://", 0) == 0 || endpoint.rfind("https://", 0) == 0;
   Core::set(call, "url", absolute ? endpoint : base_url_ + endpoint);
-  Core::set(call, "headers", headers());
+  Value resolved_headers = headers();
+  std::string request_url = str(Core::get(call, "url"));
+  std::string operation = stream ? "stream_chat" : "chat";
+  if (!stream && body_key == "data") operation = binary_response ? "speak" : "transcribe";
+  if (!stream && endpoint.find("embedding") != std::string::npos) operation = "embed";
+  if (!stream && str(Core::get(descriptor_, "transport")) == "openai-responses") operation = "responses";
+  if (credential_provider_) {
+    for (const auto& [key, value] : credential_provider_(AxCredentialRequest{profile_, operation, method, request_url})) {
+      Core::set(resolved_headers, key, value);
+    }
+  }
+  Core::set(call, "headers", resolved_headers);
   Core::set(call, body_key.empty() ? "json" : body_key, payload);
   Core::set(call, "stream", stream);
   // Signals the transport to return the raw body as base64 instead of JSON.
   if (binary_response) Core::set(call, "binary", Value(true));
   Core::set(call, "timeout", timeout_seconds_);
-  if (api_key_.empty() || api_key_ == "null") throw Core::as_error(Core::ai_error_auth("OPENAI_API_KEY is required", Value(), Value(), Value(), call));
+  if ((api_key_.empty() || api_key_ == "null") && !credential_provider_) throw Core::as_error(Core::ai_error_auth("api_key or credential_provider is required", Value(), Value(), Value(), call));
   if (transport_ != nullptr) return transport_result(transport_->call(call), call);
   throw Core::as_error(Core::ai_error_unsupported("C++ HTTP transport is not available; build with AXLLM_ENABLE_CURL=ON or pass a custom Transport"));
 }
@@ -3276,6 +3248,22 @@ AxGen& AxGen::set_examples(Value examples) {
 
 AxGen& AxGen::set_demos(Value demos) {
   Core::set(state_, "demos", demos);
+  return *this;
+}
+
+AxGen& AxGen::set_sample_count(int sample_count) {
+  Value options = Core::get(state_, "options", Value::object());
+  Core::set(options, "sampleCount", sample_count);
+  Core::set(state_, "options", options);
+  return *this;
+}
+
+AxGen& AxGen::set_result_picker(std::function<int(const Value&)> result_picker) {
+  std::string id = pointer_id(this) + ":result_picker:" + std::to_string(result_picker_registry().size());
+  result_picker_registry()[id] = std::move(result_picker);
+  Value options = Core::get(state_, "options", Value::object());
+  Core::set(options, "resultPicker", object({{"__result_picker_id", id}}));
+  Core::set(state_, "options", options);
   return *this;
 }
 
@@ -5707,40 +5695,24 @@ std::shared_ptr<AxAIService> ai(const std::string& provider, Value options) {
     throw AxError("provider", "unsupported AxAI provider: " + provider);
   }
   std::string canonical = display(Core::get(resolved, "id"));
-  if (canonical == "openai-compatible") {
-    return std::make_shared<OpenAICompatibleClient>(std::move(options));
+  Value descriptor = Core::provider_descriptor(canonical);
+  std::string transport = display(Core::get(descriptor, "transport"));
+  if (transport == "openai-responses") {
+    return std::make_shared<OpenAIResponsesClient>(canonical, std::move(options));
   }
-  if (canonical == "openai-responses") {
-    return std::make_shared<OpenAIResponsesClient>(std::move(options));
+  if (transport == "gemini-generate-content") {
+    return std::make_shared<GoogleGeminiClient>(canonical, std::move(options));
   }
-  if (canonical == "deepseek-responses") {
-    return std::make_shared<DeepSeekResponsesClient>(std::move(options));
+  if (transport == "anthropic-messages") {
+    return std::make_shared<AnthropicClient>(canonical, std::move(options));
   }
-  if (canonical == "google-gemini") {
-    return std::make_shared<GoogleGeminiClient>(std::move(options));
+  if (transport == "openai-chat") {
+    return std::make_shared<OpenAICompatibleClient>(canonical,
+        canonical, std::move(options), nullptr,
+        display(Core::get(descriptor, "defaultModel", "")),
+        display(Core::get(descriptor, "defaultEmbedModel", "")));
   }
-  if (canonical == "anthropic") {
-    return std::make_shared<AnthropicClient>(std::move(options));
-  }
-  if (canonical == "azure-openai") {
-    return std::make_shared<AzureOpenAIClient>(std::move(options));
-  }
-  if (canonical == "deepseek") {
-    return std::make_shared<DeepSeekClient>(std::move(options));
-  }
-  if (canonical == "mistral") {
-    return std::make_shared<MistralClient>(std::move(options));
-  }
-  if (canonical == "reka") {
-    return std::make_shared<RekaClient>(std::move(options));
-  }
-  if (canonical == "cohere") {
-    return std::make_shared<CohereClient>(std::move(options));
-  }
-  if (canonical == "grok") {
-    return std::make_shared<GrokClient>(std::move(options));
-  }
-  throw AxError("runtime", "unsupported AxAI provider: " + provider);
+  throw AxError("runtime", "unsupported transport for AxAI profile: " + canonical);
 }
 std::shared_ptr<AxAIService> ai(const char* provider, Value options) { return ai(std::string(provider == nullptr ? "" : provider), std::move(options)); }
 
@@ -5933,8 +5905,13 @@ Value AxBalancer::get_model_list() {
 
 Value AxBalancer::get_features(Value model) {
   Value features = balancer_base_features_cpp();
+  Value structured_output_modes = Value::array();
+  bool all_modes_advertised = !services_.empty();
   for (const auto& service : services_) {
     Value raw = service->get_features(model);
+    Value raw_modes = Core::get(raw, "structuredOutputModes", Core::get(raw, "structured_output_modes", Value()));
+    if (raw_modes.is_null()) all_modes_advertised = false;
+    else append_unique_cpp(structured_output_modes, raw_modes);
     for (const auto& pair : std::vector<std::pair<std::string, std::string>>{{"functions", ""}, {"streaming", ""}, {"thinking", ""}, {"multiTurn", "multi_turn"}, {"structuredOutputs", "structured_outputs"}, {"functionCot", "function_cot"}, {"hasThinkingBudget", "has_thinking_budget"}, {"hasShowThoughts", "has_show_thoughts"}}) {
       if (feature_truthy_cpp(raw, pair.first, pair.second)) Core::set(features, pair.first, true);
     }
@@ -5968,6 +5945,7 @@ Value AxBalancer::get_features(Value model) {
     Core::set(caching, "types", types);
     Core::set(features, "caching", caching);
   }
+  if (all_modes_advertised) Core::set(features, "structured_output_modes", structured_output_modes);
   return features;
 }
 

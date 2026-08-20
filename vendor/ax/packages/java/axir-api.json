@@ -53,7 +53,7 @@
     {
       "id": "axgen",
       "title": "AxGen",
-      "summary": "Run structured generation with Core-owned prompts, tool loops, retries, streaming folds, traces, usage, examples, and field processors.",
+      "summary": "Run structured generation with Core-owned prompts, indexed multi-sampling, result selection, tool loops, retries, streaming folds, traces, usage, examples, and field processors.",
       "symbols": [
         {
           "target_name": "java",
@@ -66,6 +66,8 @@
             "functions",
             "examples",
             "demos",
+            "sample count",
+            "result picker",
             "modelConfig",
             "maxRetries",
             "streaming assertions",
@@ -79,13 +81,15 @@
           "canonical_name": "AxGen",
           "public_name": "AxGen",
           "kind": "type",
-          "description": "Structured generation program with forward, streaming, optimization, trace, usage, and tool-call behavior.",
+          "description": "Structured generation program with indexed multi-sampling, winner selection, forward, streaming, optimization, trace, usage, and tool-call behavior.",
           "form": "new AxGen(signature)",
           "important_options": [
             "signature",
             "functions",
             "examples",
             "demos",
+            "sample count",
+            "result picker",
             "memory",
             "prompt template"
           ],
@@ -103,10 +107,10 @@
           "canonical_name": "ai",
           "public_name": "Ax.ai",
           "kind": "function",
-          "description": "Create a provider client from a provider name and options.",
+          "description": "Create a provider client from a named deployment profile and options.",
           "form": "Ax.ai(provider, options)",
           "important_options": [
-            "api key",
+            "api key or credential provider",
             "model",
             "api URL",
             "headers",
@@ -114,6 +118,38 @@
           ],
           "returns": "AI client/service",
           "example": "AxAIService client = Ax.ai(\"openai\", Map.of(\"apiKey\", System.getenv(\"OPENAI_API_KEY\")));"
+        },
+        {
+          "target_name": "java",
+          "canonical_name": "AxCredentialRequest",
+          "public_name": "OpenAICompatibleClient.CredentialRequest",
+          "kind": "type",
+          "description": "Request metadata passed to a renewable credential callback for every transport attempt.",
+          "form": "OpenAICompatibleClient.CredentialRequest",
+          "important_options": [
+            "profile",
+            "operation",
+            "method",
+            "URL"
+          ],
+          "returns": "credential request"
+        },
+        {
+          "target_name": "java",
+          "canonical_name": "AxCredentialProvider",
+          "public_name": "OpenAICompatibleClient.CredentialProvider",
+          "kind": "interface",
+          "description": "Return fresh request headers that override static profile authentication.",
+          "form": "OpenAICompatibleClient.CredentialProvider",
+          "important_options": [
+            "chat",
+            "stream",
+            "embeddings",
+            "Responses",
+            "audio",
+            "retries"
+          ],
+          "returns": "header map or credential error"
         },
         {
           "target_name": "java",
@@ -142,21 +178,6 @@
             "model",
             "audio",
             "realtime"
-          ],
-          "returns": "provider client"
-        },
-        {
-          "target_name": "java",
-          "canonical_name": "DeepSeekResponsesClient",
-          "public_name": "DeepSeekResponsesClient",
-          "kind": "type",
-          "description": "DeepSeek Responses provider mapping with stateless reasoning and function-call replay.",
-          "form": "new DeepSeekResponsesClient(options)",
-          "important_options": [
-            "api key",
-            "model",
-            "thinking",
-            "transport"
           ],
           "returns": "provider client"
         },

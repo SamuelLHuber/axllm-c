@@ -32,9 +32,12 @@ var packageSkillSpecs = []packageSkillSpec{
 		ID:          "ai",
 		Title:       "AxAI Providers",
 		Area:        "provider clients and model routing",
-		Description: "provider clients, model selection, OpenAI-compatible calls, Responses, Gemini, Anthropic, routers, and balancers",
+		Description: "named deployment profiles, generic provider clients, model selection, OpenAI-compatible calls, Responses, Gemini, Anthropic, routers, and balancers",
 		UseWhen: []string{
 			"Create provider clients or normalize provider options.",
+			"Choose a named deployment profile separately from the model ID served by that deployment.",
+			"Attach renewable per-request credentials for expiring cloud tokens.",
+			"Resolve structured-output modes from the selected profile and model.",
 			"Choose between model-list routing, ordered failover, and adaptive operational routing.",
 			"Use scripted transports for deterministic no-key examples.",
 			"Use provider-api examples only when explicit provider credentials are available.",
@@ -69,10 +72,11 @@ var packageSkillSpecs = []packageSkillSpec{
 		ID:          "gen",
 		Title:       "AxGen Structured Generation",
 		Area:        "structured generation and tools",
-		Description: "AxGen programs, forward calls, streaming, tools, assertions, traces, usage, and output parsing",
+		Description: "AxGen programs, forward calls, indexed multi-sampling, result pickers, streaming, tools, assertions, traces, usage, and output parsing",
 		UseWhen: []string{
 			"Build a structured generation program from a signature.",
 			"Attach typed tools or MCP-derived tools to a generation call.",
+			"Generate multiple validated structured samples and select a winner with a native callback.",
 			"Use package examples for no-key scripted clients and provider-api calls.",
 		},
 		Sections: []string{"axgen", "tools", "mcp"},
@@ -239,13 +243,32 @@ func renderSkill(spec packageSkillSpec, model AxRuntimeModel, target string) str
 	if expandedExamples != "" {
 		expandedExamples += "\n\n"
 	}
+	profileGuide := ""
 	routingGuide := ""
 	if spec.ID == "ai" {
+		profileGuide = readmeLines(
+			"## Named Deployment Profiles",
+			"",
+			"- The first `ai` / `NewAI` factory argument selects deployment behavior. The model option selects a model only inside that deployment; never infer request rules from a vendor-looking model ID.",
+			"- `openai` is the official OpenAI deployment. `openai-compatible` is the conservative custom-endpoint profile and requires an explicit base URL. Unknown profile names are errors.",
+			"- A Together-hosted DeepSeek model uses the `together` profile's URL, authentication, reasoning fields, and effort mapping. Native DeepSeek `thinking` fields apply only to the `deepseek` profile.",
+			"- Verified DeepSeek, Grok, Groq, Cerebras, and DeepInfra model rules default an omitted thinking level to logical `max`, mapped to the strongest documented deployment effort.",
+			"- Send `none` only where the selected deployment and model document reasoning disablement. Unsupported levels fail before network I/O; dynamic Hugging Face Router routes remain conservative.",
+			"- Structured output is an ordered model-aware capability: `native`, `function`, and `json_object`. Exact caller model metadata overrides the first matching profile rule, which overrides the profile default.",
+			"- An explicit unsupported structured-output mode fails before transport. `structuredOutputs` / `structured_outputs` remains the compatibility alias for native JSON Schema only.",
+			"- The exact Vertex `google/gemma-4-26b-a4b-it-maas` rule prefers `json_object`, excludes native schema, defaults thinking to `max`, writes nested `enable_thinking`, and extracts/replays `reasoning_content`. Unknown Vertex models stay conservative.",
+			"- Use named factories for Azure OpenAI, Cohere, DeepSeek, DeepSeek Responses, Mistral, Reka, Grok, routers, hosted inference, and configurable runtimes. Profile-only branded client constructors were removed.",
+			"- Retained client classes are transport/runtime boundaries: OpenAI-compatible Chat Completions, OpenAI Responses, Anthropic Messages, and Gemini GenerateContent. Build ordinary applications through the named factory.",
+			"- Provider descriptors and conformance fixtures are generated from the shared profile manifest. Do not add provider-name switches or cross-profile model normalization in a generated package.",
+			"",
+		) + "\n"
 		routingGuide = readmeLines(
 			"## Vertex And Prompt Caching",
 			"",
 			"- Configure Gemini or Anthropic Vertex mode with `projectId` / `project_id` and `region`; optionally select a Vertex endpoint with `endpointId` / `endpoint_id`.",
-			"- In Vertex mode, `apiKey` / `api_key` is a caller-supplied bearer access token. Generated clients may read `GOOGLE_VERTEX_ACCESS_TOKEN`, but automatic ADC and token refresh remain host-owned.",
+			"- Use `credentialProvider` / `credential_provider` for expiring Vertex and cloud tokens. It receives profile, operation, method, and URL on every attempt; its headers override static authentication.",
+			"- Credential callbacks cover chat, stream, embeddings, Responses, transcription, speech, and retries. Callback errors stop before transport, and completed 401/403 generation responses are not replayed automatically.",
+			"- Keep ADC and cloud SDK dependencies host-owned: obtain or refresh the token inside the callback. A required-auth profile accepts either a static key or the callback.",
 			"- Core resolves `global`, `us`, `eu`, and regional Vertex hosts. An explicit `baseUrl` / `base_url` takes precedence.",
 			"- OpenAI GPT-5.6 Chat explicit caching is opt-in through `contextCache` / `context_cache` or message/function cache flags. Use `promptCacheKey` / `prompt_cache_key` for stable affinity; `sessionId` / `session_id` is the fallback.",
 			"- Normalized usage separates uncached prompt, cache-read, and cache-creation tokens. `get_model_cost` / target equivalent uses the shared model catalog, including cache-write pricing and long-context thresholds.",
@@ -270,6 +293,15 @@ func renderSkill(spec packageSkillSpec, model AxRuntimeModel, target string) str
 			"## Provider Forward Options",
 			"",
 			"AxGen merges constructor and per-call forward options before invoking the provider. Provider-facing keys such as `promptCacheKey`, `sessionId`, and `contextCache` therefore reach the chat request without being copied into program inputs. Per-call values override constructor defaults.",
+			"",
+			"`structuredOutputMode` / `structured_output_mode` accepts `auto`, `native`, `function`, or `json_object`. Auto follows the selected profile/model ordering, with the provider-neutral singleton string/code JSON-object optimization. Explicit modes must be advertised and fail before transport otherwise. JSON-object mode retains exact-shape prompting, strict parsing, and one bounded correction retry without a synthetic `__axOutput` tool.",
+			"",
+			"## Multi-Sampling",
+			"",
+			"- Set `sampleCount` / `sample_count` to request N provider candidates. Core parses and validates every candidate, preserving each provider result index.",
+			"- Without a result picker, AxGen returns candidate 0. A result picker receives all `{ index, sample }` structured candidates and returns the winning list index; Core rejects an index outside `0..N-1`.",
+			"- Native callback surface: "+skillResultPickerSurface(target)+".",
+			"- OpenAI-compatible Chat and Gemini map multi-sampling to `n` and `candidateCount`. Anthropic rejects `n > 1` explicitly.",
 			"",
 		) + "\n"
 	}
@@ -327,6 +359,7 @@ func renderSkill(spec packageSkillSpec, model AxRuntimeModel, target string) str
 	}
 	if target == "go" && spec.ID == "ai" {
 		guardrails = append(guardrails, "When decorating `AIClient`, forward `GetFeatures(model) map[string]Value` whenever the wrapped client implements it. AxGen otherwise falls back to permissive capabilities, which can select an unsupported structured-output rung.")
+		guardrails = append(guardrails, "For Vertex OpenAI-compatible MaaS, prefer `NewAI(\"vertex-ai\", options)` with `AxCredentialProviderFunc`; do not reintroduce a request-rewriting response-format decorator.")
 	}
 	return readmeLines(
 		skillFrontmatter(name, description, generatedPackageVersion()),
@@ -357,7 +390,7 @@ func renderSkill(spec packageSkillSpec, model AxRuntimeModel, target string) str
 		skillSnippet(target, spec.ID),
 		"```",
 		"",
-		expandedExamples+routingGuide+genForwardGuide+agentMemoryGuide+usageObserverGuide+"## Relevant API Surface",
+		expandedExamples+profileGuide+routingGuide+genForwardGuide+agentMemoryGuide+usageObserverGuide+"## Relevant API Surface",
 		"",
 		skillAPISurface(apiRef, spec.Sections),
 		"",
@@ -365,6 +398,23 @@ func renderSkill(spec packageSkillSpec, model AxRuntimeModel, target string) str
 		"",
 		skillBulletList(guardrails),
 	)
+}
+
+func skillResultPickerSurface(target string) string {
+	switch target {
+	case "python":
+		return "`ax(..., sample_count=N, result_picker=callback)` or `set_sample_count` / `set_result_picker`"
+	case "java":
+		return "`setSampleCount` / `setResultPicker`"
+	case "cpp":
+		return "`set_sample_count` / `set_result_picker`"
+	case "go":
+		return "`SetSampleCount` / `SetResultPicker` with `AxResultPickerSample`"
+	case "rust":
+		return "`with_sample_count` / `with_result_picker` with `AxResultPickerSample`"
+	default:
+		return "the target's generated AxGen setters"
+	}
 }
 
 func skillUsageObserverSnippet(target string) string {

@@ -45,7 +45,6 @@ class RuntimeTransport;
 class AxAIService;
 class OpenAICompatibleClient;
 class OpenAIResponsesClient;
-class DeepSeekResponsesClient;
 class GoogleGeminiClient;
 class AnthropicClient;
 class AxBootstrapFewShot;
@@ -78,6 +77,14 @@ struct Value {
 using AxUsageContext = Value;
 using AxUsageEvent = Value;
 using AxUsageObserver = std::function<void(AxUsageEvent)>;
+
+struct AxCredentialRequest {
+  std::string profile;
+  std::string operation;
+  std::string method;
+  std::string url;
+};
+using AxCredentialProvider = std::function<std::map<std::string, std::string>(const AxCredentialRequest&)>;
 
 void set_usage_observer(AxUsageObserver observer);
 
@@ -543,7 +550,8 @@ class ScriptedRealtimeTransport : public RealtimeTransport {
 
 class OpenAICompatibleClient : public AxBaseAI {
  public:
-  explicit OpenAICompatibleClient(Value options = Value::object(), Transport* transport = nullptr);
+  explicit OpenAICompatibleClient(Value options = Value::object(), Transport* transport = nullptr, AxCredentialProvider credential_provider = {});
+  OpenAICompatibleClient(std::string profile, std::string name, Value options, Transport* transport, std::string default_model, std::string default_embed_model, AxCredentialProvider credential_provider = {});
   std::vector<Value> stream(Value request) override;
   Value transcribe(Value request) override;
   Value speak(Value request) override;
@@ -551,11 +559,12 @@ class OpenAICompatibleClient : public AxBaseAI {
   Value realtime_audio_setup(Value request);
   Value realtime_audio_input(Value request);
   Value realtime_chat(Value request, RealtimeTransport* transport = nullptr);
+  Value get_features(Value model = Value()) override;
   double get_estimated_cost(Value model_usage) override;
   OpenAICompatibleClient& context_cache_registry(AxContextCacheRegistry* registry);
+  OpenAICompatibleClient& credential_provider(AxCredentialProvider provider);
 
  protected:
-  OpenAICompatibleClient(std::string profile, std::string name, Value options, Transport* transport, std::string default_model, std::string default_embed_model);
   Value do_chat(Value request, Value options) override;
   Value do_embed(Value request, Value options) override;
 
@@ -569,6 +578,7 @@ class OpenAICompatibleClient : public AxBaseAI {
   std::unique_ptr<Transport> owned_transport_;
   Transport* transport_;
   AxContextCacheRegistry* context_cache_registry_ = nullptr;
+  AxCredentialProvider credential_provider_;
   Value context_cache_entries_ = Value::object();
   Value context_cache_chat(Value request, Value options, Value payload, Value model, const std::string& endpoint);
   Value request_json(const std::string& endpoint, Value payload, bool stream);
@@ -586,51 +596,19 @@ class OpenAICompatibleClient : public AxBaseAI {
 class OpenAIResponsesClient : public OpenAICompatibleClient {
  public:
   explicit OpenAIResponsesClient(Value options = Value::object(), Transport* transport = nullptr);
-};
-
-class DeepSeekResponsesClient : public OpenAICompatibleClient {
- public:
-  explicit DeepSeekResponsesClient(Value options = Value::object(), Transport* transport = nullptr);
+  OpenAIResponsesClient(std::string profile, Value options, Transport* transport = nullptr);
 };
 
 class GoogleGeminiClient : public OpenAICompatibleClient {
  public:
   explicit GoogleGeminiClient(Value options = Value::object(), Transport* transport = nullptr);
+  GoogleGeminiClient(std::string profile, Value options, Transport* transport = nullptr);
 };
 
 class AnthropicClient : public OpenAICompatibleClient {
  public:
   explicit AnthropicClient(Value options = Value::object(), Transport* transport = nullptr);
-};
-
-class AzureOpenAIClient : public OpenAICompatibleClient {
- public:
-  explicit AzureOpenAIClient(Value options = Value::object(), Transport* transport = nullptr);
-};
-
-class DeepSeekClient : public OpenAICompatibleClient {
- public:
-  explicit DeepSeekClient(Value options = Value::object(), Transport* transport = nullptr);
-};
-
-class MistralClient : public OpenAICompatibleClient {
- public:
-  explicit MistralClient(Value options = Value::object(), Transport* transport = nullptr);
-};
-
-class RekaClient : public OpenAICompatibleClient {
- public:
-  explicit RekaClient(Value options = Value::object(), Transport* transport = nullptr);
-};
-
-class CohereClient : public OpenAICompatibleClient {
- public:
-  explicit CohereClient(Value options = Value::object(), Transport* transport = nullptr);
-};
-
-class GrokClient : public OpenAICompatibleClient {
- public:
-  explicit GrokClient(Value options = Value::object(), Transport* transport = nullptr);
+  AnthropicClient(std::string profile, Value options, Transport* transport = nullptr);
 };
 
 class Tool {
@@ -687,6 +665,8 @@ class AxGen : public AxProgram {
   AxGen& add_tool(const Tool& tool);
   AxGen& set_examples(Value examples);
   AxGen& set_demos(Value demos);
+  AxGen& set_sample_count(int sample_count);
+  AxGen& set_result_picker(std::function<int(const Value&)> result_picker);
   AxGen& add_assert(Value assertion);
   AxGen& add_assert(std::function<Value(Value)> assertion);
   AxGen& add_streaming_assert(Value assertion);

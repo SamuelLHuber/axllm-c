@@ -13,6 +13,7 @@ import {
   axBaseAIDefaultCreativeConfig,
 } from '../base.js';
 import type {
+  AxAICredentialProvider,
   AxAIInputModelList,
   AxAIServiceImpl,
   AxAIServiceOptions,
@@ -181,7 +182,81 @@ type AxOpenAIBatchAudioConfig = {
   speechFormat?: AxAudioFormat;
 };
 
-type AxOpenAIReasoningContentMode = 'none' | 'deepseek';
+export type AxOpenAIReasoningContentMode =
+  | 'none'
+  | 'deepseek'
+  | {
+      assistantField?: string;
+      responseFields: readonly string[];
+      assistantDetailsField?: string;
+      responseDetailsFields?: readonly string[];
+    };
+
+const resolveReasoningAdapter = (
+  mode: AxOpenAIReasoningContentMode
+): {
+  assistantField?: string;
+  responseFields: readonly string[];
+  assistantDetailsField?: string;
+  responseDetailsFields: readonly string[];
+} => {
+  if (mode === 'none') {
+    return { responseFields: [], responseDetailsFields: [] };
+  }
+  if (mode === 'deepseek') {
+    return {
+      assistantField: 'reasoning_content',
+      responseFields: ['reasoning_content'],
+      responseDetailsFields: [],
+    };
+  }
+  return { responseDetailsFields: [], ...mode };
+};
+
+const readReasoning = (
+  value: unknown,
+  mode: AxOpenAIReasoningContentMode
+): {
+  thought?: string;
+  thoughtBlocks?: { data: string; encrypted: boolean; signature?: string }[];
+} => {
+  if (!value || typeof value !== 'object') return {};
+  const record = value as Record<string, unknown>;
+  const adapter = resolveReasoningAdapter(mode);
+  let thought: string | undefined;
+  for (const field of adapter.responseFields) {
+    const content = record[field];
+    if (typeof content === 'string' && content.length > 0) {
+      thought = content;
+      break;
+    }
+  }
+  for (const field of adapter.responseDetailsFields) {
+    const details = record[field];
+    if (!Array.isArray(details) || details.length === 0) continue;
+    const thoughtBlocks = details.map((detail) => {
+      const detailRecord =
+        detail && typeof detail === 'object'
+          ? (detail as Record<string, unknown>)
+          : undefined;
+      const summary = detailRecord?.summary;
+      const text = detailRecord?.text;
+      if (!thought && typeof summary === 'string') thought = summary;
+      if (!thought && typeof text === 'string') thought = text;
+      const type = String(detailRecord?.type ?? '');
+      const id = detailRecord?.id;
+      return {
+        data: JSON.stringify(detail),
+        encrypted: type.includes('encrypted'),
+        ...(typeof id === 'string' ? { signature: id } : {}),
+      };
+    });
+    return { thought, thoughtBlocks };
+  }
+  return thought
+    ? { thought, thoughtBlocks: [{ data: thought, encrypted: false }] }
+    : {};
+};
 
 type AxAIOpenAIBaseInternalArgs<
   TModel,
@@ -202,7 +277,9 @@ export interface AxAIOpenAIBaseArgs<
   TModelKey,
   TChatReq extends AxAIOpenAIChatRequest<TModel>,
 > {
-  apiKey: string;
+  apiKey?: string;
+  credentialProvider?: AxAICredentialProvider;
+  credentialProfile?: string;
   apiURL?: string;
   config: Readonly<AxAIOpenAIConfig<TModel, TEmbedModel>>;
   options?: Readonly<AxAIServiceOptions & { streamingUsage?: boolean }>;
@@ -565,20 +642,18 @@ class AxAIOpenAIImpl<
       );
 
       const audio = axMapOpenAIChatAudioResponse(choice.message.audio);
-      const thought =
-        this.reasoningContentMode === 'deepseek'
-          ? choice.message.reasoning_content
-          : undefined;
+      const reasoning = readReasoning(
+        choice.message,
+        this.reasoningContentMode
+      );
 
       return {
         index: choice.index,
         id: `${choice.index}`,
         content: choice.message.content ?? audio?.transcript ?? undefined,
         audio,
-        thought,
-        thoughtBlocks: thought
-          ? [{ data: thought, encrypted: false }]
-          : undefined,
+        thought: reasoning.thought,
+        thoughtBlocks: reasoning.thoughtBlocks,
         citations: choice.message.annotations
           ?.filter((a) => a?.type === 'url_citation' && (a as any).url_citation)
           .map((a) => ({
@@ -612,27 +687,22 @@ class AxAIOpenAIImpl<
     }
 
     const results = choices.map(
-      ({
-        index,
-        delta: {
+      ({ index, delta, finish_reason: oaiFinishReason }) => {
+        const {
           content,
           role,
           refusal,
           audio: audioDelta,
           tool_calls: toolCalls,
-          reasoning_content: rawThought,
           annotations,
-        },
-        finish_reason: oaiFinishReason,
-      }) => {
+        } = delta;
         // Check for refusal and throw exception if present
         if (refusal) {
           throw new AxAIRefusalError(refusal, undefined, id);
         }
 
         const finishReason = mapFinishReason(oaiFinishReason);
-        const thought =
-          this.reasoningContentMode === 'deepseek' ? rawThought : undefined;
+        const reasoning = readReasoning(delta, this.reasoningContentMode);
 
         const functionCalls = toolCalls
           ?.map(({ id: Id, index, function: { name, arguments: params } }) => {
@@ -664,10 +734,8 @@ class AxAIOpenAIImpl<
           content: content ?? audio?.transcript ?? undefined,
           role,
           audio,
-          thought,
-          thoughtBlocks: thought
-            ? [{ data: thought, encrypted: false }]
-            : undefined,
+          thought: reasoning.thought,
+          thoughtBlocks: reasoning.thoughtBlocks,
           citations: annotations
             ?.filter(
               (a) => a?.type === 'url_citation' && (a as any).url_citation
@@ -763,11 +831,28 @@ function createMessages<TModel>(
       }
 
       case 'assistant': {
-        const reasoningContent =
-          reasoningContentMode === 'deepseek'
-            ? (msg.thought ??
-              msg.thoughtBlocks?.map((block) => block.data).join(''))
-            : undefined;
+        const reasoningAdapter = resolveReasoningAdapter(reasoningContentMode);
+        const reasoningContent = reasoningAdapter.assistantField
+          ? (msg.thought ??
+            msg.thoughtBlocks?.map((block) => block.data).join(''))
+          : undefined;
+        const reasoningDetails = reasoningAdapter.assistantDetailsField
+          ? msg.thoughtBlocks
+              ?.map((block) => {
+                try {
+                  return JSON.parse(block.data) as unknown;
+                } catch {
+                  return undefined;
+                }
+              })
+              .filter((detail) => detail !== undefined)
+          : undefined;
+        const reasoningDetailsPayload =
+          reasoningAdapter.assistantDetailsField && reasoningDetails?.length
+            ? {
+                [reasoningAdapter.assistantDetailsField]: reasoningDetails,
+              }
+            : {};
         const toolCalls = msg.functionCalls?.map((v) => ({
           id: v.id,
           type: 'function' as const,
@@ -783,20 +868,26 @@ function createMessages<TModel>(
         if (toolCalls && toolCalls.length > 0) {
           return {
             role: 'assistant' as const,
-            ...(reasoningContentMode === 'deepseek'
+            ...(reasoningAdapter.assistantField
               ? { content: msg.content ?? '' }
               : msg.content
                 ? { content: msg.content }
                 : {}),
-            ...(reasoningContent
-              ? { reasoning_content: reasoningContent }
+            ...(reasoningContent && reasoningAdapter.assistantField
+              ? { [reasoningAdapter.assistantField]: reasoningContent }
               : {}),
+            ...reasoningDetailsPayload,
             name: msg.name,
             tool_calls: toolCalls,
           };
         }
 
-        if (msg.content === undefined && !msg.audio && !reasoningContent) {
+        if (
+          msg.content === undefined &&
+          !msg.audio &&
+          !reasoningContent &&
+          !reasoningDetails?.length
+        ) {
           throw new Error(
             'Assistant content is required when no tool calls are provided'
           );
@@ -805,7 +896,10 @@ function createMessages<TModel>(
         return {
           role: 'assistant' as const,
           ...(msg.content !== undefined ? { content: msg.content } : {}),
-          ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
+          ...(reasoningContent && reasoningAdapter.assistantField
+            ? { [reasoningAdapter.assistantField]: reasoningContent }
+            : {}),
+          ...reasoningDetailsPayload,
           ...(msg.audio ? { audio: { id: msg.audio.id } } : {}),
           ...(msg.name ? { name: msg.name } : {}),
         };
@@ -877,6 +971,8 @@ export class AxAIOpenAIBase<
 
   constructor({
     apiKey,
+    credentialProvider,
+    credentialProfile,
     config,
     options,
     apiURL,
@@ -892,13 +988,15 @@ export class AxAIOpenAIBase<
   }: Readonly<
     AxAIOpenAIBaseInternalArgs<TModel, TEmbedModel, TModelKey, TChatReq>
   >) {
-    if (!apiKey || apiKey === '') {
+    if ((!apiKey || apiKey === '') && !credentialProvider) {
       throw new Error('OpenAI API key not set');
     }
 
+    const effectiveApiKey = apiKey || 'renewable-credential';
+
     const aiImpl = new AxAIOpenAIImpl<TModel, TEmbedModel, TChatReq>(
       config,
-      apiKey,
+      effectiveApiKey,
       options?.streamingUsage ?? true,
       options,
       chatReqUpdater,
@@ -913,7 +1011,12 @@ export class AxAIOpenAIBase<
     super(aiImpl, {
       name: 'OpenAI',
       apiURL: resolvedApiURL,
-      headers: async () => ({ Authorization: `Bearer ${apiKey}` }),
+      headers: async () =>
+        apiKey
+          ? { Authorization: `Bearer ${apiKey}` }
+          : ({} as Record<string, string>),
+      profile: credentialProfile,
+      credentialProvider,
       modelInfo,
       defaults: {
         model: config.model,
@@ -924,7 +1027,7 @@ export class AxAIOpenAIBase<
       models,
     });
 
-    this.openAICompatibleApiKey = apiKey;
+    this.openAICompatibleApiKey = apiKey ?? '';
     this.openAICompatibleApiURL = resolvedApiURL;
   }
 
@@ -943,7 +1046,14 @@ export class AxAIOpenAIBase<
     const serviceOptions = this.getOptions();
     return await axFetchMultipartTranscription({
       url: `${this.openAICompatibleApiURL}/audio/transcriptions`,
-      headers: { Authorization: `Bearer ${this.openAICompatibleApiKey}` },
+      headers: await this.buildHeaders(
+        {},
+        {
+          operation: 'transcribe',
+          method: 'POST',
+          url: `${this.openAICompatibleApiURL}/audio/transcriptions`,
+        }
+      ),
       audio: req.audio,
       fields: {
         model: model ?? this.batchAudioConfig.transcriptionModel,
@@ -973,7 +1083,14 @@ export class AxAIOpenAIBase<
     const serviceOptions = this.getOptions();
     return await axFetchJsonSpeech({
       url: `${this.openAICompatibleApiURL}/audio/speech`,
-      headers: { Authorization: `Bearer ${this.openAICompatibleApiKey}` },
+      headers: await this.buildHeaders(
+        {},
+        {
+          operation: 'speak',
+          method: 'POST',
+          url: `${this.openAICompatibleApiURL}/audio/speech`,
+        }
+      ),
       body: {
         model,
         input: req.text,
@@ -996,6 +1113,7 @@ export class AxAIOpenAI<TModelKey = string> extends AxAIOpenAIBase<
 > {
   constructor({
     apiKey,
+    credentialProvider,
     apiURL,
     config,
     options,
@@ -1012,7 +1130,7 @@ export class AxAIOpenAI<TModelKey = string> extends AxAIOpenAIBase<
       'name'
     >
   >) {
-    if (!apiKey || apiKey === '') {
+    if ((!apiKey || apiKey === '') && !credentialProvider) {
       throw new Error('OpenAI API key not set');
     }
 
@@ -1034,12 +1152,19 @@ export class AxAIOpenAI<TModelKey = string> extends AxAIOpenAIBase<
       const isRealtimeModel = axIsOpenAIRealtimeModel(model);
       const isRealtimeTranscriptionModel =
         axIsOpenAIRealtimeTranscriptionModel(model);
+      const nativeStructuredOutputs = mi?.supported?.structuredOutputs ?? true;
+      const structuredOutputModes =
+        mi?.supported?.structuredOutputModes ??
+        (nativeStructuredOutputs
+          ? (['native', 'function', 'json_object'] as const)
+          : (['function', 'json_object'] as const));
       return {
         functions: true,
         streaming: true,
         hasThinkingBudget: mi?.supported?.thinkingBudget ?? false,
         hasShowThoughts: mi?.supported?.showThoughts ?? false,
-        structuredOutputs: mi?.supported?.structuredOutputs ?? false,
+        structuredOutputs: structuredOutputModes.includes('native'),
+        structuredOutputModes,
         media: {
           images: {
             supported: true,
@@ -1173,6 +1298,8 @@ export class AxAIOpenAI<TModelKey = string> extends AxAIOpenAIBase<
 
     super({
       apiKey,
+      credentialProvider,
+      credentialProfile: 'openai',
       apiURL,
       config: {
         ...axAIOpenAIDefaultConfig(),

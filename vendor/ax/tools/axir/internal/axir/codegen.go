@@ -246,13 +246,6 @@ func EmitJava(model AxRuntimeModel, outDir string) error {
 		"dev/axllm/ax/OpenAIResponsesClient.java":                     javaOpenAIResponses,
 		"dev/axllm/ax/GoogleGeminiClient.java":                        javaGoogleGemini,
 		"dev/axllm/ax/AnthropicClient.java":                           javaAnthropic,
-		"dev/axllm/ax/AzureOpenAIClient.java":                         javaAzureOpenAI,
-		"dev/axllm/ax/DeepSeekClient.java":                            javaDeepSeek,
-		"dev/axllm/ax/DeepSeekResponsesClient.java":                   javaDeepSeekResponses,
-		"dev/axllm/ax/MistralClient.java":                             javaMistral,
-		"dev/axllm/ax/RekaClient.java":                                javaReka,
-		"dev/axllm/ax/CohereClient.java":                              javaCohere,
-		"dev/axllm/ax/GrokClient.java":                                javaGrok,
 		"dev/axllm/ax/AxGen.java":                                     javaAxGen,
 		"dev/axllm/ax/AxBootstrapFewShot.java":                        javaAxBootstrapFewShot,
 		"dev/axllm/ax/AxACE.java":                                     javaAxACE,
@@ -392,6 +385,7 @@ func EmitGo(model AxRuntimeModel, outDir string) error {
 		"examples/axgen_scripted_client_tool/main.go":       goAxGenScriptedClientToolExample,
 		"examples/axgen_openai_api/main.go":                 goAxGenOpenAIExample,
 		"examples/vertex_gemini_api/main.go":                goVertexGeminiExample,
+		"examples/vertex_gemma_maas_no_key/main.go":         goVertexGemmaMaaSNoKeyExample,
 		"examples/provider_mapping_no_key/main.go":          goProviderMappingNoKeyExample,
 		"examples/adaptive_balancer_no_key/main.go":         goAdaptiveBalancerNoKeyExample,
 		"examples/provider_stream_no_key/main.go":           goProviderStreamNoKeyExample,
@@ -743,6 +737,7 @@ func BuildCapabilityManifest(model AxRuntimeModel, target string) (CapabilityMan
 			"axgen-context-cache",
 			"axgen-prompt-cache-key",
 			"axgen-callbacks",
+			"axgen-multi-sampling",
 			"axgen-function-trace",
 			"axgen-assertions",
 			"axgen-field-processors",
@@ -1010,7 +1005,7 @@ func ValidateAPIReferenceManifest(manifest APIReferenceManifest) error {
 			return fmt.Errorf("api reference missing section %q", id)
 		}
 	}
-	for _, canonical := range []string{"s", "ax", "ai", "AxUsageContext", "AxUsageEvent", "AxUsageObserver", "set_usage_observer", "agent", "flow", "fn", "AxMCPClient", "OpenAICompatibleClient", "OpenAIResponsesClient", "GoogleGeminiClient", "AnthropicClient", "ProcessCodeRuntime", "RuntimeCapabilities", "RuntimeEnvelope", "optimize", "AxBootstrapFewShot", "AxGEPA", "OptimizerEngine"} {
+	for _, canonical := range []string{"s", "ax", "ai", "AxCredentialRequest", "AxCredentialProvider", "AxUsageContext", "AxUsageEvent", "AxUsageObserver", "set_usage_observer", "agent", "flow", "fn", "AxMCPClient", "OpenAICompatibleClient", "OpenAIResponsesClient", "GoogleGeminiClient", "AnthropicClient", "ProcessCodeRuntime", "RuntimeCapabilities", "RuntimeEnvelope", "optimize", "AxBootstrapFewShot", "AxGEPA", "OptimizerEngine"} {
 		if !symbols[canonical] {
 			return fmt.Errorf("api reference missing canonical symbol %q", canonical)
 		}
@@ -1047,10 +1042,10 @@ func apiReferenceSectionsForTarget(target string) []APIReferenceSection {
 		{
 			ID:      "axgen",
 			Title:   "AxGen",
-			Summary: "Run structured generation with Core-owned prompts, tool loops, retries, streaming folds, traces, usage, examples, and field processors.",
+			Summary: "Run structured generation with Core-owned prompts, indexed multi-sampling, result selection, tool loops, retries, streaming folds, traces, usage, examples, and field processors.",
 			Symbols: []APIReferenceSymbol{
-				sym("ax", "function", "Create an AxGen program from a string or parsed signature.", []string{"functions", "examples", "demos", "modelConfig", "maxRetries", "streaming assertions", "field processors"}, "AxGen"),
-				sym("AxGen", "type", "Structured generation program with forward, streaming, optimization, trace, usage, and tool-call behavior.", []string{"signature", "functions", "examples", "demos", "memory", "prompt template"}, "program object"),
+				sym("ax", "function", "Create an AxGen program from a string or parsed signature.", []string{"functions", "examples", "demos", "sample count", "result picker", "modelConfig", "maxRetries", "streaming assertions", "field processors"}, "AxGen"),
+				sym("AxGen", "type", "Structured generation program with indexed multi-sampling, winner selection, forward, streaming, optimization, trace, usage, and tool-call behavior.", []string{"signature", "functions", "examples", "demos", "sample count", "result picker", "memory", "prompt template"}, "program object"),
 			},
 		},
 		{
@@ -1058,10 +1053,11 @@ func apiReferenceSectionsForTarget(target string) []APIReferenceSection {
 			Title:   "AxAI",
 			Summary: "Call supported providers through the shared provider descriptor registry, scripted transports, routers, and balancers.",
 			Symbols: []APIReferenceSymbol{
-				sym("ai", "function", "Create a provider client from a provider name and options.", []string{"api key", "model", "api URL", "headers", "transport"}, "AI client/service"),
+				sym("ai", "function", "Create a provider client from a named deployment profile and options.", []string{"api key or credential provider", "model", "api URL", "headers", "transport"}, "AI client/service"),
+				sym("AxCredentialRequest", "type", "Request metadata passed to a renewable credential callback for every transport attempt.", []string{"profile", "operation", "method", "URL"}, "credential request"),
+				sym("AxCredentialProvider", "interface", "Return fresh request headers that override static profile authentication.", []string{"chat", "stream", "embeddings", "Responses", "audio", "retries"}, "header map or credential error"),
 				sym("OpenAICompatibleClient", "type", "OpenAI-compatible chat, stream, embedding, audio, and realtime provider boundary.", []string{"api key", "model", "base URL", "transport"}, "provider client"),
 				sym("OpenAIResponsesClient", "type", "OpenAI Responses provider mapping using the same Core-owned request and response contract.", []string{"api key", "model", "audio", "realtime"}, "provider client"),
-				sym("DeepSeekResponsesClient", "type", "DeepSeek Responses provider mapping with stateless reasoning and function-call replay.", []string{"api key", "model", "thinking", "transport"}, "provider client"),
 				sym("GoogleGeminiClient", "type", "Gemini provider mapping for chat, streaming, media, tools, embeddings, and usage normalization.", []string{"api key", "model", "embed model"}, "provider client"),
 				sym("AnthropicClient", "type", "Anthropic provider mapping for messages, thinking, cache control, streaming, and usage normalization.", []string{"api key", "model", "thinking", "cache control"}, "provider client"),
 				sym("AxUsageContext", "type", "Application attribution merged from service defaults and per-call overrides.", []string{"tenant", "user", "request", "run", "feature", "attributes"}, "usage context"),
@@ -1200,6 +1196,10 @@ func apiReferencePublicName(target, canonical string) string {
 		return mapTarget(target, "create_balancer_route_stats", "AxBalancerAdaptive.createRouteStats", "axllm::create_balancer_route_stats", "axllm.CreateBalancerRouteStats", "create_balancer_route_stats")
 	case "AxUsageContext":
 		return mapTarget(target, "AxUsageContext", "Map<String, Object>", "axllm::AxUsageContext", "axllm.AxUsageContext", "AxUsageContext")
+	case "AxCredentialRequest":
+		return mapTarget(target, "dict[str, str]", "OpenAICompatibleClient.CredentialRequest", "axllm::AxCredentialRequest", "axllm.AxCredentialRequest", "AxCredentialRequest")
+	case "AxCredentialProvider":
+		return mapTarget(target, "Callable[[dict[str, str]], dict[str, str]]", "OpenAICompatibleClient.CredentialProvider", "axllm::AxCredentialProvider", "axllm.AxCredentialProvider", "AxCredentialProvider")
 	case "set_usage_observer":
 		return mapTarget(target, "set_usage_observer", "AxGlobals.setUsageObserver", "axllm::set_usage_observer", "axllm.SetUsageObserver", "set_usage_observer")
 	case "update_balancer_route_stats":
@@ -1263,13 +1263,17 @@ func apiReferenceForm(target, canonical, publicName string) string {
 		return mapTarget(target, "ai(provider='openai', **options)", "Ax.ai(provider, options)", "axllm::ai(provider, options)", "axllm.NewAI(provider, options)", "ai(provider, options)")
 	case "AxUsageContext":
 		return mapTarget(target, "dict[str, object]", "Map<String, Object>", "axllm::AxUsageContext", "axllm.AxUsageContext", "AxUsageContext")
+	case "AxCredentialRequest":
+		return mapTarget(target, "dict[str, str]", "OpenAICompatibleClient.CredentialRequest", "axllm::AxCredentialRequest", "axllm.AxCredentialRequest", "AxCredentialRequest")
+	case "AxCredentialProvider":
+		return mapTarget(target, "Callable[[dict[str, str]], dict[str, str]]", "OpenAICompatibleClient.CredentialProvider", "axllm::AxCredentialProvider", "axllm.AxCredentialProvider", "dyn AxCredentialProvider")
 	case "AxUsageEvent":
 		return mapTarget(target, "AxUsageEvent", "AxUsageEvent", "axllm::AxUsageEvent", "axllm.AxUsageEvent", "AxUsageEvent")
 	case "AxUsageObserver":
 		return mapTarget(target, "AxUsageObserver", "AxUsageObserver", "axllm::AxUsageObserver", "axllm.AxUsageObserver", "AxUsageObserver")
 	case "set_usage_observer":
 		return mapTarget(target, "set_usage_observer(observer)", "AxGlobals.setUsageObserver(observer)", "axllm::set_usage_observer(observer)", "axllm.SetUsageObserver(observer)", "set_usage_observer(observer)")
-	case "OpenAICompatibleClient", "OpenAIResponsesClient", "DeepSeekResponsesClient", "GoogleGeminiClient", "AnthropicClient":
+	case "OpenAICompatibleClient", "OpenAIResponsesClient", "GoogleGeminiClient", "AnthropicClient":
 		return providerClientForm(target, canonical)
 	case "AxBalancer":
 		return mapTarget(target, "AxBalancer(services, options=None)", "new AxBalancer(services, options)", "axllm::AxBalancer(services, options)", "axllm.NewAxBalancer(services, options)", "AxBalancer")
@@ -2110,7 +2114,7 @@ func packageREADME(model AxRuntimeModel, target string) string {
 		"",
 		"- Signatures and schemas: describe inputs and outputs once, then reuse that shape for validation, prompts, tools, and typed results.",
 		"- AxGen: run structured generation with retries, tool calls, field processors, assertions, traces, usage, and provider-backed output parsing.",
-		"- AxAI: call OpenAI-compatible, OpenAI Responses, Gemini, Anthropic, Azure OpenAI, DeepSeek, Mistral, Reka, Cohere, and Grok clients through one provider boundary.",
+		"- AxAI: select named deployment profiles independently from model IDs, resolve model-aware structured-output modes, and attach renewable request credentials through one provider boundary.",
 		"- Audio and realtime: `.chat()` accepts `input_audio` content parts, `transcribe()`/`speak()` do batch speech-to-text and text-to-speech, and realtime-capable models stream audio over a WebSocket — transparently through `chat()` or via the productized `realtime_chat()` driver (Go: `RealtimeChat`).",
 		"- AxAgent and RLM: let an agent plan and execute actor-code steps while Ax keeps envelopes, state, logs, traces, context, discovery, recall, and final typed responses aligned.",
 		"- AxFlow: compose AxGen, AxAgent, and nested flows into a portable program graph.",
@@ -2120,7 +2124,7 @@ func packageREADME(model AxRuntimeModel, target string) string {
 		"",
 		cfg.PackageFacts,
 		"",
-		"Shared Ax behavior is Core-owned. The generated target code stays focused on idiomatic wrappers, transports, dynamic value helpers, and host-runtime boundaries.",
+		"Shared Ax behavior is Core-owned. The generated target code stays focused on idiomatic wrappers, transports, dynamic value helpers, and host-runtime boundaries. Authentication-required profiles accept a static key or a credential callback; the callback is invoked on every request attempt and its headers override static profile authentication.",
 		"",
 		"## Examples",
 		"",
@@ -2128,7 +2132,7 @@ func packageREADME(model AxRuntimeModel, target string) string {
 		"",
 		cfg.NoKeyExamples,
 		"",
-		"`provider-api` examples make a real provider call. OpenAI examples require `OPENAI_API_KEY`; Vertex examples require `GOOGLE_VERTEX_ACCESS_TOKEN`, `GOOGLE_PROJECT_ID`, and `GOOGLE_REGION`:",
+		"`provider-api` examples make a real provider call. OpenAI examples require `OPENAI_API_KEY`; each Vertex command below lists its native-routing or OpenAI-compatible endpoint variables:",
 		"",
 		cfg.ProviderExamples,
 		"",
@@ -2406,6 +2410,7 @@ func packageReadmeConfigForTarget(target string, network string) packageReadmeCo
 				"- `go run ./examples/signature_schema`: signature parsing and JSON schema generation",
 				"- `go run ./examples/axgen_scripted_client_tool`: AxGen with a scripted client and tool",
 				"- `go run ./examples/provider_mapping_no_key`: provider mapping through a scripted transport",
+				"- `go run ./examples/vertex_gemma_maas_no_key`: Vertex Gemma MaaS JSON-object, thinking, reasoning replay, and renewable-header mapping through a scripted transport",
 				"- `go run ./examples/adaptive_balancer_no_key`: adaptive balancer state, scoring, and stable route keys without a provider key",
 				"- `go run ./examples/provider_stream_no_key`: provider streaming through a scripted SSE transport",
 				"- `go run ./examples/axflow_program_graph`: AxFlow program graph",
@@ -2425,7 +2430,7 @@ func packageReadmeConfigForTarget(target string, network string) packageReadmeCo
 			),
 			ProviderExamples: readmeLines(
 				"- `OPENAI_API_KEY=... go run ./examples/axgen_openai_api`: GPT-5.6 prompt-cached AxGen with the OpenAI Chat API",
-				"- `GOOGLE_VERTEX_ACCESS_TOKEN=... GOOGLE_PROJECT_ID=... GOOGLE_REGION=... go run ./examples/vertex_gemini_api`: Gemini through Vertex routing",
+				"- `VERTEX_AI_API_URL=... GOOGLE_VERTEX_ACCESS_TOKEN=... go run ./examples/vertex_gemini_api`: Vertex OpenAI-compatible MaaS with renewable credentials",
 				"- From the repo root, `OPENAI_API_KEY=... npm run example -- go flow_openai_api.go`: AxFlow with a real OpenAI-compatible provider API",
 			),
 			RuntimeProfiles: readmeLines(

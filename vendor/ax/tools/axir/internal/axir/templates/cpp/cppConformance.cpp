@@ -679,6 +679,14 @@ static void run_forward(Value fixture) {
   if (!Core::get(fixture, "stop_functions", Core::get(fixture, "stopFunctions")).is_null()) {
     gen.set_stop_functions(Core::get(fixture, "stop_functions", Core::get(fixture, "stopFunctions", Value::array())));
   }
+  Value picker_index = Core::get(fixture, "result_picker_index");
+  if (!picker_index.is_null()) {
+    gen.set_result_picker([fixture, picker_index](const Value& samples) {
+      Value expected = Core::get(fixture, "expected_picker_samples");
+      if (!expected.is_null()) assert_equal(samples, expected, "result picker samples");
+      return std::stoi(display(picker_index));
+    });
+  }
   ConformanceScriptedAI client(Core::get(fixture, "responses", Value::array()), Core::get(fixture, "features"));
   Value input = Core::get(fixture, "input", Core::get(fixture, "values", Value::object()));
   Value output = expect_maybe_error([&] { return gen.forward(client, input, Core::get(fixture, "forward_options", Value::object())); }, fixture);
@@ -2025,41 +2033,55 @@ static void run_agent_runtime_protocol(Value fixture) {
 
 struct ClientFixture {
   ScriptedTransport transport;
+  std::shared_ptr<Value> credential_requests;
   std::unique_ptr<OpenAICompatibleClient> client;
 
   explicit ClientFixture(Value fixture)
       : transport(Core::get(fixture, "transport_responses", Core::get(fixture, "responses", Value::array()))),
-        client(make_client(fixture, &transport)) {}
+        credential_requests(std::make_shared<Value>(Value::array())),
+        client(make_client(fixture, &transport, credential_requests)) {}
 
-  static std::unique_ptr<OpenAICompatibleClient> make_client(Value fixture, ScriptedTransport* transport) {
-    std::string provider = display(Core::provider_normalize_profile(Core::get(fixture, "provider", "openai-compatible")));
-    if (provider == "google-gemini") return std::make_unique<GoogleGeminiClient>(options(fixture), transport);
-    if (provider == "anthropic") return std::make_unique<AnthropicClient>(options(fixture), transport);
-    if (provider == "openai-responses") return std::make_unique<OpenAIResponsesClient>(options(fixture), transport);
-    if (provider == "deepseek-responses") return std::make_unique<DeepSeekResponsesClient>(options(fixture), transport);
-    if (provider == "azure-openai") return std::make_unique<AzureOpenAIClient>(options(fixture), transport);
-    if (provider == "deepseek") return std::make_unique<DeepSeekClient>(options(fixture), transport);
-    if (provider == "mistral") return std::make_unique<MistralClient>(options(fixture), transport);
-    if (provider == "reka") return std::make_unique<RekaClient>(options(fixture), transport);
-    if (provider == "cohere") return std::make_unique<CohereClient>(options(fixture), transport);
-    if (provider == "grok") return std::make_unique<GrokClient>(options(fixture), transport);
-    return std::make_unique<OpenAICompatibleClient>(options(fixture), transport);
+  static std::unique_ptr<OpenAICompatibleClient> make_client(Value fixture, ScriptedTransport* transport, std::shared_ptr<Value> credential_requests) {
+    std::string provider = display(Core::provider_normalize_profile(Core::get(fixture, "provider", "openai")));
+    Value descriptor = Core::provider_descriptor(provider);
+    std::string provider_transport = display(Core::get(descriptor, "transport"));
+    std::unique_ptr<OpenAICompatibleClient> client;
+    if (provider_transport == "gemini-generate-content") client = std::make_unique<GoogleGeminiClient>(provider, options(fixture), transport);
+    else if (provider_transport == "anthropic-messages") client = std::make_unique<AnthropicClient>(provider, options(fixture), transport);
+    else if (provider_transport == "openai-responses") client = std::make_unique<OpenAIResponsesClient>(provider, options(fixture), transport);
+    else client = std::make_unique<OpenAICompatibleClient>(provider,
+          provider, options(fixture), transport,
+          display(Core::get(descriptor, "defaultModel", "")),
+          display(Core::get(descriptor, "defaultEmbedModel", "")));
+    Value credential_fixture = Core::get(fixture, "credential_provider_fixture");
+    if (!credential_fixture.is_null()) {
+      auto calls = std::make_shared<std::size_t>(0);
+      Value header_sets = Core::get(credential_fixture, "headers", Value::array());
+      client->credential_provider([credential_fixture, header_sets, calls, credential_requests](const AxCredentialRequest& request) {
+        Core::append(*credential_requests, object({
+            {"profile", request.profile}, {"operation", request.operation},
+            {"method", request.method}, {"url", request.url}}));
+        Value error = Core::get(credential_fixture, "error");
+        if (!error.is_null()) throw AxError("authentication", display(error));
+        std::map<std::string, std::string> headers;
+        auto sets = as_array(header_sets);
+        if (!sets.empty()) {
+          std::size_t index = std::min(*calls, sets.size() - 1);
+          *calls += 1;
+          for (const auto& key : Core::iter(Core::map_keys(sets[index]))) headers[display(key)] = display(Core::get(sets[index], key));
+        }
+        return headers;
+      });
+    }
+    return client;
   }
 
   static Value options(Value fixture) {
     Value out = Value::object();
-    std::string provider = display(Core::provider_normalize_profile(Core::get(fixture, "provider", "openai-compatible")));
-    bool responses_provider = provider == "openai-responses" || provider == "deepseek-responses";
-    bool gemini_provider = provider == "google-gemini";
-    bool anthropic_provider = provider == "anthropic";
-    bool azure_provider = provider == "azure-openai";
-    bool deepseek_provider = provider == "deepseek" || provider == "deepseek-responses";
-    bool mistral_provider = provider == "mistral";
-    bool reka_provider = provider == "reka";
-    bool cohere_provider = provider == "cohere";
-    bool grok_provider = provider == "grok";
-    std::string default_model = anthropic_provider ? "claude-3-7-sonnet-latest" : gemini_provider ? "gemini-2.5-flash" : provider == "deepseek-responses" ? "deepseek-v4-flash" : responses_provider ? "gpt-4o" : azure_provider ? "gpt-5-mini" : deepseek_provider ? "deepseek-v4-flash" : mistral_provider ? "mistral-small-latest" : reka_provider ? "reka-core" : cohere_provider ? "command-r-plus" : grok_provider ? "grok-4.3" : "gpt-4.1-mini";
-    std::string default_embed_model = anthropic_provider || deepseek_provider || reka_provider || grok_provider ? "" : gemini_provider ? "gemini-embedding-2" : responses_provider ? "text-embedding-ada-002" : mistral_provider ? "mistral-embed" : cohere_provider ? "embed-english-v3.0" : "text-embedding-3-small";
+    std::string provider = display(Core::provider_normalize_profile(Core::get(fixture, "provider", "openai")));
+    Value descriptor = Core::provider_descriptor(provider);
+    std::string default_model = display(Core::get(descriptor, "defaultModel", ""));
+    std::string default_embed_model = display(Core::get(descriptor, "defaultEmbedModel", ""));
     Core::set(out, "model", Core::get(fixture, "model", default_model));
     Core::set(out, "embed_model", Core::get(fixture, "embed_model", default_embed_model));
     Core::set(out, "api_key", "test-key");
@@ -2086,7 +2108,18 @@ static bool json_path_exists(Value value, const std::string& path) {
   return true;
 }
 
-static void assert_transport(Value fixture, const ScriptedTransport& transport) {
+static void assert_transport(Value fixture, const ScriptedTransport& transport, Value credential_requests = Value::array()) {
+  Value expected_count = Core::get(fixture, "expected_transport_request_count");
+  if (!expected_count.is_null() && transport.requests.size() != static_cast<std::size_t>(std::stoul(display(expected_count)))) throw AxError("fixture", "provider transport request count mismatch");
+  Value expected_credentials = Core::get(fixture, "expected_credential_requests");
+  if (!expected_credentials.is_null()) assert_equal(credential_requests, expected_credentials, "credential requests");
+  Value expected_requests = Core::get(fixture, "expected_transport_requests", Value::array());
+  std::size_t request_index = 0;
+  for (const auto& expected_request : Core::iter(expected_requests)) {
+    if (request_index >= transport.requests.size()) throw AxError("fixture", "missing provider transport request");
+    assert_subset(transport.requests[request_index], expected_request, "provider request " + std::to_string(request_index));
+    request_index += 1;
+  }
   Value expected = Core::get(fixture, "expected_transport_request");
   Value expected_absent = Core::get(fixture, "expected_transport_json_absent");
   if (expected.is_null() && expected_absent.is_null()) return;
@@ -2117,7 +2150,10 @@ static void assert_ai_error(const AxError& error, Value fixture, const ScriptedT
 
 static void run_ai_chat(Value fixture) {
   ClientFixture cf(fixture);
-  Value result = cf.client->chat(Core::get(fixture, "request", Value::object()));
+  Value result = expect_maybe_error([&] {
+    return cf.client->chat(Core::get(fixture, "request", Value::object()));
+  }, fixture);
+  if (!Core::get(fixture, "expected_error_contains").is_null()) { assert_transport(fixture, cf.transport, *cf.credential_requests); return; }
   Value expected = Core::get(fixture, "expected_output");
   if (!expected.is_null()) assert_equal(result, expected, "ai chat output");
   Value expected_request = Core::get(fixture, "expected_request_after");
@@ -2127,7 +2163,16 @@ static void run_ai_chat(Value fixture) {
     double actual_cost = cf.client->get_estimated_cost(Core::get(result, "model_usage", Value::object()));
     if (std::abs(actual_cost - Core::number(expected_cost)) > 1e-12) throw AxError("fixture", "estimated cost mismatch");
   }
-  assert_transport(fixture, cf.transport);
+  assert_transport(fixture, cf.transport, *cf.credential_requests);
+}
+
+static void run_ai_credential_wrapper(Value fixture) {
+  ClientFixture cf(fixture);
+  std::shared_ptr<AxAIService> service(cf.client.release());
+  MultiServiceRouter router;
+  router.set_service_entry("wrapped", service);
+  router.chat(Core::get(fixture, "request", Value::object()));
+  assert_transport(fixture, cf.transport, *cf.credential_requests);
 }
 
 static void run_ai_embed(Value fixture) {
@@ -2135,7 +2180,7 @@ static void run_ai_embed(Value fixture) {
   Value result = cf.client->embed(Core::get(fixture, "request", Value::object()));
   Value expected = Core::get(fixture, "expected_output");
   if (!expected.is_null()) assert_equal(result, expected, "ai embed output");
-  assert_transport(fixture, cf.transport);
+  assert_transport(fixture, cf.transport, *cf.credential_requests);
 }
 
 static void run_ai_stream(Value fixture) {
@@ -2144,7 +2189,7 @@ static void run_ai_stream(Value fixture) {
   for (const auto& item : cf.client->stream(Core::get(fixture, "request", Value::object()))) Core::append(out, item);
   Value expected = Core::get(fixture, "expected_output");
   if (!expected.is_null()) assert_equal(out, expected, "ai stream output");
-  assert_transport(fixture, cf.transport);
+  assert_transport(fixture, cf.transport, *cf.credential_requests);
 }
 
 static void run_ai_usage_observer(Value fixture) {
@@ -2213,13 +2258,21 @@ static void run_ai_unsupported(Value fixture) {
 }
 
 static void run_ai_provider_descriptor(Value fixture) {
-  Value provider = Core::get(fixture, "provider", "openai-compatible");
+  Value provider = Core::get(fixture, "provider", "openai");
   Value options = Core::get(fixture, "options");
   Value descriptor = !options.is_null()
     ? Core::provider_resolve_descriptor(provider, options)
     : Core::provider_descriptor(provider);
   Value expected = Core::get(fixture, "expected_output");
   if (!expected.is_null()) assert_subset(descriptor, expected, "provider descriptor");
+}
+
+static void run_ai_provider_features(Value fixture) {
+  ClientFixture cf(fixture);
+  assert_subset(
+      cf.client->get_features(Core::get(fixture, "model", "")),
+      Core::get(fixture, "expected_output", Value::object()),
+      "provider features");
 }
 
 static void run_ai_provider_registry(Value fixture) {
@@ -2831,12 +2884,16 @@ static void run(Value fixture) {
     run_ai_stream(fixture);
   } else if (kind == "ai_usage_observer") {
     run_ai_usage_observer(fixture);
+  } else if (kind == "ai_credential_wrapper") {
+    run_ai_credential_wrapper(fixture);
   } else if (kind == "ai_error") {
     run_ai_error(fixture);
   } else if (kind == "ai_unsupported") {
     run_ai_unsupported(fixture);
   } else if (kind == "ai_provider_descriptor") {
     run_ai_provider_descriptor(fixture);
+  } else if (kind == "ai_provider_features") {
+    run_ai_provider_features(fixture);
   } else if (kind == "ai_provider_registry") {
     run_ai_provider_registry(fixture);
   } else if (kind == "ai_model_catalog_audit") {

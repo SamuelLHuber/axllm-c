@@ -8,7 +8,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from .ai import AnthropicClient, AzureOpenAIClient, AxAIServiceAuthenticationError, AxAIServiceError, AxAIServiceNetworkError, AxAIServiceResponseError, AxAIServiceStatusError, AxAIServiceStreamTerminatedError, AxAIServiceTimeoutError, AxBaseAI, AxBalancer, CohereClient, DeepSeekClient, DeepSeekResponsesClient, GoogleGeminiClient, GrokClient, MistralClient, MultiServiceRouter, OpenAICompatibleClient, OpenAIResponsesClient, ProviderRouter, RekaClient, get_supported_ai_models, provider_descriptor, provider_model_catalog_summary, provider_normalize_profile, provider_profile_registry, provider_resolve_descriptor, set_usage_observer
+from .ai import AnthropicClient, AxAIServiceAuthenticationError, AxAIServiceError, AxAIServiceNetworkError, AxAIServiceResponseError, AxAIServiceStatusError, AxAIServiceStreamTerminatedError, AxAIServiceTimeoutError, AxBaseAI, AxBalancer, GoogleGeminiClient, MultiServiceRouter, OpenAICompatibleClient, OpenAIResponsesClient, ProviderRouter, ai, get_supported_ai_models, provider_descriptor, provider_model_catalog_summary, provider_normalize_profile, provider_profile_registry, provider_resolve_descriptor, set_usage_observer
 from .ai import build_chat_request, build_embed_request, normalize_chat_response, normalize_embed_response, normalize_stream_delta, provider_resolve_profile, _gemini_build_speak_request, _gemini_build_transcribe_request, _gemini_normalize_speak_response, _gemini_normalize_transcribe_response, _grok_build_speak_request, _grok_build_transcribe_request, _openai_tool_call_to_provider_impl, ai_context_cache_expiry, ai_context_cache_plan, ai_context_cache_recovery, ai_context_cache_rejection, ai_gemini_cache_ops
 from .ai import AxBalancerAdaptiveStrategy, AxBalancerOptions, AxInMemoryBalancerStatsStore, _core_set_math_random_values, create_balancer_route_stats, provider_balancer_adaptive_score, sample_balancer_route_health, update_balancer_route_stats
 from .gen import (
@@ -496,12 +496,16 @@ def run_fixture(fixture: dict[str, Any], *, source: str | None = None):
             _run_ai_stream(fixture)
         elif kind == "ai_usage_observer":
             _run_ai_usage_observer(fixture)
+        elif kind == "ai_credential_wrapper":
+            _run_ai_credential_wrapper(fixture)
         elif kind == "ai_error":
             _run_ai_error(fixture)
         elif kind == "ai_unsupported":
             _run_ai_unsupported(fixture)
         elif kind == "ai_provider_descriptor":
             _run_ai_provider_descriptor(fixture)
+        elif kind == "ai_provider_features":
+            _run_ai_provider_features(fixture)
         elif kind == "ai_provider_registry":
             _run_ai_provider_registry(fixture)
         elif kind == "ai_model_catalog_audit":
@@ -961,6 +965,12 @@ def _run_forward(fixture):
         gen.add_field_processor(processor.get("field"), processor.get("processor", processor.get("op")))
     if "stop_functions" in fixture or "stopFunctions" in fixture:
         gen.set_stop_functions(fixture.get("stop_functions") or fixture.get("stopFunctions") or [])
+    if "result_picker_index" in fixture:
+        def pick_result(samples):
+            if "expected_picker_samples" in fixture:
+                _assert_equal(samples, fixture["expected_picker_samples"], "result picker samples")
+            return fixture["result_picker_index"]
+        gen.set_result_picker(pick_result)
     client = ConformanceScriptedAI(fixture.get("responses") or [], fixture.get("stream_events") or [], fixture.get("transcribe_responses") or [], fixture.get("features"))
     try:
         output = gen.forward(client, fixture.get("input") or {}, fixture.get("forward_options"))
@@ -2349,7 +2359,16 @@ def _run_agent_runtime_protocol(fixture):
 
 def _run_ai_chat(fixture):
     client, transport = _openai_fixture_client(fixture)
-    result = client.chat(fixture["request"], fixture.get("options"))
+    try:
+        result = client.chat(fixture["request"], fixture.get("options"))
+    except Exception as exc:
+        expected = fixture.get("expected_error_contains")
+        if expected and expected in str(exc):
+            _assert_transport_request(fixture, transport)
+            return
+        raise
+    if fixture.get("expected_error_contains"):
+        raise FixtureError("expected AI chat request to fail")
     if "expected_output" in fixture:
         _assert_equal(result, fixture["expected_output"], "ai chat output")
     if "expected_request_after" in fixture:
@@ -2358,6 +2377,13 @@ def _run_ai_chat(fixture):
         actual_cost = client.get_estimated_cost(result.get("model_usage"))
         if abs(actual_cost - fixture["expected_estimated_cost"]) > 1e-12:
             raise FixtureError(f"estimated cost mismatch: {actual_cost} != {fixture['expected_estimated_cost']}")
+    _assert_transport_request(fixture, transport)
+
+
+def _run_ai_credential_wrapper(fixture):
+    client, transport = _openai_fixture_client(fixture)
+    router = MultiServiceRouter([{"key": "wrapped", "service": client}])
+    router.chat(fixture.get("request") or {})
     _assert_transport_request(fixture, transport)
 
 
@@ -2446,10 +2472,19 @@ def _run_ai_unsupported(fixture):
 
 
 def _run_ai_provider_descriptor(fixture):
-    provider = fixture.get("provider", "openai-compatible")
+    provider = fixture.get("provider", "openai")
     descriptor = provider_resolve_descriptor(provider, fixture.get("options")) if "options" in fixture else provider_descriptor(provider)
     if "expected_output" in fixture:
         _assert_subset(descriptor, fixture["expected_output"], "provider descriptor")
+
+
+def _run_ai_provider_features(fixture):
+    client, _transport = _openai_fixture_client(fixture)
+    _assert_subset(
+        client.get_features(fixture.get("model")),
+        fixture.get("expected_output") or {},
+        "provider features",
+    )
 
 
 def _run_ai_provider_registry(fixture):
@@ -2789,62 +2824,40 @@ def _error_category(exc):
 
 def _openai_fixture_client(fixture):
     transport = ScriptedTransport(fixture.get("transport_responses") or fixture.get("responses") or [])
-    provider = provider_normalize_profile(str(fixture.get("provider", "openai-compatible")))
-    if provider == "openai-responses":
-        client_cls = OpenAIResponsesClient
-        default_model = "gpt-4o"
-        default_embed_model = "text-embedding-ada-002"
-    elif provider == "deepseek-responses":
-        client_cls = DeepSeekResponsesClient
-        default_model = "deepseek-v4-flash"
-        default_embed_model = ""
-    elif provider == "google-gemini":
-        client_cls = GoogleGeminiClient
-        default_model = "gemini-2.5-flash"
-        default_embed_model = "gemini-embedding-2"
-    elif provider == "anthropic":
-        client_cls = AnthropicClient
-        default_model = "claude-3-7-sonnet-latest"
-        default_embed_model = ""
-    elif provider == "azure-openai":
-        client_cls = AzureOpenAIClient
-        default_model = "gpt-5-mini"
-        default_embed_model = "text-embedding-3-small"
-    elif provider == "deepseek":
-        client_cls = DeepSeekClient
-        default_model = "deepseek-v4-flash"
-        default_embed_model = ""
-    elif provider == "mistral":
-        client_cls = MistralClient
-        default_model = "mistral-small-latest"
-        default_embed_model = "mistral-embed"
-    elif provider == "reka":
-        client_cls = RekaClient
-        default_model = "reka-core"
-        default_embed_model = ""
-    elif provider == "cohere":
-        client_cls = CohereClient
-        default_model = "command-r-plus"
-        default_embed_model = "embed-english-v3.0"
-    elif provider == "grok":
-        client_cls = GrokClient
-        default_model = "grok-4.3"
-        default_embed_model = ""
-    else:
-        client_cls = OpenAICompatibleClient
-        default_model = "gpt-4.1-mini"
-        default_embed_model = "text-embedding-3-small"
+    provider = provider_normalize_profile(str(fixture.get("provider", "openai")))
+    descriptor = provider_descriptor(provider)
+    default_model = descriptor.get("defaultModel") or ""
+    default_embed_model = descriptor.get("defaultEmbedModel") or ""
     extra_options = {}
     for key in ("base_url", "baseUrl", "resource_name", "resourceName", "deployment_name", "deploymentName", "api_version", "apiVersion", "version"):
         if key in fixture:
             extra_options[key] = fixture[key]
-    client = client_cls(
+    credential_provider = None
+    credential_fixture = fixture.get("credential_provider_fixture")
+    if credential_fixture is not None:
+        fixture["__credential_requests"] = []
+        credential_headers = list(credential_fixture.get("headers") or [])
+        credential_calls = 0
+
+        def credential_provider(request):
+            nonlocal credential_calls
+            fixture["__credential_requests"].append(copy.deepcopy(request))
+            if credential_fixture.get("error"):
+                raise RuntimeError(str(credential_fixture["error"]))
+            if not credential_headers:
+                return {}
+            index = min(credential_calls, len(credential_headers) - 1)
+            credential_calls += 1
+            return copy.deepcopy(credential_headers[index])
+    client = ai(
+        provider,
         model=fixture.get("model", default_model),
         embed_model=fixture.get("embed_model", default_embed_model),
         api_key="test-key",
         transport=transport,
         model_config=fixture.get("model_config"),
         options=fixture.get("service_options") or fixture.get("options") or {},
+        credential_provider=credential_provider,
         **extra_options,
     )
     return client, transport
@@ -2860,6 +2873,14 @@ def _json_path_exists(value, path):
 
 
 def _assert_transport_request(fixture, transport):
+    if "expected_transport_request_count" in fixture:
+        _assert_equal(len(transport.requests), fixture["expected_transport_request_count"], "provider request count")
+    if "expected_credential_requests" in fixture:
+        _assert_equal(fixture.get("__credential_requests") or [], fixture["expected_credential_requests"], "credential requests")
+    for index, expected in enumerate(fixture.get("expected_transport_requests") or []):
+        if index >= len(transport.requests):
+            raise FixtureError("missing provider transport request")
+        _assert_subset(transport.requests[index], expected, f"provider request {index}")
     if "expected_transport_request" not in fixture and "expected_transport_json_absent" not in fixture:
         return
     if not transport.requests:
