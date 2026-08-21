@@ -551,7 +551,8 @@ export const axAIProviderProfiles = {
       "thinking": false,
       "multiTurn": true,
       "structuredOutputModes": [
-        "function"
+        "function",
+        "json_object"
       ]
     },
     "operations": {
@@ -1069,11 +1070,13 @@ export const axAIProviderProfiles = {
     "capabilities": {
       "functions": true,
       "streaming": true,
-      "structuredOutputs": false,
+      "structuredOutputs": true,
       "thinking": false,
       "multiTurn": true,
       "structuredOutputModes": [
-        "function"
+        "native",
+        "function",
+        "json_object"
       ]
     },
     "operations": {
@@ -1215,6 +1218,44 @@ export const axAIProviderProfiles = {
       "https://openrouter.ai/docs/guides/best-practices/reasoning-tokens"
     ],
     "reviewedAt": "2026-08-18"
+  },
+  "orcarouter": {
+    "id": "orcarouter",
+    "name": "OrcaRouter",
+    "aliases": [
+      "orcarouter"
+    ],
+    "transport": "openai-chat",
+    "baseURL": "https://api.orcarouter.ai/v1",
+    "requiresApiURL": false,
+    "auth": {
+      "type": "bearer",
+      "required": true
+    },
+    "defaults": {
+      "model": "orcarouter/auto"
+    },
+    "capabilities": {
+      "functions": true,
+      "streaming": true,
+      "structuredOutputs": false,
+      "thinking": false,
+      "multiTurn": true,
+      "structuredOutputModes": [
+        "function"
+      ]
+    },
+    "operations": {
+      "chat": {
+        "path": "/chat/completions",
+        "dialect": "openai-chat"
+      }
+    },
+    "modelRules": [],
+    "sources": [
+      "https://www.orcarouter.ai"
+    ],
+    "reviewedAt": "2026-08-19"
   },
   "fireworks": {
     "id": "fireworks",
@@ -2651,6 +2692,7 @@ export const axAIProviderAliases = {
   "together-ai": "together",
   "together_ai": "together",
   "openrouter": "openrouter",
+  "orcarouter": "orcarouter",
   "fireworks": "fireworks",
   "fireworks-ai": "fireworks",
   "huggingface-router": "huggingface-router",
@@ -2720,6 +2762,7 @@ export const axAIProviderProfileIds = [
   "reka",
   "together",
   "openrouter",
+  "orcarouter",
   "fireworks",
   "huggingface-router",
   "amazon-bedrock",
