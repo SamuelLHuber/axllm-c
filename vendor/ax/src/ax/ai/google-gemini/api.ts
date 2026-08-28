@@ -444,7 +444,7 @@ class AxAIGoogleGeminiImpl
       typeof this.apiKey === 'function' ? await this.apiKey() : this.apiKey;
     const url = this.isVertex
       ? `${this.getVertexApiURL(model as string, options?.beta)}/models/${model}:generateContent`
-      : `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent${keyValue ? `?key=${keyValue}` : ''}`;
+      : `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
     const body = {
       contents: [
         {
@@ -472,7 +472,9 @@ class AxAIGoogleGeminiImpl
       'Content-Type': 'application/json',
       ...(this.isVertex && keyValue
         ? { Authorization: `Bearer ${keyValue}` }
-        : {}),
+        : !this.isVertex && keyValue
+          ? { 'x-goog-api-key': keyValue }
+          : {}),
     };
     const response = await (options?.fetch ?? globalThis.fetch)(url, {
       method: 'POST',
@@ -514,7 +516,7 @@ class AxAIGoogleGeminiImpl
       typeof this.apiKey === 'function' ? await this.apiKey() : this.apiKey;
     const url = this.isVertex
       ? `${this.getVertexApiURL(model as string, options?.beta)}/models/${model}:generateContent`
-      : `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent${keyValue ? `?key=${keyValue}` : ''}`;
+      : `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
     const voice =
       typeof req.voice === 'object' ? req.voice.id : (req.voice ?? 'Kore');
     return await axFetchJsonSpeech({
@@ -522,7 +524,9 @@ class AxAIGoogleGeminiImpl
       headers: {
         ...(this.isVertex && keyValue
           ? { Authorization: `Bearer ${keyValue}` }
-          : {}),
+          : !this.isVertex && keyValue
+            ? { 'x-goog-api-key': keyValue }
+            : {}),
         ...(this.credentialProvider
           ? await this.credentialProvider({
               profile: 'google-gemini',
@@ -799,6 +803,12 @@ class AxAIGoogleGeminiImpl
       throw new Error('Chat prompt is empty');
     }
 
+    if (useLiveAudio && this.config.serviceTier) {
+      throw new Error(
+        'Gemini inference service tiers are not supported by the Live API'
+      );
+    }
+
     let apiConfig: AxAPI;
     if (useLiveAudio) {
       if (this.isVertex) {
@@ -823,13 +833,6 @@ class AxAIGoogleGeminiImpl
 
     if (!useLiveAudio && this.isVertex) {
       apiConfig.url = this.getVertexApiURL(model as string, config?.beta);
-    }
-
-    if (!useLiveAudio && !this.isVertex) {
-      const pf = stream ? '&' : '?';
-      const keyValue =
-        typeof this.apiKey === 'function' ? await this.apiKey() : this.apiKey;
-      if (keyValue) apiConfig.name += `${pf}key=${keyValue}`;
     }
 
     const systemPrompts = req.chatPrompt
@@ -1221,6 +1224,9 @@ class AxAIGoogleGeminiImpl
       systemInstruction,
       generationConfig,
       safetySettings,
+      ...(this.config.serviceTier
+        ? { service_tier: this.config.serviceTier }
+        : {}),
     };
 
     if (useLiveAudio) {
@@ -1288,10 +1294,8 @@ class AxAIGoogleGeminiImpl
         },
       };
     } else {
-      const keyValue =
-        typeof this.apiKey === 'function' ? await this.apiKey() : this.apiKey;
       apiConfig = {
-        name: `/models/${model}:batchEmbedContents${keyValue ? `?key=${keyValue}` : ''}`,
+        name: `/models/${model}:batchEmbedContents`,
       };
 
       reqValue = {
@@ -1516,6 +1520,10 @@ class AxAIGoogleGeminiImpl
 
     if (resp.usageMetadata) {
       const cachedTokens = resp.usageMetadata.cachedContentTokenCount ?? 0;
+      const serviceTier =
+        resp.usageMetadata.serviceTier === 'unspecified'
+          ? 'standard'
+          : resp.usageMetadata.serviceTier;
       this.tokensUsed = {
         totalTokens: resp.usageMetadata.totalTokenCount,
         // Subtract cached tokens so promptTokens represents only uncached input,
@@ -1524,6 +1532,7 @@ class AxAIGoogleGeminiImpl
         completionTokens: resp.usageMetadata.candidatesTokenCount,
         thoughtsTokens: resp.usageMetadata.thoughtsTokenCount,
         ...(cachedTokens > 0 ? { cacheReadTokens: cachedTokens } : {}),
+        ...(serviceTier ? { serviceTier } : {}),
       };
     }
     const response: AxChatResponse = {
@@ -1643,10 +1652,7 @@ class AxAIGoogleGeminiImpl
     if (vertexCtx) {
       apiPath = `/${vertexCtx.parent}/cachedContents`;
     } else {
-      // Add API key for non-Vertex
-      const keyValue =
-        typeof this.apiKey === 'function' ? 'ASYNC_KEY' : this.apiKey;
-      apiPath = `/cachedContents${keyValue ? `?key=${keyValue}` : ''}`;
+      apiPath = '/cachedContents';
     }
 
     return {
@@ -1724,11 +1730,6 @@ class AxAIGoogleGeminiImpl
     };
 
     const query = new URLSearchParams({ updateMask: 'ttl' });
-    if (!this.isVertex && this.apiKey) {
-      const keyValue =
-        typeof this.apiKey === 'function' ? 'ASYNC_KEY' : this.apiKey;
-      query.set('key', keyValue);
-    }
     const apiPath = `/${cacheName}?${query.toString()}`;
 
     const vertexCtx = this.getVertexCacheContext();
@@ -1757,12 +1758,7 @@ class AxAIGoogleGeminiImpl
    * Build a cache deletion operation.
    */
   buildCacheDeleteOp = (cacheName: string): AxContextCacheOperation => {
-    let apiPath = `/${cacheName}`;
-    if (!this.isVertex && this.apiKey) {
-      const keyValue =
-        typeof this.apiKey === 'function' ? 'ASYNC_KEY' : this.apiKey;
-      apiPath += `?key=${keyValue}`;
-    }
+    const apiPath = `/${cacheName}`;
 
     const vertexCtx = this.getVertexCacheContext();
     return {
@@ -1815,13 +1811,6 @@ class AxAIGoogleGeminiImpl
       };
     }
 
-    if (!this.isVertex) {
-      const pf = stream ? '&' : '?';
-      const keyValue =
-        typeof this.apiKey === 'function' ? await this.apiKey() : this.apiKey;
-      if (keyValue) apiConfig.name += `${pf}key=${keyValue}`;
-    }
-
     // Build the generation config using existing logic
     const serverManagedSampling = usesServerManagedSampling(model as string);
     const generationConfig: AxAIGoogleGeminiGenerationConfig = {
@@ -1864,6 +1853,9 @@ class AxAIGoogleGeminiImpl
       cachedContent: existingCacheName,
       generationConfig,
       safetySettings,
+      ...(this.config.serviceTier
+        ? { service_tier: this.config.serviceTier }
+        : {}),
     };
 
     if (!cacheableTools) {
@@ -2220,6 +2212,12 @@ export class AxAIGoogleGemini<TModelKey = string> extends AxBaseAI<
       ...config,
     };
 
+    if (vertexConfig && Config.serviceTier) {
+      throw new Error(
+        'Gemini inference service tiers are not supported by Vertex AI'
+      );
+    }
+
     let apiURL: string;
     let headers: () => Promise<Record<string, string>>;
     let buildVertexApiURL:
@@ -2266,7 +2264,14 @@ export class AxAIGoogleGemini<TModelKey = string> extends AxBaseAI<
         );
       }
       apiURL = 'https://generativelanguage.googleapis.com/v1beta';
-      headers = async () => ({});
+      headers = async () => ({
+        ...(apiKey
+          ? {
+              'x-goog-api-key':
+                typeof apiKey === 'function' ? await apiKey() : apiKey,
+            }
+          : {}),
+      });
     }
 
     const aiImpl = new AxAIGoogleGeminiImpl(

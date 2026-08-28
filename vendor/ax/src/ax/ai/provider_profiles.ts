@@ -171,6 +171,7 @@ export type AxAIProfileSummary = Readonly<{
 const profiles = axAIProviderProfiles as unknown as Readonly<
   Record<AxAIProfileId, ProfileSpec>
 >;
+
 const aliases = axAIProviderAliases as unknown as Readonly<
   Record<string, AxAIProfileId>
 >;
