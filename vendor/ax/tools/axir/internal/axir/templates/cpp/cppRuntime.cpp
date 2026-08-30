@@ -2166,6 +2166,8 @@ Value Core::axgen_record_chat_log(Value gen, Value request, Value response) {
       {"session_id", get_key(response, "session_id")},
       {"usage", get_key(response, "usage", get_key(response, "model_usage"))},
       {"function_calls", get_key(response, "function_calls", Value::array())},
+      {"thought", get_key(response, "thought")},
+      {"thought_blocks", get_key(response, "thought_blocks", Value::array())},
       {"providerMetadata", get_key(request, "provider_metadata", Value::object())},
   });
   append(chat_log, entry);
@@ -2903,7 +2905,8 @@ OpenAIResponsesClient::OpenAIResponsesClient(std::string profile, Value options,
           display(Core::get(Core::provider_descriptor(profile), "defaultEmbedModel", ""))) {}
 
 double OpenAICompatibleClient::get_estimated_cost(Value model_usage) {
-  return num(Core::provider_estimate_cost(std::move(model_usage)));
+  Value model_info = Core::get(options_, "modelInfo", Core::get(options_, "model_info", Value()));
+  return num(Core::provider_estimate_cost(std::move(model_usage), std::move(model_info)));
 }
 
 Value OpenAICompatibleClient::get_features(Value model) {

@@ -2676,7 +2676,8 @@ impl AxAIClient for OpenAICompatibleClient {
         self.options.get("modelList").or_else(|| self.options.get("model_list")).cloned().unwrap_or_else(|| json!([{"key": self.model, "model": self.model}]))
     }
     fn get_estimated_cost(&self, usage: &Value) -> f64 {
-        provider_estimate_cost(&[core_value_from_json(usage)])
+        let model_info = self.options.get("modelInfo").or_else(|| self.options.get("model_info")).unwrap_or(&Value::Null);
+        provider_estimate_cost(&[core_value_from_json(usage), core_value_from_json(model_info)])
             .ok()
             .and_then(|value| core_value_to_json(&value).as_f64())
             .unwrap_or(0.0)
@@ -13469,6 +13470,12 @@ fn run_simple_forward_fixture(fixture: &Value) -> AxResult<()> {
     {
         expect_json_list_subset("memory history", &Value::Array(program.memory.clone()), expected)?;
     }
+    if let Some(expected) = fixture
+        .get("expected_chat_log_subset")
+        .and_then(Value::as_array)
+    {
+        expect_json_list_subset("chat log", &Value::Array(program.chat_log.clone()), expected)?;
+    }
     if let Some(expected) = fixture.get("expected_tool_calls").and_then(Value::as_array) {
         let actual = Value::Array(recorded_calls.lock().unwrap().clone());
         expect_json_list_exact_subsets("tool calls", &actual, expected)?;
@@ -18023,6 +18030,18 @@ fn core_axgen_record_chat_log(args: &[CoreValue]) -> Result<CoreValue, AxError> 
             core_get(
                 &response,
                 &CoreValue::from("function_calls"),
+                CoreValue::new_list(),
+            ),
+        ),
+        (
+            "thought",
+            core_get(&response, &CoreValue::from("thought"), CoreValue::Null),
+        ),
+        (
+            "thought_blocks",
+            core_get(
+                &response,
+                &CoreValue::from("thought_blocks"),
                 CoreValue::new_list(),
             ),
         ),
