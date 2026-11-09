@@ -1,5 +1,5 @@
 import type { AxAIService } from '../../ai/types.js';
-import { AxGen } from '../../dsp/generate.js';
+import { AxGen, withoutRunScopedOptions } from '../../dsp/generate.js';
 import type { AxSignature } from '../../dsp/sig.js';
 import type { AxFieldValue, AxProgramForwardOptions } from '../../dsp/types.js';
 import { axMCPChildExecutionOptions } from '../../mcp/execution.js';
@@ -64,7 +64,7 @@ export function buildLlmQueryBindings(
   const createSimpleSubAgent = () =>
     new AxGen<any, { answer: AxFieldValue }>(
       simpleChildSignature,
-      recursionForwardOptions
+      withoutRunScopedOptions(recursionForwardOptions)
     );
 
   const llmQuery = async (
@@ -143,8 +143,11 @@ export function buildLlmQueryBindings(
       }
       llmQueryBudgetState.global.used++;
       llmQueryBudgetState.localUsed++;
+      const queryPath = `${parentForwardOptions.executionPath ?? 'root'}/llmQuery/${llmQueryBudgetState.localUsed}`;
 
-      const maxAttempts = 3;
+      const maxAttempts = ai?.getFeatures(parentForwardOptions.model).asyncTools
+        ? 1
+        : 3;
       let lastError: unknown;
       const formatSubAgentError = (error: unknown) =>
         `[ERROR] ${error instanceof Error ? error.message : String(error)}. Retry with a simpler query, handle in JS, or proceed with data already gathered.`;
@@ -165,6 +168,7 @@ export function buildLlmQueryBindings(
             ...(recursionRestOptions as Partial<
               Omit<AxProgramForwardOptions<string>, 'functions'>
             >),
+            executionPath: queryPath,
             abortSignal,
             debug,
           });

@@ -13,7 +13,7 @@
                 "query": "Search docs"
               }
             },
-            "id": "search",
+            "id": "gemini-search-1",
             "type": "function"
           }
         ],
@@ -52,7 +52,7 @@
             {
               "description": "Search docs",
               "name": "search",
-              "parameters": {
+              "parametersJsonSchema": {
                 "properties": {
                   "query": {
                     "type": "string"
@@ -70,6 +70,7 @@
     }
   },
   "kind": "ai_chat",
+  "model": "gemini-2.5-flash",
   "name": "gemini-tool-call",
   "provider": "gemini",
   "request": {
@@ -134,6 +135,7 @@
                     "args": {
                       "query": "Search docs"
                     },
+                    "id": "gemini-search-1",
                     "name": "search"
                   }
                 }

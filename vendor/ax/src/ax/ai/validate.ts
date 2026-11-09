@@ -267,6 +267,11 @@ export function axValidateChatRequestMessage(item: AxChatRequestMessage): void {
           ? (item as any).audio
           : undefined;
 
+      const images =
+        typeof item === 'object' && item !== null && 'images' in item
+          ? (item as any).images
+          : undefined;
+
       const hasNonEmptyContent =
         typeof content === 'string' && content.trim() !== '';
       const hasFunctionCalls =
@@ -275,18 +280,21 @@ export function axValidateChatRequestMessage(item: AxChatRequestMessage): void {
         Array.isArray(thoughtBlocks) && thoughtBlocks.length > 0;
       const hasAudioReference =
         typeof audio?.id === 'string' && audio.id.trim() !== '';
+      const hasImages = Array.isArray(images) && images.length > 0;
 
       if (
         !hasNonEmptyContent &&
         !hasFunctionCalls &&
         !hasThoughtBlocks &&
-        !hasAudioReference
+        !hasAudioReference &&
+        !hasImages
       ) {
         raiseValidationError(
-          'Assistant message must include non-empty content, at least one function call, thought blocks, or an audio reference',
+          'Assistant message must include non-empty content, at least one function call, thought blocks, an audio reference, or generated images',
           {
-            fieldPath: 'content | functionCalls | thoughtBlocks | audio.id',
-            value: { content, functionCalls, thoughtBlocks, audio },
+            fieldPath:
+              'content | functionCalls | thoughtBlocks | audio.id | images',
+            value: { content, functionCalls, thoughtBlocks, audio, images },
             item,
           }
         );
@@ -329,6 +337,28 @@ export function axValidateChatRequestMessage(item: AxChatRequestMessage): void {
               item,
             }
           );
+        }
+      }
+
+      if (images !== undefined) {
+        if (!Array.isArray(images) || images.length === 0) {
+          raiseValidationError(
+            'Assistant message images must be a non-empty array when provided',
+            { fieldPath: 'images', value: images, item }
+          );
+        }
+        for (let index = 0; index < images.length; index++) {
+          const image = images[index];
+          if (
+            !image ||
+            typeof image !== 'object' ||
+            (typeof image.data !== 'string' && typeof image.url !== 'string')
+          ) {
+            raiseValidationError(
+              'Assistant message image must include data or url',
+              { fieldPath: `images[${index}]`, value: image, item }
+            );
+          }
         }
       }
 
@@ -528,11 +558,13 @@ export function axValidateChatResponseResult(
       !result.content &&
       !result.thought &&
       (!result.thoughtBlocks || result.thoughtBlocks.length === 0) &&
+      (!result.images || result.images.length === 0) &&
+      !result.audio &&
       !result.functionCalls &&
       !result.finishReason
     ) {
       throw new Error(
-        `Chat response result at index ${arrayIndex} must have at least one of: content, thought, thoughtBlocks, functionCalls, or finishReason, received: ${value({ content: result.content, thought: result.thought, thoughtBlocks: result.thoughtBlocks, functionCalls: result.functionCalls, finishReason: result.finishReason })}`
+        `Chat response result at index ${arrayIndex} must have at least one of: content, thought, thoughtBlocks, images, audio, functionCalls, or finishReason, received: ${value({ content: result.content, thought: result.thought, thoughtBlocks: result.thoughtBlocks, images: result.images, audio: result.audio, functionCalls: result.functionCalls, finishReason: result.finishReason })}`
       );
     }
 
@@ -583,7 +615,70 @@ export function axValidateChatResponseResult(
             `Chat response result thoughtBlocks[${blockIndex}].signature at index ${arrayIndex} must be a string when provided, received: ${value(tb.signature)}`
           );
         }
+        for (const field of ['id', 'summary', 'encryptedContent'] as const) {
+          if (tb[field] !== undefined && typeof tb[field] !== 'string') {
+            throw new Error(
+              `Chat response result thoughtBlocks[${blockIndex}].${field} at index ${arrayIndex} must be a string when provided, received: ${value(tb[field])}`
+            );
+          }
+        }
+        if (
+          tb.phase !== undefined &&
+          tb.phase !== 'commentary' &&
+          tb.phase !== 'final_answer'
+        ) {
+          throw new Error(
+            `Chat response result thoughtBlocks[${blockIndex}].phase at index ${arrayIndex} must be 'commentary' or 'final_answer' when provided, received: ${value(tb.phase)}`
+          );
+        }
       }
+    }
+
+    if (result.images !== undefined) {
+      if (!Array.isArray(result.images)) {
+        throw new Error(
+          `Chat response result images at index ${arrayIndex} must be an array, received: ${value(result.images)}`
+        );
+      }
+      for (
+        let imageIndex = 0;
+        imageIndex < result.images.length;
+        imageIndex++
+      ) {
+        const image = result.images[imageIndex];
+        if (!image || typeof image !== 'object') {
+          throw new Error(
+            `Chat response result images[${imageIndex}] at index ${arrayIndex} must be an object, received: ${value(image)}`
+          );
+        }
+        if (!image.data && !image.url) {
+          throw new Error(
+            `Chat response result images[${imageIndex}] at index ${arrayIndex} must have data or url, received: ${value(image)}`
+          );
+        }
+        for (const field of ['id', 'data', 'url', 'mimeType'] as const) {
+          if (image[field] !== undefined && typeof image[field] !== 'string') {
+            throw new Error(
+              `Chat response result images[${imageIndex}].${field} at index ${arrayIndex} must be a string when provided, received: ${value(image[field])}`
+            );
+          }
+        }
+        if (image.isDelta !== undefined && typeof image.isDelta !== 'boolean') {
+          throw new Error(
+            `Chat response result images[${imageIndex}].isDelta at index ${arrayIndex} must be a boolean when provided, received: ${value(image.isDelta)}`
+          );
+        }
+      }
+    }
+
+    if (
+      result.phase !== undefined &&
+      result.phase !== 'commentary' &&
+      result.phase !== 'final_answer'
+    ) {
+      throw new Error(
+        `Chat response result phase at index ${arrayIndex} must be 'commentary' or 'final_answer' when provided, received: ${value(result.phase)}`
+      );
     }
 
     // Validate name if present
@@ -651,67 +746,7 @@ export function axValidateChatResponseResult(
 
     // Validate functionCalls if present
     if (result.functionCalls !== undefined) {
-      if (!Array.isArray(result.functionCalls)) {
-        throw new Error(
-          `Chat response result functionCalls at index ${arrayIndex} must be an array, received: ${value(result.functionCalls)}`
-        );
-      }
-
-      for (
-        let callIndex = 0;
-        callIndex < result.functionCalls.length;
-        callIndex++
-      ) {
-        const functionCall = result.functionCalls[callIndex];
-        if (!functionCall) {
-          throw new Error(
-            `Function call at index ${callIndex} in result ${arrayIndex} cannot be null or undefined, received: ${value(functionCall)}`
-          );
-        }
-
-        if (
-          !functionCall.id ||
-          typeof functionCall.id !== 'string' ||
-          functionCall.id.trim() === ''
-        ) {
-          throw new Error(
-            `Function call at index ${callIndex} in result ${arrayIndex} must have a non-empty string id, received: ${value(functionCall.id)}`
-          );
-        }
-
-        if (functionCall.type !== 'function') {
-          throw new Error(
-            `Function call at index ${callIndex} in result ${arrayIndex} must have type 'function', received: ${value(functionCall.type)}`
-          );
-        }
-
-        if (!functionCall.function) {
-          throw new Error(
-            `Function call at index ${callIndex} in result ${arrayIndex} must have a function object, received: ${value(functionCall.function)}`
-          );
-        }
-
-        if (
-          !functionCall.function.name ||
-          typeof functionCall.function.name !== 'string' ||
-          functionCall.function.name.trim() === ''
-        ) {
-          throw new Error(
-            `Function call at index ${callIndex} in result ${arrayIndex} must have a non-empty function name, received: ${value(functionCall.function.name)}`
-          );
-        }
-
-        if (functionCall.function.params !== undefined) {
-          if (
-            typeof functionCall.function.params !== 'string' &&
-            typeof functionCall.function.params !== 'object'
-          ) {
-            throw new Error(
-              `Function call params at index ${callIndex} in result ${arrayIndex} must be a string or object, received: ${value(functionCall.function.params)}`
-            );
-          }
-        }
-      }
+      validateChatResponseFunctionCalls(result.functionCalls, arrayIndex);
     }
 
     // Validate finishReason if present
@@ -726,6 +761,80 @@ export function axValidateChatResponseResult(
       if (!validFinishReasons.includes(result.finishReason)) {
         throw new Error(
           `Chat response result finishReason at index ${arrayIndex} must be one of: ${validFinishReasons.join(', ')}, received: ${value(result.finishReason)}`
+        );
+      }
+    }
+  }
+}
+
+/**
+ * The function-call checks of `axValidateChatResponseResult` for one result:
+ * each call needs a non-empty string id, type 'function', a function object
+ * with a non-empty name, and string or object params. A streamed result's
+ * merged calls go through the same checks before any function runs.
+ *
+ * @param functionCalls - The result's function calls
+ * @param arrayIndex - The result's position, for the error messages
+ * @throws {Error} When a call fails a check
+ */
+export function validateChatResponseFunctionCalls(
+  functionCalls: unknown,
+  arrayIndex: number
+): void {
+  const value = (v: unknown) => JSON.stringify(v, null, 2);
+  if (!Array.isArray(functionCalls)) {
+    throw new Error(
+      `Chat response result functionCalls at index ${arrayIndex} must be an array, received: ${value(functionCalls)}`
+    );
+  }
+
+  for (let callIndex = 0; callIndex < functionCalls.length; callIndex++) {
+    const functionCall = functionCalls[callIndex];
+    if (!functionCall) {
+      throw new Error(
+        `Function call at index ${callIndex} in result ${arrayIndex} cannot be null or undefined, received: ${value(functionCall)}`
+      );
+    }
+
+    if (
+      !functionCall.id ||
+      typeof functionCall.id !== 'string' ||
+      functionCall.id.trim() === ''
+    ) {
+      throw new Error(
+        `Function call at index ${callIndex} in result ${arrayIndex} must have a non-empty string id, received: ${value(functionCall.id)}`
+      );
+    }
+
+    if (functionCall.type !== 'function') {
+      throw new Error(
+        `Function call at index ${callIndex} in result ${arrayIndex} must have type 'function', received: ${value(functionCall.type)}`
+      );
+    }
+
+    if (!functionCall.function) {
+      throw new Error(
+        `Function call at index ${callIndex} in result ${arrayIndex} must have a function object, received: ${value(functionCall.function)}`
+      );
+    }
+
+    if (
+      !functionCall.function.name ||
+      typeof functionCall.function.name !== 'string' ||
+      functionCall.function.name.trim() === ''
+    ) {
+      throw new Error(
+        `Function call at index ${callIndex} in result ${arrayIndex} must have a non-empty function name, received: ${value(functionCall.function.name)}`
+      );
+    }
+
+    if (functionCall.function.params !== undefined) {
+      if (
+        typeof functionCall.function.params !== 'string' &&
+        typeof functionCall.function.params !== 'object'
+      ) {
+        throw new Error(
+          `Function call params at index ${callIndex} in result ${arrayIndex} must be a string or object, received: ${value(functionCall.function.params)}`
         );
       }
     }

@@ -8,7 +8,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.function.Consumer;
 
-public final class AxMultiServiceRouter implements AxAIService {
+public final class AxMultiServiceRouter implements AxAIService, AxChatSession.Provider {
   public static final class Entry {
     public final String key;
     public final AxAIService service;
@@ -28,6 +28,13 @@ public final class AxMultiServiceRouter implements AxAIService {
   private final LinkedHashMap<String, Map<String, Object>> services = new LinkedHashMap<>();
   private AxAIService lastUsedService;
   private Map<String, Object> options = new LinkedHashMap<>();
+
+  public java.util.function.Supplier<AiClient> ownedWorkerFactory() {
+    var factories=new LinkedHashMap<String,java.util.function.Supplier<AiClient>>();var metadata=new LinkedHashMap<String,Map<String,Object>>();
+    for(var item:services.entrySet()){var factory=((AxAIService)item.getValue().get("service")).ownedWorkerFactory();if(factory==null)return null;factories.put(item.getKey(),factory);var entry=new LinkedHashMap<>(item.getValue());entry.remove("service");metadata.put(item.getKey(),Core.asMap(Core.ownedCopy(entry)));}
+    var options=Core.asMap(Core.ownedCopy(this.options));
+    return ()->{var entries=new ArrayList<Object>();for(var key:factories.keySet()){var entry=Core.asMap(Core.ownedCopy(metadata.get(key)));entry.put("key",key);entry.put("service",factories.get(key).get());entries.add(entry);}var worker=new AxMultiServiceRouter(entries);worker.services.clear();for(var entry:entries){var value=Core.asMap(entry);String key=String.valueOf(value.remove("key"));worker.services.put(key,value);}worker.options=Core.asMap(Core.ownedCopy(options));return worker;};
+  }
 
   public AxMultiServiceRouter(List<?> items) {
     if (items == null || items.isEmpty()) throw new IllegalArgumentException("No AI services provided.");
@@ -97,8 +104,17 @@ public final class AxMultiServiceRouter implements AxAIService {
   }
 
   public Map<String, Object> getFeatures(String model) {
-    if (model != null && services.containsKey(model)) return ((AxAIService) services.get(model).get("service")).getFeatures(model);
+    if (model != null && services.containsKey(model)) return ((AxAIService) services.get(model).get("service")).getFeatures((String) services.get(model).get("model"));
     return Core.defaultRouterFeatures();
+  }
+
+  public AxChatSession openChatSession(Map<String,Object> request,Map<String,Object> options) throws Exception {
+    var entry=services.get(String.valueOf(request.get("model")));
+    if(entry==null)throw new IllegalArgumentException("No service found for model key: "+request.get("model"));
+    lastUsedService=(AxAIService)entry.get("service");
+    if(!(lastUsedService instanceof AxChatSession.Provider provider))throw new IllegalStateException("Selected service does not support sessions");
+    var resolved=Core.asMap(Core.provider_session_route(entry,request,options));
+    return provider.openChatSession(Core.asMap(resolved.get("request")),Core.asMap(resolved.get("options")));
   }
 
   public Map<String, Object> chat(Map<String, Object> request) throws Exception { return chat(request, Map.of()); }
@@ -115,7 +131,13 @@ public final class AxMultiServiceRouter implements AxAIService {
     return lastUsedService.chat(req, options);
   }
 
-  @Override public AxChatStream openStream(Map<String, Object> request) throws Exception {
+  @Override public AxChatStream openStream(Map<String, Object> request) throws Exception {return openStream(request,null);}
+
+  @Override public AxChatStream openStream(Map<String,Object> request,AxCancellationToken cancellation)throws Exception {return openStream(request,Map.of(),cancellation);}
+
+  // The selected service gates its own stream; the call options travel with the request.
+  @Override public AxChatStream openStream(Map<String,Object> request,Map<String,Object> options,AxCancellationToken cancellation)throws Exception {
+    if(cancellation!=null)cancellation.throwIfCancelled();
     Object modelKey = request.get("model");
     if (modelKey == null) throw new IllegalArgumentException("Model key must be specified for multi-service");
     Map<String, Object> entry = services.get(String.valueOf(modelKey));
@@ -124,10 +146,11 @@ public final class AxMultiServiceRouter implements AxAIService {
     Map<String, Object> req = new LinkedHashMap<>(request);
     if (req.containsKey("modelConfig") && !req.containsKey("model_config")) req.put("model_config", req.get("modelConfig"));
     if (!entry.containsKey("model")) req.remove("model");
-    return lastUsedService.openStream(req);
+    return lastUsedService.openStream(req,options,cancellation);
   }
 
   @Override public AxChatStream stream(Map<String, Object> request) { return AxChatStream.lazy(() -> openStream(request)); }
+  @Override public Iterable<Map<String,Object>> stream(Map<String,Object> request,AxCancellationToken cancellation){return AxChatStream.lazy(()->openStream(request,cancellation));}
 
   public Map<String, Object> embed(Map<String, Object> request) throws Exception {
     return embed(request, Map.of());
@@ -139,11 +162,7 @@ public final class AxMultiServiceRouter implements AxAIService {
     Map<String, Object> entry = services.get(String.valueOf(modelKey));
     if (entry == null) throw new IllegalArgumentException("No service found for embed model key: " + modelKey);
     lastUsedService = (AxAIService) entry.get("service");
-    Map<String, Object> req = new LinkedHashMap<>(request);
-    if (!entry.containsKey("model")) {
-      req.remove("embedModel");
-      req.remove("embed_model");
-    }
+    Map<String, Object> req = (Map<String, Object>) Core.router_embed_request(request, entry.get("model"), entry.get("embedModel"));
     return lastUsedService.embed(req, options);
   }
 

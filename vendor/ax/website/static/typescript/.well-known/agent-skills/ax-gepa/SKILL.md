@@ -1,7 +1,7 @@
 ---
 name: ax-gepa
 description: This skill helps an LLM generate correct AxGEPA optimization code using @ax-llm/ax. Use when the user asks about AxGEPA, GEPA, Pareto optimization, multi-objective prompt tuning, reflective prompt evolution, validationExamples, maxMetricCalls, or optimizing a generator, flow, or agent tree.
-version: "24.0.14"
+version: "25.4.9"
 ---
 
 # GEPA Optimization Codegen Rules (@ax-llm/ax)
@@ -14,7 +14,7 @@ Use this skill to generate GEPA optimization code. Prefer the top-level `optimiz
 - Prefer `ai()`, `ax()`, and `flow()` for new code.
 - Use a strong `teacherAI` and a cheaper `studentAI`.
 - Pass `validationExamples` when you have a holdout set.
-- Set `maxMetricCalls` to bound optimizer cost; `optimize(...)` defaults it to `100`.
+- Set `maxMetricCalls` to bound optimizer cost. `optimize(...)` uses at least `100` by default, increasing that implicit budget only when needed to fit the required validation passes. Explicit limits are always respected.
 - Use scalar metrics for one objective and object metrics for Pareto optimization.
 - Apply results with `program.applyOptimization(result.optimizedProgram!)`.
 - For tree-wide runs, expect `optimizedProgram.componentMap`.
@@ -33,6 +33,9 @@ Use this skill to generate GEPA optimization code. Prefer the top-level `optimiz
 - GEPA optimizes generic string components exposed by `getOptimizableComponents()`. If a tree exposes no components, optimization will fail.
 - Use held-out validation examples for selection. Do not reuse the training set as `validationExamples`.
 - `result.optimizedProgram` is the easy-to-apply best candidate. `result.paretoFront` is the full trade-off set for multi-objective runs.
+- `result.baselineScore` and `result.baselineScores` report the original program before this run changes demos or components, including any caller-supplied demos. Both `optimize(...)` and direct `AxGEPA.compile()` measure this before bootstrap.
+- The baseline uses the same validation subset (including GEPA's size cap), student model, `sampleCount`, metric or adapter, and scalarization as final selection. `baselineScores` contains averaged objective values; scalar metrics use `{ score: value }`. `baselineScore` scalarizes that average vector, just like `bestScore`.
+- Baseline fields survive even if the seed is dominated and omitted from `paretoFront`. They are result metadata; save them alongside serialized artifacts when tracking experiments. Other optimizers may omit these optional fields.
 - Direct `AxGEPA` still has its own `bootstrap` option, but top-level `optimize(...)` composes the existing `AxBootstrapFewShot` optimizer before GEPA instead.
 
 ## Metric Selection
@@ -57,13 +60,13 @@ import { ai, ax, optimize, AxAIOpenAIModel } from '@ax-llm/ax';
 const student = ai({
   name: 'openai',
   apiKey: process.env.OPENAI_APIKEY!,
-  config: { model: AxAIOpenAIModel.GPT54Mini },
+  config: { model: AxAIOpenAIModel.GPT56Luna },
 });
 
 const teacher = ai({
   name: 'openai',
   apiKey: process.env.OPENAI_APIKEY!,
-  config: { model: AxAIOpenAIModel.GPT54 },
+  config: { model: AxAIOpenAIModel.GPT56 },
 });
 
 const classifier = ax(
@@ -96,7 +99,13 @@ const result = await optimize(classifier, train, metric, {
 });
 
 classifier.applyOptimization(result.optimizedProgram!);
-console.log(result.bestScore);
+console.log({
+  baseline: result.baselineScore,
+  optimized: result.bestScore,
+  delta: result.baselineScore === undefined
+    ? undefined
+    : result.bestScore - result.baselineScore,
+});
 ```
 
 ## Canonical Pareto Pattern
@@ -208,7 +217,7 @@ const loaded = JSON.parse(saved);
 program.applyOptimization(loaded);
 ```
 
-- Single-target runs usually populate both `optimizedProgram.instruction` and `optimizedProgram.componentMap`.
+- Single-generator runs store optimized components in `optimizedProgram.componentMap`, with instructions keyed by `${programId}::instruction`. Other components, such as descriptions, have their own keys.
 - Tree-wide runs rely on `componentMap`, keyed by full component key.
 - Pareto points expose candidate configs under `point.configuration.componentMap`.
 
@@ -236,11 +245,14 @@ const optimizer = new AxGEPA({
 - `earlyStoppingTrials`: stop after repeated non-improvement.
 - `minImprovementThreshold`: reject tiny gains below this threshold.
 - `seed`: stabilize sampling during demos and tests.
+- `teacherOptions`: AI service options for the teacher calls: GEPA feedback and proposals, plus the bootstrap demo runs in `optimize(...)`. A teacher model marked `isExpensive` (for example OpenAI `o3-pro` or `gpt-5.5-pro`) is rejected unless you pass `teacherOptions: { useExpensiveModel: 'yes' }`.
 
 ## Budgeting and Validation
 
 - Always create distinct `train` and `validationExamples` arrays.
-- Size `maxMetricCalls` for at least one full validation pass plus several rounds.
+- Size `maxMetricCalls` for at least one full validation pass plus several rounds. If bootstrap adds demos, reserve two validation passes: the original baseline and the bootstrapped seed. Runs without new demos reuse the baseline evaluation without extra model calls.
+- Both validation passes count against GEPA's `maxMetricCalls`. Bootstrap demo generation remains separately bounded by its bootstrap options; `stats.totalCalls` includes bootstrap and GEPA evaluations.
+- Bootstrap collects only fresh traces from the current training run. A conditional child that was last used during baseline validation cannot contribute its stale held-out trace as a demo.
 - If the user wants a strict budget, say so explicitly and set `maxMetricCalls`.
 - For expensive trees, start with `auto: 'light'` or fewer `numTrials`, then scale up.
 - GEPA selects among exposed components using measured accept/reject history, not LLM-generated numeric scores. The LLM proposes component text; metrics decide whether to keep it.
@@ -249,6 +261,7 @@ const optimizer = new AxGEPA({
 ## Troubleshooting
 
 - Error about `maxMetricCalls` being too small: increase it until the initial validation pass fits.
+- Components never change: GEPA reports each failed teacher call as a `gepa_teacher` notification through the optimizer's `logger` (by default the student AI's logger); `verbose: false` silences it. A teacher marked `isExpensive` fails until you set `teacherOptions: { useExpensiveModel: 'yes' }`.
 - Empty or poor Pareto front: verify the metric returns numbers for every example.
 - No tree optimization effect: ensure child programs are registered under the root and expose optimizable components.
 - Saved optimization applies only partly: use `program.applyOptimization(...)`, not just `setInstruction(...)`, so `componentMap` reaches the full tree.

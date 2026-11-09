@@ -6,6 +6,8 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -57,7 +59,8 @@ void drain_request(int fd) {
   }
 }
 
-void write_response(int fd, const std::string& content_type, const std::string& first, const std::string& rest) {
+void write_response(int fd, const std::string& content_type, const std::string& first, const std::string& rest,
+                    std::chrono::milliseconds delay, const std::function<void()>& release = {}) {
   std::string out = "HTTP/1.1 200 OK\r\nContent-Type: " + content_type +
                     "\r\nContent-Length: " + std::to_string(first.size() + rest.size()) +
                     "\r\nConnection: close\r\n\r\n";
@@ -68,13 +71,45 @@ void write_response(int fd, const std::string& content_type, const std::string& 
     off += static_cast<size_t>(n);
   }
   for (char byte : first) send(fd, &byte, 1, 0);
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  if (release) release();
+  else std::this_thread::sleep_for(delay);
   send(fd, rest.data(), rest.size(), 0);
+}
+
+
+// The server waits for the client to close the connection once the run is
+// aborted. The 30 s receive timeout only runs out when the client keeps the
+// connection; it is generous so that a slow machine cannot trip it.
+void stalled_http_cancellation() {
+  using namespace axllm;
+  int listener=socket(AF_INET,SOCK_STREAM,0);
+  if(listener<0)throw std::runtime_error("socket failed");
+  sockaddr_in address{};address.sin_family=AF_INET;address.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
+  if(bind(listener,reinterpret_cast<sockaddr*>(&address),sizeof(address))<0||listen(listener,1)<0)throw std::runtime_error("listen failed");
+  socklen_t size=sizeof(address);getsockname(listener,reinterpret_cast<sockaddr*>(&address),&size);
+  std::atomic<bool> closed{false};
+  std::thread server([&]{
+    int connection=accept(listener,nullptr,nullptr);if(connection<0)return;
+    drain_request(connection);timeval timeout{30,0};setsockopt(connection,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout));
+    const std::string event="data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"item\",\"call_id\":\"http-pending\",\"name\":\"lookup\",\"arguments\":\"{}\"}}\n\n";
+    const std::string response="HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100000\r\n\r\n"+event;
+    size_t offset=0;while(offset<response.size()){auto written=send(connection,response.data()+offset,response.size()-offset,0);if(written<=0)break;offset+=written;}
+    char byte;auto count=recv(connection,&byte,1,0);closed.store(count==0||(count<0&&(errno==ECONNRESET||errno==ECONNABORTED)));close(connection);
+  });
+  auto control=run_control();Tool lookup("lookup","Lookup");lookup.execution("background").context_handler([control](Value,const AxToolContext&){control.abort();return Value("LATE");});
+  auto program=ax("question -> answer");program.add_tool(lookup);
+  auto client=ai("openai",object({{"api_key","test"},{"model","gpt-6-astra"},{"base_url","http://127.0.0.1:"+std::to_string(ntohs(address.sin_port))}}));
+  std::string failure;
+  try{program.forward(*client,object({{"question","Lookup"}}),object({{"control",control.value()}}));}catch(const std::exception& error){failure=error.what();}
+  server.join();close(listener);
+  if(failure.find("http-pending")==std::string::npos||!closed.load())throw std::runtime_error("Cancelled HTTP run retained its connection: "+failure);
+  std::cout<<"cpp cancellation closes a stalled native HTTP connection\n";
 }
 
 }  // namespace
 
 int main() {
+  ::signal(SIGPIPE, SIG_IGN);
   // One logical delta whose JSON is split across two data: lines (folded with
   // "\n"), then a single-line delta accepted at EOF without a delimiter.
   const std::string event1a =
@@ -108,12 +143,38 @@ int main() {
   getsockname(server_fd, reinterpret_cast<sockaddr*>(&addr), &alen);
   int port = ntohs(addr.sin_port);
 
+  // Both requests hold the rest of the body back and record whether the
+  // client got there first: the order proves incremental delivery and prompt
+  // cancellation, so a slow machine cannot fail either check. The 30 s bounds
+  // only run out when the client never gets there.
+  std::mutex release_mutex;
+  std::condition_variable release_rest;
+  bool first_received = false;
+  bool cancel_returned = false;
+  std::atomic<bool> release_timed_out{false};
+  std::atomic<bool> cancel_hold_expired{false};
   std::thread server([&]() {
-    int fd = accept(server_fd, nullptr, nullptr);
-    if (fd < 0) return;
-    drain_request(fd);
-    write_response(fd, "text/event-stream", sse_first, sse_rest);
-    close(fd);
+    for (int request = 0; request < 2; ++request) {
+      int fd = accept(server_fd, nullptr, nullptr);
+      if (fd < 0) return;
+      drain_request(fd);
+      if (request == 0) {
+        write_response(fd, "text/event-stream", sse_first, sse_rest,
+                       std::chrono::milliseconds(0), [&] {
+          std::unique_lock<std::mutex> lock(release_mutex);
+          if (!release_rest.wait_for(lock, std::chrono::seconds(30), [&] { return first_received; }))
+            release_timed_out.store(true);
+        });
+      } else {
+        write_response(fd, "text/event-stream", sse_first, sse_rest,
+                       std::chrono::milliseconds(0), [&] {
+          std::unique_lock<std::mutex> lock(release_mutex);
+          if (!release_rest.wait_for(lock, std::chrono::seconds(30), [&] { return cancel_returned; }))
+            cancel_hold_expired.store(true);
+        });
+      }
+      close(fd);
+    }
   });
 
   axllm::OpenAICompatibleClient client(
@@ -122,20 +183,18 @@ int main() {
                      {"model", "gpt-5.4-mini"}}),
       nullptr);
   std::vector<std::string> deltas;
-  auto started = std::chrono::steady_clock::now();
-  std::chrono::steady_clock::time_point first_at;
   client.stream_each(axllm::object({{"chat_prompt", axllm::array({axllm::object({{"role", "user"}, {"content", "stream"}})})}}), [&](const axllm::Value& event) {
-    if (first_at.time_since_epoch().count() == 0) first_at = std::chrono::steady_clock::now();
+    {
+      std::lock_guard<std::mutex> lock(release_mutex);
+      first_received = true;
+    }
+    release_rest.notify_one();
     std::string content = axllm::display(
         axllm::Core::get(axllm::Core::get(axllm::Core::get(event, "results"), 0), "content", ""));
     if (!content.empty()) deltas.push_back(content);
     return true;
   });
-  auto completed = std::chrono::steady_clock::now();
-  if (completed - first_at < std::chrono::milliseconds(200)) { std::cerr << "first event was not incremental\n"; return 1; }
-
-  server.join();
-  close(server_fd);
+  if (release_timed_out.load()) { std::cerr << "first event was not incremental\n"; return 1; }
 
   if (deltas.empty() || deltas.front() != "Hello 🌍 ") {
     std::cerr << "multi-line data: event was not folded into one JSON value\n";
@@ -147,6 +206,42 @@ int main() {
     std::cerr << "bad stream fold: " << text << "\n";
     return 1;
   }
+  stalled_http_cancellation();
+
+  axllm::AxCancellationToken token;
+  bool aborted = false;
+  bool cancelled = false;
+  try {
+    client.stream_each(
+        axllm::object({{"chat_prompt", axllm::array({axllm::object({
+            {"role", "user"}, {"content", "cancel stream"}})})}}),
+        [&](const axllm::Value&) {
+          cancelled = true;
+          token.cancel("loopback stopped");
+          return true;
+        },
+        &token);
+  } catch (const axllm::AxAIServiceAbortedError& error) {
+    aborted = true;
+    if (error.retryable || std::string(error.what()).find("loopback stopped") == std::string::npos) {
+      std::cerr << "wrong cancellation error: " << error.what() << "\n";
+      return 1;
+    }
+  }
+  bool held = !cancel_hold_expired.load();
+  {
+    std::lock_guard<std::mutex> lock(release_mutex);
+    cancel_returned = true;
+  }
+  release_rest.notify_one();
+  if (!aborted || !cancelled || !held) {
+    std::cerr << "real HTTP stream cancellation was not prompt\n";
+    server.join();
+    return 1;
+  }
+
+  server.join();
+  close(server_fd);
   std::cout << "stream-http-roundtrip-ok\n";
   return 0;
 }

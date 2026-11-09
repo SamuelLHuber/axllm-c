@@ -6,10 +6,41 @@ import java.util.List;
 import java.util.Map;
 
 public final class AxGen implements AxProgram {
+  public static final class AxDecisionRefusalError extends RuntimeException {
+    public final String fieldPath;
+    public final Map<String,Object> provenance;
+    AxDecisionRefusalError(String path, Map<String,Object> source) { super("Decision refused: " + path); fieldPath=path; provenance=source; }
+  }
+
+  public java.util.function.Supplier<AxProgram> ownedWorkerFactory() {
+    if(executionContext!=null)return null;
+    Map<String,Object> snapshot=Core.asMap(Core.ownedCopy(options));
+    snapshot.put("functions",new ArrayList<>(functions));snapshot.put("memory",memory.ownedCopy());
+    snapshot.put("examples",Core.ownedCopy(examples));snapshot.put("demos",Core.ownedCopy(demos));
+    snapshot.put("assertions",Core.ownedCopy(assertions));snapshot.put("streaming_assertions",Core.ownedCopy(streamingAssertions));
+    snapshot.put("field_processors",Core.ownedCopy(fieldProcessors));snapshot.put("stop_functions",new ArrayList<>(stopFunctions));
+    snapshot.put("feedback_processors",Core.ownedCopy(feedbackProcessors));snapshot.put("streaming_field_processors",Core.ownedCopy(streamingFieldProcessors));
+    Object log=Core.ownedCopy(chatLog),calls=Core.ownedCopy(functionCallTraces),trace=Core.ownedCopy(traces);
+    String instructions=instruction;AxRuntimeHooks hooks=runtimeHooks;
+    return ()->{
+      AxGen owned=new AxGen(signature,Core.asMap(Core.ownedCopy(snapshot)),hooks);owned.setInstruction(instructions);
+      for(Object item:Core.iter(Core.ownedCopy(log)))owned.chatLog.add(Core.asMap(item));
+      for(Object item:Core.iter(Core.ownedCopy(calls)))owned.functionCallTraces.add(Core.asMap(item));
+      for(Object item:Core.iter(Core.ownedCopy(trace)))owned.traces.add(Core.asMap(item));
+      return owned;
+    };
+  }
   public interface AssertionCallback { Object apply(Map<String, Object> output); }
+  /** A callable assertion with the message TypeScript addAssert(fn, message) takes. */
+  public record MessageAssertion(AssertionCallback callback, String message) {}
   public interface FieldProcessorCallback { Object apply(Object value); }
   public interface FunctionCallHook { void accept(Map<String, Object> record); }
   public interface ResultPickerCallback { int pick(List<Map<String, Object>> samples); }
+  /**
+   * Writes a tool result for the model, as TS's functionResultFormatter option does. A formatter that
+   * throws fails the forward ("Generate failed: ..."), as in TS.
+   */
+  public interface FunctionResultFormatter { String format(Object result); }
 
   final AxSignature signature;
   final Map<String, Object> options;
@@ -22,6 +53,10 @@ public final class AxGen implements AxProgram {
   final List<Object> assertions;
   final List<Object> streamingAssertions;
   final List<Map<String, Object>> fieldProcessors;
+  // TypeScript field processors: {field, processor(value, {values, done})};
+  // a non-empty result is sent back to the model for another step.
+  final List<Map<String, Object>> feedbackProcessors;
+  final List<Map<String, Object>> streamingFieldProcessors;
   final List<String> stopFunctions;
   final AxMemory memory;
   final List<Map<String, Object>> chatLog;
@@ -58,6 +93,10 @@ public final class AxGen implements AxProgram {
     this.streamingAssertions = new ArrayList<>(Core.asList(this.options.getOrDefault("streaming_assertions", this.options.getOrDefault("streamingAssertions", List.of()))));
     this.fieldProcessors = new ArrayList<>();
     for (Object item : Core.asList(this.options.getOrDefault("field_processors", this.options.getOrDefault("fieldProcessors", List.of())))) this.fieldProcessors.add(Core.asMap(item));
+    this.feedbackProcessors = new ArrayList<>();
+    for (Object item : Core.asList(this.options.getOrDefault("feedback_processors", this.options.getOrDefault("feedbackProcessors", List.of())))) this.feedbackProcessors.add(Core.asMap(item));
+    this.streamingFieldProcessors = new ArrayList<>();
+    for (Object item : Core.asList(this.options.getOrDefault("streaming_field_processors", this.options.getOrDefault("streamingFieldProcessors", List.of())))) this.streamingFieldProcessors.add(Core.asMap(item));
     this.stopFunctions = new ArrayList<>();
     for (Object item : Core.asList(this.options.getOrDefault("stop_functions", this.options.getOrDefault("stopFunctions", List.of())))) this.stopFunctions.add(String.valueOf(item));
     this.memory = this.options.get("memory") instanceof AxMemory mem ? mem : new AxMemory();
@@ -70,7 +109,8 @@ public final class AxGen implements AxProgram {
       signature,
       functions,
       (String) this.options.getOrDefault("structured_output_function_name", this.options.get("structuredOutputFunctionName")),
-      (String) this.options.getOrDefault("custom_template", this.options.get("customTemplate"))
+      (String) this.options.getOrDefault("custom_template", this.options.get("customTemplate")),
+      Core.truthy(this.options.getOrDefault("include_optional_input_fields_in_system_prompt", this.options.getOrDefault("includeOptionalInputFieldsInSystemPrompt", false)))
     );
     if (!this.instruction.isEmpty()) {
       this.promptTemplate.setInstruction(this.instruction);
@@ -108,6 +148,14 @@ public final class AxGen implements AxProgram {
     return this;
   }
 
+  // The program's tool result formatter. Without one, a string goes as it is,
+  // null as "done", and any other value as pretty JSON; a forward call's
+  // "functionResultFormatter" option wins over it.
+  public AxGen setFunctionResultFormatter(FunctionResultFormatter formatter) {
+    this.options.put("functionResultFormatter", formatter);
+    return this;
+  }
+
   public AxGen addAssert(Map<String, Object> assertion) {
     this.assertions.add(assertion);
     return this;
@@ -115,6 +163,16 @@ public final class AxGen implements AxProgram {
 
   public AxGen addAssert(AssertionCallback assertion) {
     this.assertions.add(assertion);
+    return this;
+  }
+
+  /**
+   * Adds a callable assertion with a message. A {@code false} result fails with
+   * the message and is retried with a correction, as in TypeScript; without a
+   * message the failure surfaces at once.
+   */
+  public AxGen addAssert(AssertionCallback assertion, String message) {
+    this.assertions.add(message == null ? assertion : new MessageAssertion(assertion, message));
     return this;
   }
 
@@ -135,17 +193,114 @@ public final class AxGen implements AxProgram {
     return addStreamingAssert(spec);
   }
 
-  public AxGen addFieldProcessor(String field, String op) {
-    this.fieldProcessors.add(new java.util.LinkedHashMap<>(Map.of("field", field, "processor", op)));
+  /** Adds a streaming assertion without a message of its own; see {@link #addStreamingAssert(String, AxStreamingAssertion, String)}. */
+  public AxGen addStreamingAssert(String field, AxStreamingAssertion assertion) {
+    return addStreamingAssert(field, assertion, null);
+  }
+
+  /**
+   * Adds a TypeScript streaming assertion on a string or code output field: {@code
+   * assertion.check(text, done)} sees the field's text so far as it streams. {@code null} or {@code
+   * true} passes; {@code false} or a message string stops the attempt and retries it with a
+   * correction (the returned message, else {@code message}, else a default). An exception the check
+   * throws ends the forward without a retry.
+   *
+   * @throws IllegalArgumentException when field is not a string or code output field
+   */
+  public AxGen addStreamingAssert(String field, AxStreamingAssertion assertion, String message) {
+    if (assertion == null) throw new IllegalArgumentException("addStreamingAssert: assertion is required");
+    Field output = null;
+    for (Field item : signature.outputs) if (item.name.equals(field)) output = item;
+    if (output == null) throw new IllegalArgumentException("addStreamingAssert: field " + field + " not found in output signature");
+    if (!isTextField(output)) throw new IllegalArgumentException("addStreamingAssert: field " + field + " must be a string field for streaming assertions");
+    Map<String, Object> spec = new LinkedHashMap<>();
+    spec.put("field", field);
+    spec.put("fn", assertion);
+    if (message != null) spec.put("message", message);
+    return addStreamingAssert(spec);
+  }
+
+  /**
+   * Rewrites an output field's final value before the assertions run. op is "uppercase",
+   * "lowercase", "trim", "prefix:&lt;text&gt;" or "suffix:&lt;text&gt;". This is a port extension:
+   * TypeScript field processors send their result back to the model instead ({@link
+   * #addFieldProcessor(String, AxFieldProcessor, AxFieldProcessorMode)} with {@link
+   * AxFieldProcessorMode#FEEDBACK}). {@link #streamingForward} holds a transformed field back and
+   * sends it once, transformed.
+   */
+  public AxGen addFieldTransform(String field, String op) {
+    this.fieldProcessors.add(processorSpec(field, op));
     return this;
   }
 
-  public AxGen addFieldProcessor(String field, FieldProcessorCallback processor) {
+  /** Rewrites an output field's final value with {@code transform}'s result; see {@link #addFieldTransform(String, String)}. */
+  public AxGen addFieldTransform(String field, FieldProcessorCallback transform) {
+    this.fieldProcessors.add(processorSpec(field, transform));
+    return this;
+  }
+
+  /** Sends processor feedback to the model, matching TypeScript's default. */
+  public AxGen addFieldProcessor(String field, AxFieldProcessor processor) {
+    return addFieldProcessor(field, processor, AxFieldProcessorMode.FEEDBACK);
+  }
+
+  /**
+   * Adds a field processor. With {@link AxFieldProcessorMode#FEEDBACK} it follows TypeScript:
+   * {@code processor.process(value, context)} runs on the field's final value, and a non-empty
+   * result goes back to the model as a user message for another step, whose answer replaces the
+   * earlier one. With {@link AxFieldProcessorMode#TRANSFORM} the returned value rewrites the field,
+   * as {@link #addFieldTransform} does.
+   *
+   * @throws IllegalArgumentException with FEEDBACK, when field is not an output field
+   */
+  public AxGen addFieldProcessor(String field, AxFieldProcessor processor, AxFieldProcessorMode mode) {
+    if (processor == null) throw new IllegalArgumentException("addFieldProcessor: processor is required");
+    if (mode == null) throw new IllegalArgumentException("addFieldProcessor: mode is required");
+    if (mode == AxFieldProcessorMode.TRANSFORM) {
+      this.fieldProcessors.add(processorSpec(field, processor));
+      return this;
+    }
+    outputField("addFieldProcessor", field, false);
+    this.feedbackProcessors.add(processorSpec(field, processor));
+    return this;
+  }
+
+  /**
+   * Adds a TypeScript streaming field processor: {@code processor.process(text, context)} runs on
+   * each streamed chunk of a string or code output field with the field's text so far ({@code
+   * context.done()} marks the final call); a non-empty result goes back to the model as a user
+   * message for another step.
+   *
+   * @throws IllegalArgumentException when field is not a string or code output field
+   */
+  public AxGen addStreamingFieldProcessor(String field, AxFieldProcessor processor) {
+    if (processor == null) throw new IllegalArgumentException("addFieldProcessor: processor is required");
+    outputField("addFieldProcessor", field, true);
+    this.streamingFieldProcessors.add(processorSpec(field, processor));
+    return this;
+  }
+
+  // Throws, as TypeScript does, when field is not an output field or, for
+  // text, not a string or code field.
+  private void outputField(String method, String field, boolean text) {
+    for (Field output : signature.outputs) {
+      if (!output.name.equals(field)) continue;
+      if (text && !isTextField(output)) throw new IllegalArgumentException(method + ": field " + field + " must be a text field");
+      return;
+    }
+    throw new IllegalArgumentException(method + ": field " + field + " not found");
+  }
+
+  private static boolean isTextField(Field field) {
+    String typeName = field.type == null || field.type.name == null ? "string" : field.type.name;
+    return "string".equals(typeName) || "code".equals(typeName);
+  }
+
+  private static Map<String, Object> processorSpec(String field, Object processor) {
     Map<String, Object> spec = new LinkedHashMap<>();
     spec.put("field", field);
     spec.put("processor", processor);
-    this.fieldProcessors.add(spec);
-    return this;
+    return spec;
   }
 
   public AxGen onFunctionCall(FunctionCallHook hook) {
@@ -241,7 +396,7 @@ public final class AxGen implements AxProgram {
       String name = updates.containsKey(programId + "::fn:" + tool.name + ":name") ? String.valueOf(updates.get(programId + "::fn:" + tool.name + ":name")).trim() : tool.name;
       if (!name.matches("^[a-z][a-z0-9_]{0,31}$")) throw new RuntimeException("invalid optimized function name: " + name);
       for (Tool other : functions) if (other != tool && other.name.equals(name)) throw new RuntimeException("duplicate optimized function name: " + name);
-      if (!desc.equals(tool.description) || !name.equals(tool.name)) functions.set(i, new Tool(name, desc, tool.args, tool.returns, tool.handler));
+      if (!desc.equals(tool.description) || !name.equals(tool.name)) functions.set(i, new Tool(name, desc, tool.args, tool.returns, tool.handler,tool.execution,tool.contextHandler));
     }
     return this;
   }
@@ -257,6 +412,7 @@ public final class AxGen implements AxProgram {
 
   public Map<String, Object> evaluateOptimization(AiClient client, Object dataset, Map<String, Object> candidateMap, Map<String, Object> options) {
     Map<String, Object> opts = options == null ? Map.of() : options;
+    if (opts.get("demos") instanceof List<?> demos && !demos.isEmpty()) setDemos(Core.asMapList(demos));
     Map<String, Object> normalized = Core.asMap(Core._normalize_optimization_dataset(dataset == null ? List.of() : dataset));
     List<Object> rows = new ArrayList<>();
     Map<String, Object> original = Core.asMap(Core._optimization_component_current_map(getOptimizableComponents()));
@@ -346,15 +502,25 @@ public final class AxGen implements AxProgram {
     return forward(client, values, forwardOptions, AxRuntimeHooks.fromOptions(forwardOptions));
   }
 
+  public Map<String,Object> forwardWithCancellation(AiClient client,Map<String,Object> values,AxCancellationToken cancellation){return forwardWithCancellation(client,values,Map.of(),cancellation);}
+  public Map<String,Object> forwardWithCancellation(AiClient client,Map<String,Object> values,Map<String,Object> options,AxCancellationToken cancellation){Map<String,Object> resolved=new LinkedHashMap<>(options==null?Map.of():options);resolved.put("cancellation",cancellation);return forward(client,values,resolved);}
+
   public Map<String, Object> forward(AiClient client, Map<String, Object> values, Map<String, Object> forwardOptions, AxRuntimeHooks hooks) {
+    // As in TypeScript, the cache is read before the run's span and metrics,
+    // so a stored output records neither; an error from the read propagates.
+    Map<String, Object> callOptions = AxRuntimeHooks.strip(forwardOptions);
+    Map<String, Object> cached = readCacheFirst(client, values, callOptions, false);
+    // A stored output's audio outputs are rendered, as TypeScript does.
+    if (cached != null) return Core.asMap(Core._render_audio_outputs_impl(this, client, cached, callOptions));
     AxGlobals.Scope scope = AxGlobals.openScope(
         hooks,
         runtimeHooks,
         "ax_gen_forward",
         "ax_gen_generation",
-        Map.of("ax.program.id", programId, "ax.program.type", "AxGen"));
+        Map.of("ax.program.id", programId, "ax.program.type", "AxGen"),
+        AxGlobals.genMetricLabels(client, options, callOptions));
     try {
-      return forwardUnscoped(client, values, AxRuntimeHooks.strip(forwardOptions));
+      return forwardUnscoped(client, values, callOptions);
     } catch (RuntimeException | Error error) {
       scope.fail(error);
       throw error;
@@ -363,10 +529,189 @@ public final class AxGen implements AxProgram {
     }
   }
 
+  // The forward's cache read (Core._cache_lookup_impl), made before the run
+  // opens its span and metrics. It returns the stored output on a hit;
+  // after a miss it adds the lookup to callOptions as _ax_cache_lookup, so
+  // the forward only stores, and returns null. Options that already carry a
+  // lookup (an enclosing forward made it) are left as they are, and without
+  // a caching function the options stay unchanged.
+  private Map<String, Object> readCacheFirst(AiClient client, Map<String, Object> values, Map<String, Object> callOptions, boolean ignoreReadErrors) {
+    if (callOptions.containsKey(CACHE_LOOKUP)) return null;
+    callOptions.put("_evidence_cache_identity", System.identityHashCode(client));
+    Map<String, Object> lookup = Core.asMap(Core._cache_lookup_impl(this, values, callOptions, ignoreReadErrors));
+    if (lookup.get("fn") == null) return null;
+    if (Core.truthy(lookup.get("hit"))) return Core.asMap(lookup.get("value"));
+    callOptions.put(CACHE_LOOKUP, lookup);
+    return null;
+  }
+
+  // Call options holding only the cache lookup, for a call-scoped generator.
+  private static Map<String, Object> cacheLookupOnly(Map<String, Object> options) {
+    Map<String, Object> out = new LinkedHashMap<>();
+    if (options != null && options.containsKey(CACHE_LOOKUP)) out.put(CACHE_LOOKUP, options.get(CACHE_LOOKUP));
+    return out;
+  }
+
+  private static final String CACHE_LOOKUP = "_ax_cache_lookup";
+
+  /** Streams a forward with no options; see {@link #streamingForward(AiClient, Map, Map, AxCancellationToken)}. */
+  public AxGenDeltaStream streamingForward(AiClient client, Map<String, Object> values) {
+    return streamingForward(client, values, Map.of(), null);
+  }
+
+  /** Streams a forward; see {@link #streamingForward(AiClient, Map, Map, AxCancellationToken)}. */
+  public AxGenDeltaStream streamingForward(AiClient client, Map<String, Object> values, Map<String, Object> options) {
+    return streamingForward(client, values, options, null);
+  }
+
+  /**
+   * Runs the forward and returns TypeScript's streamed updates as the model streams (see {@link
+   * AxGenDelta}): merge each index's deltas (strings and lists append, other values replace) and
+   * discard what you merged when the version changes. Retries, steps, tools, assertions and field
+   * processors work as in {@link #forward}. The forward runs on a worker thread that starts when
+   * iteration starts and waits while the caller handles each delta. Use try-with-resources: closing
+   * the stream stops the run; cancelling {@code cancellation} (or an {@code AxCancellationToken}
+   * under the {@code cancellation} option) aborts it, and the iterator then throws the {@link
+   * AxAIServiceAbortedError}. A forward error is rethrown from the iterator as the forward raised it.
+   * With a run {@code control} option the run reports started, then completed or failed, and applies
+   * the control's updates at each request, as {@link #forward} does; a stream closed early ends the
+   * run with an aborted event rather than failed.
+   */
+  public AxGenDeltaStream streamingForward(AiClient client, Map<String, Object> values, Map<String, Object> options, AxCancellationToken cancellation) {
+    Map<String, Object> runOptions = new LinkedHashMap<>(options == null ? Map.of() : options);
+    AxCancellationToken parent = cancellation;
+    for (String key : List.of("cancellation", "cancellationToken", "cancellation_token")) {
+      Object token = runOptions.remove(key);
+      if (parent == null && token instanceof AxCancellationToken given) parent = given;
+    }
+    // A token among the constructor options applies too, as it does in forward().
+    for (String key : List.of("cancellation", "cancellationToken", "cancellation_token")) {
+      if (parent == null && this.options.get(key) instanceof AxCancellationToken given) parent = given;
+    }
+    AxGenDeltaStream.StopToken stop = new AxGenDeltaStream.StopToken();
+    runOptions.put("cancellation", stop);
+    Map<String, Object> input = values == null ? new LinkedHashMap<>() : new LinkedHashMap<>(values);
+    return new AxGenDeltaStream(sink -> streamingForwardWith(client, input, runOptions, sink), stop, parent);
+  }
+
+  // Runs the TypeScript streaming forward on the calling thread, handing each
+  // {version, index, delta} envelope to sink as the provider stream arrives,
+  // and returns the merged output of the picked sample. A sink that throws
+  // (e.g. AxAIServiceAbortedError) stops the run. streamingForward() runs it
+  // on a worker thread.
+  Map<String, Object> streamingForwardWith(AiClient client, Map<String, Object> values, Map<String, Object> forwardOptions, java.util.function.Consumer<Map<String, Object>> sink) {
+    Map<String, Object> input = values == null ? new LinkedHashMap<>() : values;
+    // As in TypeScript, the cache is read before the run's span and metrics,
+    // an error from the read is ignored, and a stored output arrives as one
+    // delta without a run.
+    Map<String, Object> callOptions = AxRuntimeHooks.strip(forwardOptions);
+    Map<String, Object> stored = readCacheFirst(client, input, callOptions, true);
+    if (stored != null) {
+      // A stored output's audio outputs are rendered, as TypeScript does.
+      Map<String, Object> cached = Core.asMap(Core._render_audio_outputs_impl(this, client, stored, callOptions));
+      Map<String, Object> envelope = new LinkedHashMap<>();
+      envelope.put("version", 0);
+      envelope.put("index", 0);
+      envelope.put("delta", cached);
+      sink.accept(envelope);
+      return cached;
+    }
+    Map<String, Object> attributes = new LinkedHashMap<>();
+    attributes.put("ax.program.id", programId);
+    attributes.put("ax.program.type", "AxGen");
+    attributes.put("ax.streaming", true);
+    AxGlobals.Scope scope = AxGlobals.openScope(AxRuntimeHooks.fromOptions(forwardOptions), runtimeHooks, "ax_gen_forward", "ax_gen_generation", attributes, AxGlobals.genMetricLabels(client, options, callOptions));
+    try {
+      java.util.function.Consumer<Object> emit = envelope -> sink.accept(Core.asMap(envelope));
+      return streamingForwardUnscoped(client, input, callOptions, emit);
+    } catch (RuntimeException | Error error) {
+      scope.fail(error);
+      throw error;
+    } finally {
+      scope.close();
+    }
+  }
+
+  private Map<String, Object> streamingForwardUnscoped(AiClient client, Map<String, Object> values, Map<String, Object> options, java.util.function.Consumer<Object> emit) {
+    if (!(client instanceof SessionRun)) {
+      Map<String, Object> runOptions = new LinkedHashMap<>(this.options);
+      runOptions.putAll(options);
+      boolean controlled = runOptions.get("control") instanceof AxRunControl;
+      boolean sessionMode = Core.truthy(Core.chat_session_mode_enabled(runOptions));
+      AxChatSession.Provider opener = null;
+      if (client instanceof AxChatSession.Provider provider && sessionMode && Core.truthy(Core.get(Core.aiClientFeatures(client, runOptions.get("model")), "asyncTools", false))) opener = provider;
+      boolean sessionCapable = opener != null || (client instanceof ChatRunSelector && sessionMode);
+      // As in forward(), run controls apply at each request boundary, and a
+      // session-capable client pins the run: each request streams its own
+      // native session's items.
+      if (controlled || (sessionCapable && functions.stream().anyMatch(tool -> "background".equals(tool.execution)))) {
+        SessionRun run = new SessionRun(this, client, opener, runOptions);
+        Map<String, Object> runCallOptions = options;
+        if (sessionCapable) {
+          runCallOptions = new LinkedHashMap<>(options);
+          runCallOptions.put("infraRetries", 0);
+        }
+        try {
+          Map<String, Object> output = streamingForwardUnscoped(run, values, runCallOptions, emit);
+          run.finish(null);
+          return output;
+        } catch (RuntimeException | Error error) {
+          // A run the streamingForward() consumer stopped early ends with an
+          // aborted event rather than failed.
+          run.finish(error, runOptions.get("cancellation") instanceof AxGenDeltaStream.StopToken stop && stop.consumerStopped());
+          throw error;
+        }
+      }
+    }
+    AxExecutionContext callContext = AxExecutionContext.resolve(options, executionContext);
+    if (callContext == executionContext) return Core.asMap(Core._streaming_forward_impl(this, client, values, options, emit));
+    AxGen call = callScoped(callContext, options);
+    try {
+      return Core.asMap(Core._streaming_forward_impl(call, client, values, cacheLookupOnly(options), emit));
+    } finally {
+      chatLog.addAll(call.chatLog);
+      functionCallTraces.addAll(call.functionCallTraces);
+      traces.addAll(call.traces);
+    }
+  }
+
+  // A generator for one call with its own execution context (MCP/UCP tools),
+  // keeping this generator's assertions, processors, examples and memory.
+  private AxGen callScoped(AxExecutionContext callContext, Map<String, Object> forwardOptions) {
+    Map<String, Object> callOptions = new LinkedHashMap<>(options);
+    callOptions.putAll(forwardOptions);
+    callOptions.remove(CACHE_LOOKUP);
+    callOptions.put("functions", baseFunctions);
+    if (callContext == null) {
+      callOptions.remove("mcp");
+      callOptions.remove("ucp");
+      callOptions.remove("executionContext");
+    } else callOptions.put("executionContext", callContext);
+    callOptions.put("memory", memory);
+    AxGen call = new AxGen(signature, callOptions, runtimeHooks);
+    call.setExamples(examples);
+    call.setDemos(demos);
+    call.assertions.clear();
+    call.assertions.addAll(assertions);
+    call.streamingAssertions.clear();
+    call.streamingAssertions.addAll(streamingAssertions);
+    call.fieldProcessors.clear();
+    call.fieldProcessors.addAll(fieldProcessors);
+    call.feedbackProcessors.clear();
+    call.feedbackProcessors.addAll(feedbackProcessors);
+    call.streamingFieldProcessors.clear();
+    call.streamingFieldProcessors.addAll(streamingFieldProcessors);
+    call.setStopFunctions(stopFunctions);
+    return call;
+  }
+
   private Map<String, Object> forwardUnscoped(AiClient client, Map<String, Object> values, Map<String, Object> forwardOptions) {
+    Map<String,Object> runOptions=new LinkedHashMap<>(options);
+    if(forwardOptions!=null) runOptions.putAll(forwardOptions);
     AxExecutionContext callContext = AxExecutionContext.resolve(forwardOptions, executionContext);
     if (callContext != executionContext) {
-      Map<String, Object> callOptions = new LinkedHashMap<>(options);
+      Map<String, Object> callOptions = new LinkedHashMap<>(runOptions);
+      callOptions.remove(CACHE_LOOKUP);
       callOptions.put("functions", baseFunctions);
       if (callContext == null) {
         callOptions.remove("mcp");
@@ -374,11 +719,25 @@ public final class AxGen implements AxProgram {
         callOptions.remove("executionContext");
       } else callOptions.put("executionContext", callContext);
       AxGen call = new AxGen(signature, callOptions);
-      Map<String, Object> result = call.forward(client, values, Map.of());
+      // The call-scoped forward keeps this forward's cache read.
+      Map<String, Object> result = call.forward(client, values, cacheLookupOnly(forwardOptions));
       chatLog.addAll(call.chatLog);
       functionCallTraces.addAll(call.functionCallTraces);
       traces.addAll(call.traces);
       return result;
+    }
+    if(!(client instanceof SessionRun)) {
+      boolean controlled=runOptions.get("control") instanceof AxRunControl;
+      AxChatSession.Provider opener=null;
+      if(client instanceof AxChatSession.Provider provider && Core.truthy(Core.chat_session_mode_enabled(runOptions))) {
+        if(Core.truthy(Core.get(Core.aiClientFeatures(client,runOptions.get("model")),"asyncTools",false)))opener=provider;
+      }
+      if(controlled || ((opener!=null || (client instanceof ChatRunSelector && Core.truthy(Core.chat_session_mode_enabled(runOptions)))) && functions.stream().anyMatch(tool->"background".equals(tool.execution)))) {
+        SessionRun session=new SessionRun(this,client,opener,runOptions);
+        if(opener!=null || client instanceof ChatRunSelector)runOptions.put("infraRetries",0);
+        try {var output=forwardUnscoped(session,values,runOptions);session.finish(null);return output;}
+        catch(RuntimeException|Error error){session.finish(error);throw error;}
+      }
     }
     return Core.asMap(Core._forward_impl(this, client, values, forwardOptions == null ? java.util.Map.of() : forwardOptions));
   }
@@ -386,6 +745,6 @@ public final class AxGen implements AxProgram {
   Map<String, Object> request(List<Map<String, Object>> messages, Map<String, Object> opts) {
     Map<String, Object> requestOptions = opts == null ? java.util.Map.of() : opts;
     Map<String, Object> selection = Core.asMap(Core._select_structured_output_rung(signature, java.util.Map.of(), requestOptions));
-    return Core.asMap(Core._build_gen_chat_request(this, messages, requestOptions, selection));
+    return Core.asMap(Core._build_gen_chat_request(this, messages, requestOptions, selection, 0));
   }
 }

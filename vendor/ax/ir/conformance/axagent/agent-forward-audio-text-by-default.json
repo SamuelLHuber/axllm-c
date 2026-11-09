@@ -1,0 +1,42 @@
+{
+  "expected_output": {
+    "speech": "Hello there"
+  },
+  "expected_request_count": 2,
+  "expected_speak_requests": [],
+  "input": {
+    "question": "Say hi"
+  },
+  "kind": "agent_forward",
+  "name": "agent-forward-audio-text-by-default",
+  "options": {
+    "runtime": {
+      "language": "JavaScript"
+    },
+    "renderAudio": false
+  },
+  "responses": [
+    {
+      "content": "Javascript Code: respond(\"direct\", {\"source\":\"forward-skill\"})"
+    },
+    {
+      "content": "Speech: Hello there"
+    }
+  ],
+  "runtime_script": [
+    {
+      "expected_code": "respond(\"direct\", {\"source\":\"forward-skill\"})",
+      "result": {
+        "args": [
+          "direct",
+          {
+            "source": "forward-skill"
+          }
+        ],
+        "type": "respond"
+      }
+    }
+  ],
+  "signature": "question:string -> speech:audio",
+  "speak_responses": []
+}

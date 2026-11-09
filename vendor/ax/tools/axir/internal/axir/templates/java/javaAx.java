@@ -1,6 +1,13 @@
 package dev.axllm.ax;
 
 public final class Ax {
+  /** Novel token overlap after history and stopword exclusion. */
+  public static double novelF1Score(String history, String prediction, String groundTruth) { return novelF1Score(history, prediction, groundTruth, false); }
+  public static double novelF1Score(String history, String prediction, String groundTruth, boolean returnRecall) { return Core.asDouble(Core.eval_novel_f1(history, prediction, groundTruth, returnRecall)); }
+
+  public static AxAIOpenAIDecisionsClient openaiDecisions(java.util.Map<String,Object> options) { return new AxAIOpenAIDecisionsClient(options); }
+  public static AxAITypesafeClient typesafe(java.util.Map<String, Object> options) { return new AxAITypesafeClient(options); }
+  public static AxRunControl runControl() { return new AxRunControl(); }
   public static AxSignature s(String signature) {
     return AxSignature.create(signature);
   }
@@ -70,6 +77,16 @@ public final class Ax {
     java.util.Map<String, Object> descriptor = Core.asMap(Core.provider_descriptor(canonical));
     String transport = String.valueOf(descriptor.get("transport"));
     java.util.Map<String, Object> resolvedOptions = options == null ? java.util.Map.of() : options;
+    // A profile without a base URL of its own needs the caller's (TS
+    // resolveProfileURL); the generic client also takes OPENAI_BASE_URL.
+    java.util.Map<String, Object> urlOptions = new java.util.LinkedHashMap<>(Core.asMap(resolvedOptions.get("options")));
+    urlOptions.putAll(resolvedOptions);
+    String envBaseUrl = Core.env("OPENAI_BASE_URL");
+    if (canonical.equals("openai-compatible") && envBaseUrl != null && !envBaseUrl.isBlank()
+        && !Core.truthy(urlOptions.get("base_url")) && !Core.truthy(urlOptions.get("baseUrl")) && !Core.truthy(urlOptions.get("apiURL"))) {
+      urlOptions.put("base_url", envBaseUrl);
+    }
+    Core.provider_require_api_url(canonical, urlOptions);
     if (transport.equals("openai-responses")) {
       return new OpenAIResponsesClient(canonical, resolvedOptions);
     }
@@ -79,7 +96,7 @@ public final class Ax {
     if (transport.equals("anthropic-messages")) {
       return new AnthropicClient(canonical, resolvedOptions);
     }
-    if (transport.equals("openai-chat")) {
+    if (transport.equals("openai-chat") || transport.equals("typesafe-system-one") || transport.equals("openai-decisions")) {
       return new OpenAICompatibleClient(
         canonical,
         canonical,
@@ -121,8 +138,21 @@ public final class Ax {
     AiClient teacherClient = teacher instanceof AiClient aiClient ? aiClient : studentClient;
     java.util.List<java.util.Map<String, Object>> data = examples == null ? java.util.List.of() : examples;
     Object bootstrapSetting = opts.containsKey("bootstrap") ? opts.get("bootstrap") : Boolean.valueOf(data.size() <= 8);
+    java.util.Map<String, Object> gepaOptions = new java.util.LinkedHashMap<>(opts);
+    Object validation = option(opts, "validationExamples", "validation_examples");
+    int validationCount = validation instanceof java.util.List<?> list && !list.isEmpty() ? list.size() : data.size();
+    gepaOptions.put("maxMetricCalls", Core._gepa_helper_metric_budget(opts, validationCount, !Boolean.FALSE.equals(bootstrapSetting)));
+    gepaOptions.put("bootstrap", false);
+    gepaOptions.put("client", studentClient);
+    gepaOptions.put("apply", false);
     Object demos = java.util.List.of();
+    int bootstrapCalls = 0;
     if (!Boolean.FALSE.equals(bootstrapSetting)) {
+      java.util.Map<String, Object> baselineOptions = new java.util.LinkedHashMap<>(gepaOptions);
+      baselineOptions.put("numTrials", 0);
+      AxGEPA baseline = new AxGEPA(teacherClient, baselineOptions);
+      optimizeWith(program, baseline, data, baselineOptions);
+      gepaOptions.put("_baselineEvaluation", baseline.baselineEvaluation);
       java.util.Map<String, Object> bootstrapOptions = new java.util.LinkedHashMap<>(opts);
       if (bootstrapSetting instanceof java.util.Map<?, ?> map) bootstrapOptions.putAll(Core.asMap(map));
       bootstrapOptions.put("client", teacherClient);
@@ -130,13 +160,12 @@ public final class Ax {
       AxBootstrapFewShot bootstrap = new AxBootstrapFewShot(bootstrapOptions);
       java.util.Map<String, Object> bootstrapArtifact = optimizeWith(program, bootstrap, data, bootstrapOptions);
       demos = bootstrapArtifact.getOrDefault("demos", java.util.List.of());
+      if (Core.asList(demos).isEmpty()) throw new RuntimeException("No demonstrations found. Either provide more examples or improve the existing ones.");
+      bootstrapCalls = ((Number) Core.asMap(bootstrapArtifact.getOrDefault("metadata", java.util.Map.of())).getOrDefault("totalMetricCalls", 0)).intValue();
       applyDemos(program, demos);
     }
-    java.util.Map<String, Object> gepaOptions = new java.util.LinkedHashMap<>(opts);
-    gepaOptions.put("bootstrap", false);
-    gepaOptions.put("maxMetricCalls", ((Number) opts.getOrDefault("maxMetricCalls", opts.getOrDefault("max_metric_calls", 100))).intValue());
-    gepaOptions.put("client", studentClient);
-    gepaOptions.put("apply", false);
+    gepaOptions.put("_bootstrapDemos", demos);
+    gepaOptions.put("_bootstrapMetricCalls", bootstrapCalls);
     AxGEPA gepa = new AxGEPA(teacherClient, gepaOptions);
     java.util.Map<String, Object> artifact = optimizeWith(program, gepa, data, gepaOptions);
     if (demos instanceof java.util.List<?> list && !list.isEmpty()) artifact.put("demos", demos);

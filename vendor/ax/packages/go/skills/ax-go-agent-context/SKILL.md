@@ -1,7 +1,7 @@
 ---
 name: "ax-go-agent-context"
 description: "Use when writing Go code with `github.com/ax-llm/ax/packages/go` for deciding between context maps, trajectory context policy, offline optimization (ACE/GEPA), and memory recall for long-context agents."
-version: "24.0.15"
+version: "25.4.9"
 ---
 # AxAgent Context Selection For Go
 
@@ -33,7 +33,7 @@ out := helper.Forward(llm, map[string]ax.Value{"question": "How should I proceed
 
 ## Relevant API Surface
 
-- Agents And RLM: `axllm.NewAgent`, `axllm.AxAgent`
+- Agents And RLM: `axllm.NewAgent`, `axllm.AxAgent`, `AxAgent.AddChildAgent`, `AxAgent.StreamingForward`
 - Runtime Profiles: `axllm.ProcessCodeRuntime`, `axllm.RuntimeCapabilities`, `axllm.RuntimeEnvelope`, `javascript-goja`
 - Optimizers: `axllm.Optimize`, `axllm.Playbook`, `axllm.AxPlaybook`, `axllm.AxBootstrapFewShot`, `axllm.AxGEPA`, `axllm.OptimizerEngine`, `axllm.OptimizerEvaluator`
 

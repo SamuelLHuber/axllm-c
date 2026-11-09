@@ -7,6 +7,9 @@ import _ "embed"
 
 // templates/cpp
 
+//go:embed templates/cpp/cppCancellationNoKey.cpp
+var cppCancellationNoKeyExample string
+
 //go:embed templates/cpp/cppAdaptiveBalancerNoKey.cpp
 var cppAdaptiveBalancerNoKeyExample string
 
@@ -31,7 +34,16 @@ var cppHeader string
 //go:embed templates/cpp/cppRuntime.cpp
 var cppRuntime string
 
+//go:embed templates/cpp/cppSession.inc
+var cppSession string
+
+//go:embed templates/cpp/cppAstraSessionNoKey.cpp
+var cppAstraSessionNoKeyExample string
+
 // templates/go
+
+//go:embed templates/go/goCancellationNoKeyExample.go.txt
+var goCancellationNoKeyExample string
 
 //go:embed templates/go/goAdaptiveBalancerNoKey.go.txt
 var goAdaptiveBalancerNoKeyExample string
@@ -54,6 +66,12 @@ var goAudioHTTPRoundtripExample string
 //go:embed templates/go/goStreamHTTPRoundtripExample.go.txt
 var goStreamHTTPRoundtripExample string
 
+//go:embed templates/go/goTimeoutHTTPRoundtripExample.go.txt
+var goTimeoutHTTPRoundtripExample string
+
+//go:embed templates/go/goTransportErrorsHTTPRoundtripExample.go.txt
+var goTransportErrorsHTTPRoundtripExample string
+
 //go:embed templates/go/goAxFlowOpenAIExample.go.txt
 var goAxFlowOpenAIExample string
 
@@ -75,6 +93,9 @@ var goConformance string
 //go:embed templates/go/goErrorBoundaryTest.go.txt
 var goErrorBoundaryTest string
 
+//go:embed templates/go/goOrderedValuesTest.go.txt
+var goOrderedValuesTest string
+
 //go:embed templates/go/goMod.mod
 var goMod string
 
@@ -95,6 +116,15 @@ var goRealtimeAudioTurnExample string
 
 //go:embed templates/go/goRuntime.go.txt
 var goRuntime string
+
+//go:embed templates/go/goSession.go.txt
+var goSession string
+
+//go:embed templates/go/goSessionTest.go.txt
+var goSessionTest string
+
+//go:embed templates/rust/rustSession.rs
+var rustSession string
 
 //go:embed templates/go/goRuntimeAdapterExample.go.txt
 var goRuntimeAdapterExample string
@@ -121,6 +151,9 @@ var goJavaScriptGojaProfileExample string
 
 // templates/java
 
+//go:embed templates/java/javaCancellationNoKey.java
+var javaCancellationNoKeyExample string
+
 //go:embed templates/java/javaAdaptiveBalancerNoKey.java
 var javaAdaptiveBalancerNoKeyExample string
 
@@ -144,6 +177,12 @@ var javaAxChatStream string
 
 //go:embed templates/java/javaAxAIServiceError.java
 var javaAxAIServiceError string
+
+//go:embed templates/java/javaAxAIServiceAbortedError.java
+var javaAxAIServiceAbortedError string
+
+//go:embed templates/java/javaAxCancellationToken.java
+var javaAxCancellationToken string
 
 //go:embed templates/java/javaAxGlobals.java
 var javaAxGlobals string
@@ -259,6 +298,42 @@ var javaAxPlaybook string
 //go:embed templates/java/javaAxGen.java
 var javaAxGen string
 
+//go:embed templates/java/javaAxGenDelta.java
+var javaAxGenDelta string
+
+//go:embed templates/java/javaAxGenDeltaStream.java
+var javaAxGenDeltaStream string
+
+//go:embed templates/java/javaAxFieldProcessor.java
+var javaAxFieldProcessor string
+
+//go:embed templates/java/javaAxFieldProcessorContext.java
+var javaAxFieldProcessorContext string
+
+//go:embed templates/java/javaAxFieldProcessorMode.java
+var javaAxFieldProcessorMode string
+
+//go:embed templates/java/javaAxStreamingAssertion.java
+var javaAxStreamingAssertion string
+
+//go:embed templates/java/javaAxCachingFunction.java
+var javaAxCachingFunction string
+
+//go:embed templates/java/javaAxRunControl.java
+var javaAxRunControl string
+
+//go:embed templates/java/javaAxChatSession.java
+var javaAxChatSession string
+
+//go:embed templates/java/javaResponsesChatSession.java
+var javaResponsesChatSession string
+
+//go:embed templates/java/javaSessionRun.java
+var javaSessionRun string
+
+//go:embed templates/java/javaAstraSessionNoKeyExample.java
+var javaAstraSessionNoKeyExample string
+
 //go:embed templates/java/javaAxMemory.java
 var javaAxMemory string
 
@@ -353,6 +428,9 @@ var javaAxEventSink string
 
 //go:embed templates/mcp/javaAxEventClock.java
 var javaAxEventClock string
+
+//go:embed templates/mcp/javaAxEventCancellationToken.java
+var javaAxEventCancellationToken string
 
 //go:embed templates/mcp/javaAxEventStore.java
 var javaAxEventStore string
@@ -464,6 +542,9 @@ var pyodideRuntimeHelper string
 var pyodideRuntimePolicyJSON string
 
 // templates/python
+
+//go:embed templates/python/pyCancellationNoKey.py
+var pyCancellationNoKeyExample string
 
 //go:embed templates/python/pyAdaptiveBalancerNoKey.py
 var pyAdaptiveBalancerNoKeyExample string
@@ -591,6 +672,12 @@ var rustAudioHTTPRoundtripExample string
 //go:embed templates/rust/rustStreamHTTPRoundtripExample.rs
 var rustStreamHTTPRoundtripExample string
 
+//go:embed templates/rust/rustTimeoutHTTPRoundtripExample.rs
+var rustTimeoutHTTPRoundtripExample string
+
+//go:embed templates/rust/rustTransportErrorsHTTPRoundtripExample.rs
+var rustTransportErrorsHTTPRoundtripExample string
+
 //go:embed templates/rust/rustAxFlowOpenAIExample.rs
 var rustAxFlowOpenAIExample string
 
@@ -606,11 +693,17 @@ var rustAxGenOpenAIExample string
 //go:embed templates/rust/rustAxGenScriptedClientToolExample.rs
 var rustAxGenScriptedClientToolExample string
 
+//go:embed templates/rust/rustAxGenStreamingNoKeyExample.rs
+var rustAxGenStreamingNoKeyExample string
+
 //go:embed templates/rust/rustCargoToml.toml
 var rustCargoToml string
 
 //go:embed templates/rust/rustConformanceMain.rs
 var rustConformanceMain string
+
+//go:embed templates/rust/rustCancellationNoKeyExample.rs
+var rustCancellationNoKeyExample string
 
 //go:embed templates/rust/rustGEPALocalOptimizerExample.rs
 var rustGEPALocalOptimizerExample string
@@ -658,3 +751,39 @@ var rustQuickJSRuntime string
 
 //go:embed templates/rust_quickjs/rustRuntimeProfilesReadme.md
 var rustRuntimeProfilesReadme string
+
+//go:embed templates/python/pySession.py
+var pySession string
+
+//go:embed templates/python/pySessionNoKeyExample.py
+var pySessionNoKeyExample string
+
+//go:embed templates/runtime/hostNamespaces.js
+var runtimeHostNamespaces string
+
+//go:embed templates/runtime/runtimeSupport.js
+var runtimeSupport string
+
+//go:embed templates/java/javaTypesafe.java
+var javaTypesafe string
+
+//go:embed templates/mcp/javaAxMCPWebSocketTransport.java
+var javaAxMCPWebSocketTransport string
+
+//go:embed templates/python/pyTypesafeMCPTest.py
+var pyTypesafeMCPTest string
+
+//go:embed templates/go/goTypesafeMCPTest.go.txt
+var goTypesafeMCPTest string
+
+//go:embed templates/java/javaTypesafeMCPTest.java
+var javaTypesafeMCPTest string
+
+//go:embed templates/cpp/cppTypesafeMCPTest.cpp
+var cppTypesafeMCPTest string
+
+//go:embed templates/java/javaAxGenerateError.java
+var javaAxGenerateError string
+
+//go:embed templates/java/javaDecisions.java
+var javaDecisions string

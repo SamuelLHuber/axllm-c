@@ -1,7 +1,7 @@
 ---
 name: "ax-go-refine"
 description: "Use when writing Go code with `github.com/ax-llm/ax/packages/go` for reward-scored generation, iterative candidate improvement, evaluator feedback, and optimizer-backed refinement patterns."
-version: "24.0.14"
+version: "25.4.9"
 ---
 # Ax Refinement Patterns For Go
 
@@ -33,7 +33,7 @@ result := engine.Optimize(request, evaluator)
 
 ## Relevant API Surface
 
-- AxGen: `axllm.NewAx`, `axllm.AxGen`
+- AxGen: `axllm.NewAx`, `axllm.NovelF1Score`, `axllm.AxGen`, `axllm.RunControl`, `axllm.AxRunControl`, `axllm.AxCachingFunction`, `axllm.SetCachingFunction`
 - Optimizers: `axllm.Optimize`, `axllm.Playbook`, `axllm.AxPlaybook`, `axllm.AxBootstrapFewShot`, `axllm.AxGEPA`, `axllm.OptimizerEngine`, `axllm.OptimizerEvaluator`
 
 ## Guardrails

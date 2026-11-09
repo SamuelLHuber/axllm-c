@@ -12,6 +12,8 @@ public final class AxGEPA implements OptimizerEngine {
   private final Map<String, Object> defaults;
   private final Map<String, Map<String, Object>> selectorState = new LinkedHashMap<>();
   private int rngState;
+  Map<String, Object> baselineEvaluation = Map.of();
+  private List<Object> activeDemos = List.of();
 
   public AxGEPA() {
     this(null, Map.of());
@@ -245,13 +247,14 @@ public final class AxGEPA implements OptimizerEngine {
 
   private Map<String, Object> eval(OptimizerEvaluator evaluator, Map<String, Object> cfg, List<Object> examples, String phase, int maxCalls, int[] totalCalls, boolean required, boolean captureTraces) {
     if (totalCalls[0] + examples.size() > maxCalls) {
-      if (required) throw new RuntimeException("AxGEPA: options.maxMetricCalls=" + maxCalls + " is too small to evaluate the initial Pareto set; need at least " + examples.size() + " metric calls");
+      if (required) throw new RuntimeException("AxGEPA: options.maxMetricCalls=" + maxCalls + " is too small for " + phase + "; need at least " + (totalCalls[0] + examples.size()) + " metric calls");
       return null;
     }
     Map<String, Object> evalOptions = new LinkedHashMap<>();
     evalOptions.put("dataset", datasetFor(examples));
     evalOptions.put("phase", phase);
     evalOptions.put("captureTraces", captureTraces);
+    if (!activeDemos.isEmpty()) evalOptions.put("demos", activeDemos);
     Map<String, Object> result = Core.asMap(evaluator.evaluate(new LinkedHashMap<>(cfg), evalOptions));
     List<Object> rows = Core.asList(result.getOrDefault("rows", List.of()));
     List<Object> scalars = new ArrayList<>();
@@ -268,11 +271,44 @@ public final class AxGEPA implements OptimizerEngine {
     return out;
   }
 
+  private static Object option(Map<String, Object> opts, String... keys) {
+    for (String key : keys) if (opts.get(key) != null) return opts.get(key);
+    return null;
+  }
+
+  // Teacher notifications go to the options logger (a Consumer of the
+  // notification map), else the student client's logger as JSON text;
+  // verbose:false silences them.
+  @SuppressWarnings("unchecked")
+  private static java.util.function.Consumer<Map<String, Object>> teacherLogger(Map<String, Object> options) {
+    if (Boolean.FALSE.equals(options.get("verbose"))) return null;
+    if (options.get("logger") instanceof java.util.function.Consumer<?> logger) return notification -> ((java.util.function.Consumer<Object>) logger).accept(notification);
+    if (option(options, "studentAI", "student_ai", "student", "client", "ai") instanceof AxAIService student) {
+      java.util.function.Consumer<String> logger = student.getLogger();
+      if (logger != null) return notification -> logger.accept(Json.stringify(notification));
+    }
+    return null;
+  }
+
+  private static void logTeacherFailure(String action, Exception error, Map<String, Object> options) {
+    java.util.function.Consumer<Map<String, Object>> logger = teacherLogger(options);
+    if (logger == null) return;
+    Map<String, Object> notification = new LinkedHashMap<>();
+    notification.put("name", "Notification");
+    notification.put("id", "gepa_teacher");
+    notification.put("value", "GEPA teacher call failed while " + action + ": " + (error.getMessage() == null ? error.toString() : error.getMessage()));
+    logger.accept(notification);
+  }
+
   private String reflect(Map<String, Object> component, String current, List<Object> tuples, List<Object> traceDataset, Map<String, Object> options) {
     if (reflectionClient == null) throw new RuntimeException("AxGEPA requires a reflection_client for reflective trials");
     int attempts = Math.max(1, intOpt(options, "maxReflectionAttempts", 2));
+    Map<String, Object> chatOptions = new LinkedHashMap<>(Core.asMap(option(options, "teacherOptions", "teacher_options")));
+    chatOptions.put("stream", false);
     Object previous = null;
+    Exception lastError = null;
     for (int i = 0; i < attempts; i++) {
+      lastError = null;
       Map<String, Object> payload = new LinkedHashMap<>();
       payload.put("componentKey", component.get("id"));
       payload.put("componentKind", component.get("kind"));
@@ -280,16 +316,25 @@ public final class AxGEPA implements OptimizerEngine {
       payload.put("previousValidationError", previous);
       payload.put("minibatch", tuples);
       payload.put("traceDataset", traceDataset);
+      Map<String, Object> prompt = Map.of("chatPrompt", List.of(Map.of("role", "user", "content", Json.stringify(payload))));
+      Map<String, Object> response;
       try {
-        Map<String, Object> response = reflectionClient.chat(Map.of("chatPrompt", List.of(Map.of("role", "user", "content", Json.stringify(payload)))));
-        String candidate = extractText(response);
-        Object validation = validateValue(component, candidate);
-        if (Boolean.TRUE.equals(validation)) return candidate;
-        previous = validation;
-      } catch (Exception e) {
-        throw new RuntimeException(e);
+        response = reflectionClient instanceof AxAIService service ? service.chat(prompt, new LinkedHashMap<>(chatOptions)) : reflectionClient.chat(prompt);
+      } catch (AxAIServiceAbortedError | java.util.concurrent.CancellationException cancelled) {
+        throw cancelled;
+      } catch (InterruptedException interrupted) {
+        Thread.currentThread().interrupt();
+        throw new RuntimeException(interrupted);
+      } catch (Exception error) {
+        lastError = error;
+        continue;
       }
+      String candidate = extractText(response);
+      Object validation = validateValue(component, candidate);
+      if (Boolean.TRUE.equals(validation)) return candidate;
+      previous = validation;
     }
+    if (lastError != null) logTeacherFailure("proposing a new value for " + component.get("id") + "; keeping the current value", lastError, options);
     return current;
   }
 
@@ -310,13 +355,24 @@ public final class AxGEPA implements OptimizerEngine {
     int minibatchSize = Math.max(1, intOpt(options, "minibatchSize", 20));
     int earlyStop = Math.max(1, intOpt(options, "earlyStoppingTrials", 5));
     double minImprovement = num(options.getOrDefault("minImprovementThreshold", options.get("min_improvement_threshold")), 0);
-    int paretoSize = Math.min(1000, Math.max(1, intOpt(options, "paretoSetSize", Math.max(10, Math.min(200, minibatchSize * 3)))));
+    int paretoSize = ((Number) Core._gepa_pareto_set_size(options)).intValue();
     double tieEps = num(options.getOrDefault("tieEpsilon", options.get("tie_epsilon")), 0);
     Map<String, Object> baseCfg = currentMap(components);
     List<Object> paretoSet = validation.subList(0, Math.min(validation.size(), paretoSize));
     initSelector(components, options.getOrDefault("selectorState", options.get("selector_state")));
     int[] totalCalls = new int[] {0};
-    List<Object> demos = new ArrayList<>();
+    activeDemos = List.of();
+    Map<String, Object> baselineEval;
+    if (options.get("_baselineEvaluation") instanceof Map<?, ?>) {
+      baselineEval = Core.asMap(options.get("_baselineEvaluation"));
+      totalCalls[0] = ((Number) baselineEval.getOrDefault("count", paretoSet.size())).intValue();
+    } else {
+      baselineEval = eval(evaluator, baseCfg, paretoSet, "baseline evaluation", maxCalls, totalCalls, true, false);
+    }
+    baselineEvaluation = new LinkedHashMap<>(baselineEval);
+    Map<String, Object> baselineReport = Core.asMap(Core._gepa_baseline_report(baselineEval, options));
+    int[] bootstrapCalls = new int[] {((Number) options.getOrDefault("_bootstrapMetricCalls", 0)).intValue()};
+    List<Object> demos = new ArrayList<>(Core.asList(options.getOrDefault("_bootstrapDemos", List.of())));
     Object bootstrapRaw = options.get("bootstrap");
     if (Core.truthy(bootstrapRaw)) {
       Map<String, Object> bootstrap = Core.asMap(bootstrapRaw);
@@ -326,19 +382,17 @@ public final class AxGEPA implements OptimizerEngine {
       int bootCalls = 0;
       for (Object example : train) {
         if (bootCalls >= maxBootCalls || demos.size() >= maxDemos) break;
-        Map<String, Object> bootEval = eval(evaluator, baseCfg, List.of(example), "bootstrap", maxCalls, totalCalls, false, false);
+        Map<String, Object> bootEval = eval(evaluator, baseCfg, List.of(example), "bootstrap", maxBootCalls, bootstrapCalls, false, false);
         bootCalls++;
         if (bootEval == null) break;
         List<Object> rows = Core.asList(bootEval.getOrDefault("rows", List.of()));
         if (!rows.isEmpty() && num(Core.asMap(rows.get(0)).get("scalar"), 0) >= threshold) {
-          Map<String, Object> demo = new LinkedHashMap<>();
-          demo.put("programId", "root");
-          demo.put("traces", List.of(Core.asMap(rows.get(0)).getOrDefault("prediction", Core.asMap(rows.get(0)).getOrDefault("input", Map.of()))));
-          demos.add(demo);
+          demos.add(Core._optimization_bootstrap_demo(rows.get(0)));
         }
       }
     }
-    Map<String, Object> baseEval = eval(evaluator, baseCfg, paretoSet, "initial Pareto evaluation", maxCalls, totalCalls, true, false);
+    activeDemos = demos;
+    Map<String, Object> baseEval = demos.isEmpty() ? baselineEval : eval(evaluator, baseCfg, paretoSet, "bootstrapped Pareto evaluation", maxCalls, totalCalls, true, false);
     List<Map<String, Object>> candidates = new ArrayList<>();
     candidates.add(new LinkedHashMap<>(Map.of("cfg", new LinkedHashMap<>(baseCfg), "scores", Core.asMap(baseEval.getOrDefault("avgScores", Map.of("score", baseEval.get("avg")))))));
     List<List<Object>> perInstance = new ArrayList<>();
@@ -419,13 +473,17 @@ public final class AxGEPA implements OptimizerEngine {
     metadata.put("selectorState", new LinkedHashMap<>(selectorState));
     metadata.put("paretoFront", front);
     metadata.put("bestScore", bestScore == Double.NEGATIVE_INFINITY ? 0 : bestScore);
+    metadata.putAll(baselineReport);
     metadata.put("totalMetricCalls", totalCalls[0]);
+    metadata.put("bootstrapMetricCalls", bootstrapCalls[0]);
+    metadata.put("totalCalls", totalCalls[0] + bootstrapCalls[0]);
     metadata.put("candidatesExplored", candidates.size());
     metadata.put("report", Map.of("summary", "GEPA Multi-Objective Optimization Complete", "statistics", Map.of("totalEvaluations", totalCalls[0], "candidatesExplored", candidates.size(), "converged", true), "paretoFrontier", Map.of("solutionCount", front.size())));
     Map<String, Object> artifact = new LinkedHashMap<>();
     artifact.put("artifactVersion", "axir-optimized-artifact-v1");
     artifact.put("optimizerName", "GEPA");
     artifact.put("optimizerVersion", version());
+    artifact.putAll(baselineReport);
     artifact.put("componentMap", new LinkedHashMap<>(bestCfg));
     artifact.put("demos", demos);
     artifact.put("metadata", metadata);

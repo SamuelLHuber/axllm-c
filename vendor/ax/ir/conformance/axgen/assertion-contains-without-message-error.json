@@ -1,0 +1,30 @@
+{
+  "assertions": [
+    {
+      "contains": "good",
+      "field": "answer"
+    }
+  ],
+  "expected_error_contains": "Assertion failed without message",
+  "expected_request_count": 1,
+  "input": {
+    "question": "Assert"
+  },
+  "kind": "forward",
+  "name": "assertion-contains-without-message-error",
+  "responses": [
+    {
+      "content": "{\"answer\":\"bad\"}"
+    },
+    {
+      "content": "{\"answer\":\"still bad\"}"
+    },
+    {
+      "content": "{\"answer\":\"again\"}"
+    },
+    {
+      "content": "{\"answer\":\"once more\"}"
+    }
+  ],
+  "signature": "question:string -> answer:string"
+}

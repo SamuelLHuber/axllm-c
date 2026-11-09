@@ -69,7 +69,17 @@ const missingTypesSig = AxSignature.create(
 type _missingTypesIn = Expect<
   Equal<
     SigIn<typeof missingTypesSig>,
-    { question: string; animalImage: { mimeType: string; data: string } }
+    {
+      question: string;
+      animalImage: {
+        mimeType: string;
+        data: string;
+        details?: 'high' | 'low' | 'auto';
+        cache?: boolean;
+        optimize?: 'quality' | 'size' | 'auto';
+        altText?: string;
+      };
+    }
   >
 >;
 type _missingTypesOut = Expect<
@@ -577,3 +587,38 @@ const responsesConfigMaxEffort: AxAIOpenAIResponsesConfig<
   string
 >['reasoningEffort'] = 'max';
 void responsesConfigMaxEffort;
+
+// === Ax 25 removes ignored provider options ===
+import type { AxAIFeatures } from './ai/base.js';
+import type { AxMockAIServiceConfig } from './ai/mock/api.js';
+import type { AxAIProfileAuthentication } from './ai/provider_profiles.js';
+
+const deprecatedFeatures: AxAIFeatures = {
+  functions: true,
+  streaming: true,
+  media: {
+    images: { supported: false, formats: [] },
+    audio: { supported: false, formats: [] },
+    files: { supported: false, formats: [], uploadMethod: 'none' },
+    urls: { supported: false, webSearch: false, contextFetching: false },
+  },
+  caching: { supported: false, types: [] },
+  thinking: false,
+  multiTurn: true,
+  // @ts-expect-error Removed in Ax 25; select structuredOutputMode on the program.
+  responseFormatWithFunctions: false,
+};
+void deprecatedFeatures;
+
+const deprecatedMockConfig: AxMockAIServiceConfig<string> = {
+  // @ts-expect-error Mock services use the same supported feature surface.
+  features: { functions: true, responseFormatWithFunctions: false },
+};
+void deprecatedMockConfig;
+
+const removedQueryKeyAuthentication: AxAIProfileAuthentication = {
+  // @ts-expect-error Query-key authentication was never implemented.
+  type: 'api-key-query',
+  required: true,
+};
+void removedQueryKeyAuthentication;

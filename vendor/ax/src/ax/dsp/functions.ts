@@ -129,6 +129,28 @@ export class FunctionError extends Error {
   }
 }
 
+/**
+ * A call to a tool name that is not registered. A tool name is model output,
+ * and providers do not hold it to the declared tools, so the call is answered
+ * with an error result like a failed tool, and the rest of its batch still runs.
+ */
+export class UnknownFunctionError extends ValidationError {
+  constructor(name: string, available: readonly string[]) {
+    super(
+      `Function not found: ${name}. Available functions: ${available.join(', ') || '(none)'}. Call one of these exact function names.`
+    );
+    this.name = 'UnknownFunctionError';
+  }
+}
+
+/** The error result a failed call is answered with, or undefined when the failure ends the run. */
+const toolErrorResult = (e: unknown) =>
+  e instanceof FunctionError
+    ? e.getFixingInstructions()
+    : e instanceof UnknownFunctionError
+      ? e.message
+      : undefined;
+
 export type AxChatResponseFunctionCall = {
   id: string;
   name: string;
@@ -173,6 +195,12 @@ export class AxFunctionProcessor {
           traceId: options.traceId,
           ai: options.ai,
           step: options.step,
+          ...(options.control
+            ? {
+                control: options.control,
+                executionPath: `${options.executionPath ?? 'root'}/${fnSpec.name}`,
+              }
+            : {}),
           abortSignal: options.abortSignal,
           eventContext: options.eventContext,
           _mcpExecutionContext: options._mcpExecutionContext,
@@ -223,11 +251,9 @@ export class AxFunctionProcessor {
       fnSpec = this.funcList.find((v) => normalize(v.name) === target);
     }
     if (!fnSpec) {
-      // Recoverable: surface the valid names so the model can self-correct via
-      // the generate retry loop instead of hard-aborting the run.
-      const available = this.funcList.map((v) => v.name).join(', ');
-      throw new ValidationError(
-        `Function not found: ${func.name}. Available functions: ${available || '(none)'}. Call one of these exact function names.`
+      throw new UnknownFunctionError(
+        func.name,
+        this.funcList.map((v) => v.name)
       );
     }
     if (!fnSpec.func) {
@@ -309,7 +335,7 @@ type ProcessFunctionsArgs = {
   ai: Readonly<AxAIService>;
   functionList: Readonly<AxFunction[]>;
   functionCalls: readonly AxChatResponseFunctionCall[];
-  mem: Readonly<AxMemory>;
+  mem: Readonly<Pick<AxMemory, 'addFunctionResults'>>;
   sessionId?: string;
   traceId?: string;
   traceContext?: any;
@@ -328,6 +354,8 @@ type ProcessFunctionsArgs = {
   ) => void | Promise<void>;
   mcpExecutionContext?: import('../mcp/execution.js').AxMCPExecutionContext;
   eventContext?: import('../event/types.js').AxEventContext;
+  control?: import('./runControl.js').AxRunControl;
+  executionPath?: string;
 };
 
 export const processFunctions = async ({
@@ -350,6 +378,8 @@ export const processFunctions = async ({
   onFunctionCall,
   mcpExecutionContext,
   eventContext,
+  control,
+  executionPath,
 }: Readonly<ProcessFunctionsArgs>) => {
   const funcProc = new AxFunctionProcessor(functionList);
   const functionsExecuted = new Set<string>();
@@ -463,6 +493,8 @@ export const processFunctions = async ({
           step,
           abortSignal,
           eventContext,
+          control,
+          executionPath,
           _mcpExecutionContext: mcpExecutionContext,
         })
         .then(
@@ -508,7 +540,8 @@ export const processFunctions = async ({
           }
         )
         .catch((e) => {
-          if (!(e instanceof FunctionError)) {
+          const result = toolErrorResult(e);
+          if (result === undefined) {
             void emitFunctionTrace(startedAt, func, {
               args: parseTraceArgs(func),
               result: e,
@@ -516,7 +549,6 @@ export const processFunctions = async ({
             });
             throw e;
           }
-          const result = e.getFixingInstructions();
           void emitFunctionTrace(startedAt, func, {
             args: parseTraceArgs(func),
             result,
@@ -569,6 +601,8 @@ export const processFunctions = async ({
               step,
               abortSignal,
               eventContext,
+              control,
+              executionPath,
               _mcpExecutionContext: mcpExecutionContext,
             });
 
@@ -608,8 +642,8 @@ export const processFunctions = async ({
           };
         } catch (e) {
           toolSpan?.recordException?.(e as Error);
-          if (e instanceof FunctionError) {
-            const result = e.getFixingInstructions();
+          const result = toolErrorResult(e);
+          if (result !== undefined) {
             await emitFunctionTrace(startedAt, func, {
               args: parseTraceArgs(func),
               result,
@@ -617,7 +651,7 @@ export const processFunctions = async ({
             });
             const errorEventData = {
               name: func.name,
-              error_type: e.name,
+              error_type: (e as Error).name,
             };
             toolSpan?.addEvent?.('function.error', errorEventData);
 
@@ -701,29 +735,22 @@ export function parseFunctionCalls(
 type FunctionCall = AxChatRequest['functionCall'] | undefined;
 
 /**
- * Utility function to parse a list of functions into AxFunction array
+ * Resolves the functions and the function call for one AxGen step.
+ *
+ * A forced call ('required' or a named function) applies to the first step
+ * only. Later steps drop it together with the tools, except those matching
+ * `keepAfterFirstStep`, so the model can produce the final answer.
  */
 export function createFunctionConfig(
   functionList?: AxInputFunctionType,
   definedFunctionCall?: FunctionCall,
   firstStep?: boolean,
-  _options?: Readonly<AxProgramForwardOptions<any>>
+  keepAfterFirstStep?: (fn: Readonly<AxFunction>) => boolean
 ): { functions: AxFunction[]; functionCall: FunctionCall } {
   const functionCall = definedFunctionCall;
 
-  if (
-    !firstStep &&
-    (functionCall === 'required' || typeof functionCall === 'function')
-  ) {
-    return { functions: [], functionCall: undefined };
-  }
-
-  if (!functionList) {
-    return { functions: [], functionCall: functionCall };
-  }
-
   // biome-ignore lint/complexity/useFlatMap: you cannot use flatMap here
-  const functions = functionList
+  const functions = (functionList ?? [])
     .map((f) => {
       if ('toFunction' in f) {
         return f.toFunction();
@@ -731,6 +758,16 @@ export function createFunctionConfig(
       return f;
     })
     .flat();
+
+  if (
+    !firstStep &&
+    (functionCall === 'required' || typeof functionCall === 'object')
+  ) {
+    return {
+      functions: keepAfterFirstStep ? functions.filter(keepAfterFirstStep) : [],
+      functionCall: undefined,
+    };
+  }
 
   return { functions, functionCall };
 }

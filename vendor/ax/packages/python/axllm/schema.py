@@ -4,6 +4,13 @@ import os
 import copy
 import re
 from typing import Any
+from .signature import _js_date_millis, _js_number_text, _js_format
+from .signature import (
+    _box_schema_impl,
+    _box_validate_impl,
+    _evidence_is_type_impl,
+    _signature_describe_field_values_impl,
+)
 
 
 class AxValidationError(ValueError):
@@ -50,6 +57,12 @@ def _core_contains(container, item):
     if container is None:
         return False
     return item in container
+
+
+def _core_string_utf16_units(value):
+    # A string's UTF-16 code units, as TS counts String.prototype.length.
+    raw = str(value).encode("utf-16-le", "surrogatepass")
+    return [raw[index] + 256 * raw[index + 1] for index in range(0, len(raw), 2)]
 
 
 def _core_len(value):
@@ -115,6 +128,10 @@ def _core_type_is(value, type_name):
         return value is None
     if type_name == "json":
         return value is None or isinstance(value, (dict, list, str, int, float, bool))
+    if type_name == "date":
+        # A native date or time value, which a date or datetime field takes
+        # where TypeScript takes a Date.
+        return _js_date_millis(value) is not None
     return False
 
 
@@ -164,7 +181,7 @@ def _core_string_lower(value):
 
 
 def _core_string_format(template, *args):
-    return str(template).format(*args)
+    return _js_format(template, args)
 
 
 def _core_description_append(base, hint):
@@ -187,6 +204,20 @@ def _core_validation_error(message):
 
 
 def _core_field_item(field):
+    if isinstance(field, dict):
+        # A nested object field the IR builds as a map; its type is a
+        # FieldType or a map.
+        item_field = dict(field)
+        field_type = item_field.get("type")
+        if isinstance(field_type, dict):
+            field_type = dict(field_type)
+            field_type.pop("isArray", None)
+            field_type["is_array"] = False
+        elif field_type is not None:
+            field_type = copy.deepcopy(field_type)
+            field_type.is_array = False
+        item_field["type"] = field_type
+        return item_field
     item_field = copy.deepcopy(field)
     item_field.type.is_array = False
     return item_field
@@ -216,6 +247,8 @@ def _nested_field(name, item):
             maximum=item.get("maximum"),
             pattern=item.get("pattern"),
             pattern_description=item.get("patternDescription", item.get("pattern_description")),
+            value_descriptions=item.get("valueDescriptions", item.get("value_descriptions")),
+            evidence=item.get("evidence"),
             format=item.get("format"),
             description=item.get("description"),
         )
@@ -318,7 +351,12 @@ def _validate_fields_impl(fields: list[Any], values: Any, context: str) -> None:
         pass
     for field in fields:
         field_name = _core_get(field, "name", None)
-        field_title = _core_get(field, "title", None)
+        field_title = _core_get(field, "title", field_name)
+        has_title = _core_truthy(field_title)
+        if has_title:
+            pass
+        else:
+            field_title = field_name
         is_optional = _core_get(field, "is_optional", False)
         has_value = _core_map_contains(values, field_name)
         missing = _core_not(has_value)
@@ -328,6 +366,13 @@ def _validate_fields_impl(fields: list[Any], values: Any, context: str) -> None:
         if missing_or_null:
             required_missing = _core_not(is_optional)
             if required_missing:
+                is_input = _core_eq(context, "input")
+                if is_input:
+                    input_message = _core_string_format("Value for input field '{}' is required.", field_name)
+                    input_error = _core_validation_error(input_message)
+                    raise input_error
+                else:
+                    pass
                 message = _core_string_format("Required field is missing: '{}'", field_title)
                 error = _core_validation_error(message)
                 raise error
@@ -383,25 +428,6 @@ def _schema_json_type_impl(type_name: str) -> Any:
     else:
         pass
     return "string"
-
-
-def _validate_output_impl(fields: list[Any], values: Any) -> Any:
-    _core_coverage_mark("_validate_output_impl")
-    normalized = values
-    for field in fields:
-        field_name = _core_get(field, "name", None)
-        field_title = _core_get(field, "title", None)
-        has_name = _core_map_contains(normalized, field_name)
-        missing_name = _core_not(has_name)
-        has_title = _core_map_contains(normalized, field_title)
-        alias_title = _core_and(missing_name, has_title)
-        if alias_title:
-            title_value = _core_get(normalized, field_title, None)
-            normalized[field_name] = title_value
-        else:
-            pass
-    _validate_fields_impl(fields, normalized, "output")
-    return normalized
 
 
 def _schema_enhance_description_impl(base: Any, typ: FieldType) -> Any:
@@ -520,17 +546,37 @@ def _schema_enhance_description_impl(base: Any, typ: FieldType) -> Any:
     return base
 
 
+def _validate_output_impl(fields: list[Any], values: Any) -> Any:
+    _core_coverage_mark("_validate_output_impl")
+    normalized = values
+    for field in fields:
+        field_name = _core_get(field, "name", None)
+        field_title = _core_get(field, "title", None)
+        has_name = _core_map_contains(normalized, field_name)
+        missing_name = _core_not(has_name)
+        has_title = _core_map_contains(normalized, field_title)
+        alias_title = _core_and(missing_name, has_title)
+        if alias_title:
+            title_value = _core_get(normalized, field_title, None)
+            normalized[field_name] = title_value
+        else:
+            pass
+    _validate_fields_impl(fields, normalized, "output")
+    return normalized
+
+
 def _validate_string_constraints_impl(value: str, field: Field) -> None:
     _core_coverage_mark("_validate_string_constraints_impl")
     typ = _core_get(field, "type", None)
     title = _core_get(field, "title", None)
+    units = _core_string_utf16_units(value)
+    length = _core_len(units)
     min_length = _core_get(typ, "min_length", None)
     has_min = _core_is_not_none(min_length)
     if has_min:
-        length = _core_len(value)
         too_short = _core_lt(length, min_length)
         if too_short:
-            message = _core_string_format("Field '{}' failed validation: String must be at least {} characters long.", title, min_length)
+            message = _core_string_format("Field '{}' failed validation: String must be at least {} characters long. You provided: \"{}\" ({} characters).", title, min_length, value, length)
             error = _core_validation_error(message)
             raise error
         else:
@@ -540,10 +586,9 @@ def _validate_string_constraints_impl(value: str, field: Field) -> None:
     max_length = _core_get(typ, "max_length", None)
     has_max = _core_is_not_none(max_length)
     if has_max:
-        length = _core_len(value)
         too_long = _core_gt(length, max_length)
         if too_long:
-            message = _core_string_format("Field '{}' failed validation: String must be at most {} characters long.", title, max_length)
+            message = _core_string_format("Field '{}' failed validation: String must be at most {} characters long. You provided: \"{}\" ({} characters).", title, max_length, value, length)
             error = _core_validation_error(message)
             raise error
         else:
@@ -556,7 +601,7 @@ def _validate_string_constraints_impl(value: str, field: Field) -> None:
         matches = _core_regex_match(pattern, value)
         pattern_failed = _core_not(matches)
         if pattern_failed:
-            message = _core_string_format("Field '{}' failed validation: String must match pattern /{}/.", title, pattern)
+            message = _core_string_format("Field '{}' failed validation: String must match pattern /{}/. You provided: \"{}\".", title, pattern, value)
             error = _core_validation_error(message)
             raise error
         else:
@@ -569,7 +614,7 @@ def _validate_string_constraints_impl(value: str, field: Field) -> None:
         valid_email = _core_regex_match("^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$", value)
         invalid_email = _core_not(valid_email)
         if invalid_email:
-            message = _core_string_format("Field '{}' failed validation: String must be a valid email address.", title)
+            message = _core_string_format("Field '{}' failed validation: String must be a valid email address. You provided: \"{}\".", title, value)
             error = _core_validation_error(message)
             raise error
         else:
@@ -584,7 +629,7 @@ def _validate_string_constraints_impl(value: str, field: Field) -> None:
         valid_url = _core_url_valid(value)
         invalid_url = _core_not(valid_url)
         if invalid_url:
-            message = _core_string_format("Invalid URL for '{}': Invalid URL format.", title)
+            message = _core_string_format("Field '{}' failed validation: String must be a valid URL. You provided: \"{}\".", title, value)
             error = _core_validation_error(message)
             raise error
         else:
@@ -603,7 +648,7 @@ def _validate_number_constraints_impl(value: float, field: Field) -> None:
     if has_minimum:
         too_small = _core_lt(value, minimum)
         if too_small:
-            message = _core_string_format("Field '{}' failed validation: Number must be at least {}.", title, minimum)
+            message = _core_string_format("Field '{}' failed validation: Number must be at least {}. You provided: {}.", title, minimum, value)
             error = _core_validation_error(message)
             raise error
         else:
@@ -615,7 +660,7 @@ def _validate_number_constraints_impl(value: float, field: Field) -> None:
     if has_maximum:
         too_large = _core_gt(value, maximum)
         if too_large:
-            message = _core_string_format("Field '{}' failed validation: Number must be at most {}.", title, maximum)
+            message = _core_string_format("Field '{}' failed validation: Number must be at most {}. You provided: {}.", title, maximum, value)
             error = _core_validation_error(message)
             raise error
         else:
@@ -722,12 +767,40 @@ def _validate_value_impl(field: Field, value: Any, path: str) -> None:
         return None
     else:
         pass
+    box = _core_eq(type_name, "box")
+    if box:
+        evidence = _core_get(typ, "evidence", None)
+        rich = _core_is_not_none(evidence)
+        coordinates = value
+        if rich:
+            policy = _core_get(evidence, "onRefusal", None)
+            return_refusal = _core_eq(policy, "return")
+            status = _core_get(value, "status", None)
+            refused = _core_eq(status, "refused")
+            allow_refusal = _core_and(return_refusal, refused)
+            if allow_refusal:
+                return None
+            else:
+                pass
+            wire = _core_get(value, "box", value)
+            coordinates = _core_get(value, "value", wire)
+        else:
+            pass
+        _box_validate_impl(coordinates, path)
+        return None
+    else:
+        pass
+    decision = _evidence_is_type_impl(typ)
+    if decision:
+        return None
+    else:
+        pass
     is_image = _core_eq(type_name, "image")
     if is_image:
         valid_image = _valid_image(value)
         invalid_image = _core_not(valid_image)
         if invalid_image:
-            message = _core_string_format("Validation failed: Expected '{}' to be type 'object ({{ mimeType: string; data: string }})'", field_name)
+            message = _core_string_format("Validation failed: Expected '{}' to be type '{}'", field_name, "object ({ mimeType: string; data: string })")
             error = _core_validation_error(message)
             raise error
         else:
@@ -740,7 +813,7 @@ def _validate_value_impl(field: Field, value: Any, path: str) -> None:
         valid_audio = _valid_audio(value)
         invalid_audio = _core_not(valid_audio)
         if invalid_audio:
-            message = _core_string_format("Validation failed: Expected '{}' to be type 'string or object ({{ data: string; format?: string }})'", field_name)
+            message = _core_string_format("Validation failed: Expected '{}' to be type '{}'", field_name, "string or object ({ data: string; format?: string })")
             error = _core_validation_error(message)
             raise error
         else:
@@ -753,7 +826,7 @@ def _validate_value_impl(field: Field, value: Any, path: str) -> None:
         valid_file = _valid_file(value)
         invalid_file = _core_not(valid_file)
         if invalid_file:
-            message = _core_string_format("Validation failed: Expected '{}' to be type 'object ({{ mimeType: string; data: string }} | {{ mimeType: string; fileUri: string }})'", field_name)
+            message = _core_string_format("Validation failed: Expected '{}' to be type '{}'", field_name, "object ({ mimeType: string; data: string } | { mimeType: string; fileUri: string })")
             error = _core_validation_error(message)
             raise error
         else:
@@ -766,7 +839,7 @@ def _validate_value_impl(field: Field, value: Any, path: str) -> None:
         valid_url_shape = _valid_url_shape(value)
         invalid_url_shape = _core_not(valid_url_shape)
         if invalid_url_shape:
-            message = _core_string_format("Validation failed: Expected '{}' to be type 'string or object ({{ url: string; title?: string; description?: string }})'", field_name)
+            message = _core_string_format("Validation failed: Expected '{}' to be type '{}'", field_name, "string or object ({ url: string; title?: string; description?: string })")
             error = _core_validation_error(message)
             raise error
         else:
@@ -785,6 +858,32 @@ def _validate_value_impl(field: Field, value: Any, path: str) -> None:
         else:
             pass
         return None
+    else:
+        pass
+    date_types = []
+    date_types.append("date")
+    date_types.append("datetime")
+    is_date_type = _core_contains(date_types, type_name)
+    is_native_date = _core_type_is(value, "date")
+    native_date_value = _core_and(is_date_type, is_native_date)
+    if native_date_value:
+        return None
+    else:
+        pass
+    range_types = []
+    range_types.append("dateRange")
+    range_types.append("datetimeRange")
+    is_range_type = _core_contains(range_types, type_name)
+    is_range_object = _core_type_is(value, "object")
+    range_object = _core_and(is_range_type, is_range_object)
+    if range_object:
+        has_start = _core_map_contains(value, "start")
+        has_end = _core_map_contains(value, "end")
+        has_bounds = _core_and(has_start, has_end)
+        if has_bounds:
+            return None
+        else:
+            pass
     else:
         pass
     string_types = []
@@ -887,7 +986,7 @@ def _validate_value_impl(field: Field, value: Any, path: str) -> None:
         nested_map = _core_get(typ, "fields", None)
         has_nested = _core_truthy(nested_map)
         if has_nested:
-            nested_fields = _core_fields_from_map(nested_map)
+            nested_fields = _validate_keyed_fields_impl(nested_map)
             _validate_fields_impl(nested_fields, value, path)
         else:
             pass
@@ -936,6 +1035,118 @@ def _schema_nullable_optional_impl(schema: Any, field: Field, options: Any) -> A
     return schema
 
 
+def _evidence_schema_impl(typ: FieldType) -> Any:
+    _core_coverage_mark("_evidence_schema_impl")
+    name = _core_get(typ, "name", None)
+    labels = _core_get(typ, "options", None)
+    p = {}
+    p["type"] = "number"
+    p["minimum"] = 0
+    p["maximum"] = 1
+    props = {}
+    is_boolean = _core_eq(name, "boolean")
+    score = _core_eq(name, "score")
+    box = _core_eq(name, "box")
+    required = []
+    if box:
+        coordinates = _box_schema_impl()
+        evidence = _core_get(typ, "evidence", None)
+        plain = _core_is_none(evidence)
+        if plain:
+            array = _core_get(typ, "is_array", False)
+            if array:
+                wrapped = {}
+                wrapped["type"] = "array"
+                wrapped["items"] = coordinates
+                return wrapped
+            else:
+                pass
+            return coordinates
+        else:
+            pass
+        props["box"] = coordinates
+        required.append("box")
+    else:
+        if is_boolean:
+            props["probability"] = p
+            required.append("probability")
+        else:
+            distribution = {}
+            if score:
+                distribution["type"] = "array"
+                distribution["items"] = p
+                count = _core_len(labels)
+                distribution["minItems"] = count
+                distribution["maxItems"] = count
+                order = _core_string_join(", ", labels)
+                hint = _core_string_format("Probabilities in rubric order, lowest to highest: {}", order)
+                distribution["description"] = hint
+            else:
+                distribution["type"] = "object"
+                ps = {}
+                for label in labels:
+                    ps[label] = p
+                distribution["properties"] = ps
+                distribution["required"] = labels
+                distribution["additionalProperties"] = False
+            props["probabilities"] = distribution
+            required.append("probabilities")
+    schema = {}
+    schema["type"] = "object"
+    schema["properties"] = props
+    schema["required"] = required
+    schema["additionalProperties"] = False
+    evidence = _core_get(typ, "evidence", None)
+    policy = _core_get(evidence, "onRefusal", "throw")
+    return_policy = _core_eq(policy, "return")
+    if return_policy:
+        status = {}
+        status["type"] = "string"
+        answered = []
+        answered.append("answered")
+        status["enum"] = answered
+        props["status"] = status
+        required.append("status")
+        schema["required"] = required
+        if box:
+            required = []
+            required.append("status")
+            required.append("box")
+            schema["required"] = required
+        else:
+            pass
+        refused = {}
+        refused["type"] = "object"
+        refusal_props = {}
+        refusal_status = {}
+        refusal_status["type"] = "string"
+        tags = []
+        tags.append("refused")
+        refusal_status["enum"] = tags
+        refusal_props["status"] = refusal_status
+        refused["properties"] = refusal_props
+        keys = []
+        keys.append("status")
+        refused["required"] = keys
+        refused["additionalProperties"] = False
+        alternatives = []
+        alternatives.append(schema)
+        alternatives.append(refused)
+        schema = {}
+        schema["anyOf"] = alternatives
+    else:
+        pass
+    array = _core_get(typ, "is_array", False)
+    if array:
+        wrapped = {}
+        wrapped["type"] = "array"
+        wrapped["items"] = schema
+        schema = wrapped
+    else:
+        pass
+    return schema
+
+
 def _schema_object_from_fields_impl(fields_map: Any, is_nested: bool, options: Any) -> Any:
     _core_coverage_mark("_schema_object_from_fields_impl")
     schema = {}
@@ -967,6 +1178,53 @@ def _schema_field_schema_impl(field: Field, is_nested: bool, options: Any) -> An
     _core_coverage_mark("_schema_field_schema_impl")
     typ = _core_get(field, "type", None)
     type_name = _core_get(typ, "name", None)
+    decision = _evidence_is_type_impl(typ)
+    if decision:
+        box = _core_eq(type_name, "box")
+        array = _core_get(typ, "is_array", False)
+        if box:
+            item_field = _core_field_item(field)
+            typ = _core_get(item_field, "type", None)
+        else:
+            pass
+        schema = _evidence_schema_impl(typ)
+        decision_mode = _core_get(options, "decisionMode", "request")
+        result_mode = _core_eq(decision_mode, "result")
+        if result_mode:
+            schema = _evidence_result_schema_impl(typ)
+        else:
+            pass
+        description = _signature_describe_field_values_impl(field)
+        if box:
+            hint = "Return normalized top, bottom, left and right edges in [0, 1], measured from the image top-left; top < bottom and left < right."
+            if result_mode:
+                hint = ""
+            else:
+                pass
+            has_description = _core_truthy(description)
+            if has_description:
+                has_hint = _core_truthy(hint)
+                if has_hint:
+                    description = _core_string_format("{} {}", description, hint)
+                else:
+                    pass
+            else:
+                description = hint
+        else:
+            pass
+        schema["description"] = description
+        box_array = _core_and(box, array)
+        if box_array:
+            wrapped = {}
+            wrapped["type"] = "array"
+            wrapped["items"] = schema
+            schema = wrapped
+        else:
+            pass
+        nullable = _schema_nullable_optional_impl(schema, field, options)
+        return nullable
+    else:
+        pass
     media_types = []
     media_types.append("image")
     media_types.append("audio")
@@ -980,7 +1238,7 @@ def _schema_field_schema_impl(field: Field, is_nested: bool, options: Any) -> An
     else:
         pass
     schema = {}
-    field_description = _core_get(field, "description", None)
+    field_description = _signature_describe_field_values_impl(field)
     description = _schema_enhance_description_impl(field_description, typ)
     has_description = _core_truthy(description)
     if has_description:
@@ -1084,6 +1342,27 @@ def _schema_field_schema_impl(field: Field, is_nested: bool, options: Any) -> An
     return nullable
 
 
+def _evidence_probability_impl(v: Any, path: str) -> f64:
+    _core_coverage_mark("_evidence_probability_impl")
+    valid = _core_type_is(v, "number")
+    if valid:
+        finite = _core_math_is_finite(v)
+        low = _core_gte(v, 0)
+        high = _core_lte(v, 1)
+        range = _core_and(low, high)
+        valid = _core_and(finite, range)
+    else:
+        pass
+    invalid = _core_not(valid)
+    if invalid:
+        message = _core_string_format("Invalid probability for {}", path)
+        error = _core_validation_error(message)
+        raise error
+    else:
+        pass
+    return v
+
+
 def _strip_internal_fields_impl(fields: list[Any], values: Any) -> Any:
     _core_coverage_mark("_strip_internal_fields_impl")
     public_values = {}
@@ -1099,6 +1378,29 @@ def _strip_internal_fields_impl(fields: list[Any], values: Any) -> Any:
         else:
             pass
     return public_values
+
+
+def _validate_keyed_fields_impl(fields_map: Any) -> list[Any]:
+    _core_coverage_mark("_validate_keyed_fields_impl")
+    out = []
+    nested_fields = _core_fields_from_map(fields_map)
+    for nested in nested_fields:
+        name = _core_get(nested, "name", "")
+        typ = _core_get(nested, "type", None)
+        optional_snake = _core_get(nested, "is_optional", False)
+        optional_value = _core_get(nested, "isOptional", optional_snake)
+        optional = _core_truthy(optional_value)
+        internal_snake = _core_get(nested, "is_internal", False)
+        internal_value = _core_get(nested, "isInternal", internal_snake)
+        internal = _core_truthy(internal_value)
+        field = {}
+        field["name"] = name
+        field["title"] = name
+        field["type"] = typ
+        field["is_optional"] = optional
+        field["is_internal"] = internal
+        out.append(field)
+    return out
 
 
 def _schema_to_json_schema_impl(fields: list[Any], schema_title: str, options: Any) -> dict[str, Any]:
@@ -1127,4 +1429,153 @@ def _schema_to_json_schema_impl(fields: list[Any], schema_title: str, options: A
             pass
     return schema
 
+
+def _evidence_result_schema_impl(typ: FieldType) -> Any:
+    _core_coverage_mark("_evidence_result_schema_impl")
+    name = _core_get(typ, "name", None)
+    levels = _core_get(typ, "options", None)
+    evidence = _core_get(typ, "evidence", None)
+    is_boolean = _core_eq(name, "boolean")
+    score = _core_eq(name, "score")
+    p = {}
+    p["type"] = "number"
+    p["minimum"] = 0
+    p["maximum"] = 1
+    value = {}
+    if is_boolean:
+        value["type"] = "boolean"
+    else:
+        if score:
+            value["type"] = "number"
+            value["minimum"] = 0
+            count = _core_len(levels)
+            maximum = _core_add(count, -1)
+            value["maximum"] = maximum
+        else:
+            value["type"] = "string"
+            value["enum"] = levels
+    box = _core_eq(name, "box")
+    if box:
+        value = _box_schema_impl()
+    else:
+        pass
+    plain = _core_is_none(evidence)
+    plain_value = _core_or(score, box)
+    plain_score = _core_and(plain, plain_value)
+    schema = value
+    rich = _core_not(plain_score)
+    if rich:
+        schema = {}
+        schema["type"] = "object"
+        props = {}
+        props["value"] = value
+        provenance = {}
+        provenance["type"] = "object"
+        provenance_props = {}
+        text = {}
+        text["type"] = "string"
+        source = {}
+        source["type"] = "string"
+        sources = []
+        sources.append("native")
+        sources.append("elicited")
+        source["enum"] = sources
+        provenance_props["source"] = source
+        provenance_props["provider"] = text
+        provenance_props["model"] = text
+        provenance["properties"] = provenance_props
+        provenance_required = []
+        provenance_required.append("source")
+        provenance_required.append("provider")
+        provenance["required"] = provenance_required
+        provenance["additionalProperties"] = False
+        props["provenance"] = provenance
+        not_box = _core_not(box)
+        if not_box:
+            if is_boolean:
+                props["probability"] = p
+                props["threshold"] = p
+            else:
+                ps = {}
+                if score:
+                    ps["type"] = "array"
+                    ps["items"] = p
+                    labels = {}
+                    labels["type"] = "array"
+                    labels["items"] = text
+                    props["levels"] = labels
+                else:
+                    ps["type"] = "object"
+                    probability_props = {}
+                    for label in levels:
+                        probability_props[label] = p
+                    ps["properties"] = probability_props
+                    ps["required"] = levels
+                    ps["additionalProperties"] = False
+                props["probabilities"] = ps
+        else:
+            pass
+        required = _core_map_keys(props)
+        schema["required"] = required
+        schema["properties"] = props
+        schema["additionalProperties"] = False
+        non_boolean = _core_not(is_boolean)
+        if non_boolean:
+            props["confidence"] = p
+        else:
+            pass
+        policy = _core_get(evidence, "onRefusal", "throw")
+        return_policy = _core_eq(policy, "return")
+        if return_policy:
+            status = {}
+            status["type"] = "string"
+            answered = []
+            answered.append("answered")
+            status["enum"] = answered
+            props["status"] = status
+            required.append("status")
+            schema["required"] = required
+            refusal = {}
+            refusal["type"] = "object"
+            refusal_props = {}
+            refusal_status = {}
+            refusal_status["type"] = "string"
+            refused = []
+            refused.append("refused")
+            refusal_status["enum"] = refused
+            refusal_props["status"] = refusal_status
+            refusal_props["provenance"] = provenance
+            refusal["properties"] = refusal_props
+            refusal_required = []
+            refusal_required.append("status")
+            refusal_required.append("provenance")
+            refusal["required"] = refusal_required
+            refusal["additionalProperties"] = False
+            alternatives = []
+            alternatives.append(schema)
+            alternatives.append(refusal)
+            schema = {}
+            schema["anyOf"] = alternatives
+        else:
+            pass
+    else:
+        pass
+    array = _core_get(typ, "is_array", False)
+    if array:
+        wrapped = {}
+        wrapped["type"] = "array"
+        wrapped["items"] = schema
+        schema = wrapped
+    else:
+        pass
+    return schema
+
 # END AXIR CORE EMITTED FUNCTIONS
+
+
+def _core_math_is_finite(value):
+    import math
+    return math.isfinite(value)
+
+
+def _core_add(a, b): return a + b

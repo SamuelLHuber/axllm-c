@@ -5,7 +5,12 @@ import {
   AxAIServiceAuthenticationError,
   AxAIServiceStatusError,
 } from '../../util/apicall.js';
-import { AxBaseAI, axBaseAIDefaultConfig } from '../base.js';
+import {
+  type AxAIFeatures,
+  AxBaseAI,
+  axBaseAIDefaultConfig,
+  warnDroppedSampling,
+} from '../base.js';
 import type {
   AxAICredentialProvider,
   AxAIInputModelList,
@@ -16,6 +21,7 @@ import type {
   AxChatResponseResult,
   AxInternalChatRequest,
   AxModelConfig,
+  AxModelInfo,
   AxThoughtBlockItem,
   AxTokenUsage,
 } from '../types.js';
@@ -99,19 +105,226 @@ function mapAnthropicErrorEvent(error: {
 const isClaudeOpus47OrLater = (model: string): boolean =>
   model.includes('claude-opus-4-7') || model.includes('claude-opus-4-8');
 
-const isClaudeOpus48 = (model: string): boolean =>
-  model.includes('claude-opus-4-8');
-
+/** Sonnet 5 and its minor versions (Sonnet 5.5). */
 const isClaude5 = (model: string): boolean => model.includes('claude-sonnet-5');
+
+// Model ids arrive qualified (`publishers/anthropic/models/claude-opus-5`) or
+// dated, so these match anywhere in the id. The boundaries avoid lookahead so
+// the AxIR port, which runs on RE2, can mirror them exactly.
+
+/**
+ * A model family without its minor versions: `claude-opus-5` and its dated or
+ * `@`-versioned snapshots, but not `claude-opus-5-5`.
+ */
+const familyPattern = (id: string): RegExp =>
+  new RegExp(`${id}(?:$|[^0-9-]|-(?:[0-9]{3,}|[^0-9]))`);
+
+/** One minor version: `claude-opus-5-5`, but not `claude-opus-5-50`. */
+const versionPattern = (id: string): RegExp => new RegExp(`${id}(?:$|[^0-9])`);
+
+const CLAUDE_OPUS_5 = familyPattern('claude-opus-5');
+const CLAUDE_OPUS_5_5 = versionPattern('claude-opus-5-5');
+const CLAUDE_FABLE_5 = familyPattern('claude-fable-5');
+const CLAUDE_FABLE_5_1 = versionPattern('claude-fable-5-1');
+const CLAUDE_SONNET_5 = familyPattern('claude-sonnet-5');
+const CLAUDE_SONNET_5_5 = versionPattern('claude-sonnet-5-5');
+const CLAUDE_HAIKU_5_5 = versionPattern('claude-haiku-5-5');
 
 /**
  * Models that use adaptive thinking + output_config.effort and reject the legacy
- * thinking.type.enabled / budget_tokens surface (Opus 4.6, Opus 4.7+, Sonnet 5).
+ * thinking.type.enabled / budget_tokens surface (Opus 4.6+, Sonnet 5, Fable 5+).
  */
 const isAdaptiveThinkingModel = (model: string): boolean =>
   model.includes('claude-opus-4-6') ||
   isClaudeOpus47OrLater(model) ||
-  isClaude5(model);
+  isClaude5(model) ||
+  CLAUDE_HAIKU_5_5.test(model) ||
+  model.includes('claude-opus-5') ||
+  model.includes('claude-fable-5');
+
+/**
+ * Models that deprecated sampling: any temperature other than 1, and any
+ * top_p or top_k, is a 400 ("`temperature` is deprecated for this model").
+ * Probed on the Messages API 2026-09-27: Opus 4.7+, Opus 5, Fable 5, Sonnet 5.
+ */
+const deprecatesSampling = (model: string): boolean =>
+  isClaudeOpus47OrLater(model) ||
+  isClaude5(model) ||
+  CLAUDE_HAIKU_5_5.test(model) ||
+  model.includes('claude-opus-5') ||
+  model.includes('claude-fable-5');
+
+/**
+ * Models that answer 400 "`temperature` and `top_p` cannot both be specified
+ * for this model" (their Anthropic model info sets
+ * `notSupported.temperatureWithTopP`; probed 2026-09-27).
+ */
+const rejectsTemperatureWithTopP = (model: string): boolean =>
+  getModelInfo({ model, modelInfo: axModelInfoAnthropic })?.notSupported
+    ?.temperatureWithTopP === true;
+
+/**
+ * Models whose thinking cannot be switched off: `thinking.type.disabled` is a
+ * 400, so the lowest effort is the closest Ax can get to `'none'`.
+ */
+const isThinkingAlwaysOn = (model: string): boolean =>
+  CLAUDE_OPUS_5_5.test(model) ||
+  CLAUDE_FABLE_5.test(model) ||
+  CLAUDE_FABLE_5_1.test(model);
+
+/**
+ * Models that think when `thinking` is omitted, so turning thinking off has to
+ * be explicit: `disabled`, or `between_tools` on Sonnet 5.5.
+ */
+const isThinkingOnByDefault = (model: string): boolean =>
+  CLAUDE_OPUS_5.test(model) ||
+  CLAUDE_SONNET_5.test(model) ||
+  CLAUDE_SONNET_5_5.test(model) ||
+  CLAUDE_HAIKU_5_5.test(model);
+
+/**
+ * Models whose off switch is `thinking.type.between_tools`: `disabled` is a
+ * 400, and the model still writes short updates between tool calls, returned
+ * as thinking blocks.
+ */
+const turnsThinkingOffBetweenTools = (model: string): boolean =>
+  CLAUDE_SONNET_5_5.test(model);
+
+/** Whether a thinking wire asks the model to think before it responds. */
+const isThinkingOnWire = (
+  wire: AxAIAnthropicThinkingWire | undefined
+): boolean =>
+  !!wire && wire.type !== 'disabled' && wire.type !== 'between_tools';
+
+/**
+ * The sampling fields to send. A default (the provider's temperature 0) keeps
+ * its historical rule: only without a thinking wire and never on
+ * adaptive-thinking models. An explicit value is sent when the Messages API
+ * accepts it (probed 2026-09-27) and otherwise dropped with a one-time warning:
+ * models that deprecated sampling take only temperature 1; the others take
+ * every value with thinking off, and while thinking only temperature 1, top_p
+ * of 0.95 or above, and no top_k. Models whose info sets
+ * `notSupported.temperatureWithTopP` answer 400 to temperature and top_p
+ * together, so after those limits an explicit top_p goes alone in place of
+ * the default temperature, and loses to an explicit temperature with a
+ * warning. Vertex was not probed, so there explicit values keep the
+ * historical rule, and a dropped one is warned about.
+ */
+const anthropicSampling = ({
+  model,
+  probed,
+  pairRejected,
+  thinkingWire,
+  explicit,
+  temperature,
+  topP,
+  topK,
+}: Readonly<{
+  model: string;
+  probed: boolean;
+  pairRejected: boolean;
+  thinkingWire: AxAIAnthropicThinkingWire | undefined;
+  explicit: ReadonlySet<string>;
+  temperature: number | undefined;
+  topP: number | undefined;
+  topK: number | undefined;
+}>): { temperature?: number; top_p?: number; top_k?: number } => {
+  const adaptive = isAdaptiveThinkingModel(model);
+  const deprecated = deprecatesSampling(model);
+  const thinking = isThinkingOnWire(thinkingWire);
+  const historical = !thinkingWire && !adaptive;
+  const out: { temperature?: number; top_p?: number; top_k?: number } = {};
+  // Why a rejected explicit value was dropped.
+  const reason = (onlyWhileThinking: string): string =>
+    probed
+      ? deprecated
+        ? 'the model does not accept it'
+        : onlyWhileThinking
+      : adaptive
+        ? 'the model does not accept it'
+        : 'the model does not accept it while thinking';
+
+  if (temperature !== undefined) {
+    if (!explicit.has('temperature')) {
+      if (historical) out.temperature = temperature;
+    } else if (
+      probed ? temperature === 1 || (!deprecated && !thinking) : historical
+    ) {
+      out.temperature = temperature;
+    } else {
+      warnDroppedSampling(
+        model,
+        'temperature',
+        probed && deprecated
+          ? 'the model accepts it only as 1'
+          : reason('the model accepts it only as 1 while thinking')
+      );
+    }
+  }
+  if (topP !== undefined) {
+    const accepted = probed
+      ? !deprecated && (!thinking || topP >= 0.95)
+      : !adaptive && (!thinkingWire || topP >= 0.95);
+    if (accepted) {
+      out.top_p = topP;
+    } else if (explicit.has('topP')) {
+      warnDroppedSampling(
+        model,
+        'topP',
+        reason('the model accepts it only at 0.95 or above while thinking')
+      );
+    }
+  }
+  if (topK) {
+    if (probed ? !deprecated && !thinking : historical) {
+      out.top_k = topK;
+    } else if (explicit.has('topK')) {
+      warnDroppedSampling(
+        model,
+        'topK',
+        reason('the model accepts it only with thinking off')
+      );
+    }
+  }
+  if (
+    probed &&
+    pairRejected &&
+    out.temperature !== undefined &&
+    out.top_p !== undefined
+  ) {
+    if (explicit.has('temperature')) {
+      delete out.top_p;
+      warnDroppedSampling(
+        model,
+        'topP',
+        'the model accepts temperature or topP, not both'
+      );
+    } else {
+      // The provider's default temperature gives way to the caller's top_p.
+      delete out.temperature;
+    }
+  }
+  return out;
+};
+
+/** Models that answer `tool_choice` of type `any` or `tool` with a 400. */
+const rejectsForcedToolChoice = (model: string): boolean =>
+  CLAUDE_OPUS_5_5.test(model) ||
+  CLAUDE_SONNET_5_5.test(model) ||
+  CLAUDE_FABLE_5_1.test(model);
+
+/**
+ * Models that keep a later `system` entry in place in the messages array
+ * instead of having it hoisted into the top-level system prompt.
+ */
+const keepsMidConversationSystem = (model: string): boolean =>
+  model.includes('claude-opus-4-8') ||
+  CLAUDE_OPUS_5.test(model) ||
+  CLAUDE_OPUS_5_5.test(model) ||
+  CLAUDE_SONNET_5_5.test(model) ||
+  CLAUDE_HAIKU_5_5.test(model) ||
+  CLAUDE_FABLE_5.test(model) ||
+  CLAUDE_FABLE_5_1.test(model);
 
 const cleanSchemaForAnthropic = (schema: any): any => {
   if (!schema || typeof schema !== 'object') {
@@ -215,7 +428,7 @@ const cleanSchemaForAnthropic = (schema: any): any => {
 
 export const axAIAnthropicDefaultConfig = (): AxAIAnthropicConfig =>
   structuredClone({
-    model: AxAIAnthropicModel.Claude37Sonnet,
+    model: AxAIAnthropicModel.Claude5Sonnet,
     maxTokens: 40000, // Ensure maxTokens is higher than highest thinking budget
     thinkingTokenBudgetLevels: {
       minimal: 1024,
@@ -236,7 +449,7 @@ export const axAIAnthropicDefaultConfig = (): AxAIAnthropicConfig =>
 
 export const axAIAnthropicVertexDefaultConfig = (): AxAIAnthropicConfig =>
   structuredClone({
-    model: AxAIAnthropicVertexModel.Claude37Sonnet,
+    model: AxAIAnthropicVertexModel.Claude5Sonnet,
     maxTokens: 40000, // Ensure maxTokens is higher than highest thinking budget
     thinkingTokenBudgetLevels: {
       minimal: 1024,
@@ -291,7 +504,13 @@ class AxAIAnthropicImpl
 
   constructor(
     private config: AxAIAnthropicConfig,
-    private isVertex: boolean
+    private isVertex: boolean,
+    private requestUpdater?: (
+      request: AxAIAnthropicChatRequest,
+      options: Readonly<AxAIServiceOptions>
+    ) => AxAIAnthropicChatRequest,
+    private readonly supportsToolChoiceNone = false,
+    private readonly supportsExtendedMedia = false
   ) {}
 
   getTokenUsage(): AxTokenUsage | undefined {
@@ -344,7 +563,12 @@ class AxAIAnthropicImpl
     }
 
     let toolsChoice:
-      | { tool_choice: { type: 'auto' | 'any' | 'tool'; name?: string } }
+      | {
+          tool_choice: {
+            type: 'auto' | 'any' | 'none' | 'tool';
+            name?: string;
+          };
+        }
       | undefined;
 
     if (req.functionCall && req.functions && req.functions.length > 0) {
@@ -357,7 +581,11 @@ class AxAIAnthropicImpl
             toolsChoice = { tool_choice: { type: 'any' as const } };
             break;
           case 'none':
-            throw new Error('functionCall none not supported');
+            if (!this.supportsToolChoiceNone) {
+              throw new Error('functionCall none not supported');
+            }
+            toolsChoice = { tool_choice: { type: 'none' as const } };
+            break;
         }
       } else if ('function' in req.functionCall) {
         toolsChoice = {
@@ -371,6 +599,27 @@ class AxAIAnthropicImpl
       }
     }
 
+    // Opus 5.5, Sonnet 5.5 and Fable 5.1 answer a forced choice with a 400.
+    // Ax's own structured-output force is dropped, since these models return
+    // the schema natively; a caller's explicit force is surfaced instead of
+    // weakened.
+    const forcedChoice = toolsChoice?.tool_choice;
+    if (
+      forcedChoice &&
+      (forcedChoice.type === 'any' || forcedChoice.type === 'tool') &&
+      rejectsForcedToolChoice(modelStr)
+    ) {
+      if (
+        config.functionCallSource !== 'ax' ||
+        forcedChoice.name !== '__axOutput'
+      ) {
+        throw new Error(
+          `${modelStr} does not support explicitly forced tool choices; use functionCall 'auto'`
+        );
+      }
+      toolsChoice = undefined;
+    }
+
     // Detect if caching is enabled (any message or function has cache: true)
     // When caching is detected, Anthropic's automatic backward lookback means we should
     // always set cache_control on system and last tool for maximum cache reuse
@@ -379,7 +628,10 @@ class AxAIAnthropicImpl
       req.functions?.some((fn) => fn.cache);
 
     const supportsMidConversationSystem =
-      !this.isVertex && isClaudeOpus48(modelStr);
+      keepsMidConversationSystem(modelStr) &&
+      (!this.isVertex ||
+        CLAUDE_SONNET_5_5.test(modelStr) ||
+        CLAUDE_HAIKU_5_5.test(modelStr));
     const firstNonSystemIndex = req.chatPrompt.findIndex(
       (msg) => msg.role !== 'system'
     );
@@ -387,8 +639,9 @@ class AxAIAnthropicImpl
       firstNonSystemIndex === -1 ? req.chatPrompt.length : firstNonSystemIndex;
 
     // Cache system prompts - always cache last system message when caching is enabled.
-    // Opus 4.8 can preserve later system entries in the messages array; older targets
-    // keep the historical Ax behavior and hoist all system prompts.
+    // Opus 4.8+ and Fable 5+ can preserve later system entries in the messages
+    // array; older targets keep the historical Ax behavior and hoist all system
+    // prompts.
     const systemMessages = (
       supportsMidConversationSystem
         ? req.chatPrompt.slice(0, leadingSystemEnd)
@@ -493,9 +746,11 @@ class AxAIAnthropicImpl
     const maxTokens = req.modelConfig?.maxTokens ?? this.config.maxTokens;
     const stopSequences =
       req.modelConfig?.stopSequences ?? this.config.stopSequences;
+    // modelConfig already carries the AI's own config; the base layer removed
+    // the values the model's info marks unsupported.
     const temperature = req.modelConfig?.temperature;
-    const topP = req.modelConfig?.topP; // do not fallback to config by default
-    const topK = req.modelConfig?.topK ?? this.config.topK;
+    const topP = req.modelConfig?.topP;
+    const topK = req.modelConfig?.topK;
     const n = req.modelConfig?.n ?? this.config.n;
     const directEffort = req.modelConfig?.effort ?? this.config.effort;
     const speed = req.modelConfig?.speed ?? this.config.speed;
@@ -507,11 +762,6 @@ class AxAIAnthropicImpl
 
     // Model detection helpers
     const isOpus45 = (m: string) => m.includes('claude-opus-4-5');
-    // Every adaptive-thinking model rejects sampling params, not just Opus 4.7+.
-    // Anthropic deprecated `temperature` on these models: any value other than
-    // the default is an unconditional 400 ("`temperature` is deprecated for this
-    // model."), regardless of whether effort or a thinking block is on the wire.
-    const samplingUnsupported = isAdaptiveThinkingModel(modelStr);
 
     // Handle thinking configuration
     let thinkingWire: AxAIAnthropicThinkingWire | undefined;
@@ -523,9 +773,25 @@ class AxAIAnthropicImpl
       const effortMap = this.config.effortLevelMapping;
 
       if (config.thinkingTokenBudget === 'none') {
-        // Disable thinking and effort entirely
-        thinkingWire = undefined;
-        outputConfig = undefined;
+        if (isThinkingAlwaysOn(modelStr)) {
+          // Thinking cannot be disabled here; the lowest effort with the
+          // reasoning summary hidden is the closest match.
+          thinkingWire = { type: 'adaptive', display: 'omitted' };
+          outputConfig = { effort: 'low' };
+        } else if (turnsThinkingOffBetweenTools(modelStr)) {
+          // The between-tool updates stay hidden, like any thought under 'none'.
+          thinkingWire = { type: 'between_tools' };
+          outputConfig = undefined;
+        } else if (isThinkingOnByDefault(modelStr)) {
+          // These models think when `thinking` is omitted, so switching it
+          // off has to be explicit.
+          thinkingWire = { type: 'disabled' };
+          outputConfig = undefined;
+        } else {
+          // Disable thinking and effort entirely
+          thinkingWire = undefined;
+          outputConfig = undefined;
+        }
       } else {
         const budgetLevel = config.thinkingTokenBudget as
           | 'minimal'
@@ -573,6 +839,20 @@ class AxAIAnthropicImpl
       outputConfig = { ...outputConfig, effort };
     }
 
+    // Opus 5, Sonnet 5.5, and Haiku 5.5 only let thinking be switched off at effort
+    // `high` or below.
+    if (
+      ((thinkingWire?.type === 'disabled' &&
+        (CLAUDE_OPUS_5.test(modelStr) || CLAUDE_HAIKU_5_5.test(modelStr))) ||
+        (thinkingWire?.type === 'between_tools' &&
+          turnsThinkingOffBetweenTools(modelStr))) &&
+      (outputConfig?.effort === 'xhigh' || outputConfig?.effort === 'max')
+    ) {
+      throw new Error(
+        `${modelStr} cannot disable thinking at effort '${outputConfig.effort}'; use effort 'high' or below, or keep thinking on`
+      );
+    }
+
     if (taskBudget) {
       if (taskBudget.total < 20_000) {
         throw new Error(
@@ -610,15 +890,20 @@ class AxAIAnthropicImpl
     }
 
     // Alias for use in downstream logic (messages, request building)
-    const thinkingEnabled = !!thinkingWire;
+    const thinkingEnabled = isThinkingOnWire(thinkingWire);
 
-    const messages = createMessages(otherMessages, thinkingEnabled);
+    const messages = createMessages(
+      otherMessages,
+      thinkingEnabled,
+      this.supportsExtendedMedia
+    );
 
     // If the outgoing messages include an assistant message that starts with a tool_use
     // block (i.e., we are pre-supplying a function call), Anthropic requires the final
     // assistant message to start with a thinking/redacted_thinking block when thinking
     // is enabled. Since we do not have a prior thinking block to echo here, disable thinking
-    // for this request to comply with their requirement.
+    // for this request to comply with their requirement. Models that think by default
+    // accept the replay as-is, and omitting the wire would not stop them thinking.
     const hasAssistantStartingWithToolUse = messages.some(
       (m) =>
         m.role === 'assistant' &&
@@ -626,7 +911,11 @@ class AxAIAnthropicImpl
         m.content.length > 0 &&
         (m.content[0] as any)?.type === 'tool_use'
     );
-    if (hasAssistantStartingWithToolUse) {
+    if (
+      hasAssistantStartingWithToolUse &&
+      !isThinkingAlwaysOn(modelStr) &&
+      !isThinkingOnByDefault(modelStr)
+    ) {
       thinkingWire = undefined;
       if (outputConfig) {
         const nextOutputConfig: AxAIAnthropicOutputConfig = {};
@@ -664,6 +953,17 @@ class AxAIAnthropicImpl
       }
     }
 
+    const sampling = anthropicSampling({
+      model: modelStr,
+      probed: !this.isVertex,
+      pairRejected: rejectsTemperatureWithTopP(modelStr),
+      thinkingWire,
+      explicit: new Set(req.explicitSamplingKeys ?? []),
+      temperature,
+      topP,
+      topK,
+    });
+
     const reqValue: AxAIAnthropicChatRequest = {
       ...(this.isVertex
         ? { anthropic_version: 'vertex-2023-10-16' }
@@ -672,18 +972,7 @@ class AxAIAnthropicImpl
       ...(stopSequences && stopSequences.length > 0
         ? { stop_sequences: stopSequences }
         : {}),
-      // Only include sampling parameters on models that accept them.
-      ...(temperature !== undefined && !thinkingWire && !samplingUnsupported
-        ? { temperature }
-        : {}),
-      // Only include top_p when thinking is not enabled, or when it's >= 0.95
-      ...(topP !== undefined &&
-      !samplingUnsupported &&
-      (!thinkingWire || topP >= 0.95)
-        ? { top_p: topP }
-        : {}),
-      // Only include top_k when thinking is not enabled
-      ...(topK && !thinkingWire && !samplingUnsupported ? { top_k: topK } : {}),
+      ...sampling,
       ...toolsChoice,
       ...(tools ? { tools } : {}),
       ...(stream ? { stream: true } : {}),
@@ -694,7 +983,10 @@ class AxAIAnthropicImpl
       messages,
     };
 
-    return [apiConfig, reqValue];
+    return [
+      apiConfig,
+      this.requestUpdater ? this.requestUpdater(reqValue, config) : reqValue,
+    ];
   };
 
   createChatResp = (
@@ -762,7 +1054,7 @@ class AxAIAnthropicImpl
           break;
         case 'thinking':
           // Store each thinking block separately with its signature
-          if (showThoughts) {
+          {
             const thinking = (block as any).thinking ?? '';
             const signature = (block as any).signature;
             thinkingBlocks.push({
@@ -774,7 +1066,7 @@ class AxAIAnthropicImpl
           break;
         case 'redacted_thinking':
           // Store each redacted thinking block separately with its signature
-          if (showThoughts) {
+          {
             const data = (block as any).data ?? '';
             const signature = (block as any).signature;
             thinkingBlocks.push({
@@ -807,7 +1099,9 @@ class AxAIAnthropicImpl
       // Store array of all thinking blocks with their signatures
       result.thoughtBlocks = thinkingBlocks;
       // Aggregate thought string for display purposes
-      result.thought = thinkingBlocks.map((b) => b.data).join('');
+      if (showThoughts) {
+        result.thought = thinkingBlocks.map((b) => b.data).join('');
+      }
     }
     if (aggregatedFunctionCalls.length > 0) {
       result.functionCalls = aggregatedFunctionCalls;
@@ -926,24 +1220,29 @@ class AxAIAnthropicImpl
         const showThoughts =
           this.currentPromptConfig?.thinkingTokenBudget !== 'none' &&
           this.currentPromptConfig?.showThoughts !== false;
-        if (showThoughts) {
-          return {
-            results: [
-              {
-                index,
-                thought: contentBlock.thinking,
-                thoughtBlocks: [
-                  {
-                    data: contentBlock.thinking,
-                    encrypted: false,
-                  },
-                ],
-              },
-            ],
-          };
-        }
         return {
-          results: [{ index, content: '' }],
+          results: [
+            {
+              index,
+              ...(showThoughts ? { thought: contentBlock.thinking } : {}),
+              thoughtBlocks: [
+                {
+                  data: contentBlock.thinking,
+                  encrypted: false,
+                },
+              ],
+            },
+          ],
+        };
+      }
+      if (contentBlock.type === 'redacted_thinking') {
+        return {
+          results: [
+            {
+              index,
+              thoughtBlocks: [{ data: contentBlock.data, encrypted: true }],
+            },
+          ],
         };
       }
       if (contentBlock.type === 'tool_use') {
@@ -1034,19 +1333,14 @@ class AxAIAnthropicImpl
         const showThoughts =
           this.currentPromptConfig?.thinkingTokenBudget !== 'none' &&
           this.currentPromptConfig?.showThoughts !== false;
-        if (showThoughts) {
-          return {
-            results: [
-              {
-                index,
-                thought: delta.thinking,
-                thoughtBlocks: [{ data: delta.thinking, encrypted: false }],
-              },
-            ],
-          };
-        }
         return {
-          results: [{ index, content: '' }],
+          results: [
+            {
+              index,
+              ...(showThoughts ? { thought: delta.thinking } : {}),
+              thoughtBlocks: [{ data: delta.thinking, encrypted: false }],
+            },
+          ],
         };
       }
       if (delta.type === 'signature_delta') {
@@ -1090,16 +1384,25 @@ class AxAIAnthropicImpl
       const { delta, usage } =
         resp as unknown as AxAIAnthropicMessageDeltaEvent;
 
+      // message_delta usage is cumulative and can carry the final input and
+      // cache counts (for example with server tools); prefer them when present.
+      const promptTokens =
+        usage.input_tokens ?? this.tokensUsed?.promptTokens ?? 0;
+      const cacheCreationTokens =
+        usage.cache_creation_input_tokens ??
+        this.tokensUsed?.cacheCreationTokens;
+      const cacheReadTokens =
+        usage.cache_read_input_tokens ?? this.tokensUsed?.cacheReadTokens;
       this.tokensUsed = {
-        promptTokens: this.tokensUsed?.promptTokens ?? 0,
+        promptTokens,
         completionTokens: usage.output_tokens,
         totalTokens:
-          (this.tokensUsed?.promptTokens ?? 0) +
+          promptTokens +
           usage.output_tokens +
-          (this.tokensUsed?.cacheCreationTokens ?? 0) +
-          (this.tokensUsed?.cacheReadTokens ?? 0),
-        cacheCreationTokens: this.tokensUsed?.cacheCreationTokens,
-        cacheReadTokens: this.tokensUsed?.cacheReadTokens,
+          (cacheCreationTokens ?? 0) +
+          (cacheReadTokens ?? 0),
+        cacheCreationTokens,
+        cacheReadTokens,
         speed: usage.speed ?? this.tokensUsed?.speed,
       };
 
@@ -1160,13 +1463,34 @@ export class AxAIAnthropic<TModelKey = string> extends AxBaseAI<
     config,
     options,
     models,
-  }: Readonly<Omit<AxAIAnthropicArgs<TModelKey>, 'name'>>) {
+    _profile,
+  }: Readonly<
+    Omit<AxAIAnthropicArgs<TModelKey>, 'name'> & {
+      _profile?: {
+        id: string;
+        name: string;
+        apiURL: string;
+        headers: () => Promise<Record<string, string>>;
+        defaultModel: string;
+        modelInfo: ReadonlyArray<AxModelInfo>;
+        supportFor: (model: string) => AxAIFeatures;
+        requestUpdater?: (
+          request: AxAIAnthropicChatRequest,
+          options: Readonly<AxAIServiceOptions>
+        ) => AxAIAnthropicChatRequest;
+        supportsToolChoiceNone?: boolean;
+      };
+    }
+  >) {
     const isVertex = projectId !== undefined && region !== undefined;
 
     let apiURL: string;
     let headers: () => Promise<Record<string, string>>;
 
-    if (projectId !== undefined && region !== undefined) {
+    if (_profile) {
+      apiURL = _profile.apiURL;
+      headers = _profile.headers;
+    } else if (projectId !== undefined && region !== undefined) {
       if (!apiKey && !credentialProvider) {
         throw new Error(
           'Anthropic Vertex API key or credential provider not set'
@@ -1202,16 +1526,30 @@ export class AxAIAnthropic<TModelKey = string> extends AxBaseAI<
       });
     }
 
-    const Config = {
+    const Config: AxAIAnthropicConfig = {
       ...axAIAnthropicDefaultConfig(),
+      ...(_profile
+        ? {
+            model: _profile.defaultModel as
+              | AxAIAnthropicModel
+              | AxAIAnthropicVertexModel,
+          }
+        : {}),
       ...config,
     };
 
-    const aiImpl = new AxAIAnthropicImpl(Config, isVertex);
+    const aiImpl = new AxAIAnthropicImpl(
+      Config,
+      isVertex,
+      _profile?.requestUpdater,
+      _profile?.supportsToolChoiceNone ?? false,
+      _profile !== undefined
+    );
 
     const supportFor = (
       model: AxAIAnthropicModel | AxAIAnthropicVertexModel
     ) => {
+      if (_profile) return _profile.supportFor(String(model));
       const mi = getModelInfo<
         AxAIAnthropicModel | AxAIAnthropicVertexModel,
         undefined,
@@ -1335,17 +1673,18 @@ export class AxAIAnthropic<TModelKey = string> extends AxBaseAI<
     });
 
     super(aiImpl, {
-      name: 'Anthropic',
+      name: _profile?.name ?? 'Anthropic',
       apiURL,
       headers,
-      modelInfo: axModelInfoAnthropic,
+      modelInfo: _profile?.modelInfo ?? axModelInfoAnthropic,
       defaults: { model: Config.model },
       options,
       credentialProvider,
-      profile: 'anthropic',
+      profile: _profile?.id ?? 'anthropic',
       supportFor,
       models: normalizedModels ?? models,
     });
+    this.setExplicitModelConfigKeys(config);
   }
 }
 
@@ -1399,7 +1738,8 @@ function anthropicToolResultContent(
 
 function createMessages(
   chatPrompt: Readonly<AxChatRequest['chatPrompt']>,
-  _thinkingEnabled?: boolean
+  _thinkingEnabled?: boolean,
+  supportsExtendedMedia = false
 ): AxAIAnthropicChatRequest['messages'] {
   const items: AxAIAnthropicChatRequest['messages'] = chatPrompt.map((msg) => {
     switch (msg.role) {
@@ -1468,6 +1808,55 @@ function createMessages(
                   media_type: v.mimeType,
                   data: v.image,
                 },
+                ...(v.cache
+                  ? { cache_control: { type: 'ephemeral' as const } }
+                  : {}),
+              };
+            case 'audio':
+              if (!supportsExtendedMedia)
+                throw new Error('Invalid content type');
+              return {
+                type: 'audio' as const,
+                source: {
+                  type: 'base64' as const,
+                  media_type: `audio/${v.format ?? 'wav'}`,
+                  data: v.data,
+                },
+                ...(v.cache
+                  ? { cache_control: { type: 'ephemeral' as const } }
+                  : {}),
+              };
+            case 'file': {
+              if (!supportsExtendedMedia)
+                throw new Error('Invalid content type');
+              const type = v.mimeType.startsWith('image/')
+                ? ('image' as const)
+                : v.mimeType.startsWith('video/')
+                  ? ('video' as const)
+                  : ('document' as const);
+              return {
+                type,
+                source:
+                  'fileUri' in v
+                    ? { type: 'url' as const, url: v.fileUri }
+                    : {
+                        type: 'base64' as const,
+                        media_type: v.mimeType,
+                        data: v.data,
+                      },
+                ...(v.cache
+                  ? { cache_control: { type: 'ephemeral' as const } }
+                  : {}),
+              };
+            }
+            case 'url':
+              if (!supportsExtendedMedia)
+                throw new Error('Invalid content type');
+              return {
+                type: 'text' as const,
+                text:
+                  v.cachedContent ??
+                  [v.title, v.description, v.url].filter(Boolean).join('\n'),
                 ...(v.cache
                   ? { cache_control: { type: 'ephemeral' as const } }
                   : {}),
@@ -1546,12 +1935,12 @@ function createMessages(
         }
 
         if (typeof msg.content === 'string') {
-          // If we have preserved thinking, convert to block array and append text
+          // Keep signed thinking blocks even when there is no visible text.
           if (preservedThinkingBlocks.length > 0) {
-            content = [
-              ...preservedThinkingBlocks,
-              { type: 'text' as const, text: msg.content },
-            ];
+            content = [...preservedThinkingBlocks];
+            if (msg.content.length > 0) {
+              content.push({ type: 'text', text: msg.content });
+            }
           } else {
             content = msg.content;
           }

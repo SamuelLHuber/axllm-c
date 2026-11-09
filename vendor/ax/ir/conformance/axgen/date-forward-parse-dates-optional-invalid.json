@@ -1,0 +1,23 @@
+{
+  "expected_output": {
+    "answer": "ok"
+  },
+  "expected_request_count": 1,
+  "input": {
+    "question": "Status?"
+  },
+  "kind": "forward",
+  "name": "date-forward-parse-dates-optional-invalid",
+  "responses": [
+    {
+      "results": [
+        {
+          "content": "Answer: ok\nDue: whenever",
+          "finish_reason": "stop",
+          "index": 0
+        }
+      ]
+    }
+  ],
+  "signature": "question:string -> answer:string, due?:date"
+}

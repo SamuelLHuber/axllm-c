@@ -26,6 +26,7 @@ import type {
   AxAgentTestCompletionPayload,
   AxAgentTestResult,
 } from './agentPublicTypes.js';
+import type { ActorCodeExecutionResult } from './runtimeExecutionHelpers.js';
 
 // Re-export to avoid unused-import warnings when types are used only transitively
 export type { AxIField };
@@ -146,6 +147,10 @@ export type AxAgentGuidanceState = {
 };
 
 export type AxAgentRuntimeExecutionContext = {
+  consumeNativeToolActivity?: () => readonly string[];
+  getNativeFunctions?: (
+    options: import('../../dsp/types.js').AxProgramForwardOptions<string>
+  ) => import('../../ai/types.js').AxFunction[];
   effectiveContextConfig: AxResolvedContextPolicy;
   bootstrapContextSummary?: string;
   applyBootstrapRuntimeContext: () => Promise<string | undefined>;
@@ -163,9 +168,7 @@ export type AxAgentRuntimeExecutionContext = {
     options?: Readonly<{ skipBindings?: boolean }>
   ) => Promise<AxPreparedRestoredState>;
   syncRuntimeInputsToSession: () => Promise<void>;
-  executeActorCode: (
-    code: string
-  ) => Promise<{ result: unknown; output: string; isError: boolean }>;
+  executeActorCode: (code: string) => Promise<ActorCodeExecutionResult>;
   executeTestCode: (code: string) => Promise<AxAgentTestResult>;
   /**
    * Present only when the run participates in a pipeline-owned shared runtime

@@ -1,5 +1,13 @@
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { perturbFixture, sampleFixtures } from './axir-perturb-check.mjs';
+import {
+  perturbFixture,
+  runnerForTarget,
+  runnerForTargetAsync,
+  sampleFixtures,
+} from './axir-perturb-check.mjs';
 
 describe('perturbFixture', () => {
   it('mutates the first expected_* leaf by type', () => {
@@ -35,6 +43,39 @@ describe('perturbFixture', () => {
   });
 });
 
+describe('runnerForTarget', () => {
+  // A stand-in C++ conformance binary; the cpp runner execs it directly.
+  function withStandInRunner(script, check) {
+    const outDir = mkdtempSync(path.join(os.tmpdir(), 'axir-perturb-runner-'));
+    const bin = path.join(outDir, 'conformance_bin');
+    writeFileSync(bin, `#!/bin/sh\n${script}\n`);
+    chmodSync(bin, 0o755);
+    try {
+      check(runnerForTarget('cpp', outDir, 500));
+    } finally {
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  }
+
+  it('returns the result of a runner that finishes', () => {
+    withStandInRunner('echo "ok $1"', (runner) => {
+      const result = runner('/suites/axevent', 'pristine suite axevent');
+      expect(result.status).toBe(0);
+      expect(result.stdout).toBe('ok /suites/axevent\n');
+    });
+  });
+
+  it('kills a hung runner and names the target and suite', () => {
+    withStandInRunner('echo started; exec sleep 30', (runner) => {
+      const startedAt = Date.now();
+      expect(() => runner('/suites/axevent', 'pristine suite axevent')).toThrow(
+        'TIMEOUT: cpp conformance runner exceeded 0.5s on pristine suite axevent and was killed.\nstarted\n'
+      );
+      expect(Date.now() - startedAt).toBeLessThan(10_000);
+    });
+  });
+});
+
 describe('sampleFixtures', () => {
   it('samples one fixture per suite deterministically', () => {
     const sample = sampleFixtures();
@@ -42,5 +83,54 @@ describe('sampleFixtures', () => {
     const suites = sample.map(({ suite }) => suite);
     expect(new Set(suites).size).toBe(suites.length);
     expect(sample.every(({ file }) => file.endsWith('.json'))).toBe(true);
+  });
+});
+
+describe('async mutation runner', () => {
+  async function withRunner(script, check, timeoutMs = 5000) {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'axir-async-test-'));
+    writeFileSync(path.join(dir, 'conformance_bin'), `#!/bin/sh\n${script}\n`);
+    chmodSync(path.join(dir, 'conformance_bin'), 0o755);
+    try {
+      await check(runnerForTargetAsync('cpp', dir, timeoutMs));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  it('preserves nonzero assertion results', async () => {
+    await withRunner('echo assertion-failed; exit 1', async (runner) => {
+      const result = await runner('/case', 'mutated fixture');
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain('assertion-failed');
+    });
+  });
+  it('fails the gate on a timeout instead of counting it as a rejection', async () => {
+    await withRunner(
+      'exec sleep 30',
+      async (runner) => {
+        await expect(runner('/case', 'mutated fixture')).rejects.toThrow(
+          'TIMEOUT: cpp conformance runner exceeded 0.5s on mutated fixture'
+        );
+      },
+      500
+    );
+  });
+  it('bounds a runner whose descendant keeps stdout open', async () => {
+    await withRunner(
+      'sleep 2 & exit 0',
+      async (runner) => {
+        await expect(runner('/case', 'leaked child')).rejects.toThrow(
+          'TIMEOUT:'
+        );
+      },
+      500
+    );
+  });
+  it('fails the gate when a process is terminated by a signal', async () => {
+    await withRunner('kill -TERM $$', async (runner) => {
+      await expect(runner('/case', 'mutated fixture')).rejects.toThrow(
+        'terminated by SIGTERM'
+      );
+    });
   });
 });

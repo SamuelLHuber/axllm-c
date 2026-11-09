@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+from .session import _core_run_control_aborted
 
 from abc import ABC, abstractmethod
 import copy
@@ -16,11 +17,15 @@ from .ai import (
     _merge_runtime_hooks,
     _runtime_hook_scope,
     _runtime_hooks_from_options,
+    _snapshot_global_caching_function,
     _strip_runtime_hooks,
 )
 from .gen import (
     AxGen,
     ax,
+    _core_axgen_cache_read,
+    _core_axgen_cache_write,
+    _core_crypto_sha256_hex,
     _core_exception_message,
     _core_eq,
     _core_gte,
@@ -58,12 +63,16 @@ from .gen import (
     _validate_optimized_artifact,
 )
 from .signature import (
+    _js_text,
     _core_string_extract_leading_group,
     _core_string_find_outside_quotes,
     _core_string_split_once,
     _core_string_split_top_level,
+    _js_json_dumps,
+    _js_number_text,
 )
 from .agent import (
+    AxAgent,
     OptimizerEngine,
     OptimizerEvaluator,
     _build_agent_eval_prediction,
@@ -181,6 +190,9 @@ def _flow_mapper_from_spec(spec):
 
 
 class AxProgram(ABC):
+    def owned_worker_factory(self):
+        return None
+
     @abstractmethod
     def forward(self, client, values, options=None):
         ...
@@ -193,6 +205,25 @@ class AxProgram(ABC):
 
 
 class AxFlow(AxProgram):
+    def owned_worker_factory(self):
+        if self.execution_context is not None: return None
+        factories = {}
+        memo = {id(self.runtime_hooks):self.runtime_hooks}
+        for index, step in enumerate(self.state.get("steps", [])):
+            program = step.get("program")
+            if program is None: continue
+            factory = _owned_program_factory(program)
+            if factory is None: return None
+            factories[index] = factory
+            memo[id(program)] = program
+        try: snapshot = copy.deepcopy(self, dict(memo))
+        except (TypeError, ValueError): return None
+        def factory():
+            owned = copy.deepcopy(snapshot, dict(memo))
+            for index, create in factories.items(): owned.state["steps"][index]["program"] = create()
+            return owned
+        return factory
+
     def __init__(self, options: dict[str, Any] | str | None = None, bindings: dict[str, Any] | None = None, hooks: AxRuntimeHooks | None = None):
         if isinstance(options, str):
             normalized = _normalize_mermaid_bindings(bindings)
@@ -333,6 +364,8 @@ class AxFlow(AxProgram):
         return self.apply_optimized_components(artifact.get("componentMap") or {})
 
     def evaluate_optimization(self, client, dataset, candidate_map: dict[str, Any] | None = None, options: dict[str, Any] | None = None):
+        if (options or {}).get("demos"):
+            self.set_demos(options["demos"])
         return _flow_evaluate_optimization(self.state, client, dataset or [], candidate_map or {}, options or {})
 
     def optimize_with(self, engine: OptimizerEngine, dataset, options: dict[str, Any] | None = None):
@@ -375,15 +408,35 @@ class AxFlow(AxProgram):
         options: dict[str, Any] | None = None,
         hooks: AxRuntimeHooks | None = None,
     ):
+        # As in TS, the flow reads its cache before its span and metrics, so a
+        # stored output records neither.
+        run_options = _strip_runtime_hooks(options) or {}
+        lookup = _flow_cache_lookup_impl(self.state, values or {}, run_options)
+        if lookup.get("hit"):
+            return lookup.get("value")
         call_hooks = _merge_runtime_hooks(_coerce_runtime_hooks(hooks), _runtime_hooks_from_options(options))
-        with _runtime_hook_scope(
-            call_hooks,
-            self.runtime_hooks,
-            span_name="ax_gen_flow_forward",
-            attributes={"ax.program.id": self.state.get("program_id", "root.flow"), "ax.program.type": "AxFlow"},
-            metric_prefix="ax_gen_flow",
-        ):
-            return self._forward_unscoped(client, values, _strip_runtime_hooks(options))
+        # As TypeScript's AxFlow.forward does, a run control hears the flow's
+        # own lifecycle at its path; each node reports at <path>/<node>.
+        control = run_options.get("control")
+        run_path = run_options.get("execution_path", run_options.get("executionPath", "root"))
+        if control is not None:
+            control._emit({"type": "started", "path": run_path})
+        try:
+            with _runtime_hook_scope(
+                call_hooks,
+                self.runtime_hooks,
+                span_name="ax_gen_flow_forward",
+                attributes={"ax.program.id": self.state.get("program_id", "root.flow"), "ax.program.type": "AxFlow"},
+                metric_prefix="ax_gen_flow",
+            ):
+                output = self._forward_unscoped(client, values, {**run_options, "_ax_flow_cache_lookup": lookup})
+        except Exception as error:
+            if control is not None:
+                control._emit({"type": "failed", "path": run_path, "error": str(error)})
+            raise
+        if control is not None:
+            control._emit({"type": "completed", "path": run_path})
+        return output
 
     def _forward_unscoped(self, client: AIClient, values: dict[str, Any], options: dict[str, Any] | None = None):
         call_options = dict(options or {})
@@ -536,15 +589,26 @@ def _core_string_split_trim_nonempty(value, sep):
 
 
 def _core_string_str(value):
-    return str(value)
+    return _js_text(value)
 
 
 def _core_string_starts_with(value, prefix):
     return str(value).startswith(str(prefix))
 
 
+def _core_flow_caching_function(options):
+    # TS AxFlow's cachingFunction: the call's, else the process-wide one; the
+    # flow's constructor takes none.
+    options = options or {}
+    for key in ("cachingFunction", "caching_function"):
+        fn = options.get(key)
+        if fn is not None:
+            return fn
+    return _snapshot_global_caching_function()
+
+
 def _core_json_stable_stringify(value):
-    return json.dumps(value or {}, sort_keys=True, separators=(",", ":"))
+    return _js_json_dumps(value or {}, sort_keys=True)
 
 
 def _core_program_components(program):
@@ -557,6 +621,14 @@ def _core_program_apply_components(program, component_map):
     if hasattr(program, "apply_optimized_components"):
         program.apply_optimized_components(component_map or {})
     return {}
+
+
+def _core_program_signature(program):
+    # An AxGen's or AxAgent's signature text. Any other program (a nested
+    # flow, a custom program) has none, and its undeclared step is a barrier.
+    if isinstance(program, (AxGen, AxAgent)):
+        return str(program.signature)
+    return None
 
 
 # BEGIN AXIR CORE EMITTED FUNCTIONS
@@ -623,7 +695,7 @@ def _program_trace_event(program_id: str, kind: str, payload: Any) -> Any:
 
 def _flow_step(kind: str, name: str, program: Any, options: Any) -> Any:
     _core_coverage_mark("_flow_step")
-    trimmed = str(name).strip()
+    trimmed = str(name).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
     missing_name = _core_eq(trimmed, "")
     if missing_name:
         err = _core_runtime_error("flow step name is required")
@@ -672,6 +744,19 @@ def _flow_step(kind: str, name: str, program: Any, options: Any) -> Any:
     may_parallel = _core_or(is_execute, is_derive)
     if may_parallel:
         default_barrier = False
+    else:
+        pass
+    io = _flow_step_program_io(kind, trimmed, program, opts)
+    infers_io = _core_get(io, "infer", False)
+    if infers_io:
+        io_has_signature = _core_get(io, "hasSignature", False)
+        if io_has_signature:
+            reads = _core_get(io, "reads", None)
+            writes = _core_get(io, "writes", None)
+            io_outputs = _core_get(io, "outputs", None)
+            step["outputs"] = io_outputs
+        else:
+            default_barrier = True
     else:
         pass
     barrier_from_snake = _core_get(opts, "is_barrier", default_barrier)
@@ -763,6 +848,12 @@ def _flow_plan_entry(step: Any, step_index: int) -> Any:
     entry["kind"] = kind
     entry["reads"] = reads
     entry["writes"] = writes
+    has_outputs = _core_map_contains(step, "outputs")
+    if has_outputs:
+        outputs = _core_get(step, "outputs", None)
+        entry["outputs"] = outputs
+    else:
+        pass
     entry["barrier"] = barrier
     entry["stepIndex"] = step_index
     return entry
@@ -774,6 +865,7 @@ def _flow_plan_can_share_group(group: Any, candidate: Any) -> bool:
     candidate_barrier = _core_get(candidate, "barrier", True)
     candidate_writes = _core_get(candidate, "writes", empty_list)
     candidate_reads = _core_get(candidate, "reads", empty_list)
+    candidate_outputs = _core_get(candidate, "outputs", empty_list)
     write_count = _core_len(candidate_writes)
     no_writes = _core_eq(write_count, 0)
     can_share = True
@@ -793,6 +885,7 @@ def _flow_plan_can_share_group(group: Any, candidate: Any) -> bool:
             pass
         existing_writes = _core_get(existing, "writes", empty_list)
         existing_reads = _core_get(existing, "reads", empty_list)
+        existing_outputs = _core_get(existing, "outputs", empty_list)
         for read in candidate_reads:
             read_conflict = _core_contains(existing_writes, read)
             if read_conflict:
@@ -801,13 +894,21 @@ def _flow_plan_can_share_group(group: Any, candidate: Any) -> bool:
                 pass
         for existing_read in existing_reads:
             reverse_read_conflict = _core_contains(candidate_writes, existing_read)
-            if reverse_read_conflict:
+            reverse_read_output = _core_contains(candidate_outputs, existing_read)
+            reverse_read_ordered = _core_not(reverse_read_output)
+            reverse_read_blocks = _core_and(reverse_read_conflict, reverse_read_ordered)
+            if reverse_read_blocks:
                 can_share = False
             else:
                 pass
         for write in candidate_writes:
             write_conflict = _core_contains(existing_writes, write)
-            if write_conflict:
+            candidate_write_output = _core_contains(candidate_outputs, write)
+            existing_write_output = _core_contains(existing_outputs, write)
+            write_output = _core_or(candidate_write_output, existing_write_output)
+            write_ordered = _core_not(write_output)
+            write_blocks = _core_and(write_conflict, write_ordered)
+            if write_blocks:
                 can_share = False
             else:
                 pass
@@ -911,14 +1012,22 @@ def _flow_plan(flow: Any) -> Any:
     return plan
 
 
-def _flow_cache_key(values: Any) -> str:
+def _flow_cache_key(flow: Any, values: Any) -> str:
     _core_coverage_mark("_flow_cache_key")
-    key = _core_json_stable_stringify(values)
+    plan = _flow_plan(flow)
+    plan_text = _core_json_stable_stringify(plan)
+    values_text = _core_json_stable_stringify(values)
+    parts = []
+    parts.append("axflow")
+    parts.append(plan_text)
+    parts.append(values_text)
+    text = _core_string_join("\n", parts)
+    key = _core_crypto_sha256_hex(text)
     return key
 
 
-def _flow_cache_read_write(flow: Any, values: Any, options: Any, mode: str, cached_value: Any) -> Any:
-    _core_coverage_mark("_flow_cache_read_write")
+def _flow_cache_lookup_impl(flow: Any, values: Any, options: Any) -> Any:
+    _core_coverage_mark("_flow_cache_lookup_impl")
     empty_map = {}
     opts_missing = _core_is_none(options)
     opts = options
@@ -926,53 +1035,52 @@ def _flow_cache_read_write(flow: Any, values: Any, options: Any, mode: str, cach
         opts = empty_map
     else:
         pass
-    key = _flow_cache_key(values)
-    store_snake = _core_get(opts, "cache_store", None)
-    store = _core_get(opts, "cacheStore", store_snake)
-    has_store = _core_is_not_none(store)
-    read_error_snake = _core_get(opts, "cache_read_error", False)
-    read_error = _core_get(opts, "cacheReadError", read_error_snake)
-    write_error_snake = _core_get(opts, "cache_write_error", False)
-    write_error = _core_get(opts, "cacheWriteError", write_error_snake)
-    is_read = _core_eq(mode, "read")
-    is_write = _core_eq(mode, "write")
     none = _core_none()
-    result = {}
-    result["key"] = key
-    result["hit"] = False
-    result["value"] = none
-    if is_read:
-        can_read_store = _core_and(has_store, read_error)
-        skip_read = _core_truthy(can_read_store)
-        if skip_read:
-            pass
-        else:
-            if has_store:
-                cached = _core_get(store, key, None)
-                hit = _core_is_not_none(cached)
-                if hit:
-                    result["hit"] = True
-                    result["value"] = cached
-                else:
-                    pass
-            else:
-                pass
+    lookup = {}
+    lookup["fn"] = none
+    lookup["key"] = ""
+    lookup["hit"] = False
+    controller = _core_get(opts, "control", None)
+    controlled = _core_is_not_none(controller)
+    if controlled:
+        return lookup
     else:
         pass
-    if is_write:
-        can_write_store = _core_and(has_store, write_error)
-        skip_write = _core_truthy(can_write_store)
-        if skip_write:
-            pass
-        else:
-            if has_store:
-                store[key] = cached_value
-                result["value"] = cached_value
-            else:
-                pass
+    cache_fn = _core_flow_caching_function(opts)
+    no_cache = _core_is_none(cache_fn)
+    if no_cache:
+        return lookup
     else:
         pass
-    return result
+    key = _flow_cache_key(flow, values)
+    lookup["fn"] = cache_fn
+    lookup["key"] = key
+    cached = _core_none()
+    try:
+        cached = _core_axgen_cache_read(cache_fn, key)
+    except Exception as read_error:
+        pass
+    hit = _core_is_not_none(cached)
+    if hit:
+        lookup["hit"] = True
+        lookup["value"] = cached
+    else:
+        pass
+    return lookup
+
+
+def _flow_cache_store_impl(cache_fn: Any, key: str, output: Any) -> None:
+    _core_coverage_mark("_flow_cache_store_impl")
+    no_cache = _core_is_none(cache_fn)
+    if no_cache:
+        return None
+    else:
+        pass
+    try:
+        _core_axgen_cache_write(cache_fn, key, output)
+    except Exception as write_error:
+        pass
+    return None
 
 
 def _flow_check_abort(options: Any, location: str) -> None:
@@ -982,6 +1090,9 @@ def _flow_check_abort(options: Any, location: str) -> None:
     abort_camel = _core_get(options, "abortBeforeStep", abort_snake)
     aborted = _core_get(options, "aborted", abort_camel)
     abort = _core_get(options, "abort", aborted)
+    controller = _core_get(options, "control", None)
+    control_aborted = _core_run_control_aborted(controller)
+    abort = _core_or(abort, control_aborted)
     if abort:
         message = _core_string_format("Flow aborted at {}", location)
         err = _core_runtime_error(message)
@@ -1077,8 +1188,8 @@ def _flow_record_child_traces(flow: Any, node: str, program: Any) -> Any:
     return traces
 
 
-def _flow_execute_program_node(flow: Any, step: Any, client: Any, state: Any, options: Any) -> Any:
-    _core_coverage_mark("_flow_execute_program_node")
+def _flow_prepare_program_node(flow: Any, step: Any, client: Any, state: Any, options: Any) -> Any:
+    _core_coverage_mark("_flow_prepare_program_node")
     empty_map = {}
     name = _core_get(step, "name", "")
     kind = _core_get(step, "kind", "execute")
@@ -1087,6 +1198,17 @@ def _flow_execute_program_node(flow: Any, step: Any, client: Any, state: Any, op
     base_options = _core_get(flow, "options", empty_map)
     runtime_base = _core_map_merge(base_options, options)
     runtime_options = _core_map_merge(runtime_base, step_options)
+    parent_path_snake = _core_get(runtime_base, "execution_path", "root")
+    parent_path = _core_get(runtime_base, "executionPath", parent_path_snake)
+    node_path = _core_string_format("{}/{}", parent_path, name)
+    runtime_options["execution_path"] = node_path
+    runtime_options["executionPath"] = node_path
+    controller = _core_get(runtime_base, "control", None)
+    controlled = _core_is_not_none(controller)
+    if controlled:
+        runtime_options["control"] = controller
+    else:
+        pass
     trace_label_in = _core_get(options, "traceLabel", "")
     has_trace_label = _core_truthy(trace_label_in)
     trace_label = _core_string_format("Node:{}", name)
@@ -1110,7 +1232,18 @@ def _flow_execute_program_node(flow: Any, step: Any, client: Any, state: Any, op
         raise abort_error
     else:
         pass
-    result = _core_agent_stage_forward(program, client, state, runtime_options)
+    prepared = {}
+    prepared["name"] = name
+    prepared["program"] = program
+    prepared["options"] = runtime_options
+    return prepared
+
+
+def _flow_finish_program_node(flow: Any, prepared: Any, result: Any, state: Any) -> Any:
+    _core_coverage_mark("_flow_finish_program_node")
+    empty_map = {}
+    name = _core_get(prepared, "name", "")
+    program = _core_get(prepared, "program", None)
     out = _core_map_merge(state, empty_map)
     result_key = _core_string_format("{}Result", name)
     out[result_key] = result
@@ -1118,6 +1251,16 @@ def _flow_execute_program_node(flow: Any, step: Any, client: Any, state: Any, op
     _flow_record_child_chat_log(flow, name, program)
     _flow_record_child_usage(flow, name, program)
     _flow_record_child_traces(flow, name, program)
+    return out
+
+
+def _flow_execute_program_node(flow: Any, step: Any, client: Any, state: Any, options: Any) -> Any:
+    _core_coverage_mark("_flow_execute_program_node")
+    prepared = _flow_prepare_program_node(flow, step, client, state, options)
+    program = _core_get(prepared, "program", None)
+    runtime_options = _core_get(prepared, "options", None)
+    result = _core_agent_stage_forward(program, client, state, runtime_options)
+    out = _flow_finish_program_node(flow, prepared, result, state)
     return out
 
 
@@ -1364,6 +1507,41 @@ def _flow_execute_nested_steps(flow: Any, client: Any, steps: Any, state: Any, o
     return out
 
 
+def flow_execute_owned_worker(flow: Any, step: Any, plan_step: Any, client: Any, state: Any, options: Any) -> Any:
+    _core_coverage_mark("flow_execute_owned_worker")
+    empty_map = {}
+    traces = []
+    chat_log = []
+    usage = {}
+    flow["traces"] = traces
+    flow["chat_log"] = chat_log
+    flow["usage"] = usage
+    report = {}
+    try:
+        result_state = _flow_execute_step(flow, step, plan_step, client, state, options)
+        report["state"] = result_state
+    except Exception as error:
+        message = _core_exception_message(error)
+        name = _core_get(step, "name", "")
+        message = _core_string_format("Flow node {} failed: {}", name, message)
+        report["error"] = message
+        program = _core_get(step, "program", None)
+        has_program = _core_is_not_none(program)
+        if has_program:
+            _flow_record_child_chat_log(flow, name, program)
+            _flow_record_child_usage(flow, name, program)
+            _flow_record_child_traces(flow, name, program)
+        else:
+            pass
+    traces = _core_get(flow, "traces", None)
+    chat_log = _core_get(flow, "chat_log", None)
+    usage = _core_get(flow, "usage", None)
+    report["traces"] = traces
+    report["chat_log"] = chat_log
+    report["usage"] = usage
+    return report
+
+
 def _flow_execute_steps(flow: Any, client: Any, state: Any, options: Any) -> Any:
     _core_coverage_mark("_flow_execute_steps")
     empty_map = {}
@@ -1415,11 +1593,64 @@ def _flow_execute_steps(flow: Any, client: Any, state: Any, options: Any) -> Any
         is_parallel_group = _core_gt(group_count, 1)
         if is_parallel_group:
             group_start = _core_map_merge(current, empty_map)
-            for plan_step in group_steps:
-                index = _core_get(plan_step, "stepIndex", 0)
-                step = _core_list_get(steps, index, None)
-                result_state = _flow_execute_step(flow, step, plan_step, client, group_start, options)
-                current = _flow_merge_parallel_results(current, result_state)
+            reports = _core_flow_dispatch_group(flow, client, group_steps, group_start, options)
+            fallback = _core_is_none(reports)
+            if fallback:
+                traces = _core_get(flow, "traces", empty_list)
+                program_id = _core_get(flow, "program_id", "root.flow")
+                payload = {}
+                payload["level"] = level
+                payload["reason"] = "owned-worker-unavailable"
+                fallback_event = _program_trace_event(program_id, "flow_parallel_fallback", payload)
+                traces.append(fallback_event)
+                for plan_step in group_steps:
+                    index = _core_get(plan_step, "stepIndex", 0)
+                    step = _core_list_get(steps, index, None)
+                    result_state = _flow_execute_step(flow, step, plan_step, client, group_start, options)
+                    current = _flow_merge_group_step(current, step, group_start, result_state)
+            else:
+                report_count = _core_len(reports)
+                complete_reports = _core_eq(report_count, group_count)
+                if complete_reports:
+                    pass
+                else:
+                    error = _core_runtime_error("Flow dispatcher omitted node outcomes")
+                    raise error
+                failures = []
+                report_position = 0
+                for report in reports:
+                    worker_traces = _core_get(report, "traces", empty_list)
+                    traces = _core_get(flow, "traces", empty_list)
+                    for trace in worker_traces:
+                        traces.append(trace)
+                    worker_log = _core_get(report, "chat_log", empty_list)
+                    chat_log = _core_get(flow, "chat_log", empty_list)
+                    for entry in worker_log:
+                        chat_log.append(entry)
+                    worker_usage = _core_get(report, "usage", empty_map)
+                    usage = _core_get(flow, "usage", empty_map)
+                    merged_usage = _core_map_merge(usage, worker_usage)
+                    flow["usage"] = merged_usage
+                    failure = _core_get(report, "error", None)
+                    failed = _core_is_not_none(failure)
+                    if failed:
+                        failures.append(failure)
+                    else:
+                        result_state = _core_get(report, "state", None)
+                        report_plan_step = _core_list_get(group_steps, report_position, None)
+                        report_step_index = _core_get(report_plan_step, "stepIndex", 0)
+                        report_step = _core_list_get(steps, report_step_index, None)
+                        current = _flow_merge_group_step(current, report_step, group_start, result_state)
+                    report_position = _core_add(report_position, 1)
+                failure_count = _core_len(failures)
+                failed = _core_gt(failure_count, 0)
+                if failed:
+                    flow["completed_state"] = current
+                    message = _core_string_join("; ", failures)
+                    error = _core_runtime_error(message)
+                    raise error
+                else:
+                    pass
         else:
             for plan_step in group_steps:
                 index = _core_get(plan_step, "stepIndex", 0)
@@ -1437,13 +1668,25 @@ def _flow_forward(flow: Any, client: Any, values: Any, options: Any) -> Any:
         opts = empty_map
     else:
         pass
-    cache_read = _flow_cache_read_write(flow, values, opts, "read", None)
-    cache_hit = _core_get(cache_read, "hit", False)
-    if cache_hit:
-        cached_value = _core_get(cache_read, "value", None)
-        return cached_value
+    opts = _core_map_merge(empty_map, opts)
+    cache_fn = _core_none()
+    flow_cache_key = ""
+    host_lookup = _core_get(opts, "_ax_flow_cache_lookup", None)
+    looked_up = _core_is_not_none(host_lookup)
+    if looked_up:
+        cache_fn = _core_get(host_lookup, "fn", None)
+        flow_cache_key = _core_get(host_lookup, "key", "")
     else:
-        pass
+        cache_read = _flow_cache_lookup_impl(flow, values, opts)
+        cache_hit = _core_get(cache_read, "hit", False)
+        if cache_hit:
+            cached_value = _core_get(cache_read, "value", None)
+            return cached_value
+        else:
+            pass
+        cache_fn = _core_get(cache_read, "fn", None)
+        flow_cache_key = _core_get(cache_read, "key", "")
+    _core_map_delete(opts, "_ax_flow_cache_lookup")
     fresh_traces = []
     fresh_chat_log = []
     fresh_usage = {}
@@ -1453,13 +1696,13 @@ def _flow_forward(flow: Any, client: Any, values: Any, options: Any) -> Any:
     state = _core_map_merge(empty_map, values)
     traces = _core_get(flow, "traces", None)
     program_id = _core_get(flow, "program_id", "root.flow")
-    cache_key = _flow_cache_key(values)
+    cache_key = _flow_cache_key(flow, values)
     begin = _program_trace_event(program_id, "flow_start", state)
     traces.append(begin)
     state = _flow_execute_steps(flow, client, state, opts)
     returns = _core_get(flow, "returns", empty_map)
     output = _flow_project_returns(state, returns)
-    _flow_cache_read_write(flow, values, opts, "write", output)
+    _flow_cache_store_impl(cache_fn, flow_cache_key, output)
     done_payload = {}
     done_payload["cache_key"] = cache_key
     done_payload["output"] = output
@@ -1756,7 +1999,7 @@ def _flow_mermaid_register_node(ast: Any, id: str, shape: str, label: Any, line:
 
 def _flow_mermaid_parse_node_ref(ast: Any, text: str, line: int) -> str:
     _core_coverage_mark("_flow_mermaid_parse_node_ref")
-    source = str(text).strip()
+    source = str(text).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
     source_len = _core_len(source)
     empty = _core_eq(source_len, 0)
     if empty:
@@ -1778,9 +2021,9 @@ def _flow_mermaid_parse_node_ref(ast: Any, text: str, line: int) -> str:
         else:
             pass
     id_raw = _core_string_slice(source, 0, split_at)
-    id = str(id_raw).strip()
+    id = str(id_raw).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
     tail = _core_string_slice(source, split_at)
-    tail = str(tail).strip()
+    tail = str(tail).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
     shape = "rect"
     label = _core_none()
     has_tail = _core_truthy(tail)
@@ -1806,7 +2049,7 @@ def _flow_mermaid_parse_node_ref(ast: Any, text: str, line: int) -> str:
                     _flow_mermaid_fail("Unexpected content after node id", line)
         balanced = _core_get(group, "balanced", False)
         rest = _core_get(group, "rest", "")
-        rest = str(rest).strip()
+        rest = str(rest).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
         trailing = _core_truthy(rest)
         bad = _core_not(balanced)
         bad = _core_or(bad, trailing)
@@ -1829,7 +2072,7 @@ def _flow_mermaid_parse_node_ref(ast: Any, text: str, line: int) -> str:
             label_text = _core_string_slice(label_text, 1, inner_end)
         else:
             pass
-        label_text = str(label_text).strip()
+        label_text = str(label_text).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
         quoted_double = _core_string_starts_with(label_text, "\"")
         quoted_single = _core_string_starts_with(label_text, "'")
         quoted = _core_or(quoted_double, quoted_single)
@@ -1887,7 +2130,7 @@ def _flow_mermaid_parse(text: str) -> Any:
     line_number = 0
     for raw in lines:
         line_number = _core_add(line_number, 1)
-        line = str(raw).strip()
+        line = str(raw).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
         is_empty = _core_eq(line, "")
         if is_empty:
             pass
@@ -1905,9 +2148,9 @@ def _flow_mermaid_parse(text: str) -> Any:
                 else:
                     _flow_mermaid_fail("Invalid Ax directive", line_number)
                 id = _core_get(parts, "left", "")
-                id = str(id).strip()
+                id = str(id).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
                 sig = _core_get(parts, "right", "")
-                sig = str(sig).strip()
+                sig = str(sig).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
                 valid_id = _core_regex_match("^[A-Za-z_][A-Za-z0-9_]*$", id)
                 invalid_id = _core_not(valid_id)
                 if invalid_id:
@@ -1977,7 +2220,7 @@ def _flow_mermaid_parse(text: str) -> Any:
                             else:
                                 pass
                             segment = _core_list_get(segments, segment_index, "")
-                            segment = str(segment).strip()
+                            segment = str(segment).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
                             label = _core_none()
                             has_label = _core_string_starts_with(segment, "|")
                             if has_label:
@@ -1989,9 +2232,9 @@ def _flow_mermaid_parse(text: str) -> Any:
                                 else:
                                     _flow_mermaid_fail("Unterminated edge label", line_number)
                                 label = _core_get(label_parts, "left", "")
-                                label = str(label).strip()
+                                label = str(label).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
                                 segment = _core_get(label_parts, "right", "")
-                                segment = str(segment).strip()
+                                segment = str(segment).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
                             else:
                                 pass
                             to_ids = _flow_mermaid_parse_group(ast, segment, line_number)
@@ -2551,7 +2794,7 @@ def _flow_mermaid_compile(ast: Any, bindings: Any) -> Any:
                 meta["target"] = to
                 if is_while:
                     condition_name = _core_string_slice(main, 6)
-                    condition_name = str(condition_name).strip()
+                    condition_name = str(condition_name).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
                     condition = _core_get(conditions, condition_name, None)
                     missing_condition = _core_is_none(condition)
                     if missing_condition:
@@ -2566,7 +2809,7 @@ def _flow_mermaid_compile(ast: Any, bindings: Any) -> Any:
                 else:
                     if is_if:
                         condition_name = _core_string_slice(main, 3)
-                        condition_name = str(condition_name).strip()
+                        condition_name = str(condition_name).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
                         condition = _core_get(conditions, condition_name, None)
                         missing_condition = _core_is_none(condition)
                         if missing_condition:
@@ -2802,6 +3045,11 @@ def _flow_mermaid_render_flow(flow: Any, options: Any) -> str:
                 step_options = _core_get(step, "options", empty_map)
                 empty_reads = []
                 step_reads = _core_get(step, "reads", empty_reads)
+                inferred_reads = _core_map_contains(step, "outputs")
+                if inferred_reads:
+                    step_reads = empty_reads
+                else:
+                    pass
                 reads = _core_get(step_options, "reads", step_reads)
                 for read in reads:
                     is_result = _core_string_ends_with(read, "Result")
@@ -2846,4 +3094,275 @@ def _flow_to_mermaid(flow: Any, options: Any) -> str:
     rendered = _flow_mermaid_render_flow(flow, options)
     return rendered
 
+
+def _flow_group_step_changes(step: Any, group_start: Any, result_state: Any) -> list[Any]:
+    _core_coverage_mark("_flow_group_step_changes")
+    empty_map = {}
+    empty_list = []
+    changes = []
+    missing_step = _core_is_none(step)
+    if missing_step:
+        return changes
+    else:
+        pass
+    kind = _core_get(step, "kind", "execute")
+    name = _core_get(step, "name", "")
+    step_options = _core_get(step, "options", empty_map)
+    guard = _core_get(step_options, "guard", None)
+    has_guard = _core_is_not_none(guard)
+    if has_guard:
+        guard_matches = _flow_evaluate_data_predicate(guard, group_start, False)
+        guard_skipped = _core_not(guard_matches)
+        if guard_skipped:
+            return changes
+        else:
+            pass
+    else:
+        pass
+    result_key = _core_string_format("{}Result", name)
+    is_derive = _core_eq(kind, "derive")
+    if is_derive:
+        writes = _core_get(step, "writes", empty_list)
+        output_field = _core_list_get(writes, 0, name)
+        changes.append(output_field)
+        return changes
+    else:
+        pass
+    is_map = _core_eq(kind, "map")
+    is_branch = _core_eq(kind, "branch")
+    is_while = _core_eq(kind, "while")
+    is_feedback = _core_eq(kind, "feedback")
+    is_parallel = _core_eq(kind, "parallel")
+    is_parallel_merge = _core_eq(kind, "parallelMerge")
+    is_loop = _core_or(is_while, is_feedback)
+    is_control = _core_or(is_branch, is_loop)
+    is_explicit_parallel = _core_or(is_parallel, is_parallel_merge)
+    compares_values = _core_or(is_control, is_explicit_parallel)
+    not_program = _core_or(is_map, compares_values)
+    is_program = _core_not(not_program)
+    if is_program:
+        changes.append(result_key)
+        result = _core_get(result_state, result_key, None)
+        result_is_map = _core_type_is(result, "object")
+        if result_is_map:
+            result_fields = _core_map_keys(result)
+            for result_field in result_fields:
+                field_listed = _core_contains(changes, result_field)
+                if field_listed:
+                    pass
+                else:
+                    changes.append(result_field)
+        else:
+            pass
+        return changes
+    else:
+        pass
+    if is_map:
+        changes.append(result_key)
+    else:
+        pass
+    state_keys = _core_map_keys(result_state)
+    for state_key in state_keys:
+        key_listed = _core_contains(changes, state_key)
+        if key_listed:
+            pass
+        else:
+            in_start = _core_map_contains(group_start, state_key)
+            if in_start:
+                before = _core_get(group_start, state_key, None)
+                after = _core_get(result_state, state_key, None)
+                unchanged = _core_eq(before, after)
+                if unchanged:
+                    pass
+                else:
+                    changes.append(state_key)
+            else:
+                changes.append(state_key)
+    return changes
+
+
+def _flow_merge_group_step(current: Any, step: Any, group_start: Any, result_state: Any) -> Any:
+    _core_coverage_mark("_flow_merge_group_step")
+    empty_map = {}
+    out = _core_map_merge(current, empty_map)
+    changes = _flow_group_step_changes(step, group_start, result_state)
+    for change in changes:
+        present = _core_map_contains(result_state, change)
+        if present:
+            value = _core_get(result_state, change, None)
+            out[change] = value
+        else:
+            pass
+    return out
+
+
+def _flow_step_program_io(kind: str, name: str, program: Any, options: Any) -> Any:
+    _core_coverage_mark("_flow_step_program_io")
+    io = {}
+    io["infer"] = False
+    is_execute = _core_eq(kind, "execute")
+    not_execute = _core_not(is_execute)
+    if not_execute:
+        return io
+    else:
+        pass
+    declares_reads = _core_map_contains(options, "reads")
+    declares_writes = _core_map_contains(options, "writes")
+    declares = _core_or(declares_reads, declares_writes)
+    if declares:
+        return io
+    else:
+        pass
+    io["infer"] = True
+    signature_text = _core_program_signature(program)
+    has_signature = _core_truthy(signature_text)
+    io["hasSignature"] = has_signature
+    no_signature = _core_not(has_signature)
+    if no_signature:
+        return io
+    else:
+        pass
+    signature = parse_signature(signature_text)
+    reads = []
+    input_fields = _core_get(signature, "input_fields", None)
+    for input_field in input_fields:
+        input_name = _core_get(input_field, "name", "")
+        reads.append(input_name)
+    writes = []
+    result_key = _core_string_format("{}Result", name)
+    writes.append(result_key)
+    outputs = []
+    output_fields = _core_get(signature, "output_fields", None)
+    for output_field in output_fields:
+        output_name = _core_get(output_field, "name", "")
+        is_result_key = _core_eq(output_name, result_key)
+        if is_result_key:
+            pass
+        else:
+            outputs.append(output_name)
+            writes.append(output_name)
+    io["reads"] = reads
+    io["writes"] = writes
+    io["outputs"] = outputs
+    return io
+
 # END AXIR CORE EMITTED FUNCTIONS
+
+
+def _owned_program_factory(program):
+    method = getattr(program, "owned_worker_factory", None)
+    return method() if callable(method) else None
+
+
+def _core_flow_dispatch_group(flow_state, client, plans, state, options):
+    import contextvars
+    import queue
+    import threading
+    import time
+    from .session import AxRunControl
+    from .ai import AxCancellationToken
+    factory_method = getattr(client, "owned_worker_factory", None)
+    client_factory = factory_method() if callable(factory_method) else None
+    if client_factory is None:
+        return None
+    tasks = []
+    steps = flow_state.get("steps", [])
+    for plan in plans:
+        index = int(plan.get("stepIndex", 0))
+        step = steps[index]
+        if step.get("kind", "execute") != "execute":
+            return None
+        factory = _owned_program_factory(step.get("program"))
+        if factory is None:
+            return None
+        tasks.append((index, plan, step, factory(), client_factory()))
+    parent = (options or {}).get("control")
+    parent_token = (options or {}).get("cancellation", (options or {}).get("cancellationToken", (options or {}).get("cancellation_token")))
+    cancelled = threading.Event()
+    deliveries = queue.Queue()
+    delivery_lock = threading.Lock()
+    accepting_deliveries = True
+    def deliver(value):
+        with delivery_lock:
+            if accepting_deliveries: deliveries.put(value)
+    def close_deliveries():
+        nonlocal accepting_deliveries
+        with delivery_lock: accepting_deliveries = False
+    tokens = []
+    def stop():
+        cancelled.set()
+        for token in tokens: token.cancel("Flow group cancelled")
+    class Signal:
+        def is_set(self):
+            return cancelled.is_set() or bool(parent and parent.signal.is_set())
+    class WorkerControl(AxRunControl):
+        def __init__(self):
+            super().__init__()
+            self.signal = Signal()
+        def _pending(self, path, after):
+            return parent._pending(path, after) if parent else []
+        def _emit(self, event):
+            deliver(("event", dict(event)))
+    def run(position, task, owned_flow, owned_state, owned_options):
+        index, plan, step, program, owned_client = task
+        owned_step = {**copy.deepcopy({key:value for key,value in step.items() if key != "program"}), "program":program}
+        try:
+            report = flow_execute_owned_worker(owned_flow, owned_step, copy.deepcopy(plan), owned_client, owned_state, owned_options)
+        except BaseException as error:
+            report = {"error":str(error)}
+        deliver(("result", (position, report)))
+    for position, task in enumerate(tasks):
+        # Programs belonging to other nodes are opaque handles and never run in
+        # this worker. The selected program is supplied as an owned instance.
+        memo = {id(step.get("program")):step.get("program") for step in steps if step.get("program") is not None}
+        owned_flow = copy.deepcopy(flow_state, memo)
+        owned_options = copy.deepcopy(options or {}, {id(parent_token): parent_token} if parent_token is not None else {})
+        owned_options["control"] = WorkerControl()
+        cancellation = AxCancellationToken()
+        tokens.append(cancellation)
+        owned_options["cancellation"] = cancellation
+        context = contextvars.copy_context()
+        threading.Thread(target=context.run, args=(run,position,task,owned_flow,copy.deepcopy(state),owned_options), daemon=True).start()
+    reports = [None] * len(tasks)
+    deadline = None
+    pending = {}
+    def consume(kind, delivery):
+        nonlocal deadline
+        if kind == "event":
+            key = (delivery.get("path"), delivery.get("call_id"))
+            if delivery.get("type") == "tool.started": pending[key] = True
+            if delivery.get("type") in ("tool.completed", "tool.failed"): pending.pop(key, None)
+            if parent: parent._emit(delivery)
+            return
+        position, report = delivery
+        if reports[position] is not None: return
+        reports[position] = report
+        if report.get("error") is not None:
+            stop()
+            if deadline is None: deadline = time.monotonic() + 0.1
+        else:
+            steps[tasks[position][0]]["program"] = tasks[position][3]
+    try:
+        while any(report is None for report in reports):
+            if (parent and parent.signal.is_set()) or (parent_token and parent_token.cancelled):
+                stop()
+                if deadline is None: deadline = time.monotonic() + 0.1
+            try:
+                consume(*deliveries.get(timeout=0.02))
+            except queue.Empty:
+                pass
+            if deadline is not None and time.monotonic() >= deadline:
+                close_deliveries()
+                while True:
+                    try: consume(*deliveries.get_nowait())
+                    except queue.Empty: break
+                for position, task in enumerate(tasks):
+                    if reports[position] is None:
+                        node_path = str((options or {}).get("execution_path", (options or {}).get("executionPath", "root"))) + "/" + task[2].get("name", "")
+                        unresolved = [call_id for (path,call_id) in pending if path == node_path]
+                        reports[position] = {"error":f"Flow cancelled; unresolved node: {node_path}; unresolved calls: {unresolved}"}
+                break
+    finally:
+        close_deliveries()
+        stop()
+    return reports

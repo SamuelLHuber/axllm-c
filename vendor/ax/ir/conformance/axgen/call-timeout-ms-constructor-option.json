@@ -1,0 +1,24 @@
+{
+  "description": "AxGen passes timeout to ai.chat from the forward call, else the constructor, as TS passes its per-call timeout.",
+  "expected_chat_options_subset": {
+    "timeoutMs": 1000
+  },
+  "expected_output": {
+    "answer": "on time"
+  },
+  "expected_request_count": 1,
+  "input": {
+    "question": "Answer within the timeout"
+  },
+  "kind": "forward",
+  "name": "call-timeout-ms-constructor-option",
+  "options": {
+    "timeout": 1000
+  },
+  "responses": [
+    {
+      "content": "Answer: on time"
+    }
+  ],
+  "signature": "question:string -> answer:string"
+}

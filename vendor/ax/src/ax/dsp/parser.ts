@@ -1,3 +1,5 @@
+import { type AxEvidenceOptions, validateDecisionField } from './decision.js';
+import { validateValueDescriptions } from './valueDescriptions.js';
 // ============================================================================
 // STRING SIGNATURE PARSER - TYPE DEFINITIONS
 // ============================================================================
@@ -25,6 +27,9 @@
 
 export type TypeNotClass =
   | 'string'
+  | 'score'
+  | 'box'
+  | 'class'
   | 'number'
   | 'boolean'
   | 'json' // Flexible type - inferred as 'any', accepts any JSON
@@ -39,7 +44,7 @@ export type TypeNotClass =
   | 'code'
   | 'object'; // Flexible type - inferred as 'any', same as 'json'
 
-export type Type = TypeNotClass | 'class';
+export type Type = TypeNotClass | 'score' | 'class';
 export type ParsedIdentifier = string;
 export type ParsedString = string;
 
@@ -53,6 +58,8 @@ export type ParsedSignature = {
 // e.g. `string(min 2, max 50)`, `string(format email)` or `code(python)`.
 // Keys mirror the constraint slots on AxFieldType/AxField in sig.ts.
 export type ParsedTypeConstraints = {
+  evidence?: AxEvidenceOptions;
+  valueDescriptions?: Readonly<Record<string, string>>;
   minLength?: number;
   maxLength?: number;
   minimum?: number;
@@ -66,7 +73,7 @@ export type ParsedTypeConstraints = {
 // A field type inside `object{ ... }`. Structurally compatible with
 // AxFieldType in sig.ts, which cannot be imported here without a cycle.
 export type ParsedNestedFieldType = ParsedTypeConstraints & {
-  type: TypeNotClass | 'class';
+  type: TypeNotClass | 'score' | 'class';
   isArray: boolean;
   options?: string[];
   fields?: Record<string, ParsedNestedFieldType>;
@@ -82,6 +89,7 @@ export type ParsedFieldType = ParsedTypeConstraints & {
   name: TypeNotClass;
   isArray: boolean;
   fields?: Record<string, ParsedNestedFieldType>;
+  options?: string[];
   description?: string;
 };
 
@@ -98,7 +106,13 @@ export type OutputParsedField = {
   desc?: string;
   type?:
     | (ParsedFieldType & { options?: string[] })
-    | { name: 'class'; isArray: boolean; options: string[] };
+    | {
+        name: 'class';
+        isArray: boolean;
+        options: string[];
+        evidence?: AxEvidenceOptions;
+        valueDescriptions?: Readonly<Record<string, string>>;
+      };
   isOptional?: boolean;
   isInternal?: boolean;
 };
@@ -471,9 +485,12 @@ class SignatureParser {
     this.skipWhitespace();
     if (this.match(':')) {
       this.skipWhitespace();
-      if (this.match('class')) {
+      if (this.match('class') || this.match('score')) {
+        const enumType = this.input.slice(this.position - 5, this.position) as
+          | 'class'
+          | 'score';
         this.rejectClassModifierBag(name);
-        const isArray = this.match('[]');
+        let isArray = this.match('[]');
         this.rejectClassModifierBag(name);
         this.skipWhitespace();
         const classNamesString = this.parseParsedString();
@@ -488,7 +505,7 @@ class SignatureParser {
         const options = classNamesString
           .split(/[,|]/)
           .map((s) => s.trim())
-          .filter((s) => s.length > 0);
+          .filter((s) => enumType === 'score' || s.length > 0);
 
         if (options.length === 0) {
           throw new SignatureValidationError(
@@ -499,7 +516,22 @@ class SignatureParser {
           );
         }
 
-        type = { name: 'class', isArray, options };
+        const valueDescriptions = this.parseClassValueDescriptions(
+          options,
+          name
+        );
+        if (this.match('[]')) isArray = true;
+        validateDecisionField({
+          type: enumType,
+          options,
+          evidence: valueDescriptions?.evidence,
+        });
+        type = {
+          name: enumType,
+          isArray,
+          options,
+          ...(valueDescriptions ?? {}),
+        };
       } else {
         try {
           const parsed = this.parseNonClassType('output', name);
@@ -642,6 +674,9 @@ class SignatureParser {
     const types: TypeNotClass[] = [
       'string',
       'number',
+      'score',
+      'box',
+      'class',
       'boolean',
       'json',
       'image',
@@ -728,6 +763,28 @@ class SignatureParser {
     fieldName: string
   ): { type: ParsedFieldType; isCached?: boolean } {
     const typeName = this.parseTypeNotClass();
+    if (typeName === 'score' || typeName === 'class') {
+      const isArray = this.match('[]');
+      this.skipWhitespace();
+      const labels = this.parseParsedString();
+      if (!labels) throw new Error(`${typeName} requires quoted labels`);
+      const options = labels.split(/[,|]/).map((s) => s.trim());
+      const constraints =
+        this.parseClassValueDescriptions(options, fieldName) ?? {};
+      validateDecisionField({
+        type: typeName,
+        options,
+        evidence: constraints.evidence,
+      });
+      return {
+        type: {
+          name: typeName,
+          isArray: this.match('[]') || isArray,
+          options,
+          ...constraints,
+        },
+      };
+    }
 
     if (typeName === 'object') {
       const beforeBrace = this.position;
@@ -805,6 +862,8 @@ class SignatureParser {
       if (typeName === 'number') {
         allowed.push('min <n>', 'max <n>');
       }
+      if (typeName === 'boolean')
+        allowed.push('true "<description>"', 'false "<description>"');
       if (typeName === 'code') {
         allowed.push('<language>');
       }
@@ -861,6 +920,61 @@ class SignatureParser {
       this.position += token.length;
 
       switch (token) {
+        case 'evidence':
+          markSeen(token);
+          if (!['boolean', 'score', 'class', 'box'].includes(typeName))
+            bagError('Evidence requires boolean, class, score or box');
+          constraints.evidence = { ...constraints.evidence };
+          break;
+        case 'threshold': {
+          markSeen(token);
+          if (typeName !== 'boolean')
+            bagError('threshold requires boolean evidence');
+          this.skipWhitespace();
+          const n = /^(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)/.exec(
+            this.input.slice(this.position)
+          )?.[0];
+          if (!n) bagError('threshold requires a number in [0, 1]');
+          this.position += n!.length;
+          constraints.evidence = {
+            ...constraints.evidence,
+            threshold: Number(n),
+          };
+          break;
+        }
+        case 'refusal': {
+          markSeen(token);
+          this.skipWhitespace();
+          const policy = /^(return|throw)\b/.exec(
+            this.input.slice(this.position)
+          )?.[0];
+          if (!policy) bagError('refusal requires return or throw');
+          this.position += policy!.length;
+          constraints.evidence = {
+            ...constraints.evidence,
+            onRefusal: policy as 'return' | 'throw',
+          };
+          break;
+        }
+        case 'true':
+        case 'false': {
+          markSeen(token);
+          if (typeName !== 'boolean')
+            bagError(
+              `Field "${fieldName}": "${token}" value descriptions require a boolean field`
+            );
+          this.skipWhitespace();
+          const description = this.parseParsedString();
+          if (description === undefined || !description.trim())
+            bagError(
+              `Field "${fieldName}": "${token}" requires a nonempty quoted description`
+            );
+          constraints.valueDescriptions = {
+            ...constraints.valueDescriptions,
+            [token]: description!,
+          };
+          break;
+        }
         case 'min':
         case 'max': {
           markSeen(token);
@@ -1009,7 +1123,85 @@ class SignatureParser {
       );
     }
 
+    if (constraints.evidence && !seen.has('evidence'))
+      bagError('threshold/refusal requires evidence');
+    validateDecisionField({ type: typeName, evidence: constraints.evidence });
     return { constraints, isCached, itemDescription };
+  }
+
+  // Class descriptions follow the declared labels, keeping existing enum syntax unchanged.
+  private parseClassValueDescriptions(
+    options: string[],
+    fieldName: string
+  ): ParsedTypeConstraints | undefined {
+    this.skipWhitespace();
+    if (!this.match('(')) return undefined;
+    let descriptions: Record<string, string> = {};
+    let evidence: AxEvidenceOptions | undefined;
+    const modifiers = new Set<string>();
+    const fail = (message: string): never => {
+      throw new SignatureValidationError(
+        `Field "${fieldName}": ${message}`,
+        this.position,
+        this.getErrorContext()
+      );
+    };
+    this.skipWhitespace();
+    if (this.input[this.position] === ')') fail('empty value description list');
+    while (true) {
+      this.skipWhitespace();
+      const quoted = this.input[this.position] === '"';
+      let value = this.parseParsedString();
+      if (value === undefined) {
+        value = /^[A-Za-z_][A-Za-z0-9_.-]*/.exec(
+          this.input.slice(this.position)
+        )?.[0];
+        if (value === undefined) fail('expected a class label');
+        this.position += value!.length;
+      }
+      this.skipWhitespace();
+      if (!quoted && (value === 'evidence' || value === 'refusal')) {
+        if (modifiers.has(value!)) fail(`duplicate ${value} modifier`);
+        modifiers.add(value!);
+        if (value === 'evidence') {
+          evidence = { ...evidence };
+        } else {
+          const policy = /^(return|throw)\b/.exec(
+            this.input.slice(this.position)
+          )?.[0];
+          if (!policy) fail('refusal requires return or throw');
+          this.position += policy!.length;
+          evidence = { ...evidence, onRefusal: policy as 'return' | 'throw' };
+        }
+      } else {
+        if (Object.hasOwn(descriptions, value!))
+          fail(`duplicate description for "${value}"`);
+        this.skipWhitespace();
+        const description = this.parseParsedString();
+        if (description === undefined || !description.trim())
+          fail(`"${value}" requires a nonempty quoted description`);
+        descriptions = { ...descriptions, [value!]: description! };
+      }
+      this.skipWhitespace();
+      if (this.match(')')) break;
+      if (!this.match(',')) fail('expected "," or ")" in value descriptions');
+      this.skipWhitespace();
+      if (this.input[this.position] === ')')
+        fail('trailing comma in value descriptions');
+    }
+    if (evidence && !modifiers.has('evidence'))
+      fail('refusal requires the evidence modifier');
+    try {
+      validateValueDescriptions('class', descriptions, options, fieldName);
+    } catch (error) {
+      fail(error instanceof Error ? error.message : String(error));
+    }
+    return {
+      ...(Object.keys(descriptions).length
+        ? { valueDescriptions: descriptions }
+        : {}),
+      ...(evidence ? { evidence } : {}),
+    };
   }
 
   // Parses the field list of `object{ ... }`. The opening "{" has already
@@ -1112,10 +1304,13 @@ class SignatureParser {
     this.skipWhitespace();
     if (this.match(':')) {
       this.skipWhitespace();
-      if (/^class\b/.test(this.input.slice(this.position))) {
-        this.match('class');
+      if (/^(class|score)\b/.test(this.input.slice(this.position))) {
+        const enumType = /^(class|score)/.exec(
+          this.input.slice(this.position)
+        )![0] as 'class' | 'score';
+        this.match(enumType);
         this.rejectClassModifierBag(qualified);
-        const isArray = this.match('[]');
+        let isArray = this.match('[]');
         this.rejectClassModifierBag(qualified);
         this.skipWhitespace();
         const classNamesString = this.parseParsedString();
@@ -1130,7 +1325,7 @@ class SignatureParser {
         const options = classNamesString
           .split(/[,|]/)
           .map((s) => s.trim())
-          .filter((s) => s.length > 0);
+          .filter((s) => enumType === 'score' || s.length > 0);
         if (options.length === 0) {
           throw new SignatureValidationError(
             `Object field "${qualified}": Empty class list provided`,
@@ -1139,10 +1334,21 @@ class SignatureParser {
             'Provide at least one class option. Example: "high, medium"'
           );
         }
+        const valueDescriptions = this.parseClassValueDescriptions(
+          options,
+          qualified
+        );
+        if (this.match('[]')) isArray = true;
+        validateDecisionField({
+          type: enumType,
+          options,
+          evidence: valueDescriptions?.evidence,
+        });
         type = {
-          type: 'class',
+          type: enumType,
           isArray,
           options,
+          ...(valueDescriptions ?? {}),
           isOptional,
           isInternal: false,
         };

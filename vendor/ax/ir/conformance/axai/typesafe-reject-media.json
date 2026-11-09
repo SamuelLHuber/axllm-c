@@ -1,0 +1,58 @@
+{
+  "expected_error_contains": "Typesafe supports text",
+  "expected_transport_request_count": 0,
+  "kind": "ai_chat",
+  "name": "typesafe-reject-media",
+  "provider": "typesafe",
+  "request": {
+    "chatPrompt": [
+      {
+        "content": [
+          {
+            "data": "AAAA",
+            "format": "wav",
+            "type": "audio"
+          }
+        ],
+        "role": "user"
+      }
+    ],
+    "modelConfig": {
+      "stream": false
+    },
+    "responseFormat": {
+      "fieldDescriptions": {
+        "team": {
+          "description": "Responsible team",
+          "valueDescriptions": {
+            "billing": "Payment questions",
+            "support": "Product help"
+          }
+        }
+      },
+      "schema": {
+        "name": "decision",
+        "schema": {
+          "properties": {
+            "team": {
+              "enum": [
+                "support",
+                "billing"
+              ],
+              "type": "string"
+            },
+            "urgent": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "urgent",
+            "team"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "json_schema"
+    }
+  }
+}

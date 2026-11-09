@@ -1,7 +1,7 @@
 ---
 name: "ax-go-agent-optimize"
 description: "Use when writing Go code with `github.com/ax-llm/ax/packages/go` for agent optimization, verified agent-playbook evolution, evaluators, judges, optimizer artifacts, BootstrapFewShot, and GEPA."
-version: "24.0.14"
+version: "25.4.9"
 ---
 # AxAgent Optimize For Go
 
@@ -34,7 +34,7 @@ result := engine.Optimize(request, evaluator)
 
 ## Relevant API Surface
 
-- Agents And RLM: `axllm.NewAgent`, `axllm.AxAgent`
+- Agents And RLM: `axllm.NewAgent`, `axllm.AxAgent`, `AxAgent.AddChildAgent`, `AxAgent.StreamingForward`
 - Optimizers: `axllm.Optimize`, `axllm.Playbook`, `axllm.AxPlaybook`, `axllm.AxBootstrapFewShot`, `axllm.AxGEPA`, `axllm.OptimizerEngine`, `axllm.OptimizerEvaluator`
 
 ## Guardrails
@@ -44,3 +44,6 @@ result := engine.Optimize(request, evaluator)
 - Use `no-key` examples for deterministic local checks and provider request mapping.
 - Treat AxIR as the source of generated package truth: if package docs disagree with source code, update the compiler and regenerate packages.
 - Do not copy repo-maintainer skills from `tools/*/skills/` into user packages.
+- GEPA returns baselineScore and baselineScores at the artifact top level and in metadata, measured before bootstrap or component changes. Compare metadata.bestScore with baselineScore; the original candidate need not remain on the Pareto frontier.
+- Baseline and seeded validation use the same capped held-out subset and selection scalarization. Both consume maxMetricCalls. Bootstrap generation has separate limits; metadata.bootstrapMetricCalls plus metadata.totalMetricCalls equals metadata.totalCalls. Without new demos, reuse the baseline evaluation.
+- Bootstrap demos contain only fresh training inputs and outputs; never recover demos from a retained validation or inactive-child trace tree.

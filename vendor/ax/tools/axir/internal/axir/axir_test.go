@@ -119,6 +119,60 @@ func TestFlowMermaidCrossLanguageParity(t *testing.T) {
 	}
 }
 
+// TestNumberFormatCrossLanguageParity keeps prompt/number-format-cases.json
+// dispatched by every runner: it is the only fixture that reaches NaN, the
+// infinities and -0, which a JSON fixture cannot hold.
+func TestNumberFormatCrossLanguageParity(t *testing.T) {
+	dispatch := map[string]struct{ source, marker string }{
+		"go":     {goRuntime + goConformance, `case "number_format":`},
+		"cpp":    {cppConformance, `kind == "number_format"`},
+		"java":   {javaConformance, `case "number_format" ->`},
+		"rust":   {rustLib, `"number_format" => run_number_format_fixture`},
+		"python": {pyConformance, `kind == "number_format"`},
+	}
+	for language, entry := range dispatch {
+		if !strings.Contains(entry.source, entry.marker) {
+			t.Errorf("DRIFT: number_format fixtures are not dispatched by the %s runner", language)
+		}
+	}
+}
+
+// TestDateFieldValueCrossLanguageParity keeps the axgen/date-field-values-*
+// corpus (TypeScript's date parsing with parse_dates on) and the date input
+// fixture dispatched by every runner, and the date zone intrinsic bound in
+// every language.
+func TestDateFieldValueCrossLanguageParity(t *testing.T) {
+	dispatch := map[string]struct{ source, marker string }{
+		"go":     {goRuntime + goConformance, `case "date_field_value":`},
+		"cpp":    {cppConformance, `kind == "date_field_value"`},
+		"java":   {javaConformance, `case "date_field_value" ->`},
+		"rust":   {rustLib, `"date_field_value" => run_date_field_value_fixture`},
+		"python": {pyConformance, `kind == "date_field_value"`},
+	}
+	for language, entry := range dispatch {
+		if !strings.Contains(entry.source, entry.marker) {
+			t.Errorf("DRIFT: date_field_value fixtures are not dispatched by the %s runner", language)
+		}
+		inputMarker := strings.ReplaceAll(strings.ReplaceAll(entry.marker, "date_field_value", "date_input"), "run_date_field_value_fixture", "run_date_input_fixture")
+		if !strings.Contains(entry.source, inputMarker) {
+			t.Errorf("DRIFT: date_input fixtures are not dispatched by the %s runner", language)
+		}
+	}
+	for language, bindings := range map[string]map[CoreIntrinsic]string{
+		"Python": coreIntrinsicPython,
+		"Rust":   coreIntrinsicRust,
+		"Cpp":    coreIntrinsicCpp,
+		"Java":   coreIntrinsicJava,
+	} {
+		if _, ok := bindings[IntrinsicDateZoneOffset]; !ok {
+			t.Errorf("DRIFT: intrinsic.date.zone_offset is not bound in coreIntrinsic%s", language)
+		}
+	}
+	if !coreIntrinsicGoRaising[IntrinsicDateZoneOffset] {
+		t.Errorf("DRIFT: intrinsic.date.zone_offset must return an error in Go")
+	}
+}
+
 // TestAgentPublicAPIParity is the G9 gate: cross-language public-API parity for AxAgent.
 //
 // The Rust agent shipped without optimize()/playbook(), and Go without optimize(), because no
@@ -305,6 +359,11 @@ func TestPublicGeneratedSurfaceHygiene(t *testing.T) {
 				auditPublicSurfacePathHygiene(t, repoRoot, path)
 				return nil
 			}
+			// A worktree's node_modules (or build) may be a symlink to a
+			// directory: skip it as the directory itself is skipped.
+			if entry.Type()&fs.ModeSymlink != 0 && generatedPackageHygieneSkipDir(entry.Name()) {
+				return nil
+			}
 			auditPublicSurfacePathHygiene(t, repoRoot, path)
 			if generatedPackageHygieneSkipFile(entry.Name()) {
 				return nil
@@ -394,7 +453,6 @@ func TestLoadCheckLowerAxCore(t *testing.T) {
 		"op core.func @execute_tool_call",
 		"op core.func @build_gen_chat_request",
 		"op core.method @forward",
-		"op core.func @complete_with_retries_impl",
 		"op core.func @fold_stream",
 		"op core.func @stream_event_content_parts_impl",
 		"op core.func @ai",
@@ -763,7 +821,7 @@ func TestBuildRuntimeModel(t *testing.T) {
 			t.Fatalf("runtime model missing core body source for %s: %#v", want, model.BodySources)
 		}
 	}
-	for _, want := range []string{"signature_parse_impl", "signature_parse_type_expr_impl", "signature_parse_modifier_bag_impl", "signature_parse_object_fields_impl", "schema_to_json_schema_impl", "validate_value_impl", "template_parse_impl", "prompt_messages_impl", "complete_with_retries_impl", "parse_output_impl", "tool_spec_impl", "ai_model_usage_impl", "openai_message_impl", "openai_stream_choice_impl", "stream_event_content_parts_impl"} {
+	for _, want := range []string{"signature_parse_impl", "signature_parse_type_expr_impl", "signature_parse_modifier_bag_impl", "signature_parse_object_fields_impl", "schema_to_json_schema_impl", "validate_value_impl", "template_parse_impl", "prompt_messages_impl", "parse_output_impl", "tool_spec_impl", "ai_model_usage_impl", "openai_message_impl", "openai_stream_choice_impl", "stream_event_content_parts_impl"} {
 		if model.BodySources[want] != "core" || !model.PrivateSymbols[want] {
 			t.Fatalf("runtime model missing private core helper %s: body=%#v private=%#v", want, model.BodySources, model.PrivateSymbols)
 		}
@@ -803,6 +861,7 @@ func TestCapabilityManifestsAndGeneratedPackageShape(t *testing.T) {
 				"axllm/gen.py",
 				"axllm/conformance.py",
 				"examples/signature_schema.py",
+				"examples/model_catalog.py",
 				"examples/axgen_scripted_client_tool.py",
 				"examples/axgen_openai_api.py",
 				"examples/vertex_gemini_api.py",
@@ -823,6 +882,8 @@ func TestCapabilityManifestsAndGeneratedPackageShape(t *testing.T) {
 				"examples/audio_responses_mapping.py",
 				"examples/audio_http_roundtrip.py",
 				"examples/stream_http_roundtrip.py",
+				"examples/timeout_http_roundtrip.py",
+				"examples/transport_errors_http_roundtrip.py",
 				"examples/realtime_audio_events.py",
 				"examples/realtime_audio_turn.py",
 				"examples/optimizer_artifact.py",
@@ -873,8 +934,17 @@ func TestCapabilityManifestsAndGeneratedPackageShape(t *testing.T) {
 				"dev/axllm/ax/AxInMemoryBalancerStatsStore.java",
 				"dev/axllm/ax/AxProviderRouter.java",
 				"dev/axllm/ax/Conformance.java",
+				"dev/axllm/ax/AxGenDelta.java",
+				"dev/axllm/ax/AxGenDeltaStream.java",
+				"dev/axllm/ax/AxFieldProcessor.java",
+				"dev/axllm/ax/AxFieldProcessorContext.java",
+				"dev/axllm/ax/AxFieldProcessorMode.java",
+				"dev/axllm/ax/AxStreamingAssertion.java",
+				"dev/axllm/ax/AxCachingFunction.java",
 				"examples/SignatureSchemaExample.java",
+				"examples/ModelCatalogExample.java",
 				"examples/AxGenScriptedClientToolExample.java",
+				"examples/AxGenStreamingNoKeyExample.java",
 				"examples/AxGenOpenAIExample.java",
 				"examples/VertexGeminiExample.java",
 				"examples/ProviderMappingNoKeyExample.java",
@@ -898,6 +968,8 @@ func TestCapabilityManifestsAndGeneratedPackageShape(t *testing.T) {
 				"examples/AudioResponsesMappingExample.java",
 				"examples/AudioHTTPRoundtripExample.java",
 				"examples/StreamHTTPRoundtripExample.java",
+				"examples/TimeoutHTTPRoundtripExample.java",
+				"examples/TransportErrorsHTTPRoundtripExample.java",
 				"examples/RealtimeAudioEventsExample.java",
 				"examples/RealtimeAudioTurnExample.java",
 				"examples/OptimizerArtifactExample.java",
@@ -921,6 +993,7 @@ func TestCapabilityManifestsAndGeneratedPackageShape(t *testing.T) {
 				"axllm/axllm.cpp",
 				"conformance.cpp",
 				"examples/signature_schema.cpp",
+				"examples/model_catalog.cpp",
 				"examples/axgen_scripted_client_tool.cpp",
 				"examples/axgen_openai_api.cpp",
 				"examples/vertex_gemini_api.cpp",
@@ -942,6 +1015,8 @@ func TestCapabilityManifestsAndGeneratedPackageShape(t *testing.T) {
 				"examples/audio_responses_mapping.cpp",
 				"examples/audio_http_roundtrip.cpp",
 				"examples/stream_http_roundtrip.cpp",
+				"examples/timeout_http_roundtrip.cpp",
+				"examples/transport_errors_http_roundtrip.cpp",
 				"examples/realtime_audio_events.cpp",
 				"examples/realtime_audio_turn.cpp",
 				"examples/optimizer_artifact.cpp",
@@ -960,6 +1035,7 @@ func TestCapabilityManifestsAndGeneratedPackageShape(t *testing.T) {
 				"go.sum",
 				"axllm.go",
 				"errors_test.go",
+				"ordered_values_test.go",
 				"runtime/goja/goja.go",
 				"runtime/goja/goja_test.go",
 				"axir-capabilities.json",
@@ -967,6 +1043,7 @@ func TestCapabilityManifestsAndGeneratedPackageShape(t *testing.T) {
 				"conformance-coverage.json",
 				"conformance/main.go",
 				"examples/signature_schema/main.go",
+				"examples/model_catalog/main.go",
 				"examples/axgen_scripted_client_tool/main.go",
 				"examples/axgen_openai_api/main.go",
 				"examples/vertex_gemini_api/main.go",
@@ -983,6 +1060,8 @@ func TestCapabilityManifestsAndGeneratedPackageShape(t *testing.T) {
 				"examples/audio_responses_mapping/main.go",
 				"examples/audio_http_roundtrip/main.go",
 				"examples/stream_http_roundtrip/main.go",
+				"examples/timeout_http_roundtrip/main.go",
+				"examples/transport_errors_http_roundtrip/main.go",
 				"examples/realtime_audio_events/main.go",
 				"examples/realtime_audio_turn/main.go",
 				"examples/optimizer_artifact/main.go",
@@ -1005,10 +1084,12 @@ func TestCapabilityManifestsAndGeneratedPackageShape(t *testing.T) {
 				"axir-api.json",
 				"conformance-coverage.json",
 				"examples/signature_schema.rs",
+				"examples/model_catalog.rs",
 				"examples/provider_mapping_no_key.rs",
 				"examples/adaptive_balancer_no_key.rs",
 				"examples/provider_stream_no_key.rs",
 				"examples/axgen_scripted_client_tool.rs",
+				"examples/axgen_streaming_no_key.rs",
 				"examples/axgen_openai_api.rs",
 				"examples/vertex_gemini_api.rs",
 				"examples/runtime_adapter.rs",
@@ -1021,6 +1102,8 @@ func TestCapabilityManifestsAndGeneratedPackageShape(t *testing.T) {
 				"examples/audio_responses_mapping.rs",
 				"examples/audio_http_roundtrip.rs",
 				"examples/stream_http_roundtrip.rs",
+				"examples/timeout_http_roundtrip.rs",
+				"examples/transport_errors_http_roundtrip.rs",
 				"examples/realtime_audio_events.rs",
 				"examples/realtime_audio_turn.rs",
 				"examples/optimizer_artifact.rs",
@@ -1047,6 +1130,21 @@ func TestCapabilityManifestsAndGeneratedPackageShape(t *testing.T) {
 					t.Fatalf("generated %s package missing skill %s; files=%v", tc.target, want, files)
 				}
 				assertGeneratedSkillFrontmatter(t, dir, want, tc.target)
+			}
+			routerDir := "skills/ax-" + tc.target + "-llm/"
+			router := readRepoFile(t, dir, filepath.FromSlash(routerDir+"SKILL.md"))
+			if len(strings.Split(router, "\n")) > 90 {
+				t.Fatalf("%s entry point should stay compact", tc.target)
+			}
+			for _, spec := range packageSkillSpecs {
+				ref := "references/" + skillName(tc.target, spec) + ".md"
+				if spec.ID == "llm" {
+					ref = "references/quickstart.md"
+				}
+				body := readRepoFile(t, dir, filepath.FromSlash(routerDir+ref))
+				if !strings.Contains(router, "]("+ref+")") || !strings.HasPrefix(body, "# ") {
+					t.Fatalf("%s entry point should link to bundled guide %s", tc.target, ref)
+				}
 			}
 			for _, profileExample := range runtimeProfileExampleGuards(tc.target) {
 				data, err := os.ReadFile(filepath.Join(dir, profileExample))
@@ -1207,22 +1305,23 @@ func TestCapabilityManifestsAndGeneratedPackageShape(t *testing.T) {
 				checkGeneratedFileContains(t, dir, "pom.xml", "<groupId>dev.axllm</groupId>", "<artifactId>ax</artifactId>", "dev/axllm/ax/*.java")
 				checkGeneratedFileContains(t, dir, "build.gradle", "java-library", "dev/axllm/ax/*.java")
 			case "cpp":
-				checkGeneratedFileContains(t, dir, "CMakeLists.txt", "add_library(axllm axllm/axllm.cpp axllm/mcp.cpp)", "add_library(axllm::axllm ALIAS axllm)", "AX_BUILD_QUICKJS_PROFILE", "AX_QUICKJS_CFLAGS", "AX_QUICKJS_LDFLAGS", "add_library(axllm_quickjs", "find_package(CURL QUIET)", "AXLLM_ENABLE_CURL", "AXLLM_ENABLE_MCP_STDIO_BOOST", "AXLLM_ENABLE_REALTIME", "provider_stream_no_key", "flow_openai_api", "audio_responses_mapping", "realtime_audio_events", "gepa_local_optimizer", "mcp_scripted_tools")
-				checkGeneratedFileContains(t, dir, "axllm/axllm.hpp", "class HttpTransport", "std::unique_ptr<Transport> owned_transport_")
+				checkGeneratedFileContains(t, dir, "CMakeLists.txt", "add_library(axllm axllm/axllm.cpp axllm/mcp.cpp)", "add_library(axllm::axllm ALIAS axllm)", "Threads::Threads", "AX_BUILD_QUICKJS_PROFILE", "AX_QUICKJS_CFLAGS", "AX_QUICKJS_LDFLAGS", "add_library(axllm_quickjs", "find_package(CURL QUIET)", "AXLLM_ENABLE_CURL", "AXLLM_ENABLE_MCP_STDIO_BOOST", "AXLLM_ENABLE_REALTIME", "provider_stream_no_key", "flow_openai_api", "audio_responses_mapping", "realtime_audio_events", "gepa_local_optimizer", "mcp_scripted_tools")
+				checkGeneratedFileContains(t, dir, "axllm/axllm.hpp", "class HttpTransport", "std::shared_ptr<Transport> owned_transport_")
 				checkGeneratedFileContains(t, dir, "axllm/mcp.hpp", "class AxMCPClient", "class AxMCPStreamableHTTPTransport", "class AxMCPStdioTransport")
 				checkGeneratedFileContains(t, dir, "axllm/axllm.cpp", "HttpTransport::call", "curl_easy_perform")
-				checkGeneratedFileContains(t, dir, "cmake/axllmConfig.cmake.in", "find_dependency(OpenSSL)", "axllmTargets.cmake")
+				checkGeneratedFileContains(t, dir, "cmake/axllmConfig.cmake.in", "find_dependency(OpenSSL)", "find_dependency(Threads)", "axllmTargets.cmake")
 			case "go":
 				checkGeneratedFileContains(t, dir, "go.mod", "module github.com/ax-llm/ax/packages/go", "go 1.23", "github.com/dop251/goja", "github.com/coder/websocket")
 				checkGeneratedFileContains(t, dir, "axllm.go", "package axllm", "type Value = any", "func NewSignature", "type HTTPTransport struct")
 				checkGeneratedFileContains(t, dir, "axllm.go", "func AsAxError(err error) (AxError, bool)", "func IsRetryable(err error) bool", "func (e AIServiceError) Unwrap() error")
 				checkGeneratedFileContains(t, dir, "runtime/goja/goja.go", "package goja", "func NewRuntime(options ...Option) *Runtime", "func (r *Runtime) RegisterCallable", "gojavm.New")
-				checkGeneratedFileContains(t, dir, "runtime/goja/goja_test.go", "TestExecuteSurfacesConsoleLogsOnIntermediateStep", "TestExecuteResetsLogsBetweenTurns", "TestConsoleVariantsDoNotThrow")
-				checkGeneratedFileContains(t, dir, "errors_test.go", "TestErrorsAsReachesAxErrorThroughServiceError", "TestAsAxErrorReportsEnvelopePresence", "TestIsRetryableFollowsCoreStatusSet")
+				checkGeneratedFileContains(t, dir, "runtime/goja/goja_test.go", "TestExecuteSurfacesConsoleLogsOnIntermediateStep", "TestExecuteResetsLogsBetweenTurns", "TestConsoleVariantsDoNotThrow", "TestAgentProviderErrorKeepsGenerateTypeAndCause")
+				checkGeneratedFileContains(t, dir, "errors_test.go", "TestErrorsAsReachesAxErrorThroughServiceError", "TestAsAxErrorReportsEnvelopePresence", "TestIsRetryableFollowsCoreStatusSet", "TestGenerateErrorValueRoundTripKeepsCause")
+				checkGeneratedFileContains(t, dir, "ordered_values_test.go", "TestForwardReturnsPlainMaps", "TestInternalForwardKeepsKeyOrder", "TestMapCopiesListEachKeyOnce", "TestDeleteThenSetListsKeyOnceAtTheEnd", "TestJSONTextOmitsOrderListsAndHTMLEscapes", "TestMCPWireJSONOmitsOrderListsAndEscapesControlCharacters", "TestLoneSurrogateEscapesKeepTheirHalves", "TestStreamedSplitSurrogatePairJoins")
 				checkGeneratedFileContains(t, dir, "examples/runtime_profiles/javascript_goja/main.go", "go-javascript-goja-profile-ok", "ax.NewAgent", "agent.Test(runtime", "while (true) {}")
 			case "rust":
 				checkGeneratedFileContains(t, dir, "Cargo.toml", `name = "axllm"`, "reqwest", "rustls-tls", "rquickjs", "runtime-quickjs", `required-features = ["runtime-quickjs"]`, "tungstenite", `realtime = ["dep:tungstenite"]`)
-				checkGeneratedFileContains(t, dir, "src/lib.rs", "pub fn s(", "pub fn ax(", "pub fn agent(", "pub fn flow(", "pub fn ai(", "pub fn tool(", "pub trait AxCodeRuntime", "pub struct ProcessCodeRuntime", "pub mod runtime")
+				checkGeneratedFileContains(t, dir, "src/lib.rs", "pub fn s(", "pub fn ax(", "pub fn agent(", "pub fn flow(", "pub fn ai(", "pub fn tool(", "pub fn get_supported_ai_models() -> AxResult<Vec<Value>>", "pub fn get_supported_ai_models_with_options(options: Value)", "provider_model_catalog(&[", "pub trait AxCodeRuntime", "pub struct ProcessCodeRuntime", "pub mod runtime")
 				checkGeneratedFileContains(t, dir, "src/lib.rs", "BEGIN AXIR CORE EMITTED FUNCTIONS", "fn parse_signature(args: &[CoreValue])", "fn _schema_flexible_json_as_string_impl(args: &[CoreValue])", "enum CoreValue")
 				checkGeneratedFileContains(t, dir, "src/lib.rs", "fn provider_normalize_chat_response(args: &[CoreValue])", "fn _build_agent_actor_prompt_policy(args: &[CoreValue])")
 				checkGeneratedFileContains(t, dir, "src/runtime/quickjs.rs", "pub struct QuickJsCodeRuntime", "pub struct QuickJsCodeSession", "pub type HostCallable", "rquickjs", "set_interrupt_handler", "allowFilesystem", "allowNetwork", "allowProcess", "allowNativeHostAccess")
@@ -1403,7 +1502,7 @@ func assertGeneratedSkillFrontmatter(t *testing.T, root, rel, target string) {
 		}
 		wants := []string{"Start from the complete programs under `examples/`", "https://axllm.dev/" + target + "/"}
 		if strings.HasSuffix(wantName, "-flow") {
-			wants = append(wants, "Class decision", "Parallel fan-out and join", "Draft, critique, revise")
+			wants = append(wants, "Class decision", "Fan-out and join", "Owned clients and programs run concurrently; unsupported custom workers use a traced serial fallback.", "Draft, critique, revise")
 		} else {
 			wants = append(wants, "Simple string contract", "Bounded class output", "JSON schema", "Reuse the signature")
 		}
@@ -1669,7 +1768,7 @@ func generatedCapabilityGuards(target string) []generatedCapabilityGuard {
 					"def transcribe(self, request: dict[str, Any], options: dict[str, Any] | None = None):",
 					"def speak(self, request: dict[str, Any], options: dict[str, Any] | None = None):",
 					"def _selected_provider(self, request: dict[str, Any]):",
-					"processed_request = provider_route_preprocess_request(provider.get_features(), request)",
+					"processed_request = _preprocess_provider_files(provider.get_features(request.get(\"model\")), request, self.processing)",
 					"return provider.embed(request, options)",
 					"return provider.transcribe(request, options)",
 					"return provider.speak(request, options)",
@@ -2258,10 +2357,15 @@ func TestFlowGoldensExtractorUsesTSReference(t *testing.T) {
 		if err := json.Unmarshal(data, &fixture); err != nil {
 			t.Fatalf("%s: %v", path, err)
 		}
-		source, ok := fixture["source"].(map[string]any)
-		if !ok || source["tsDerived"] != true {
-			t.Fatalf("%s missing TS-derived source metadata", path)
+		if source, ok := fixture["source"].(map[string]any); ok && source["tsDerived"] == true {
+			continue
 		}
+		// A port-only fixture (behavior TS has no counterpart for) says so in
+		// its description.
+		if description, _ := fixture["description"].(string); strings.HasPrefix(description, "Port-only.") {
+			continue
+		}
+		t.Fatalf("%s has neither TS-derived source metadata nor a \"Port-only.\" description", path)
 	}
 }
 
@@ -2598,6 +2702,15 @@ func TestCoreBodyCheckerDiagnostics(t *testing.T) {
 			want: "core.try missing error binding",
 		},
 		{
+			name: "quoted raise error",
+			op: badBodyOp([]Operation{{
+				Name:       "core.raise",
+				Attributes: []Attribute{{Kind: "attr", Name: "error", Value: QuotedString("%input"), Line: 4}},
+				Line:       4,
+			}}),
+			want: "core.raise error must be a value ref",
+		},
+		{
 			name: "unreachable after terminator",
 			op: badBodyOp([]Operation{
 				{Name: "core.return", Line: 4},
@@ -2805,6 +2918,16 @@ func TestPromptConformanceFixturesLoad(t *testing.T) {
 			if _, ok := fixture["expected_result"]; !ok {
 				t.Fatalf("%s missing expected_result", file)
 			}
+		case "number_format", "json_stringify":
+			if cases, ok := fixture["cases"].([]any); !ok || len(cases) == 0 {
+				t.Fatalf("%s missing cases", file)
+			}
+		case "string_format":
+			formatCases, formatOK := fixture["format_cases"].([]any)
+			strCases, strOK := fixture["str_cases"].([]any)
+			if !formatOK || !strOK || len(formatCases) == 0 || len(strCases) == 0 {
+				t.Fatalf("%s missing format_cases/str_cases", file)
+			}
 		default:
 			t.Fatalf("%s has unknown prompt kind %v", file, fixture["kind"])
 		}
@@ -2833,6 +2956,12 @@ func TestAxAgentConformanceFixturesLoad(t *testing.T) {
 		}
 		kind := fmt.Sprint(fixture["kind"])
 		switch kind {
+		case "agent_streaming_forward":
+			for _, key := range []string{"signature", "input", "expected_deltas"} {
+				if _, ok := fixture[key]; !ok {
+					t.Fatalf("%s missing %s", file, key)
+				}
+			}
 		case "agent_forward":
 			if _, ok := fixture["signature"]; !ok {
 				t.Fatalf("%s missing signature", file)
@@ -2952,7 +3081,9 @@ func TestAxAgentConformanceFixturesLoad(t *testing.T) {
 			if !ok || len(cases) == 0 {
 				t.Fatalf("%s missing playbook evolve cases", file)
 			}
-			if responses, ok := fixture["responses"].([]any); !ok || len(responses) == 0 {
+			// Empty when every run throws before its first request (a task
+			// without its required input).
+			if _, ok := fixture["responses"].([]any); !ok {
 				t.Fatalf("%s missing responses", file)
 			}
 			if _, ok := fixture["runtime_script"]; !ok {
@@ -3077,8 +3208,10 @@ func TestAxOptimizeConformanceFixturesLoad(t *testing.T) {
 			if _, ok := fixture["optimize_options"]; !ok {
 				t.Fatalf("%s missing optimize_options", file)
 			}
-			if _, ok := fixture["expected_artifact_subset"]; !ok {
-				t.Fatalf("%s missing expected_artifact_subset", file)
+			_, hasArtifact := fixture["expected_artifact_subset"]
+			expectedError, _ := fixture["expected_error_contains"].(string)
+			if !hasArtifact && strings.TrimSpace(expectedError) == "" {
+				t.Fatalf("%s missing helper artifact or error expectation", file)
 			}
 		case "eval":
 			if _, ok := fixture["responses"]; !ok {
@@ -3087,6 +3220,12 @@ func TestAxOptimizeConformanceFixturesLoad(t *testing.T) {
 		case "verification":
 			if _, ok := fixture["expected_output"]; !ok {
 				t.Fatalf("%s missing expected_output", file)
+			}
+		case "playbook-evolve":
+			for _, key := range []string{"responses", "teacher_responses", "expected_playbook"} {
+				if _, ok := fixture[key]; !ok {
+					t.Fatalf("%s missing %s", file, key)
+				}
 			}
 		default:
 			t.Fatalf("%s has unknown axoptimize operation %v", file, fixture["operation"])
@@ -3221,10 +3360,10 @@ class Scripted(AxBaseAI):
     def _chat(self, request, options):
         self.calls += 1
         if self.calls == 1:
-            return {'results': [{'index': 0, 'content': '', 'function_calls': [{'id': 'c1', 'function': {'name': 'search', 'params': {'query': 'q'}}}]}]}
+            return {'results': [{'index': 0, 'content': '', 'function_calls': [{'id': 'c1', 'type': 'function', 'function': {'name': 'search', 'params': {'query': 'q'}}}]}]}
         if self.calls == 2:
-            return {'results': [{'index': 0, 'content': '{}'}]}
-        return {'results': [{'index': 0, 'content': '{"answer": "done"}'}]}
+            return {'results': [{'index': 0, 'content': 'Answer: '}]}
+        return {'results': [{'index': 0, 'content': 'Answer: done'}]}
     def _embed(self, request, options):
         return {'embeddings': [[0.0]], 'model_usage': {'ai': 'scripted'}}
     def transcribe(self, request, options=None):
@@ -3233,8 +3372,10 @@ class Scripted(AxBaseAI):
         return {'audio': 'scripted-audio'}
 
 gen = ax('query:string -> answer:string', {'functions': [search], 'validation_retries': 2})
-out = gen.forward(Scripted(), {'query': 'q'})
+scripted = Scripted()
+out = gen.forward(scripted, {'query': 'q'})
 assert out == {'answer': 'done'}, out
+assert scripted.calls == 3, scripted.calls
 
 class AgentScripted(AxBaseAI):
     def __init__(self):
@@ -3243,10 +3384,10 @@ class AgentScripted(AxBaseAI):
     def _chat(self, request, options):
         self.calls += 1
         if self.calls == 1:
-            return {'results': [{'index': 0, 'content': '{"completion":{"type":"final","args":["Answer",{}]}}'}]}
+            return {'results': [{'index': 0, 'content': 'Completion: {"type":"final","args":["Answer",{}]}'}]}
         if self.calls == 2:
-            return {'results': [{'index': 0, 'content': '{"completion":{"type":"final","args":["Answer",{"answer":"done"}]}}'}]}
-        return {'results': [{'index': 0, 'content': '{"answer": "done"}'}]}
+            return {'results': [{'index': 0, 'content': 'Completion: {"type":"final","args":["Answer",{"answer":"done"}]}'}]}
+        return {'results': [{'index': 0, 'content': 'Answer: done'}]}
     def _embed(self, request, options):
         return {'embeddings': [[0.0]], 'model_usage': {'ai': 'agent-scripted'}}
     def transcribe(self, request, options=None):
@@ -3254,32 +3395,32 @@ class AgentScripted(AxBaseAI):
     def speak(self, request, options=None):
         return {'audio': 'scripted-audio'}
 
-ag = agent('question:string -> answer:string', {'contextFields': []})
+ag = agent('question:string -> answer:string', {'contextFields': [], 'actorMode': 'completion'})
 agent_out = ag.forward(AgentScripted(), {'question': 'q'})
 assert agent_out == {'answer': 'done'}, agent_out
 assert len(ag.get_chat_log()) == 3
 
-service = ai('openai', api_key='test', transport=lambda req: {
+service = ai('openai', model='gpt-6-luna', api_key='test', transport=lambda req: {
     'status': 200,
     'json': {
         'id': 'chatcmpl_smoke',
-        'model': 'gpt-4.1-mini',
-        'choices': [{'index': 0, 'finish_reason': 'stop', 'message': {'content': 'ok'}}],
+        'model': 'gpt-6-luna',
+        'output': [{'id': 'm1', 'type': 'message', 'content': [{'type': 'output_text', 'text': 'ok'}]}],
     },
 })
 assert isinstance(service, OpenAICompatibleClient)
 chat = service.chat({'chat_prompt': [{'role': 'user', 'content': 'hello'}], 'model_config': {'stream': False}})
 assert chat['results'][0]['content'] == 'ok', chat
-assert service.get_last_used_chat_model() == 'gpt-5-mini'
-responses_service = ai('openai-responses', api_key='test', transport=lambda req: {
+assert service.get_last_used_chat_model() == 'gpt-6-luna'
+responses_service = ai('openai-responses', model='gpt-6-luna', api_key='test', transport=lambda req: {
     'status': 200,
-    'json': {'id': 'resp_smoke', 'model': 'gpt-4o', 'output': [{'id': 'm1', 'type': 'message', 'content': [{'type': 'output_text', 'text': 'ok'}]}]},
+    'json': {'id': 'resp_smoke', 'model': 'gpt-6-luna', 'output': [{'id': 'm1', 'type': 'message', 'content': [{'type': 'output_text', 'text': 'ok'}]}]},
 })
 assert isinstance(responses_service, OpenAIResponsesClient)
 responses_chat = responses_service.chat({'chat_prompt': [{'role': 'user', 'content': 'hello'}], 'model_config': {'stream': False}})
 assert responses_chat['results'][0]['content'] == 'ok', responses_chat
 gemini_requests = []
-gemini_service = ai('google-gemini', api_key='test', transport=lambda req: (
+gemini_service = ai('google-gemini', model='gemini-3.8-flash', api_key='test', transport=lambda req: (
     gemini_requests.append(req) or {
         'status': 200,
         'json': {'responseId': 'gem_smoke', 'candidates': [{'finishReason': 'STOP', 'content': {'parts': [{'text': 'ok'}]}}]},
@@ -3288,13 +3429,13 @@ gemini_service = ai('google-gemini', api_key='test', transport=lambda req: (
 assert isinstance(gemini_service, GoogleGeminiClient)
 gemini_chat = gemini_service.chat({'chat_prompt': [{'role': 'user', 'content': 'hello'}], 'model_config': {'stream': False}})
 assert gemini_chat['results'][0]['content'] == 'ok', gemini_chat
-assert gemini_requests[0]['url'].endswith('/models/gemini-3.5-flash:generateContent'), gemini_requests[0]
+assert gemini_requests[0]['url'].endswith('/models/gemini-3.8-flash:generateContent'), gemini_requests[0]
 assert gemini_requests[0]['headers']['x-goog-api-key'] == 'test', gemini_requests[0]
 anthropic_requests = []
-anthropic_service = ai('anthropic', api_key='test', transport=lambda req: (
+anthropic_service = ai('anthropic', model='claude-sonnet-5-5', api_key='test', transport=lambda req: (
     anthropic_requests.append(req) or {
         'status': 200,
-        'json': {'id': 'msg_smoke', 'model': 'claude-3-7-sonnet-latest', 'content': [{'type': 'text', 'text': 'ok'}], 'stop_reason': 'end_turn'},
+        'json': {'id': 'msg_smoke', 'model': 'claude-sonnet-5-5', 'content': [{'type': 'text', 'text': 'ok'}], 'stop_reason': 'end_turn'},
     }
 ))
 assert isinstance(anthropic_service, AnthropicClient)
@@ -3384,37 +3525,59 @@ func TestResponsePerturbationGate(t *testing.T) {
 // the real runtime loop while its sibling is left as a one-shot that demands a
 // structured completion. Scripted fixtures hide it by hand-feeding the one-shot
 // stage a completion; a live model returns RLM code and the stage throws
-// "Required field is missing: Completion". Every actor stage must (a) switch to a
-// code-output signature under runtime and (b) drive the engine via
-// @agent_runtime_execute_step in an actor loop. This is exactly the distiller bug
+// "Required field is missing: Completion". Under a runtime every actor stage must
+// (a) take a code-output signature and (b) drive the engine via
+// @agent_runtime_execute_step in its actor loop. This is exactly the distiller bug
 // a real-model run surfaced that all scripted conformance + the G1 antidote missed.
+// The stage signatures come from @agent_actor_stage_signatures, which the factory
+// and a forward-call runtime both call; with a runtime it returns TS's actor
+// signatures from @agent_rlm_actor_signatures.
 func TestRLMStagesSymmetric(t *testing.T) {
-	data, err := os.ReadFile(filepath.Join(repoRootPath(), "ir", "axcore", "agent.axir"))
-	if err != nil {
-		t.Fatal(err)
+	text := readRepoFile(t, repoRootPath(), "ir", "axcore", "agent.axir")
+	opBody := func(name string) string {
+		t.Helper()
+		body, ok := extractBracedFunctionBody(text, " @"+name+" {")
+		if !ok {
+			t.Fatalf("agent.axir has no op @%s", name)
+		}
+		return body
 	}
-	text := string(data)
+	const oneShot = "a one-shot stage will throw 'Required field is missing: Completion' on a live model"
+	// (a) Both builders of the stage signatures (the factory and a forward-call
+	// runtime) take them from @agent_actor_stage_signatures, which under a
+	// runtime returns the RLM signatures for both stages.
+	if n := strings.Count(text, "@agent_actor_stage_signatures("); n < 2 {
+		t.Fatalf("expected the factory and the forward-call runtime to take the actor stage signatures from @agent_actor_stage_signatures, found %d call sites", n)
+	}
+	runtimeBranch, ok := extractBracedFunctionBody(opBody("agent_actor_stage_signatures"), "core.if %runtime_enabled")
+	if !ok || !strings.Contains(runtimeBranch, "@agent_rlm_actor_signatures(") || !strings.Contains(runtimeBranch, "core.return") {
+		t.Fatalf("under a runtime, @agent_actor_stage_signatures does not return @agent_rlm_actor_signatures for both stages; %s", oneShot)
+	}
+	rlm := opBody("agent_rlm_actor_signatures")
+	if !strings.Contains(rlm, `%output = core.call intrinsic.string.format("{}:code `) {
+		t.Fatalf("@agent_rlm_actor_signatures builds no code output field; %s", oneShot)
+	}
+	if strings.Contains(rlm, "-> completion") {
+		t.Fatalf("@agent_rlm_actor_signatures gives a stage a completion output; %s", oneShot)
+	}
 	for _, stage := range []string{"distiller", "executor"} {
-		sigVar := "%runtime_" + stage + "_signature"
-		if !strings.Contains(text, sigVar+" = core.call intrinsic.string.format(") {
-			t.Fatalf("RLM stage %q has no runtime code signature %s; a one-shot stage will throw 'Required field is missing: Completion' on a live model", stage, sigVar)
-		}
-		if !strings.Contains(text, "%"+stage+"_signature = core.let "+sigVar) {
-			t.Fatalf("RLM stage %q does not switch to its code signature under runtime", stage)
+		signature := "%" + stage + "_signature"
+		built := signature + ` = core.call intrinsic.string.format("{} -> {}", %` + stage + `_inputs, %output)`
+		returned := `core.set %out["` + stage + `"] = ` + signature
+		if !strings.Contains(rlm, built) || !strings.Contains(rlm, returned) {
+			t.Fatalf("RLM stage %q does not take the code-output signature under a runtime; %s", stage, oneShot)
 		}
 	}
-	// Both stages must build a code-output runtime signature and run the engine.
-	if c := strings.Count(text, "-> {}:code"); c < 2 {
-		t.Fatalf("expected distiller AND executor code-output runtime signatures (-> {}:code), found %d", c)
-	}
-	if !strings.Contains(text, "agent distiller loop exceeded max steps") {
+	// (b) Each stage's actor loop runs model-authored code through the engine.
+	loops := opBody("agent_run_actor_stages")
+	if !strings.Contains(loops, "agent distiller loop exceeded max steps") {
 		t.Fatal("distiller has no runtime actor loop (missing its loop guard); it cannot execute model-authored code through the engine")
 	}
-	if !strings.Contains(text, "agent actor loop exceeded max steps") {
+	if !strings.Contains(loops, "agent actor loop exceeded max steps") {
 		t.Fatal("executor has no runtime actor loop guard")
 	}
-	if n := strings.Count(text, "@agent_runtime_execute_step("); n < 2 {
-		t.Fatalf("expected >= 2 @agent_runtime_execute_step call sites (distiller + executor actor loops), found %d", n)
+	if n := strings.Count(loops, "@agent_runtime_execute_step("); n < 2 {
+		t.Fatalf("expected >= 2 @agent_runtime_execute_step call sites in @agent_run_actor_stages (distiller + executor actor loops), found %d", n)
 	}
 }
 
@@ -3761,7 +3924,6 @@ func TestPythonGeneratedIdioms(t *testing.T) {
 	for _, want := range []string{
 		"# BEGIN AXIR CORE EMITTED FUNCTIONS",
 		"def _build_gen_chat_request(",
-		"def _complete_with_retries_impl(",
 		"def _parse_output_impl(",
 		"def _render_examples(",
 		"def _render_demos(",
@@ -4278,7 +4440,7 @@ import java.util.*;
 public class Smoke {
   static final class Scripted implements AiClient {
     public Map<String, Object> complete(Map<String, Object> request) {
-      return Map.of("content", "{\"answer\":\"Paris\"}");
+      return Map.of("content", "Answer: Paris");
     }
   }
   public static void main(String[] args) throws Exception {
@@ -4290,12 +4452,12 @@ public class Smoke {
       int calls = 0;
       public Map<String, Object> complete(Map<String, Object> request) {
         calls++;
-        if (calls == 1) return Map.of("content", "{\"completion\":{\"type\":\"final\",\"args\":[\"Answer\",{}]}}");
-        if (calls == 2) return Map.of("content", "{\"completion\":{\"type\":\"final\",\"args\":[\"Answer\",{\"answer\":\"Paris\"}]}}");
-        return Map.of("content", "{\"answer\":\"Paris\"}");
+        if (calls == 1) return Map.of("content", "Completion: {\"type\":\"final\",\"args\":[\"Answer\",{}]}");
+        if (calls == 2) return Map.of("content", "Completion: {\"type\":\"final\",\"args\":[\"Answer\",{\"answer\":\"Paris\"}]}");
+        return Map.of("content", "Answer: Paris");
       }
     }
-    AxAgent agent = Ax.agent("question:string -> answer:string", Map.of("contextFields", List.of()));
+    AxAgent agent = Ax.agent("question:string -> answer:string", Map.of("contextFields", List.of(), "actorMode", "completion"));
     Map<String, Object> agentOut = agent.forward(new AgentScripted(), Map.of("question", "Capital?"));
     if (!"Paris".equals(agentOut.get("answer"))) throw new RuntimeException("bad agent output: " + agentOut);
     System.out.println("java-ok");
@@ -4524,7 +4686,7 @@ int main() {
   if (!axllm::Core::truthy(messages) || !axllm::Core::truthy(schema)) return 1;
   struct ScriptedClient : axllm::AIClient {
     axllm::Value complete(axllm::Value) override {
-      return axllm::object({{"content", "{\"answer\":\"Paris\"}"}});
+      return axllm::object({{"content", "Answer: Paris"}});
     }
   } client;
   auto qa = axllm::ax("question:string -> answer:string");
@@ -4534,15 +4696,15 @@ int main() {
     int calls = 0;
     axllm::Value complete(axllm::Value) override {
       ++calls;
-      if (calls == 1) return axllm::object({{"content", "{\"completion\":{\"type\":\"final\",\"args\":[\"Answer\",{}]}}"}});
-      if (calls == 2) return axllm::object({{"content", "{\"completion\":{\"type\":\"final\",\"args\":[\"Answer\",{\"answer\":\"Paris\"}]}}"}});
-      return axllm::object({{"content", "{\"answer\":\"Paris\"}"}});
+      if (calls == 1) return axllm::object({{"content", "Completion: {\"type\":\"final\",\"args\":[\"Answer\",{}]}"}});
+      if (calls == 2) return axllm::object({{"content", "Completion: {\"type\":\"final\",\"args\":[\"Answer\",{\"answer\":\"Paris\"}]}"}});
+      return axllm::object({{"content", "Answer: Paris"}});
     }
   } agent_client;
-  auto ag = axllm::agent("question:string -> answer:string", axllm::object({{"contextFields", axllm::array({})}}));
+  auto ag = axllm::agent("question:string -> answer:string", axllm::object({{"contextFields", axllm::array({})}, {"actorMode", "completion"}}));
   axllm::Value agent_out = ag.forward(agent_client, axllm::object({{"question", "Capital?"}}));
   if (!axllm::equal(axllm::Core::get(agent_out, "answer"), "Paris")) return 3;
-  auto service = axllm::ai("openai", axllm::object({{"model", "gpt-4.1-mini"}, {"api_key", "test-key"}}));
+  auto service = axllm::ai("openai", axllm::object({{"model", "gpt-6-luna"}, {"api_key", "test-key"}}));
   (void)service;
   std::cout << "cpp-ok\n";
 }

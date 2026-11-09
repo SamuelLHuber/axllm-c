@@ -1,7 +1,11 @@
 #include "axllm.hpp"
 
 #include <array>
+#include <atomic>
+#include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <fstream>
 #include <iostream>
 #include <mutex>
@@ -18,6 +22,39 @@
 #endif
 
 namespace axllm {
+double novel_f1_score(const std::string& history, const std::string& prediction, const std::string& ground_truth, bool return_recall) {
+  return Core::number(Core::eval_novel_f1(history, prediction, ground_truth, return_recall));
+}
+
+static std::function<bool()> agent_cancellation_check(Value options);
+namespace detail {
+static thread_local std::shared_ptr<AgentExecutionContext> active_mcp_context;
+MCPRunScope::MCPRunScope(std::shared_ptr<AgentExecutionContext> context) : previous_(std::move(active_mcp_context)) { active_mcp_context = std::move(context); }
+MCPRunScope::~MCPRunScope() { active_mcp_context = std::move(previous_); }
+std::shared_ptr<AgentExecutionContext> MCPRunScope::current() { return active_mcp_context; }
+}
+
+
+thread_local const AxCancellationToken* ax_current_cancellation_token = nullptr;
+
+namespace {
+// A chat, stream or embed call's merged options while it builds its requests:
+// build_request reads the call's timeoutMs and base URL from them.
+thread_local const Value* ax_current_call_options = nullptr;
+struct AxCallOptionsScope {
+  const Value* previous;
+  explicit AxCallOptionsScope(const Value& options) : previous(ax_current_call_options) { ax_current_call_options = &options; }
+  ~AxCallOptionsScope() { ax_current_call_options = previous; }
+  AxCallOptionsScope(const AxCallOptionsScope&) = delete;
+  AxCallOptionsScope& operator=(const AxCallOptionsScope&) = delete;
+};
+}
+
+const AxCancellationToken* current_cancellation_token() { return ax_current_cancellation_token; }
+// A cancelled token throws before the scope takes over: a constructor that
+// throws runs no destructor, which would leave the thread's token dangling.
+AxCancellationScope::AxCancellationScope(const AxCancellationToken* token) : previous_(ax_current_cancellation_token) { if (token) token->throw_if_cancelled(); ax_current_cancellation_token = token; }
+AxCancellationScope::~AxCancellationScope() { ax_current_cancellation_token = previous_; }
 
 Value::Value() : data(nullptr) {}
 Value::Value(std::nullptr_t) : data(nullptr) {}
@@ -117,9 +154,19 @@ Value register_agent_observer(std::function<void(Value)> fn) {
   return object({{"__agent_observer_id", id}});
 }
 
+static std::mutex& tool_registry_mutex(){static std::mutex mutex;return mutex;}
+static std::string next_tool_id(){static std::atomic<std::uint64_t> next{0};return "__tool_"+std::to_string(++next);}
+static std::map<std::string,std::function<Value(Value,const AxToolContext&)>>& contextual_tool_registry(){static std::map<std::string,std::function<Value(Value,const AxToolContext&)>> values;return values;}
 static std::map<std::string, std::function<Value(Value)>>& tool_registry() {
   static std::map<std::string, std::function<Value(Value)>> handlers;
   return handlers;
+}
+
+static std::pair<std::function<Value(Value)>,std::function<Value(Value,const AxToolContext&)>> registered_tool(const std::string& id){
+  std::lock_guard<std::mutex> lock(tool_registry_mutex());
+  auto found=tool_registry().find(id);if(found==tool_registry().end())throw AxError("runtime","Unknown tool handler");
+  auto contextual=contextual_tool_registry().find(id);
+  return {found->second,contextual==contextual_tool_registry().end()?std::function<Value(Value,const AxToolContext&)>{}:contextual->second};
 }
 
 static std::map<std::string, std::function<Value(Value)>>& assertion_registry() {
@@ -207,6 +254,7 @@ static Object& object_mut(Value& value) {
 }
 
 static std::string stable_stringify(const Value& value);
+static std::string pretty_stringify(const Value& value);
 
 static std::string str(const Value& value) {
   if (auto p = std::get_if<std::string>(&value.data)) return *p;
@@ -228,14 +276,15 @@ static std::string key_string(const Value& key) {
 }
 
 static Value get_key(const Value& object, const std::string& key, Value fallback = Value()) {
-  const auto& obj = object_ref(object);
+  if (!object.is_object()) return fallback;
+  const auto& obj = *std::get<std::shared_ptr<Object>>(object.data);
   auto it = obj.find(key);
   if (it != obj.end()) return it->second;
   static const std::map<std::string, std::string> aliases = {
       {"is_array", "isArray"}, {"is_optional", "isOptional"},
       {"is_internal", "isInternal"}, {"is_cached", "isCached"},
       {"min_length", "minLength"}, {"max_length", "maxLength"},
-      {"pattern_description", "patternDescription"},
+      {"pattern_description", "patternDescription"}, {"value_descriptions", "valueDescriptions"},
       {"input_fields", "inputs"}, {"output_fields", "outputs"}};
   auto alias = aliases.find(key);
   if (alias != aliases.end()) {
@@ -245,6 +294,98 @@ static Value get_key(const Value& object, const std::string& key, Value fallback
   return fallback;
 }
 
+// Function result formatters the AxGen IR reaches through
+// {"__function_result_formatter_id"} markers, as caching functions are: the
+// registry holds each handle's state weakly, and a handle (the caller's or an
+// AxGen's) keeps it registered.
+struct AxFunctionResultFormatterHandle::State {
+  std::string id;
+  AxFunctionResultFormatter fn;
+};
+
+struct FunctionResultFormatterRegistry {
+  std::mutex mutex;
+  std::uint64_t next_id = 0;
+  std::map<std::string, std::weak_ptr<AxFunctionResultFormatterHandle::State>> handles;
+  // The process-wide formatter (set_function_result_formatter).
+  std::shared_ptr<AxFunctionResultFormatterHandle::State> global;
+};
+
+static FunctionResultFormatterRegistry& function_result_formatter_registry() {
+  static FunctionResultFormatterRegistry registry;
+  return registry;
+}
+
+// Calls the formatter a marker names, outside the registry lock. The
+// process-wide marker calls the formatter set when the call runs, as TS reads
+// axGlobals at each call; if it was cleared meanwhile, the result gets the
+// default text.
+static Value call_function_result_formatter(const Value& marker, const Value& result) {
+  if (Core::truthy(get_key(marker, "__function_result_formatter_global"))) {
+    std::shared_ptr<AxFunctionResultFormatterHandle::State> global;
+    {
+      auto& registry = function_result_formatter_registry();
+      std::lock_guard<std::mutex> lock(registry.mutex);
+      global = registry.global;
+    }
+    if (global) return Value(global->fn(result));
+    if (result.is_string()) return result;
+    if (result.is_null()) return Value("");
+    return Core::json_pretty(result);
+  }
+  std::string id = str(get_key(marker, "__function_result_formatter_id"));
+  if (id.empty()) {
+    throw AxError("validation", "The functionResultFormatter option must be an axllm::function_result_formatter() handle value");
+  }
+  std::shared_ptr<AxFunctionResultFormatterHandle::State> state;
+  {
+    auto& registry = function_result_formatter_registry();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    auto it = registry.handles.find(id);
+    if (it != registry.handles.end()) state = it->second.lock();
+  }
+  if (!state) throw AxError("validation", "Function result formatter handle has expired");
+  return Value(state->fn(result));
+}
+
+AxFunctionResultFormatterHandle::AxFunctionResultFormatterHandle(AxFunctionResultFormatter fn) : state_(std::make_shared<State>()) {
+  if (!fn) throw AxError("validation", "Function result formatter must be callable");
+  state_->fn = std::move(fn);
+  auto& registry = function_result_formatter_registry();
+  std::lock_guard<std::mutex> lock(registry.mutex);
+  state_->id = "__function_result_formatter_" + std::to_string(++registry.next_id);
+  for (auto it = registry.handles.begin(); it != registry.handles.end();) {
+    if (it->second.expired()) it = registry.handles.erase(it);
+    else ++it;
+  }
+  registry.handles[state_->id] = state_;
+}
+
+Value AxFunctionResultFormatterHandle::value() const { return object({{"__function_result_formatter_id", state_->id}}); }
+
+AxFunctionResultFormatterHandle function_result_formatter(AxFunctionResultFormatter fn) {
+  return AxFunctionResultFormatterHandle(std::move(fn));
+}
+
+void set_function_result_formatter(AxFunctionResultFormatter fn) {
+  std::shared_ptr<AxFunctionResultFormatterHandle::State> next;
+  if (fn) {
+    next = std::make_shared<AxFunctionResultFormatterHandle::State>();
+    next->id = "__function_result_formatter_global";
+    next->fn = std::move(fn);
+  }
+  auto& registry = function_result_formatter_registry();
+  std::lock_guard<std::mutex> lock(registry.mutex);
+  registry.global.swap(next);
+}
+
+Value Core::axgen_function_result_formatter() {
+  auto& registry = function_result_formatter_registry();
+  std::lock_guard<std::mutex> lock(registry.mutex);
+  if (!registry.global) return Value();
+  return object({{"__function_result_formatter_global", true}});
+}
+
 static bool has_key(const Value& object, const std::string& key) {
   const auto& obj = object_ref(object);
   if (obj.count(key) > 0) return true;
@@ -252,7 +393,7 @@ static bool has_key(const Value& object, const std::string& key) {
       {"is_array", "isArray"}, {"is_optional", "isOptional"},
       {"is_internal", "isInternal"}, {"is_cached", "isCached"},
       {"min_length", "minLength"}, {"max_length", "maxLength"},
-      {"pattern_description", "patternDescription"}};
+      {"pattern_description", "patternDescription"}, {"value_descriptions", "valueDescriptions"}};
   auto alias = aliases.find(key);
   return alias != aliases.end() && obj.count(alias->second) > 0;
 }
@@ -331,8 +472,8 @@ static std::string axir_base64_encode(const std::string& input) {
 }
 
 // Encode a request payload as multipart/form-data. Multipart operations (e.g.
-// OpenAI /audio/transcriptions) carry the audio as a binary `file` part; every
-// other field is a plain form field. The `file` value is a base64 string
+// OpenAI /audio/transcriptions) carry audio as a binary `file` or `audio` part; every
+// other field is a plain form field. The binary value is a base64 string
 // (optionally a data: URL) or an object {data, mimeType?, filename?}. Returns
 // the raw (binary-safe) body and the matching Content-Type header value.
 static std::pair<std::string, std::string> axir_encode_multipart(const Value& payload) {
@@ -343,7 +484,7 @@ static std::pair<std::string, std::string> axir_encode_multipart(const Value& pa
     const std::string& key = field.first;
     const Value& value = field.second;
     if (value.is_null()) continue;
-    if (key == "file") {
+    if (key == "file" || key == "audio") {
       std::string data;
       std::string filename = "audio.wav";
       std::string content_type = "audio/wav";
@@ -364,12 +505,14 @@ static std::pair<std::string, std::string> axir_encode_multipart(const Value& pa
       std::string file_bytes = axir_base64_decode(data);
       if (file_bytes.empty() && !data.empty()) file_bytes = data;  // not base64 -> send raw
       body += "--" + boundary + crlf;
-      body += "Content-Disposition: form-data; name=\"file\"; filename=\"" + filename + "\"" + crlf;
+      body += "Content-Disposition: form-data; name=\"" + key + "\"; filename=\"" + filename + "\"" + crlf;
       body += "Content-Type: " + content_type + crlf + crlf;
       body += file_bytes + crlf;
     } else {
       body += "--" + boundary + crlf;
-      body += "Content-Disposition: form-data; name=\"" + key + "\"" + crlf + crlf;
+      body += "Content-Disposition: form-data; name=\"" + key + "\"" + crlf;
+      if (key == "request") body += "Content-Type: application/json" + crlf;
+      body += crlf;
       body += str(value) + crlf;
     }
   }
@@ -381,7 +524,94 @@ void Transport::stream(Value request, AxTransportStreamHandler handler) {
   handler(call(std::move(request)));
 }
 
+void Transport::stream_cancellable(Value request,AxTransportStreamHandler handler,std::shared_ptr<std::atomic<bool>> cancelled){
+  if(cancelled->load())return;
+  stream(std::move(request),[handler,cancelled](Value value){return !cancelled->load()&&handler(std::move(value));});
+}
+Value Transport::call(Value request, const AxCancellationToken* cancellation) {
+  if (cancellation) cancellation->throw_if_cancelled();
+  AxCancellationScope scope(cancellation);
+  Value response = call(std::move(request));
+  if (cancellation) cancellation->throw_if_cancelled();
+  return response;
+}
+
+void Transport::stream(Value request, AxTransportStreamHandler handler, const AxCancellationToken* cancellation) {
+  if (cancellation) cancellation->throw_if_cancelled();
+  AxCancellationScope scope(cancellation);
+  stream(std::move(request), [&](Value chunk) {
+    if (cancellation) cancellation->throw_if_cancelled();
+    bool keep_going = handler(std::move(chunk));
+    if (cancellation) cancellation->throw_if_cancelled();
+    return keep_going;
+  });
+}
+
 void HttpTransport::stream(Value request, AxTransportStreamHandler handler) {
+  stream(std::move(request), std::move(handler), current_cancellation_token());
+}
+
+void HttpTransport::stream(Value request, AxTransportStreamHandler handler, const AxCancellationToken* cancellation) {
+  stream_impl(std::move(request), std::move(handler), cancellation, nullptr);
+}
+
+void HttpTransport::stream_cancellable(Value request, AxTransportStreamHandler handler, std::shared_ptr<std::atomic<bool>> cancelled) {
+  stream_impl(std::move(request), std::move(handler), nullptr, std::move(cancelled));
+}
+
+// The last request's Retry-After on a status response, and whether its
+// response had begun when the transfer failed. TS reads a stream's body after
+// apiCall returns, so a failure after the response began is not retried.
+thread_local std::string ax_transport_retry_after;
+thread_local bool ax_transport_response_started = false;
+
+#if defined(AXLLM_ENABLE_CURL)
+static CURLcode ax_curl_perform(CURL* curl,const std::function<bool()>& cancelled);
+
+// TS apiCall's timer for a call's timeoutMs: it ends a request whose response
+// has not started in time and stops once the status line is in.
+struct AxHeaderDeadline {
+  CURL* curl;
+  double timeout_ms;
+  std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+  bool timed_out = false;
+  bool passed() {
+    if (timeout_ms <= 0 || timed_out) return timed_out;
+    long code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    if (code >= 200) return false;
+    if (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count() < timeout_ms) return false;
+    timed_out = true;
+    return true;
+  }
+};
+
+// The client's timeout still caps the transfer; a longer timeoutMs raises the cap.
+static void ax_set_transfer_timeout(CURL* curl, double timeout_seconds, double timeout_ms) {
+  if (timeout_seconds <= 0) return;
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(std::max(timeout_seconds * 1000.0, timeout_ms)));
+}
+
+static AxError ax_call_timeout_error(const Value& timeout_ms) {
+  return Core::as_error(Core::ai_error_timeout(Core::provider_call_timeout_message(timeout_ms), Value(), Value(), Value(), Value(), true));
+}
+
+// The client's own timeout (seconds here) ended the transfer: TS's
+// AxAIServiceTimeoutError in TS's words, with the timeout curl was given in
+// milliseconds and curl's text kept as the cause. Without a configured
+// timeout (curl's own connect timeout), curl's text stays the message.
+static AxError ax_transfer_timeout_error(double timeout_seconds, double timeout_ms, const std::string& message) {
+  if (timeout_seconds <= 0) return Core::as_error(Core::ai_error_timeout(message, Value(), Value(), Value(), Value(), false));
+  double transfer_ms = static_cast<double>(static_cast<long>(std::max(timeout_seconds * 1000.0, timeout_ms)));
+  AxError error = Core::as_error(Core::ai_error_timeout(Core::provider_call_timeout_message(transfer_ms), Value(), Value(), Value(), Value(), true));
+  error.set_cause(std::make_shared<AxError>("network", message));
+  return error;
+}
+#endif
+
+void HttpTransport::stream_impl(Value request, AxTransportStreamHandler handler, const AxCancellationToken* cancellation, std::shared_ptr<std::atomic<bool>> cancelled) {
+  if (cancellation) cancellation->throw_if_cancelled();
+  if (cancelled && cancelled->load()) return;
 #if !defined(AXLLM_ENABLE_CURL)
   (void)request;
   (void)handler;
@@ -404,14 +634,17 @@ void HttpTransport::stream(Value request, AxTransportStreamHandler handler) {
   std::string method = str(Core::get(request, "method", "POST"));
   std::string url = str(Core::get(request, "url"));
   double timeout = num(Core::get(request, "timeout", 0));
+  double timeout_ms = num(Core::get(request, "timeout_ms", 0));
 
   struct StreamContext {
     CURL* curl = nullptr;
     AxTransportStreamHandler* handler = nullptr;
     std::string* error_body = nullptr;
     bool cancelled = false;
+    const AxCancellationToken* cancellation = nullptr;
+    std::shared_ptr<std::atomic<bool>> session_cancelled;
     std::exception_ptr exception;
-  } context{curl, &handler, &error_body, false, nullptr};
+  } context{curl, &handler, &error_body, false, cancellation, cancelled, nullptr};
 
   curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
   curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, error_buffer);
@@ -434,36 +667,91 @@ void HttpTransport::stream(Value request, AxTransportStreamHandler handler) {
     }
   });
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &context);
-  if (timeout > 0) curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(timeout * 1000.0));
+  std::string retry_after;
+  curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, +[](char* ptr, size_t size, size_t nmemb, void* userdata) -> size_t {
+    std::string line(ptr, size * nmemb);
+    auto colon = line.find(':');
+    if (colon != std::string::npos) {
+      std::string name = line.substr(0, colon);
+      for (char& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      if (name == "retry-after") {
+        std::string value = line.substr(colon + 1);
+        auto begin = value.find_first_not_of(" \t");
+        auto end = value.find_last_not_of(" \t\r\n");
+        *static_cast<std::string*>(userdata) = begin == std::string::npos ? std::string() : value.substr(begin, end - begin + 1);
+      }
+    }
+    return size * nmemb;
+  });
+  curl_easy_setopt(curl, CURLOPT_HEADERDATA, &retry_after);
+  curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+  curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, +[](void* userdata, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int {auto* context=static_cast<StreamContext*>(userdata);return (context->cancellation&&context->cancellation->is_cancelled()) || (context->session_cancelled&&context->session_cancelled->load())?1:0;});
+  curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &context);
+  ax_set_transfer_timeout(curl, timeout, timeout_ms);
   if (method == "POST") curl_easy_setopt(curl, CURLOPT_POST, 1L);
   else curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method.c_str());
   curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.data());
   curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(payload.size()));
 
-  CURLcode rc = curl_easy_perform(curl);
+  // A call's timeoutMs polls its header deadline; other streams run as before.
+  AxHeaderDeadline deadline{curl, timeout_ms};
+  CURLcode rc = timeout_ms > 0
+      ? ax_curl_perform(curl, [&] { return (cancellation && cancellation->is_cancelled()) || (cancelled && cancelled->load()) || deadline.passed(); })
+      : curl_easy_perform(curl);
   long status = 0;
   curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
   curl_slist_free_all(headers);
   curl_easy_cleanup(curl);
+  ax_transport_retry_after = status >= 400 ? retry_after : std::string();
+  ax_transport_response_started = status >= 200 && status < 400;
   if (context.exception) std::rethrow_exception(context.exception);
+  if (cancellation && cancellation->is_cancelled()) throw AxAIServiceAbortedError(cancellation->reason());
   // Returning false is the transport seam's normal cancellation signal. libcurl
   // may report it as CURLE_WRITE_ERROR (or another callback-abort code), but the
   // handler decision is authoritative once callback exceptions are excluded.
-  if (context.cancelled) return;
+  if (context.cancelled || (cancelled && cancelled->load())) return;
+  if (deadline.timed_out) throw ax_call_timeout_error(Core::get(request, "timeout_ms"));
+  // Provider errors never take the transport request: its headers hold the API
+  // key or credential tokens, and AxError has no request field to carry anyway.
   if (rc != CURLE_OK) {
     std::string message = error_buffer[0] ? error_buffer : curl_easy_strerror(rc);
-    if (rc == CURLE_OPERATION_TIMEDOUT) throw Core::as_error(Core::ai_error_timeout(message, Value(), Value(), Value(), request, false));
-    throw AxError("network", message, "AxAIServiceNetworkError", 0, "", true);
+    if (rc == CURLE_OPERATION_TIMEDOUT) throw ax_transfer_timeout_error(timeout, timeout_ms, message);
+    // TS's AxAIServiceNetworkError: "Network Error: " and curl's text.
+    throw AxError("network", "Network Error: " + message, "AxAIServiceNetworkError", 0, "", true);
   }
   if (status >= 400) {
     Value body;
     try { body = Core::json_parse(error_body); } catch (...) { body = Value(error_body); }
-    throw Core::as_error(Core::openai_normalize_error(static_cast<double>(status), body, request));
+    throw Core::as_error(Core::openai_normalize_error(static_cast<double>(status), body, Value(), Value()));
   }
 #endif
 }
 
+#if defined(AXLLM_ENABLE_CURL)
+static CURLcode ax_curl_perform(CURL* curl,const std::function<bool()>& cancelled){
+  CURLM* multi=curl_multi_init();if(!multi)return CURLE_FAILED_INIT;
+  if(curl_multi_add_handle(multi,curl)!=CURLM_OK){curl_multi_cleanup(multi);return CURLE_FAILED_INIT;}
+  int running=0;CURLcode result=CURLE_OK;CURLMcode code=curl_multi_perform(multi,&running);
+  while(code==CURLM_OK&&running&&!cancelled()){
+    code=curl_multi_poll(multi,nullptr,0,20,nullptr);
+    if(code==CURLM_OK)code=curl_multi_perform(multi,&running);
+  }
+  if(cancelled())result=CURLE_ABORTED_BY_CALLBACK;
+  else if(code!=CURLM_OK)result=CURLE_RECV_ERROR;
+  else{int remaining=0;while(auto* message=curl_multi_info_read(multi,&remaining))if(message->msg==CURLMSG_DONE)result=message->data.result;}
+  curl_multi_remove_handle(multi,curl);curl_multi_cleanup(multi);return result;
+}
+#endif
+
 Value HttpTransport::call(Value request) {
+  return call(std::move(request), current_cancellation_token());
+}
+
+Value HttpTransport::call(Value request, const AxCancellationToken* cancellation) {return call_impl(std::move(request),cancellation,{});}
+Value HttpTransport::call_cancellable(Value request,std::function<bool()> cancelled){return call_impl(std::move(request),current_cancellation_token(),std::move(cancelled));}
+Value HttpTransport::call_impl(Value request,const AxCancellationToken* cancellation,std::function<bool()> cancelled) {
+  if(cancelled&&cancelled())throw AxAIServiceAbortedError("MCP invocation cancelled");
+  if (cancellation) cancellation->throw_if_cancelled();
 #if !defined(AXLLM_ENABLE_CURL)
   (void)request;
   throw Core::as_error(Core::ai_error_unsupported("C++ HTTP transport requires libcurl. Build with CMake and AXLLM_ENABLE_CURL=ON, or pass a custom Transport."));
@@ -519,6 +807,7 @@ Value HttpTransport::call(Value request) {
   // must not be JSON-parsed or UTF-8 handled; they are returned as base64.
   bool binary_response = Core::truthy(Core::get(request, "binary", false));
   double timeout = num(Core::get(request, "timeout", 0));
+  double timeout_ms = num(Core::get(request, "timeout_ms", 0));
 
   curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
   curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, error_buffer);
@@ -543,7 +832,10 @@ Value HttpTransport::call(Value request) {
     return size * nmemb;
   });
   curl_easy_setopt(curl, CURLOPT_HEADERDATA, &response_headers);
-  if (timeout > 0) curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(timeout * 1000.0));
+  curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+  curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, +[](void* userdata, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int {auto* token=static_cast<const AxCancellationToken*>(userdata);return token&&token->is_cancelled()?1:0;});
+  curl_easy_setopt(curl, CURLOPT_XFERINFODATA, const_cast<AxCancellationToken*>(cancellation));
+  ax_set_transfer_timeout(curl, timeout, timeout_ms);
   if (method == "POST") {
     curl_easy_setopt(curl, CURLOPT_POST, 1L);
     // POSTFIELDSIZE makes the body binary-safe: curl sends exactly this many
@@ -551,13 +843,17 @@ Value HttpTransport::call(Value request) {
     // required for the raw audio bytes embedded in a multipart body.
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.data());
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(payload.size()));
+  } else if (method == "GET" || method == "HEAD") {
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method.c_str());
+    if (method == "HEAD") curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
   } else {
     curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method.c_str());
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.data());
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(payload.size()));
   }
 
-  CURLcode rc = curl_easy_perform(curl);
+  AxHeaderDeadline deadline{curl, timeout_ms};
+  CURLcode rc = ax_curl_perform(curl,[&]{return (cancellation&&cancellation->is_cancelled())||(cancelled&&cancelled())||deadline.passed();});
   long status = 0;
   curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
   // Capture the response Content-Type before cleanup so callers (e.g. the MCP
@@ -568,11 +864,16 @@ Value HttpTransport::call(Value request) {
   curl_slist_free_all(headers);
   curl_easy_cleanup(curl);
 
+  if (cancellation && cancellation->is_cancelled()) throw AxAIServiceAbortedError(cancellation->reason());
+  if(cancelled&&cancelled())throw AxAIServiceAbortedError("MCP invocation cancelled");
+  if (deadline.timed_out) throw ax_call_timeout_error(Core::get(request, "timeout_ms"));
+  ax_transport_response_started = rc != CURLE_OK && status >= 200 && status < 400;
+
   if (rc != CURLE_OK) {
     std::string message = error_buffer[0] ? error_buffer : curl_easy_strerror(rc);
-    if (rc == CURLE_OPERATION_TIMEDOUT) {
-      throw Core::as_error(Core::ai_error_timeout(message, Value(), Value(), Value(), request, false));
-    }
+    if (rc == CURLE_OPERATION_TIMEDOUT) throw ax_transfer_timeout_error(timeout, timeout_ms, message);
+    // Untyped here, as the MCP transport shares this call; the AI client
+    // types it where it catches it (ax_transport_network_error).
     throw AxError("network", message);
   }
 
@@ -581,9 +882,15 @@ Value HttpTransport::call(Value request) {
   Core::set(out, "contentType", content_type);
   Core::set(out, "headers", response_headers);
   if (binary_response) {
-    // Base64-encode the full (binary-safe) body; response may contain NULs, so
-    // axir_base64_encode reads its whole .size() rather than a c_str().
-    Core::set(out, "body", Value(axir_base64_encode(response)));
+    // A JSON body (as TS reads one by its Content-Type) goes on parsed.
+    // Otherwise base64-encode the full (binary-safe) body; response may
+    // contain NULs, so axir_base64_encode reads its whole .size() rather than
+    // a c_str(). The Content-Type goes on beside it.
+    if (content_type.find("application/json") != std::string::npos) {
+      Core::set(out, "json", Core::json_parse(response));
+    } else {
+      Core::set(out, "body", Value(axir_base64_encode(response)));
+    }
   } else if (stream) {
     Core::set(out, "body", response);
   } else {
@@ -639,6 +946,344 @@ Value Core::div(Value left, Value right) {
   return Value(num(left) / (denom == 0.0 ? 1.0 : denom));
 }
 Value Core::math_abs(Value value) { return Value(std::abs(num(value))); }
+Value Core::string_utf8_length(Value value) { return Value(static_cast<double>(str(value).size())); }
+Value Core::string_utf16_units(Value value) {
+  Array units;const auto text=str(value);size_t index=0;
+  while(index<text.size()) {
+    unsigned int point=static_cast<unsigned char>(text[index++]);int trailing=0;
+    if(point>=0xf0){point&=7;trailing=3;}else if(point>=0xe0){point&=15;trailing=2;}else if(point>=0xc0){point&=31;trailing=1;}
+    while(trailing-->0&&index<text.size())point=(point<<6)|(static_cast<unsigned char>(text[index++])&63);
+    if(point>0xffff){point-=0x10000;units.emplace_back(static_cast<double>(0xd800+(point>>10)));units.emplace_back(static_cast<double>(0xdc00+(point&1023)));}
+    else units.emplace_back(static_cast<double>(point));
+  }
+  return Value(units);
+}
+Value Core::string_codepoint_length(Value value) { size_t count = 0; for (unsigned char byte : str(value)) if ((byte & 0xc0) != 0x80) ++count; return Value(static_cast<double>(count)); }
+
+// ----- intrinsic.date.zone_offset: the platform tz database -----
+// A std-only reader for TZif files (RFC 8536): $TZDIR, then the usual
+// zoneinfo directories. Past the last transition the POSIX TZ footer rule
+// decides; before the first, the zone's first local time type.
+namespace {
+
+struct DateTzRuleDate {
+  char kind = 'n';  // 'J' (1-365, no Feb 29), 'n' (0-365), 'M' (month.week.day)
+  long long day = 0, week = 0, month = 0, time = 7200;
+};
+
+struct DateTzRule {
+  long long std_offset = 0;
+  bool has_dst = false;
+  long long dst_offset = 0;
+  DateTzRuleDate start, end;
+};
+
+struct DateTzZone {
+  std::vector<long long> transitions;
+  std::vector<size_t> transition_types;
+  std::vector<long long> offsets;
+  bool has_footer = false;
+  DateTzRule footer;
+};
+
+long long date_floor_div(long long value, long long divisor) {
+  long long quotient = value / divisor;
+  if ((value % divisor != 0) && ((value < 0) != (divisor < 0))) --quotient;
+  return quotient;
+}
+
+long long date_days_from_civil(long long year, long long month, long long day) {
+  long long y = month <= 2 ? year - 1 : year;
+  long long era = date_floor_div(y, 400);
+  long long yoe = y - era * 400;
+  long long mp = (month + 9) % 12;
+  long long doy = (153 * mp + 2) / 5 + day - 1;
+  long long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + doe - 719468;
+}
+
+long long date_year_of_days(long long days) {
+  long long z = days + 719468;
+  long long era = date_floor_div(z, 146097);
+  long long doe = z - era * 146097;
+  long long yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  long long doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  long long mp = (5 * doy + 2) / 153;
+  long long month = mp < 10 ? mp + 3 : mp - 9;
+  return yoe + era * 400 + (month <= 2 ? 1 : 0);
+}
+
+bool date_is_leap(long long year) { return (year % 4 == 0 && year % 100 != 0) || year % 400 == 0; }
+
+// The UTC second of a rule date's local time in `year`, for a zone at
+// `offset` seconds east of UTC.
+long long date_rule_instant(long long year, const DateTzRuleDate& rule, long long offset) {
+  long long first = date_days_from_civil(year, 1, 1);
+  long long day = 0;
+  if (rule.kind == 'J') {
+    day = first + rule.day - 1 + ((date_is_leap(year) && rule.day >= 60) ? 1 : 0);
+  } else if (rule.kind == 'n') {
+    day = first + rule.day;
+  } else {
+    long long month_first = date_days_from_civil(year, rule.month, 1);
+    // 1970-01-01 was a Thursday (4).
+    long long weekday = ((month_first + 4) % 7 + 7) % 7;
+    day = month_first + ((rule.day - weekday) % 7 + 7) % 7 + (rule.week - 1) * 7;
+    long long next_month = rule.month == 12 ? date_days_from_civil(year + 1, 1, 1) : date_days_from_civil(year, rule.month + 1, 1);
+    while (day >= next_month) day -= 7;
+  }
+  return day * 86400 + rule.time - offset;
+}
+
+long long date_rule_offset(const DateTzRule& rule, long long seconds) {
+  if (!rule.has_dst) return rule.std_offset;
+  long long year = date_year_of_days(date_floor_div(seconds + rule.std_offset, 86400));
+  // The latest DST start or end at or before the instant, over the
+  // neighbouring years, decides. Of two at the same instant the later one in
+  // the sequence wins: a permanent-DST footer such as
+  // "XXX-2<+01>-1,0/0,J365/23" ends one year where the next begins.
+  bool found = false, dst = false;
+  long long best = 0;
+  for (long long y = year - 1; y <= year + 1; ++y) {
+    const long long begins = date_rule_instant(y, rule.start, rule.std_offset);
+    const long long ends = date_rule_instant(y, rule.end, rule.dst_offset);
+    for (int pick = 0; pick < 2; ++pick) {
+      const long long at = pick == 0 ? begins : ends;
+      if (at <= seconds && (!found || at >= best)) {
+        found = true;
+        best = at;
+        dst = pick == 0;
+      }
+    }
+  }
+  return found && dst ? rule.dst_offset : rule.std_offset;
+}
+
+// [+-]hh[:mm[:ss]] as seconds.
+bool date_tz_parse_seconds(const std::string& text, size_t& at, long long& out) {
+  long long sign = 1;
+  if (at < text.size() && (text[at] == '+' || text[at] == '-')) {
+    if (text[at] == '-') sign = -1;
+    ++at;
+  }
+  long long parts[3] = {0, 0, 0};
+  for (int index = 0; index < 3; ++index) {
+    if (index > 0) {
+      if (at < text.size() && text[at] == ':') ++at;
+      else break;
+    }
+    const size_t start = at;
+    while (at < text.size() && std::isdigit(static_cast<unsigned char>(text[at]))) parts[index] = parts[index] * 10 + (text[at++] - '0');
+    if (at == start) return false;
+  }
+  out = sign * (parts[0] * 3600 + parts[1] * 60 + parts[2]);
+  return true;
+}
+
+bool date_tz_parse_name(const std::string& text, size_t& at) {
+  if (at < text.size() && text[at] == '<') {
+    while (at < text.size() && text[at] != '>') ++at;
+    if (at >= text.size()) return false;
+    ++at;
+    return true;
+  }
+  const size_t start = at;
+  while (at < text.size() && std::isalpha(static_cast<unsigned char>(text[at]))) ++at;
+  return at > start;
+}
+
+bool date_tz_parse_number(const std::string& text, size_t& at, long long& out) {
+  const size_t start = at;
+  out = 0;
+  while (at < text.size() && std::isdigit(static_cast<unsigned char>(text[at]))) out = out * 10 + (text[at++] - '0');
+  return at > start;
+}
+
+bool date_tz_parse_rule_date(const std::string& text, size_t& at, DateTzRuleDate& date) {
+  if (at < text.size() && text[at] == 'J') {
+    ++at;
+    date.kind = 'J';
+    if (!date_tz_parse_number(text, at, date.day)) return false;
+  } else if (at < text.size() && text[at] == 'M') {
+    ++at;
+    date.kind = 'M';
+    if (!date_tz_parse_number(text, at, date.month) || at >= text.size() || text[at] != '.') return false;
+    ++at;
+    if (!date_tz_parse_number(text, at, date.week) || at >= text.size() || text[at] != '.') return false;
+    ++at;
+    if (!date_tz_parse_number(text, at, date.day)) return false;
+    if (date.month < 1 || date.month > 12 || date.week < 1 || date.week > 5 || date.day > 6) return false;
+  } else {
+    date.kind = 'n';
+    if (!date_tz_parse_number(text, at, date.day)) return false;
+  }
+  if (at < text.size() && text[at] == '/') {
+    ++at;
+    if (!date_tz_parse_seconds(text, at, date.time)) return false;
+  }
+  return true;
+}
+
+// A POSIX TZ string such as "EST5EDT,M3.2.0,M11.1.0" or "<+0530>-5:30".
+bool date_tz_parse_rule(const std::string& text, DateTzRule& rule) {
+  size_t at = 0;
+  long long value = 0;
+  if (!date_tz_parse_name(text, at) || !date_tz_parse_seconds(text, at, value)) return false;
+  rule.std_offset = -value;
+  if (at >= text.size()) return true;
+  if (!date_tz_parse_name(text, at)) return false;
+  rule.has_dst = true;
+  rule.dst_offset = rule.std_offset + 3600;
+  if (at < text.size() && text[at] != ',') {
+    if (!date_tz_parse_seconds(text, at, value)) return false;
+    rule.dst_offset = -value;
+  }
+  if (at >= text.size()) {
+    // POSIX leaves the rule to the implementation; this is the US one.
+    rule.start = DateTzRuleDate{'M', 0, 2, 3, 7200};
+    rule.end = DateTzRuleDate{'M', 0, 1, 11, 7200};
+    return true;
+  }
+  if (text[at] != ',') return false;
+  ++at;
+  if (!date_tz_parse_rule_date(text, at, rule.start) || at >= text.size() || text[at] != ',') return false;
+  ++at;
+  if (!date_tz_parse_rule_date(text, at, rule.end)) return false;
+  return at == text.size();
+}
+
+bool date_tzif_u32(const std::string& data, size_t at, unsigned long& out) {
+  if (at + 4 > data.size()) return false;
+  out = (static_cast<unsigned long>(static_cast<unsigned char>(data[at])) << 24) |
+        (static_cast<unsigned long>(static_cast<unsigned char>(data[at + 1])) << 16) |
+        (static_cast<unsigned long>(static_cast<unsigned char>(data[at + 2])) << 8) |
+        static_cast<unsigned long>(static_cast<unsigned char>(data[at + 3]));
+  return true;
+}
+
+bool date_tzif_counts(const std::string& data, size_t at, size_t counts[6]) {
+  for (int index = 0; index < 6; ++index) {
+    unsigned long value = 0;
+    if (!date_tzif_u32(data, at + 20 + index * 4, value)) return false;
+    counts[index] = static_cast<size_t>(value);
+  }
+  return true;
+}
+
+bool date_parse_tzif(const std::string& data, DateTzZone& zone) {
+  if (data.size() < 44 || data.compare(0, 4, "TZif") != 0) return false;
+  const char version = data[4];
+  size_t counts[6];
+  if (!date_tzif_counts(data, 0, counts)) return false;
+  size_t at = 44;
+  size_t time_size = 4;
+  if (version >= '2') {
+    const size_t v1_size = counts[3] * 5 + counts[4] * 6 + counts[5] + counts[2] * 8 + counts[1] + counts[0];
+    const size_t second = 44 + v1_size;
+    if (second + 44 > data.size() || data.compare(second, 4, "TZif") != 0 || !date_tzif_counts(data, second, counts)) return false;
+    at = second + 44;
+    time_size = 8;
+  }
+  const size_t isut = counts[0], isstd = counts[1], leap = counts[2], time = counts[3], typ = counts[4], chars = counts[5];
+  const size_t data_size = time * time_size + time + typ * 6 + chars + leap * (time_size + 4) + isstd + isut;
+  if (at + data_size > data.size() || typ == 0) return false;
+  for (size_t index = 0; index < time; ++index) {
+    const size_t offset = at + index * time_size;
+    if (time_size == 8) {
+      unsigned long high = 0, low = 0;
+      date_tzif_u32(data, offset, high);
+      date_tzif_u32(data, offset + 4, low);
+      const unsigned long long bits = (static_cast<unsigned long long>(high) << 32) | low;
+      zone.transitions.push_back(static_cast<long long>(bits));
+    } else {
+      unsigned long value = 0;
+      date_tzif_u32(data, offset, value);
+      zone.transitions.push_back(static_cast<long long>(static_cast<int32_t>(static_cast<uint32_t>(value))));
+    }
+  }
+  at += time * time_size;
+  for (size_t index = 0; index < time; ++index) {
+    const size_t type_index = static_cast<unsigned char>(data[at + index]);
+    if (type_index >= typ) return false;
+    zone.transition_types.push_back(type_index);
+  }
+  at += time;
+  for (size_t index = 0; index < typ; ++index) {
+    unsigned long value = 0;
+    date_tzif_u32(data, at + index * 6, value);
+    zone.offsets.push_back(static_cast<long long>(static_cast<int32_t>(static_cast<uint32_t>(value))));
+  }
+  at += typ * 6 + chars + leap * (time_size + 4) + isstd + isut;
+  if (version >= '2' && at < data.size() && data[at] == '\n') {
+    const size_t end = data.find('\n', at + 1);
+    if (end != std::string::npos && end > at + 1) {
+      zone.has_footer = date_tz_parse_rule(data.substr(at + 1, end - at - 1), zone.footer);
+    }
+  }
+  return true;
+}
+
+long long date_zone_offset_at(const DateTzZone& zone, long long seconds) {
+  if (zone.transitions.empty()) return zone.has_footer ? date_rule_offset(zone.footer, seconds) : zone.offsets[0];
+  if (seconds < zone.transitions.front()) return zone.offsets[0];
+  const size_t index = static_cast<size_t>(std::upper_bound(zone.transitions.begin(), zone.transitions.end(), seconds) - zone.transitions.begin()) - 1;
+  if (index + 1 == zone.transitions.size() && zone.has_footer) return date_rule_offset(zone.footer, seconds);
+  return zone.offsets[zone.transition_types[index]];
+}
+
+std::shared_ptr<DateTzZone> date_zone_load(const std::string& name) {
+  static std::mutex mutex;
+  static std::map<std::string, std::shared_ptr<DateTzZone>> zones;
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto found = zones.find(name);
+    if (found != zones.end()) return found->second;
+  }
+  bool safe = !name.empty() && name[0] != '/' && name.find('\\') == std::string::npos && name.find('\0') == std::string::npos;
+  if (safe) {
+    size_t start = 0;
+    while (start <= name.size()) {
+      const size_t slash = name.find('/', start);
+      const std::string part = name.substr(start, slash == std::string::npos ? std::string::npos : slash - start);
+      if (part.empty() || part == "." || part == "..") safe = false;
+      if (slash == std::string::npos) break;
+      start = slash + 1;
+    }
+  }
+  std::shared_ptr<DateTzZone> loaded;
+  if (safe) {
+    std::vector<std::string> dirs;
+    if (const char* tzdir = std::getenv("TZDIR")) {
+      if (*tzdir) dirs.emplace_back(tzdir);
+    }
+    for (const char* dir : {"/usr/share/zoneinfo", "/usr/lib/zoneinfo", "/usr/share/lib/zoneinfo", "/etc/zoneinfo"}) dirs.emplace_back(dir);
+    for (const auto& dir : dirs) {
+      std::ifstream file(dir + "/" + name, std::ios::binary);
+      if (!file) continue;
+      std::string data((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+      auto zone = std::make_shared<DateTzZone>();
+      if (date_parse_tzif(data, *zone)) {
+        loaded = zone;
+        break;
+      }
+    }
+  }
+  std::lock_guard<std::mutex> lock(mutex);
+  zones[name] = loaded;
+  return loaded;
+}
+
+}  // namespace
+
+Value Core::date_zone_offset(Value name, Value epoch_ms) {
+  const std::string zone_name = str(name);
+  const auto zone = date_zone_load(zone_name);
+  if (!zone) throw AxError("runtime", "unknown time zone " + zone_name);
+  const long long seconds = static_cast<long long>(std::floor(num(epoch_ms) / 1000.0));
+  return Value(static_cast<double>(date_zone_offset_at(*zone, seconds)));
+}
+Value Core::math_is_finite(Value value) { return Value(std::isfinite(num(value))); }
+Value Core::math_floor(Value value) { return Value(std::floor(num(value))); }
 Value Core::math_log(Value value) { return Value(std::log(num(value))); }
 Value Core::math_exp(Value value) { return Value(std::exp(num(value))); }
 Value Core::math_sqrt(Value value) { return Value(std::sqrt(num(value))); }
@@ -666,7 +1311,7 @@ Value Core::contains(Value container, Value item) {
 }
 Value Core::len(Value value) {
   if (value.is_string()) return Value(static_cast<double>(str(value).size()));
-  if (value.is_array()) return Value(static_cast<double>(array_ref(value).size()));
+  if (value.is_array()) return Value(static_cast<double>(std::get<std::shared_ptr<Array>>(value.data)->size()));
   if (value.is_object()) return Value(static_cast<double>(entries(value).size()));
   return Value(0);
 }
@@ -682,7 +1327,7 @@ Value Core::get(Value target, Value key, Value default_value) {
   if (target.is_object()) return get_key(target, key_string(key), default_value);
   if (target.is_array() && key.is_number()) {
     int idx = static_cast<int>(num(key));
-    const auto& arr = array_ref(target);
+    const auto& arr = *std::get<std::shared_ptr<Array>>(target.data);
     return idx >= 0 && static_cast<size_t>(idx) < arr.size() ? arr[idx] : default_value;
   }
   return default_value;
@@ -691,9 +1336,12 @@ void Core::set(Value& target, Value key, Value value) {
   std::string k = key_string(key);
   Object& obj = object_mut(target);
   if (obj.count(k) == 0) {
-    Array order = array_ref(obj["__order"]);
-    order.emplace_back(k);
-    obj["__order"] = order;
+    // Copied maps retain independent ordering; a unique list can grow in place.
+    Value& order = obj["__order"];
+    if (auto shared = std::get_if<std::shared_ptr<Array>>(&order.data); shared && !shared->unique()) {
+      order = Value(**shared);
+    }
+    array_mut(order).emplace_back(k);
   }
   obj[k] = std::move(value);
 }
@@ -755,17 +1403,56 @@ Value Core::type_is(Value value, Value type_name) {
   if (t == "boolean") return Value(value.is_bool());
   if (t == "null") return Value(value.is_null());
   if (t == "json") return Value(true);
+  // No native date type: date and datetime fields take strings here.
+  if (t == "date") return Value(false);
   return Value(false);
 }
 Value Core::regex_match(Value pattern, Value value) {
+  // libc++ regex may recurse for each character in a repeated character class.
+  // Evaluate this flat ASCII pattern in constant stack space for image payloads.
+  if (value.is_string() && str(pattern) == "^[A-Za-z0-9+/]+={0,2}$") {
+    const auto& text = std::get<std::string>(value.data);
+    size_t end=text.size(), padding=0;
+    while(end>0 && text[end-1]=='='){--end;++padding;}
+    if(end==0 || padding>2)return Value(false);
+    for(size_t index=0;index<end;++index){unsigned char ch=text[index];if(!((ch>='A'&&ch<='Z')||(ch>='a'&&ch<='z')||(ch>='0'&&ch<='9')||ch=='+'||ch=='/'))return Value(false);}
+    return Value(true);
+  }
   return Value(value.is_string() && std::regex_search(str(value), std::regex(str(pattern))));
 }
+// The UTF-8 length of the JavaScript white space or line terminator at pos
+// (String.prototype.trim's set), or 0.
+static size_t js_space_at(const std::string& s, size_t pos) {
+  const auto at = [&](size_t i) { return i < s.size() ? static_cast<unsigned char>(s[i]) : 0; };
+  const unsigned char a = at(pos), b = at(pos + 1), c = at(pos + 2);
+  if (a == 0x09 || a == 0x0A || a == 0x0B || a == 0x0C || a == 0x0D || a == 0x20) return 1;
+  if (a == 0xC2 && b == 0xA0) return 2;
+  if (a == 0xE1 && b == 0x9A && c == 0x80) return 3;
+  if (a == 0xE2 && b == 0x80 && ((c >= 0x80 && c <= 0x8A) || c == 0xA8 || c == 0xA9 || c == 0xAF)) return 3;
+  if (a == 0xE2 && b == 0x81 && c == 0x9F) return 3;
+  if (a == 0xE3 && b == 0x80 && c == 0x80) return 3;
+  if (a == 0xEF && b == 0xBB && c == 0xBF) return 3;
+  return 0;
+}
+// As JavaScript's String.prototype.trim: white space and line terminators,
+// not other control characters.
 Value Core::string_trim(Value value) {
   std::string s = str(value);
-  auto start = s.find_first_not_of(" \t\n\r");
-  if (start == std::string::npos) return Value("");
-  auto end = s.find_last_not_of(" \t\n\r");
-  return Value(s.substr(start, end - start + 1));
+  size_t start = 0, end = s.size();
+  while (start < end) {
+    size_t n = js_space_at(s, start);
+    if (n == 0 || start + n > end) break;
+    start += n;
+  }
+  while (end > start) {
+    size_t trimmed = 0;
+    for (size_t n = 1; n <= 3 && n <= end - start; n++) {
+      if (js_space_at(s, end - n) == n) { trimmed = n; break; }
+    }
+    if (trimmed == 0) break;
+    end -= trimmed;
+  }
+  return Value(s.substr(start, end - start));
 }
 Value Core::string_join(Value sep, Value values) {
   std::string out;
@@ -809,6 +1496,41 @@ Value Core::string_starts_with(Value value, Value prefix) {
   std::string s = str(value), p = str(prefix);
   return Value(s.rfind(p, 0) == 0);
 }
+// C++ strings are UTF-8, but parse_json keeps a lone surrogate escape (half of
+// a pair a provider split across stream events, such as "\ud83d" and then
+// "\ude00") as its 3-byte WTF-8 form: ED A0-AF xx for a high surrogate and
+// ED B0-BF xx for a low one.
+static bool wtf8_surrogate_at(const std::string& text, std::size_t at, unsigned char low, unsigned char high) {
+  if (at + 3 > text.size()) return false;
+  auto byte = [&](std::size_t offset) { return static_cast<unsigned char>(text[at + offset]); };
+  return byte(0) == 0xED && byte(1) >= low && byte(1) <= high && (byte(2) & 0xC0) == 0x80;
+}
+static unsigned wtf8_surrogate_unit(const std::string& text, std::size_t at) {
+  return 0xD000u | ((static_cast<unsigned char>(text[at + 1]) & 0x3Fu) << 6) | (static_cast<unsigned char>(text[at + 2]) & 0x3Fu);
+}
+// Streamed text appends chunk by chunk. As in a UTF-16 string (TS, Java), a
+// high surrogate ending the text and a low one starting the chunk join into
+// the code point they make, as 4-byte UTF-8.
+Value Core::string_concat_stream_text(Value left, Value right) {
+  std::string text = str(left), chunk = str(right);
+  if (text.size() >= 3 && wtf8_surrogate_at(text, text.size() - 3, 0xA0, 0xAF) && wtf8_surrogate_at(chunk, 0, 0xB0, 0xBF)) {
+    unsigned code_point = 0x10000u + ((wtf8_surrogate_unit(text, text.size() - 3) - 0xD800u) << 10) + (wtf8_surrogate_unit(chunk, 0) - 0xDC00u);
+    text.resize(text.size() - 3);
+    text.push_back(static_cast<char>(0xF0 | (code_point >> 18)));
+    text.push_back(static_cast<char>(0x80 | ((code_point >> 12) & 0x3F)));
+    text.push_back(static_cast<char>(0x80 | ((code_point >> 6) & 0x3F)));
+    text.push_back(static_cast<char>(0x80 | (code_point & 0x3F)));
+    return Value(text + chunk.substr(3));
+  }
+  return Value(text + chunk);
+}
+// Until a field's text is final, a high surrogate at its end waits for its
+// pair, as TS holds it back, so no delta ends in half a character.
+Value Core::string_drop_trailing_high_surrogate(Value value) {
+  std::string text = str(value);
+  if (text.size() >= 3 && wtf8_surrogate_at(text, text.size() - 3, 0xA0, 0xAF)) return Value(text.substr(0, text.size() - 3));
+  return value;
+}
 Value Core::string_replace(Value value, Value old_value, Value new_value) {
   std::string s = str(value), old = str(old_value), repl = str(new_value);
   size_t pos = 0;
@@ -848,13 +1570,34 @@ Value Core::string_words(Value value) {
 Value Core::string_default_if_empty(Value value, Value fallback) {
   return truthy(string_trim(value)) ? string_trim(value) : fallback;
 }
-Value Core::string_format(Value templ, Value a, Value b, Value c) {
-  std::string out = str(templ);
-  for (const auto& arg : Array{a, b, c}) {
-    if (arg.is_null()) continue;
-    size_t pos = out.find("{}");
-    if (pos == std::string::npos) break;
-    out.replace(pos, 2, display(arg));
+// A value's text in string.format and string.str, as every port writes it: a
+// string as is, null as "null", a boolean as "true" or "false", a number as
+// JavaScript's String(x), and a list or object as compact JSON with its keys
+// in insertion order (JSON.stringify).
+static std::string js_text(const Value& value) {
+  if (value.is_null()) return "null";
+  if (value.is_array() || value.is_object()) return stringify(value);
+  return display(value);
+}
+// Each {} takes the next argument's js_text, from left to right and inserted
+// as is (never read as a template); {{ and }} write one brace, any other brace
+// is kept, and a {} past the last argument stays {}.
+Value Core::string_format_values(Value templ, const std::vector<Value>& args) {
+  std::string text = str(templ);
+  std::string out;
+  size_t next = 0;
+  for (size_t i = 0; i < text.size();) {
+    if (i + 1 < text.size()) {
+      if (text[i] == '{' && text[i + 1] == '{') { out += '{'; i += 2; continue; }
+      if (text[i] == '}' && text[i + 1] == '}') { out += '}'; i += 2; continue; }
+      if (text[i] == '{' && text[i + 1] == '}') {
+        out += next < args.size() ? js_text(args[next++]) : std::string("{}");
+        i += 2;
+        continue;
+      }
+    }
+    out += text[i];
+    i++;
   }
   return Value(out);
 }
@@ -1025,7 +1768,7 @@ Value Core::string_extract_quoted_suffix(Value text) {
   }
   return Value(Object{{"value", Value()}, {"index", Value()}, {"rest", ""}, {"head", s}, {"found", false}});
 }
-Value Core::string_str(Value value) { return Value(display(value)); }
+Value Core::string_str(Value value) { return Value(js_text(value)); }
 Value Core::regex_replace(Value pattern, Value repl, Value value) {
   return Value(std::regex_replace(str(value), std::regex(str(pattern)), str(repl)));
 }
@@ -1047,14 +1790,184 @@ Value Core::json_parse(Value value) {
   }
   return parse_json(text);
 }
+// JSON.parse: the text must be exactly one JSON value with JSON's number,
+// string, escape and literal grammar (parse_json above is deliberately
+// lenient). Callers such as TypeScript's extractValues rely on invalid JSON
+// raising.
+static Value parse_json_strict(const std::string& source) {
+  struct Parser {
+    const std::string& s;
+    size_t pos = 0;
+    [[noreturn]] void fail(const std::string& message) const { throw AxError("json", message); }
+    [[noreturn]] void unexpected() const {
+      if (pos >= s.size()) fail("Unexpected end of JSON input");
+      fail(std::string("Unexpected token '") + s[pos] + "' at position " + std::to_string(pos) + ": not valid JSON");
+    }
+    static bool digit(char c) { return c >= '0' && c <= '9'; }
+    void skip() { while (pos < s.size() && (s[pos] == ' ' || s[pos] == '\t' || s[pos] == '\n' || s[pos] == '\r')) ++pos; }
+    bool literal(const std::string& word) {
+      if (s.compare(pos, word.size(), word) != 0) return false;
+      pos += word.size();
+      return true;
+    }
+    Value value() {
+      skip();
+      if (pos >= s.size()) unexpected();
+      char c = s[pos];
+      if (c == '{') { ++pos; return object(); }
+      if (c == '[') { ++pos; return array(); }
+      if (c == '"') return Value(string());
+      if (c == '-' || digit(c)) return number();
+      if (literal("true")) return Value(true);
+      if (literal("false")) return Value(false);
+      if (literal("null")) return Value();
+      unexpected();
+    }
+    Value object() {
+      Object out;
+      Array order;
+      skip();
+      if (pos < s.size() && s[pos] == '}') { ++pos; return Value(out); }
+      while (true) {
+        skip();
+        if (pos >= s.size() || s[pos] != '"') unexpected();
+        std::string key = string();
+        skip();
+        if (pos >= s.size() || s[pos] != ':') unexpected();
+        ++pos;
+        Value item = value();
+        if (out.find(key) == out.end()) order.emplace_back(key);
+        out[key] = std::move(item);
+        skip();
+        if (pos < s.size() && s[pos] == ',') { ++pos; continue; }
+        if (pos < s.size() && s[pos] == '}') {
+          ++pos;
+          out["__order"] = Value(order);
+          return Value(out);
+        }
+        unexpected();
+      }
+    }
+    Value array() {
+      Array out;
+      skip();
+      if (pos < s.size() && s[pos] == ']') { ++pos; return Value(out); }
+      while (true) {
+        out.push_back(value());
+        skip();
+        if (pos < s.size() && s[pos] == ',') { ++pos; continue; }
+        if (pos < s.size() && s[pos] == ']') { ++pos; return Value(out); }
+        unexpected();
+      }
+    }
+    unsigned hex4() {
+      unsigned cp = 0;
+      for (int i = 0; i < 4; ++i) {
+        if (pos >= s.size()) fail("Bad Unicode escape in JSON at position " + std::to_string(pos));
+        char h = s[pos++];
+        cp <<= 4;
+        if (h >= '0' && h <= '9') cp |= static_cast<unsigned>(h - '0');
+        else if (h >= 'a' && h <= 'f') cp |= static_cast<unsigned>(h - 'a' + 10);
+        else if (h >= 'A' && h <= 'F') cp |= static_cast<unsigned>(h - 'A' + 10);
+        else fail("Bad Unicode escape in JSON at position " + std::to_string(pos - 1));
+      }
+      return cp;
+    }
+    static void append_utf8(std::string& out, unsigned cp) {
+      if (cp <= 0x7F) {
+        out.push_back(static_cast<char>(cp));
+      } else if (cp <= 0x7FF) {
+        out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+      } else if (cp <= 0xFFFF) {
+        out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+      } else {
+        out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+      }
+    }
+    std::string string() {
+      ++pos;
+      std::string out;
+      while (true) {
+        if (pos >= s.size()) fail("Unterminated string in JSON at position " + std::to_string(pos));
+        unsigned char c = static_cast<unsigned char>(s[pos++]);
+        if (c == '"') return out;
+        if (c < 0x20) fail("Bad control character in string literal in JSON at position " + std::to_string(pos - 1));
+        if (c != '\\') { out.push_back(static_cast<char>(c)); continue; }
+        if (pos >= s.size()) fail("Unterminated string in JSON at position " + std::to_string(pos));
+        char e = s[pos++];
+        switch (e) {
+          case '"': out.push_back('"'); break;
+          case '\\': out.push_back('\\'); break;
+          case '/': out.push_back('/'); break;
+          case 'b': out.push_back('\b'); break;
+          case 'f': out.push_back('\f'); break;
+          case 'n': out.push_back('\n'); break;
+          case 'r': out.push_back('\r'); break;
+          case 't': out.push_back('\t'); break;
+          case 'u': {
+            unsigned cp = hex4();
+            // A high surrogate followed by a low one is one code point.
+            if (cp >= 0xD800 && cp <= 0xDBFF && pos + 1 < s.size() && s[pos] == '\\' && s[pos + 1] == 'u') {
+              size_t pair_start = pos;
+              pos += 2;
+              unsigned low = hex4();
+              if (low >= 0xDC00 && low <= 0xDFFF) cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+              else pos = pair_start;
+            }
+            append_utf8(out, cp);
+            break;
+          }
+          default:
+            fail("Bad escaped character in JSON at position " + std::to_string(pos - 1));
+        }
+      }
+    }
+    Value number() {
+      size_t start = pos;
+      if (s[pos] == '-') ++pos;
+      if (pos >= s.size()) fail("No number after minus sign in JSON at position " + std::to_string(pos));
+      if (s[pos] == '0') {
+        ++pos;
+      } else if (digit(s[pos])) {
+        while (pos < s.size() && digit(s[pos])) ++pos;
+      } else {
+        unexpected();
+      }
+      if (pos < s.size() && s[pos] == '.') {
+        ++pos;
+        if (pos >= s.size() || !digit(s[pos])) fail("Unterminated fractional number in JSON at position " + std::to_string(pos));
+        while (pos < s.size() && digit(s[pos])) ++pos;
+      }
+      if (pos < s.size() && (s[pos] == 'e' || s[pos] == 'E')) {
+        ++pos;
+        if (pos < s.size() && (s[pos] == '+' || s[pos] == '-')) ++pos;
+        if (pos >= s.size() || !digit(s[pos])) fail("Exponent part is missing a number in JSON at position " + std::to_string(pos));
+        while (pos < s.size() && digit(s[pos])) ++pos;
+      }
+      return Value(std::strtod(s.substr(start, pos - start).c_str(), nullptr));
+    }
+  };
+  Parser parser{source};
+  Value out = parser.value();
+  parser.skip();
+  if (parser.pos < source.size()) parser.fail("Unexpected non-whitespace character after JSON at position " + std::to_string(parser.pos));
+  return out;
+}
 Value Core::json_parse_strict(Value value) {
-  return parse_json(str(string_trim(value)));
+  return parse_json_strict(str(string_trim(value)));
 }
 Value Core::json_stringify(Value value) { return Value(stringify(value)); }
 Value Core::json_stable_stringify(Value value) { return Value(stable_stringify(value)); }
-Value Core::json_pretty(Value value) { return Value(stringify(value)); }
+Value Core::json_pretty(Value value) { return Value(pretty_stringify(value)); }
 Value Core::signature_error(Value message) { return Value(Object{{"__error", "signature"}, {"message", str(message)}}); }
 Value Core::validation_error(Value message) { return Value(Object{{"__error", "validation"}, {"message", str(message)}}); }
+Value Core::decision_refusal_error(Value path, Value provenance) { return object({{"__error","decision"},{"__type","AxDecisionRefusalError"},{"message","Decision refused: " + str(path)},{"payload",object({{"fieldPath",path},{"provenance",provenance}})}}); }
 Value Core::runtime_error(Value message) { return Value(Object{{"__error", "runtime"}, {"message", str(message)}}); }
 static Value ai_error_object(const std::string& type, Value message, Value status = Value(), Value code = Value(), Value response_body = Value(), Value request = Value(), Value retryable = Value(false)) {
   Object out;
@@ -1064,7 +1977,7 @@ static Value ai_error_object(const std::string& type, Value message, Value statu
   out["status"] = status;
   out["code"] = code;
   out["response_body"] = response_body;
-  out["request"] = request;
+  out["request"] = request.is_null() ? Value() : Core::_ai_error_request(request, Value());
   out["retryable"] = Core::truthy(retryable);
   return Value(out);
 }
@@ -1083,6 +1996,20 @@ Value Core::exception_value(const std::exception& error) {
     if (!ax->code.empty()) out["code"] = ax->code;
     out["retryable"] = ax->retryable;
     if (!ax->response_body.is_null()) out["response_body"] = ax->response_body;
+    if (!ax->url.empty() || !ax->request_body.is_null()) {
+      Object request;
+      if (!ax->url.empty()) request["url"] = ax->url;
+      if (!ax->request_body.is_null()) request["json"] = ax->request_body;
+      out["request"] = Value(std::move(request));
+    }
+    if (const AxError* cause = ax->cause()) out["cause"] = exception_value(*cause);
+    if (const auto* decision = dynamic_cast<const AxDecisionRefusalError*>(ax)) {
+      out["payload"] = object({{"fieldPath", decision->field_path}, {"provenance", decision->provenance}});
+    }
+    if (const auto* clarification = dynamic_cast<const AxAgentClarificationError*>(ax)) {
+      out["clarification"] = clarification->clarification;
+      out["state"] = clarification->state;
+    }
     return Value(out);
   }
   return runtime_error(error.what());
@@ -1091,12 +2018,132 @@ Value Core::exception_message(Value error) {
   if (error.is_object() && has_key(error, "message")) return get_key(error, "message");
   return Value(str(error));
 }
+// intrinsic.exception.rewrap: a copy of the error map, so it keeps its
+// category, type and fields, with the new message and the original error as
+// its cause; anything else becomes a runtime error. The IR never rewraps an
+// aborted error.
+Value Core::exception_generate(Value error, Value message) {
+  return object({{"__error", "generate"}, {"__type", "AxGenerateError"}, {"message", message}, {"cause", error}});
+}
+Value Core::exception_rewrap(Value error, Value message) {
+  Object wrapped = error.is_object() && has_key(error, "__error") ? object_ref(error) : object_ref(runtime_error(message));
+  wrapped["message"] = str(message);
+  wrapped["cause"] = error;
+  return Value(std::move(wrapped));
+}
+namespace detail {
+std::array<unsigned char, 32> sha256(const std::string& input) {
+  static constexpr std::array<std::uint32_t, 64> constants = {
+      0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+      0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+      0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+      0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+      0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+      0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+      0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+      0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
+  auto rotate = [](std::uint32_t value, unsigned count) { return (value >> count) | (value << (32 - count)); };
+  std::vector<unsigned char> bytes(input.begin(), input.end());
+  const std::uint64_t bit_length = static_cast<std::uint64_t>(bytes.size()) * 8;
+  bytes.push_back(0x80);
+  while (bytes.size() % 64 != 56) bytes.push_back(0);
+  for (int shift = 56; shift >= 0; shift -= 8) bytes.push_back(static_cast<unsigned char>(bit_length >> shift));
+  std::array<std::uint32_t, 8> hash = {0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
+  for (std::size_t offset = 0; offset < bytes.size(); offset += 64) {
+    std::array<std::uint32_t, 64> words{};
+    for (std::size_t index = 0; index < 16; ++index) {
+      const std::size_t at = offset + index * 4;
+      words[index] = (static_cast<std::uint32_t>(bytes[at]) << 24) | (static_cast<std::uint32_t>(bytes[at + 1]) << 16) |
+                     (static_cast<std::uint32_t>(bytes[at + 2]) << 8) | bytes[at + 3];
+    }
+    for (std::size_t index = 16; index < 64; ++index) {
+      const auto s0 = rotate(words[index - 15], 7) ^ rotate(words[index - 15], 18) ^ (words[index - 15] >> 3);
+      const auto s1 = rotate(words[index - 2], 17) ^ rotate(words[index - 2], 19) ^ (words[index - 2] >> 10);
+      words[index] = words[index - 16] + s0 + words[index - 7] + s1;
+    }
+    auto state = hash;
+    for (std::size_t index = 0; index < 64; ++index) {
+      const auto sum1 = rotate(state[4], 6) ^ rotate(state[4], 11) ^ rotate(state[4], 25);
+      const auto choice = (state[4] & state[5]) ^ (~state[4] & state[6]);
+      const auto temporary1 = state[7] + sum1 + choice + constants[index] + words[index];
+      const auto sum0 = rotate(state[0], 2) ^ rotate(state[0], 13) ^ rotate(state[0], 22);
+      const auto majority = (state[0] & state[1]) ^ (state[0] & state[2]) ^ (state[1] & state[2]);
+      const auto temporary2 = sum0 + majority;
+      state = {temporary1 + temporary2,state[0],state[1],state[2],state[3] + temporary1,state[4],state[5],state[6]};
+    }
+    for (std::size_t index = 0; index < hash.size(); ++index) hash[index] += state[index];
+  }
+  std::array<unsigned char, 32> digest{};
+  for (std::size_t index = 0; index < hash.size(); ++index) for (int byte = 0; byte < 4; ++byte) digest[index * 4 + byte] = static_cast<unsigned char>(hash[index] >> (24 - byte * 8));
+  return digest;
+}
+}  // namespace detail
+Value Core::crypto_sha256_hex(Value text) {
+  static constexpr char digits[] = "0123456789abcdef";
+  std::string hex;
+  hex.reserve(64);
+  for (unsigned char byte : detail::sha256(str(text))) {
+    hex.push_back(digits[byte >> 4]);
+    hex.push_back(digits[byte & 0x0f]);
+  }
+  return Value(std::move(hex));
+}
+Value Core::exception_is_aborted(Value error) {
+  return Value(error.is_object() &&
+               (str(get_key(error, "__type")) == "AxAIServiceAbortedError" ||
+                str(get_key(error, "__error")) == "aborted"));
+}
+// TS AxGen retries only 5xx status, network, timeout and stream-termination errors.
+Value Core::exception_is_infrastructure(Value error) {
+  if (!error.is_object()) return Value(false);
+  std::string type = str(get_key(error, "__type"));
+  if (type == "AxAIServiceStatusError") {
+    Value status = get_key(error, "status");
+    if (status.is_null()) return Value(false);
+    double code = num(status);
+    return Value(code >= 500 && code < 600);
+  }
+  return Value(type == "AxAIServiceNetworkError" || type == "AxAIServiceTimeoutError" || type == "AxAIServiceStreamTerminatedError");
+}
+// TS AxGen retries a model refusal inside its validation loop.
+Value Core::exception_is_validation(Value error) {
+  if (!error.is_object()) return Value(false);
+  return Value(str(get_key(error, "__error")) == "validation");
+}
+Value Core::exception_is_refusal(Value error) {
+  if (!error.is_object()) return Value(false);
+  return Value(str(get_key(error, "__type")) == "AxAIRefusalError");
+}
 AxError Core::as_error(Value error) {
   if (error.is_object() && has_key(error, "__error")) {
     int status = get_key(error, "status").is_null() ? 0 : static_cast<int>(num(get_key(error, "status")));
-    return AxError(str(get_key(error, "__error")), str(get_key(error, "message")), str(get_key(error, "__type")), status, str(get_key(error, "code")), truthy(get_key(error, "retryable")), get_key(error, "response_body"));
+    AxError out(str(get_key(error, "__error")), str(get_key(error, "message")), str(get_key(error, "__type")), status, str(get_key(error, "code")), truthy(get_key(error, "retryable")), get_key(error, "response_body"));
+    Value request = get_key(error, "request");
+    if (request.is_object()) {
+      out.url = str(Core::get(request, "url", Value("")));
+      out.request_body = Core::get(request, "json", Core::get(request, "data"));
+    }
+    Value cause = get_key(error, "cause");
+    if (!cause.is_null()) out.set_cause(std::make_shared<AxError>(as_error(cause)));
+    return out;
   }
   return AxError("runtime", str(error));
+}
+[[noreturn]] void Core::raise_error(Value error) {
+  if (str(get_key(error,"__type")) == "AxDecisionRefusalError") { Value payload=get_key(error,"payload"); throw AxDecisionRefusalError(str(get_key(payload,"fieldPath")),get_key(payload,"provenance")); }
+  if (str(get_key(error, "__type")) == "AxGenerateError") throw AxGenerateError(as_error(error));
+  if (truthy(exception_is_aborted(error))) {
+    std::string message = str(get_key(error, "message"));
+    const std::string prefix = "Request aborted: ";
+    std::string reason = message.rfind(prefix, 0) == 0 ? message.substr(prefix.size()) : "cancelled";
+    throw AxAIServiceAbortedError(reason);
+  }
+  // A clarification keeps its payload and the runtime state, as the other
+  // ports' clarification errors do.
+  if (error.is_object() && str(get_key(error, "__error")) == "AxAgentClarificationError") {
+    throw AxAgentClarificationError(str(get_key(error, "message")), get_key(error, "clarification"), get_key(error, "state"));
+  }
+  throw as_error(std::move(error));
 }
 Value Core::coerce_chat_request(Value request) {
   if (has_key(request, "chat_prompt")) return Value(object_ref(request));
@@ -1125,9 +2172,23 @@ Value Core::client_ref(AIClient& client) {
   }
   return Value(Object{{"__client_id", id}});
 }
+static std::mutex& stage_registry_mutex() { static std::mutex mutex; return mutex; }
+static AxProgram* registered_stage(const std::string& id) {
+  std::lock_guard<std::mutex> lock(stage_registry_mutex());
+  auto it=agent_stage_registry().find(id);return it==agent_stage_registry().end()?nullptr:it->second;
+}
+using OwnedFlowPrograms = std::vector<std::shared_ptr<AxProgram>>;
+static std::mutex owned_flows_mutex;
+static std::map<std::string,std::weak_ptr<OwnedFlowPrograms>> owned_flows;
+static void register_owned_flow(Value state,const std::shared_ptr<OwnedFlowPrograms>& programs) {
+  auto id=pointer_id(programs.get());Core::set(state,"__owned_flow_id",id);
+  std::lock_guard<std::mutex> lock(owned_flows_mutex);
+  for(auto it=owned_flows.begin();it!=owned_flows.end();)if(it->second.expired())it=owned_flows.erase(it);else ++it;
+  owned_flows[id]=programs;
+}
 Value Core::agent_stage_ref(AxProgram& stage) {
   std::string id = pointer_id(&stage);
-  agent_stage_registry()[id] = &stage;
+  { std::lock_guard<std::mutex> lock(stage_registry_mutex()); agent_stage_registry()[id] = &stage; }
   return Value(Object{{"__agent_stage_id", id}});
 }
 Value Core::code_runtime_ref(AxCodeRuntime& runtime) {
@@ -1139,7 +2200,12 @@ Value Core::legacy_response_to_chat_response(Value raw) {
   if (!get_key(raw, "results").is_null()) return raw;
   Array calls;
   for (const auto& item : array_ref(get_key(raw, "function_calls"))) {
-    Object call = object_ref(item);
+    // A call already in TS's nested {id, type, function} shape is kept; a
+    // flat {id, name, params} one is nested.
+    if (get_key(item, "function").is_object()) {
+      calls.push_back(item);
+      continue;
+    }
     Object fn;
     fn["name"] = get_key(item, "name");
     fn["params"] = get_key(item, "params");
@@ -1160,10 +2226,26 @@ Value Core::legacy_response_to_chat_response(Value raw) {
   if (!usage.is_null()) out["model_usage"] = Value(Object{{"tokens", usage}});
   return Value(out);
 }
-Value Core::object_call_method(Value target, Value method_name, Value arg) {
+Value Core::object_call_method(Value target, Value method_name, Value arg, Value options) {
   if (str(method_name) == "render" && str(get_key(target, "__kind")) == "PromptTemplate") {
-    return render_prompt(get_key(target, "signature"), arg, get_key(target, "functions", Value::array()), get_key(target, "options", Value::object()));
+    Value functions = get_key(target, "functions", Value::array());
+    Value render_options = get_key(target, "options", Value::object());
+    // A render's options win over the template's; extra_functions (the
+    // function rung's __axOutput) are listed after the template's own, as TS
+    // lists them.
+    if (options.is_object()) {
+      render_options = map_merge(render_options, options);
+      Value extra = get_key(options, "extra_functions");
+      if (!extra.is_null()) {
+        Array listed = array_ref(functions);
+        for (const auto& fn : array_ref(extra)) listed.push_back(fn);
+        functions = Value(std::move(listed));
+        map_delete(render_options, "extra_functions");
+      }
+    }
+    return render_prompt(get_key(target, "signature"), arg, functions, render_options);
   }
+  if (str(method_name) == "format_result") return call_function_result_formatter(target, arg);
   if (str(method_name) == "call") {
     std::string picker_id = str(get_key(target, "__result_picker_id"));
     auto picker = result_picker_registry().find(picker_id);
@@ -1178,31 +2260,56 @@ Value Core::object_call_method(Value target, Value method_name, Value arg) {
 }
 Value Core::program_components(Value program) {
   std::string stage_id = str(get_key(program, "__agent_stage_id"));
-  auto it = agent_stage_registry().find(stage_id);
-  if (it == agent_stage_registry().end() || it->second == nullptr) return Value::array();
-  return it->second->get_optimizable_components();
+  auto* stage_ptr = registered_stage(stage_id);
+  if (!stage_ptr) return Value::array();
+  return stage_ptr->get_optimizable_components();
 }
 Value Core::program_apply_components(Value program, Value component_map) {
   std::string stage_id = str(get_key(program, "__agent_stage_id"));
-  auto it = agent_stage_registry().find(stage_id);
-  if (it != agent_stage_registry().end() && it->second != nullptr) it->second->apply_optimized_components(std::move(component_map));
+  auto* stage_ptr = registered_stage(stage_id);
+  if (stage_ptr) stage_ptr->apply_optimized_components(std::move(component_map));
   return Value::object();
+}
+// An AxGen's or AxAgent's signature text. Any other program (a nested flow, a
+// custom program) has none, and its undeclared step is a barrier.
+Value Core::program_signature(Value program) {
+  auto* stage_ptr = registered_stage(str(get_key(program, "__agent_stage_id")));
+  if (auto* gen = dynamic_cast<AxGen*>(stage_ptr)) return Core::signature_to_string(Core::get(gen->value(), "signature"));
+  if (auto* agent = dynamic_cast<AxAgent*>(stage_ptr)) return Core::signature_to_string(Core::get(agent->state_, "signature"));
+  return Value();
 }
 Value Core::ai_complete_once(Value client, Value request, Value options) {
   std::string id = str(get_key(client, "__client_id"));
   AIClient* registered = registered_client(id);
   if (registered == nullptr) throw AxError("runtime", "client does not implement AIClient");
+  // As in TS, a streamed forward folds the stream's chunks into one response.
+  if (truthy(get(get(request, "model_config", Value::object()), "stream", false))) {
+    if (auto* service = dynamic_cast<AxAIService*>(registered)) {
+      Value events = Value::array();
+      for (const auto& event : service->stream(request, options)) append(events, event);
+      return chat_response_to_completion(fold_chat_response_stream(events));
+    }
+  }
   return chat_response_to_completion(registered->chat(request, options));
 }
 Value Core::ai_client_features(Value client, Value model) {
   std::string id = str(get_key(client, "__client_id"));
   AIClient* registered = registered_client(id);
   if (registered != nullptr) {
+    Value scoped_features=registered->features_for_run(model);
+    if(!scoped_features.is_null())return scoped_features;
     if (auto* service = dynamic_cast<AxAIService*>(registered)) {
       return service->get_features(model);
     }
   }
   return object({{"functions", true}, {"structured_outputs", true}});
+}
+Value Core::axgen_speak(Value client, Value request, Value options) {
+  // Backs intrinsic.axgen.speak: the AxGen audio output renderer calls the
+  // client's speak(), as TS calls ai.speak().
+  AIClient* registered = registered_client(str(get_key(client, "__client_id")));
+  if (registered == nullptr) throw AxError("runtime", "Audio speech not supported by this AI client");
+  return registered->speak(request, options);
 }
 Value Core::agent_transcribe(Value client, Value request, Value options) {
   // Backs intrinsic.agent.transcribe: call the AI client's transcribe so audio inputs become
@@ -1212,24 +2319,76 @@ Value Core::agent_transcribe(Value client, Value request, Value options) {
   if (registered == nullptr) return object({{"text", std::string("")}});
   return registered->transcribe(request, options);
 }
-Value Core::retry_sleep(Value) { return Value(); }
-Value Core::tool_invoke(Value fn, Value params) {
+Value Core::retry_sleep(Value attempt, Value, Value) {
+  auto duration = std::chrono::milliseconds(std::min(250LL * (static_cast<long long>(num(attempt)) + 1LL), 1000LL));
+  if (const AxCancellationToken* cancellation = current_cancellation_token()) {
+    cancellation->wait_for(duration);
+    cancellation->throw_if_cancelled();
+  } else {
+    std::this_thread::sleep_for(duration);
+  }
+  return Value();
+}
+Value Core::tool_invoke(Value fn, Value params) {return tool_invoke(std::move(fn),std::move(params),AxToolContext{});}
+Value Core::tool_invoke(Value fn, Value params, Value extras) {AxToolContext context;context.set_extras(extras);return tool_invoke(std::move(fn),std::move(params),context);}
+void AxToolContext::set_extras(const Value& extras) {
+  if (!extras.is_object()) return;
+  Value session = Core::get(extras, "sessionId");
+  if (!session.is_null()) session_id = display(session);
+  Value path = Core::get(extras, "executionPath");
+  if (!path.is_null()) execution_path = display(path);
+  event_context = Core::get(extras, "eventContext");
+}
+Value Core::tool_invoke(Value fn,Value params,const AxToolContext& context) {
+  if(context.is_cancelled())throw AxAIServiceAbortedError("Tool invocation cancelled");
   Value args = get_key(fn, "args", Value::array());
   if (truthy(args)) validate_fields(args, params, "tool." + str(get_key(fn, "name")) + ".args");
   std::string id = str(get_key(fn, "__tool_id"));
-  auto it = tool_registry().find(id);
-  if (it == tool_registry().end()) throw AxError("runtime", "unknown tool");
+  auto handlers = registered_tool(id);
   Value result = invoke_runtime_tool(str(get_key(fn, "name")), [&]() {
-    return it->second(params.is_null() ? Value::object() : params);
+    auto values=params.is_null()?Value::object():params;
+    return handlers.second?handlers.second(values,context):handlers.first(values);
   });
   Value returns = get_key(fn, "returns", Value::array());
   if (truthy(returns) && result.is_object()) validate_fields(returns, result, "tool." + str(get_key(fn, "name")) + ".return");
   return result;
 }
+Value Core::agent_native_stage_forward(Value stage,Value state,Value client,Value values,Value options,Value selected) {
+  auto* gen=dynamic_cast<AxGen*>(registered_stage(str(get_key(stage,"__agent_stage_id"))));
+  auto* ai=registered_client(str(get_key(client,"__client_id")));
+  if(!gen||!ai)throw AxError("runtime","Native agent stage requires AxGen and an AI client");
+  Value target=gen->value();Value original=get(target,"functions",Value::array()),previous=get(target,"function_call_traces",Value::array());
+  Value functions=parse_json(stringify(original));
+  for(const auto& descriptor:array_ref(selected)) {
+    Value source=_agent_callable_implementation(state,get(descriptor,"qualified_name",""));
+    if(get(source,"__tool_id").is_null())throw AxError("validation","Background agent callables must have a typed Tool implementation");
+    Value tool=parse_json(stringify(source));set(tool,"name",get(descriptor,"native_name"));set(tool,"description",get(descriptor,"description"));set(tool,"execution","background");append(functions,tool);
+  }
+  set(target,"functions",functions);set(target,"function_call_traces",Value::array());
+  Value output;std::exception_ptr failure;
+  try{output=gen->forward(*ai,values,options);}catch(...){failure=std::current_exception();}
+  Value records=gen->get_function_call_traces();set(target,"functions",original);Value combined=parse_json(stringify(previous));for(const auto& record:array_ref(records))append(combined,record);set(target,"function_call_traces",combined);
+  _agent_record_native_calls(state,selected,records,options);
+  if(failure)std::rethrow_exception(failure);return output;
+}
+
+// Streams the stage's AxGen deltas to sink, each through the agent's
+// citation handling (hidden citations leave the delta).
+Value Core::agent_stage_streaming_forward(Value stage,Value state,Value client,Value values,Value options,Value sink) {
+  auto* gen=dynamic_cast<AxGen*>(registered_stage(str(get_key(stage,"__agent_stage_id"))));
+  auto* ai=registered_client(str(get_key(client,"__client_id")));
+  if(!gen||!ai)throw AxError("runtime","The agent's streamed stage requires an AxGen and an AI client");
+  return gen->streaming_forward(*ai,values,options,[state,sink](const AxGenDelta& delta) {
+    Value envelope=object({{"version",Value(static_cast<double>(delta.version))},{"index",Value(static_cast<double>(delta.index))},{"delta",delta.delta}});
+    Core::axgen_emit_delta(sink,Core::_agent_stream_citation_delta(state,envelope));
+    return true;
+  });
+}
+
 Value Core::agent_stage_forward(Value stage, Value client, Value values, Value options) {
   std::string stage_id = str(get_key(stage, "__agent_stage_id"));
-  auto stage_it = agent_stage_registry().find(stage_id);
-  if (stage_it == agent_stage_registry().end() || stage_it->second == nullptr) {
+  auto* stage_ptr = registered_stage(stage_id);
+  if (!stage_ptr) {
     throw AxError("runtime", "agent stage is not AxProgram");
   }
   std::string client_id = str(get_key(client, "__client_id"));
@@ -1237,22 +2396,39 @@ Value Core::agent_stage_forward(Value stage, Value client, Value values, Value o
   if (registered == nullptr) {
     throw AxError("runtime", "client does not implement AIClient");
   }
-  return stage_it->second->forward(*registered, values, options);
+  if (dynamic_cast<AxAgent*>(stage_ptr) && Core::truthy(Core::map_contains(options,"mcpInheritanceFromParent"))) {
+    auto parent=detail::MCPRunScope::current();
+    auto child=parent ? parent->shared_derived(Core::get(options,"mcpInheritanceFromParent")) : nullptr;
+    detail::MCPRunScope scope(std::move(child));
+    return stage_ptr->forward(*registered,values,options);
+  }
+  return stage_ptr->forward(*registered, values, options);
+}
+// A one-off AxGen (the context map's distiller and cartographer), forwarded
+// like an agent stage.
+Value Core::agent_program_forward(Value signature, Value program_options, Value client, Value values, Value options) {
+  std::string client_id = str(get_key(client, "__client_id"));
+  AIClient* registered = registered_client(client_id);
+  if (registered == nullptr) {
+    throw AxError("runtime", "client does not implement AIClient");
+  }
+  AxGen program = ax(str(signature), program_options);
+  return program.forward(*registered, values, options);
 }
 Value Core::agent_stage_chat_log(Value stage) {
   std::string stage_id = str(get_key(stage, "__agent_stage_id"));
-  auto it = agent_stage_registry().find(stage_id);
-  if (it == agent_stage_registry().end() || it->second == nullptr) return Value::array();
-  return it->second->get_chat_log();
+  auto* stage_ptr = registered_stage(stage_id);
+  if (!stage_ptr) return Value::array();
+  return stage_ptr->get_chat_log();
 }
 Value Core::agent_stage_usage(Value stage) {
   std::string stage_id = str(get_key(stage, "__agent_stage_id"));
-  auto it = agent_stage_registry().find(stage_id);
-  if (it == agent_stage_registry().end() || it->second == nullptr) return Value::array();
-  Value usage = it->second->get_usage();
+  auto* stage_ptr = registered_stage(stage_id);
+  if (!stage_ptr) return Value::array();
+  Value usage = stage_ptr->get_usage();
   if (truthy(usage)) return usage;
   Value items = Value::array();
-  for (const auto& raw_entry : array_ref(it->second->get_chat_log())) {
+  for (const auto& raw_entry : array_ref(stage_ptr->get_chat_log())) {
     Value item = get_key(raw_entry, "usage");
     if (truthy(item)) append(items, item);
   }
@@ -1260,9 +2436,9 @@ Value Core::agent_stage_usage(Value stage) {
 }
 Value Core::agent_stage_traces(Value stage) {
   std::string stage_id = str(get_key(stage, "__agent_stage_id"));
-  auto it = agent_stage_registry().find(stage_id);
-  if (it == agent_stage_registry().end() || it->second == nullptr) return Value::array();
-  return it->second->get_traces();
+  auto* stage_ptr = registered_stage(stage_id);
+  if (!stage_ptr) return Value::array();
+  return stage_ptr->get_traces();
 }
 Value Core::agent_clarification_error(Value payload, Value state) {
   Value args = get_key(payload, "args", Value::array());
@@ -1275,6 +2451,10 @@ Value Core::agent_clarification_error(Value payload, Value state) {
       {"state", get_key(state, "runtime_state", Value::object())},
       {"payload", payload},
   });
+}
+Value Core::agent_runtime_is_executable(Value runtime) {
+  auto it = code_runtime_registry().find(str(get_key(runtime, "__code_runtime_id")));
+  return Value(it != code_runtime_registry().end() && it->second != nullptr);
 }
 Value Core::agent_runtime_create_session(Value runtime, Value globals, Value options) {
   std::string runtime_id = str(get_key(runtime, "__code_runtime_id"));
@@ -1311,6 +2491,38 @@ Value Core::agent_runtime_restore_state(Value session, Value snapshot, Value opt
   auto it = code_session_registry().find(session_id);
   if (it == code_session_registry().end() || it->second == nullptr) throw AxError("runtime", "agent code session is not active");
   return it->second->restore_state(snapshot, options);
+}
+// A runtime's language: a runtime config's "language", else the code runtime's
+// own, else JavaScript, TS's default runtime.
+// A runtime's own usage instructions, as TS's getUsageInstructions(): the
+// registered code runtime's own, else a runtime config's
+// "usageInstructions", else none.
+Value Core::agent_runtime_usage_instructions(Value runtime) {
+  if (!runtime.is_object()) return Value(std::string());
+  std::string runtime_id = str(Core::get(runtime, "__code_runtime_id", Value("")));
+  if (!runtime_id.empty()) {
+    auto it = code_runtime_registry().find(runtime_id);
+    if (it != code_runtime_registry().end() && it->second != nullptr) return Value(it->second->usage_instructions());
+  }
+  Value raw = Core::get(runtime, "usageInstructions", Core::get(runtime, "usage_instructions", Value()));
+  return Value(raw.is_null() ? std::string() : display(raw));
+}
+Value Core::agent_runtime_language(Value runtime) {
+  std::string language;
+  if (runtime.is_object()) {
+    std::string runtime_id = str(Core::get(runtime, "__code_runtime_id", Value("")));
+    if (!runtime_id.empty()) {
+      auto it = code_runtime_registry().find(runtime_id);
+      if (it != code_runtime_registry().end() && it->second != nullptr) language = it->second->language();
+    } else {
+      Value raw = Core::get(runtime, "language", Value());
+      if (!raw.is_null()) language = display(raw);
+    }
+  }
+  size_t start = language.find_first_not_of(" \t\r\n");
+  size_t end = language.find_last_not_of(" \t\r\n");
+  language = start == std::string::npos ? std::string() : language.substr(start, end - start + 1);
+  return Value(language.empty() ? std::string("JavaScript") : language);
 }
 Value Core::agent_runtime_close(Value session) {
   std::string session_id = str(get_key(session, "__code_session_id"));
@@ -1428,6 +2640,9 @@ Value Core::agent_callable_invoke(Value state, Value request, Value options_arg)
   Value options = get_key(state, "options", Value::object());
   std::string qualified = str(get_key(request, "qualified_name", get_key(request, "name", Value(""))));
   std::string name = str(get_key(request, "name", Value("")));
+  Value implementation=_agent_callable_implementation(state,qualified);
+  AxToolContext context;context.call_id=str(get_key(request,"call_id",""));context.cancellation_requested=agent_cancellation_check(options_arg);
+  if(!get_key(implementation,"__tool_id",Value()).is_null())return object({{"status","ok"},{"value",tool_invoke(implementation,get_key(request,"args",Value::object()),context)}});
   Value scripted = get_key(options, "callable_results", get_key(options, "callableResults", Value::object()));
   if (scripted.is_object()) {
     Value result = get_key(scripted, qualified, Value());
@@ -1451,15 +2666,23 @@ Value Core::agent_callable_invoke(Value state, Value request, Value options_arg)
   return object({{"status", "error"}, {"error", std::string("unknown callable: ") + qualified}});
 }
 
+// A field name's title as TS's toTitle writes it (src/ax/dsp/sig.ts):
+// underscores become spaces, and a word starts at a capital after a lowercase
+// letter or digit, at the last capital of a run that begins a word, and at each
+// run of digits; words are separated by one space. userID is "User ID",
+// parseHTTPResponse "Parse HTTP Response", item123 "Item 123", field_2 "Field 2".
 static std::string titleize(const std::string& name) {
-  std::string spaced;
-  for (size_t i = 0; i < name.size(); ++i) {
-    char ch = name[i] == '_' ? ' ' : name[i];
-    if (i > 0 && (std::isupper(static_cast<unsigned char>(ch)) || std::isdigit(static_cast<unsigned char>(ch)))) spaced.push_back(' ');
-    spaced.push_back(ch);
-  }
-  Value trimmed = Core::string_trim(spaced);
-  std::string out = str(trimmed);
+  static const std::regex camel_boundary("([a-z0-9])([A-Z])");
+  static const std::regex acronym_boundary("([A-Z])([A-Z][a-z])");
+  static const std::regex digit_boundary("([^0-9])([0-9])");
+  static const std::regex spaces("\\s+");
+  std::string text = name;
+  std::replace(text.begin(), text.end(), '_', ' ');
+  text = std::regex_replace(text, camel_boundary, "$1 $2");
+  text = std::regex_replace(text, acronym_boundary, "$1 $2");
+  text = std::regex_replace(text, digit_boundary, "$1 $2");
+  text = std::regex_replace(text, spaces, " ");
+  std::string out = str(Core::string_trim(text));
   if (!out.empty()) out[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(out[0])));
   return out;
 }
@@ -1474,12 +2697,12 @@ Value Core::record_new(Value name, Value values) {
     for (const auto& key : {"options", "fields", "minimum", "maximum", "pattern", "format", "language", "description"}) {
       if (in.count(key)) out[key] = in[key];
     }
-    for (const auto& keys : {std::pair{"minLength", "min_length"}, std::pair{"maxLength", "max_length"}, std::pair{"patternDescription", "pattern_description"}}) {
+    for (const auto& keys : {std::pair{"minLength", "min_length"}, std::pair{"maxLength", "max_length"}, std::pair{"patternDescription", "pattern_description"}, std::pair{"valueDescriptions", "value_descriptions"}}) {
       auto value = get_key(values, keys.second);
       if (!value.is_null()) out[keys.first] = value;
     }
     for (const auto& kv : in) {
-      if (!out.count(kv.first) && kv.first != "is_array" && kv.first != "min_length" && kv.first != "max_length" && kv.first != "pattern_description") out[kv.first] = kv.second;
+      if (!out.count(kv.first) && kv.first != "is_array" && kv.first != "min_length" && kv.first != "max_length" && kv.first != "pattern_description" && kv.first != "value_descriptions") out[kv.first] = kv.second;
     }
     return Value(out);
   }
@@ -1532,6 +2755,19 @@ Value Core::description_append(Value base, Value hint) {
   if (b.empty()) return Value(h);
   if (b.back() != '.') b.push_back('.');
   return Value(b + " " + h);
+}
+// JavaScript's encodeURIComponent: every UTF-8 byte except A-Z a-z 0-9 and
+// - _ . ! ~ * ' ( ) becomes %XX.
+Value Core::url_encode_component(Value value) {
+  static constexpr char digits[] = "0123456789ABCDEF";
+  const std::string keep = "-_.!~*'()";
+  std::string out;
+  for (unsigned char c : value.is_null() ? std::string() : str(value)) {
+    bool alnum = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+    if (alnum || keep.find(static_cast<char>(c)) != std::string::npos) out.push_back(static_cast<char>(c));
+    else { out.push_back('%'); out.push_back(digits[c >> 4]); out.push_back(digits[c & 15]); }
+  }
+  return Value(out);
 }
 Value Core::url_valid(Value value) {
   return Value(value.is_string() && std::regex_search(str(value), std::regex("^[a-zA-Z][a-zA-Z0-9+.-]*://")));
@@ -1710,6 +2946,13 @@ static Array prompt_inputs_for_values(Value sig, Value values) {
   for (const auto& field : fields) if (!Core::truthy(get_key(field, "isOptional")) || prompt_provided(get_key(values, str(get_key(field, "name"))))) out.push_back(field);
   return out;
 }
+// The input fields the system prompt shows with TS's
+// includeOptionalInputFieldsInSystemPrompt: every one, cached first.
+static Array prompt_all_inputs(Value sig) {
+  Array fields = array_ref(get_key(sig, "inputs"));
+  std::stable_sort(fields.begin(), fields.end(), [](const Value& a, const Value& b) { return Core::truthy(get_key(a, "isCached")) && !Core::truthy(get_key(b, "isCached")); });
+  return fields;
+}
 static Array prompt_outputs(Value sig) {
   Array out;
   for (const auto& field : array_ref(get_key(sig, "outputs"))) {
@@ -1776,6 +3019,7 @@ static std::string prompt_field_type_text(Value typ) {
   return Core::truthy(get_key(typ, "isArray")) ? "json array of " + base + " items" : base;
 }
 static bool prompt_complex(Value sig) {
+  if (Core::truthy(Core::_evidence_has_fields_impl(get_key(sig, "outputs")))) return true;
   for (const auto& field : array_ref(get_key(sig, "outputs"))) {
     Value typ = get_key(field, "type");
     if (str(get_key(typ, "name")) == "object" || !object_ref(get_key(typ, "fields")).empty()) return true;
@@ -1785,9 +3029,11 @@ static bool prompt_complex(Value sig) {
 static std::string prompt_render_input_fields(const Array& fields, const Object& names) {
   std::vector<std::string> rows;
   for (const auto& f : fields) {
+    Value description = Core::_signature_describe_field_values_impl(f);
     std::string row = str(get_key(f, "title")) + ":";
-    if (!get_key(f, "description").is_null()) row += " " + prompt_format_refs(prompt_format_description(str(get_key(f, "description"))), names);
+    if (!description.is_null()) row += " " + prompt_format_refs((get_key(get_key(f, "type"), "value_descriptions").is_null() ? prompt_format_description(str(description)) : str(description)), names);
     rows.push_back(str(Core::string_trim(row)));
+    for (const auto& line : array_ref(Core::_signature_nested_value_descriptions_impl(get_key(get_key(f, "type"), "fields"), get_key(f, "name")))) rows.push_back(str(line));
   }
   std::string joined;
   for (size_t i = 0; i < rows.size(); ++i) { if (i) joined += "\n"; joined += rows[i]; }
@@ -1799,8 +3045,9 @@ static std::string prompt_render_output_fields(const Array& fields, const Object
     Value typ = get_key(f, "type");
     std::string type_text = prompt_field_type_text(typ);
     std::string req = Core::truthy(get_key(f, "isOptional")) ? "Only include this " + type_text + " field if its value is available" : "This " + type_text + " field must be included";
+    Value description = Core::_signature_describe_field_values_impl(f);
     std::string desc;
-    if (!get_key(f, "description").is_null()) desc = " " + prompt_format_refs(str(get_key(typ, "name")) == "class" ? str(get_key(f, "description")) : prompt_format_description(str(get_key(f, "description"))), names);
+    if (!description.is_null()) desc = " " + prompt_format_refs(str(get_key(typ, "name")) == "class" ? str(description) : (get_key(get_key(f, "type"), "value_descriptions").is_null() ? prompt_format_description(str(description)) : str(description)), names);
     if (!array_ref(get_key(typ, "options")).empty()) {
       std::vector<std::string> opts;
       for (const auto& option : array_ref(get_key(typ, "options"))) opts.push_back(str(option));
@@ -1810,12 +3057,14 @@ static std::string prompt_render_output_fields(const Array& fields, const Object
     }
     std::string bt(1, static_cast<char>(96));
     rows.push_back(str(Core::string_trim(str(get_key(f, "title")) + " (wire key: " + bt + str(get_key(f, "name")) + bt + "): (" + req + ")" + desc)));
+    for (const auto& line : array_ref(Core::_signature_nested_value_descriptions_impl(get_key(get_key(f, "type"), "fields"), get_key(f, "name")))) rows.push_back(str(line));
   }
   std::string joined;
   for (size_t i = 0; i < rows.size(); ++i) { if (i) joined += "\n"; joined += rows[i]; }
   return joined;
 }
 static Value prompt_output_type_placeholder(Value typ) {
+  if (Core::truthy(Core::_evidence_is_type_impl(typ))) return Core::_evidence_placeholder_impl(typ);
   std::string name = str(get_key(typ, "name"));
   Value value("<string>");
   if (name == "number") value = Value(0);
@@ -1859,7 +3108,10 @@ static std::string prompt_render_functions(Value functions) {
   return joined;
 }
 Value Core::prompt_structured(Value signature, Value values, Value functions, Value options) {
-  bool complex = prompt_complex(signature);
+  // As TS's structuredOutput option: AxGen renders with it set when a
+  // structured-output rung is selected; otherwise the signature decides.
+  Value structured = get_key(options, "structured_output", get_key(options, "structuredOutput"));
+  bool complex = structured.is_null() ? prompt_complex(signature) : truthy(structured);
   Array outputs = prompt_outputs(signature);
   std::string task = prompt_task(signature, options);
   Object vars;
@@ -1869,7 +3121,10 @@ Value Core::prompt_structured(Value signature, Value values, Value functions, Va
   vars["hasOutputFields"] = !outputs.empty();
   vars["hasComplexFields"] = complex;
   vars["hasStructuredOutputFunction"] = complex && !get_key(options, "structured_output_function_name").is_null();
-  Array inputs = prompt_inputs_for_values(signature, values);
+  // TS includeOptionalInputFieldsInSystemPrompt: the system prompt lists
+  // every input field, provided or not. Off by default.
+  bool include_optional = truthy(get_key(options, "include_optional_input_fields_in_system_prompt", get_key(options, "includeOptionalInputFieldsInSystemPrompt")));
+  Array inputs = include_optional ? prompt_all_inputs(signature) : prompt_inputs_for_values(signature, values);
   vars["identityText"] = "You will be provided with the following fields: " + prompt_desc_fields(inputs) + ". Your task is to generate new fields: " + prompt_desc_fields(outputs) + ".";
   vars["taskDefinitionText"] = task;
   vars["functionsList"] = prompt_render_functions(functions);
@@ -1894,6 +3149,109 @@ Value Core::prompt_structured(Value signature, Value values, Value functions, Va
   if (!get_key(options, "custom_template").is_null()) { source = str(get_key(options, "custom_template")); context = "inline-template"; }
   return string_trim(render_template_content(source, Value(vars), context));
 }
+// The optional keys a media part type declares (TS AxChatRequest) that the
+// value sets go on the part, so the provider or router that reads them gets
+// them; other keys stay behind.
+static Value prompt_declared_keys(Value part, const Value& value, std::initializer_list<const char*> keys) {
+  for (const char* key : keys) {
+    if (object_ref(value).count(key) > 0) Core::set(part, key, get_key(value, key));
+  }
+  return part;
+}
+// JavaScript's !value for a JSON value: objects and arrays are truthy.
+static bool prompt_js_falsy(const Value& value) {
+  if (value.is_null()) return true;
+  if (value.is_bool()) return !std::get<bool>(value.data);
+  if (value.is_string()) return std::get<std::string>(value.data).empty();
+  if (value.is_number()) {
+    double number = std::get<double>(value.data);
+    return number == 0 || number != number;
+  }
+  return false;
+}
+// Checks a media value as TS's validators do.
+static void prompt_media_object(const Value& value, const std::string& label, const std::string& required_key) {
+  if (prompt_js_falsy(value)) throw AxError("runtime", label + " field value is required.");
+  if (!value.is_object() && !value.is_array()) throw AxError("runtime", label + " field value must be an object.");
+  if (!value.is_object() || object_ref(value).count(required_key) == 0) throw AxError("runtime", label + " field must have " + required_key);
+}
+// TS's image part: the mime type, the data as `image`, and the details the
+// provider reads (OpenAI's image detail).
+static Value prompt_image_part(const Value& value) {
+  prompt_media_object(value, "Image", "mimeType");
+  if (object_ref(value).count("data") == 0) throw AxError("runtime", "Image field must have data");
+  Value part(Object{{"type", "image"}, {"mimeType", get_key(value, "mimeType")}, {"image", get_key(value, "data")}});
+  return prompt_declared_keys(part, value, {"details", "cache", "optimize", "altText"});
+}
+// TS's audio part: only the format (wav when there is none) and the data.
+static Value prompt_audio_part(const Value& value) {
+  prompt_media_object(value, "Audio", "data");
+  Value format = get_key(value, "format");
+  Value part(Object{{"type", "audio"}, {"format", format.is_null() ? Value("wav") : format}, {"data", get_key(value, "data")}});
+  return prompt_declared_keys(part, value, {"mimeType", "sampleRate", "channels", "cache", "transcription", "duration"});
+}
+// TS's file part: the mime type and either the data or the fileUri.
+static Value prompt_file_part(const Value& value) {
+  prompt_media_object(value, "File", "mimeType");
+  bool has_data = object_ref(value).count("data") > 0;
+  bool has_file_uri = object_ref(value).count("fileUri") > 0;
+  if (!has_data && !has_file_uri) throw AxError("runtime", "File field must have either data or fileUri");
+  if (has_data && has_file_uri) throw AxError("runtime", "File field cannot have both data and fileUri");
+  Value part = has_file_uri
+      ? Value(Object{{"type", "file"}, {"mimeType", get_key(value, "mimeType")}, {"fileUri", get_key(value, "fileUri")}})
+      : Value(Object{{"type", "file"}, {"mimeType", get_key(value, "mimeType")}, {"data", get_key(value, "data")}});
+  return prompt_declared_keys(part, value, {"filename", "cache", "extractedText"});
+}
+// TS's url part: the url, and the title and description when they are set; a
+// plain string is the url.
+static Value prompt_url_part(const Value& value) {
+  if (prompt_js_falsy(value)) throw AxError("runtime", "URL field value is required.");
+  if (value.is_string()) return Value(Object{{"type", "url"}, {"url", value}});
+  if (!value.is_object() && !value.is_array()) throw AxError("runtime", "URL field value must be a string or object.");
+  if (!value.is_object() || object_ref(value).count("url") == 0) throw AxError("runtime", "URL field must have url property");
+  Value part(Object{{"type", "url"}, {"url", get_key(value, "url")}});
+  Value title = get_key(value, "title");
+  if (!prompt_js_falsy(title)) Core::set(part, "title", title);
+  Value description = get_key(value, "description");
+  if (!prompt_js_falsy(description)) Core::set(part, "description", description);
+  return prompt_declared_keys(part, value, {"cachedContent", "cache"});
+}
+static std::string prompt_media_label(const std::string& kind) {
+  if (kind == "image") return "Image";
+  if (kind == "audio") return "Audio";
+  if (kind == "file") return "File";
+  return "URL";
+}
+// The snake_case aliases the provider mappings read become the part type's
+// declared camelCase keys (a camelCase key wins), so inputs written with them
+// keep working.
+static Value prompt_media_aliases(const std::string& kind, const Value& value) {
+  if (!value.is_object()) return value;
+  std::vector<std::pair<std::string, std::string>> aliases;
+  if (kind == "image") aliases = {{"mime_type", "mimeType"}};
+  else if (kind == "audio") aliases = {{"audio", "data"}, {"mime_type", "mimeType"}, {"sample_rate", "sampleRate"}};
+  else if (kind == "file") aliases = {{"mime_type", "mimeType"}, {"file_uri", "fileUri"}, {"extracted_text", "extractedText"}};
+  else aliases = {{"cached_content", "cachedContent"}};
+  Value out = value;
+  bool copied = false;
+  for (const auto& alias : aliases) {
+    if (object_ref(value).count(alias.first) > 0 && object_ref(value).count(alias.second) == 0) {
+      if (!copied) {
+        out = Value(Object(object_ref(value)));
+        copied = true;
+      }
+      Core::set(out, alias.second, get_key(value, alias.first));
+    }
+  }
+  return out;
+}
+static Value prompt_media_part(const std::string& kind, const Value& raw) {
+  Value value = prompt_media_aliases(kind, raw);
+  if (kind == "image") return prompt_image_part(value);
+  if (kind == "audio") return prompt_audio_part(value);
+  if (kind == "file") return prompt_file_part(value);
+  return prompt_url_part(value);
+}
 Value Core::prompt_user_content(Value signature, Value values) {
   Array parts;
   for (const auto& field : prompt_inputs_for_values(signature, values)) {
@@ -1903,14 +3261,45 @@ Value Core::prompt_user_content(Value signature, Value values) {
       if (truthy(get_key(field, "isOptional")) || truthy(get_key(field, "isInternal"))) continue;
       throw AxError("runtime", "Value for input field '" + name + "' is required.");
     }
-    std::string rendered = value.is_string() ? str(value) : stringify(value);
+    Value type = get_key(field, "type");
+    std::string kind = str(get_key(type, "name"));
+    // As TS: an audio object with a transcript (what an AxGen audio output
+    // renders to), like a plain string, reaches the model as text.
+    if (kind == "audio" && value.is_object() && get_key(value, "transcript").is_string()) value = get_key(value, "transcript");
+    // As TS defaultRenderInField: image, file and url values, and audio that
+    // is not text, go out as media parts after a text part with the title.
+    if (kind == "image" || kind == "file" || kind == "url" || (kind == "audio" && !value.is_string())) {
+      parts.emplace_back(Value(Object{{"type", "text"}, {"text", str(get_key(field, "title")) + ": \n"}}));
+      if (truthy(get_key(type, "isArray"))) {
+        if (!value.is_array()) throw AxError("runtime", prompt_media_label(kind) + " field value must be an array.");
+        for (const auto& item : array_ref(value)) parts.emplace_back(prompt_media_part(kind, item));
+      } else {
+        parts.emplace_back(prompt_media_part(kind, value));
+      }
+      continue;
+    }
+    std::string rendered = value.is_string() ? str(value) : pretty_stringify(value);
     Value part(Object{{"type", "text"}, {"text", str(get_key(field, "title")) + ": " + rendered + "\n"}});
     if (truthy(get_key(field, "isCached"))) Core::set(part, "cache", true);
     parts.emplace_back(part);
   }
   bool all_text = true;
-  for (const auto& part : parts) if (str(get_key(part, "type")) != "text" || truthy(get_key(part, "cache"))) all_text = false;
-  if (!all_text) return Value(parts);
+  for (const auto& part : parts) if (str(get_key(part, "type")) != "text") all_text = false;
+  if (!all_text) {
+    // As TS combineConsecutiveStrings: in a message with media, each run of
+    // text parts joins with a newline and is cached when any of them is.
+    Array combined;
+    for (const auto& part : parts) {
+      if (str(get_key(part, "type")) == "text" && !combined.empty() && str(get_key(combined.back(), "type")) == "text") {
+        Value& previous = combined.back();
+        Core::set(previous, "text", str(get_key(previous, "text")) + "\n" + str(get_key(part, "text")));
+        if (truthy(get_key(part, "cache"))) Core::set(previous, "cache", true);
+        continue;
+      }
+      combined.push_back(part);
+    }
+    return Value(combined);
+  }
   std::string out;
   for (size_t i = 0; i < parts.size(); ++i) {
     if (i) out += "\n";
@@ -1922,6 +3311,8 @@ static std::string axgen_value_text(Value value) {
   return value.is_string() ? str(value) : stringify(value);
 }
 static std::string axgen_format_values(Value gen, Value values, const std::string& kind) {
+  Value fields=Core::get(Core::get(gen,"signature"),kind+"_fields",Value::array());
+  if(kind=="output" && Core::truthy(Core::_evidence_has_fields_impl(fields))) return stringify(Core::_evidence_example_values_impl(fields,values));
   std::vector<std::string> lines;
   for (const auto& field : array_ref(Core::get(Core::get(gen, "signature"), kind + "_fields", Value::array()))) {
     std::string name = str(get_key(field, "name"));
@@ -2024,6 +3415,12 @@ Value Core::axgen_apply_field_processors(Value gen, Value output) {
         continue;
       }
     }
+    // An AxFieldProcessor added in Transform mode also gets the output so far.
+    if (!str(get_key(raw, "__field_processor_id")).empty()) {
+      set(result, field, axgen_call_processor(raw, get_key(result, field), object({{"values", result}, {"done", true}})));
+      changed = true;
+      continue;
+    }
     std::string op = str(processor);
     std::string value = str(get_key(result, field));
     if (op == "uppercase") {
@@ -2055,33 +3452,49 @@ Value Core::axgen_apply_field_processors(Value gen, Value output) {
   }
   return result;
 }
+static Value assertion_outcome(const std::string& status, const std::string& key = "", Value value = Value()) {
+  Value outcome = Value::object();
+  Core::set(outcome, "status", Value(status));
+  if (!key.empty() && !value.is_null()) Core::set(outcome, key, value);
+  return outcome;
+}
+// Evaluates the assertions in order and reports the first failure as
+// {status: "pass"}, {status: "fail", message?} or {status: "error", error};
+// gen.axir decides what each outcome raises, as TS assertAssertions does.
 Value Core::axgen_run_assertions(Value gen, Value output) {
   for (const auto& raw : array_ref(get(gen, "assertions", Value::array()))) {
+    Value raw_message = get_key(raw, "message");
+    Value message = raw_message.is_null() || str(raw_message).empty() ? Value() : Value(str(raw_message));
     std::string assertion_id = str(get_key(raw, "__assertion_id"));
     if (!assertion_id.empty()) {
       auto it = assertion_registry().find(assertion_id);
       if (it != assertion_registry().end()) {
-        Value returned = it->second(output);
-        if (returned.is_string()) throw AxError("runtime", str(returned));
-        if (returned.is_bool() && !truthy(returned)) throw AxError("runtime", "assertion failed");
+        Value returned;
+        try {
+          returned = it->second(output);
+        } catch (const std::exception& error) {
+          return assertion_outcome("error", "error", exception_value(error));
+        }
+        if (returned.is_string()) return assertion_outcome("fail", "message", returned);
+        if (returned.is_bool() && !truthy(returned)) return assertion_outcome("fail", "message", message);
       }
       continue;
     }
+    Value thrown = get_key(raw, "throw");
+    if (!thrown.is_null()) return assertion_outcome("error", "error", runtime_error(str(thrown)));
     std::string field = str(get_key(raw, "field"));
     Value value = field.empty() ? output : get_key(output, field);
-    std::string message = str(get_key(raw, "message", "assertion failed"));
     Value returned = get_key(raw, "return");
     if (!returned.is_null()) {
-      if (returned.is_bool() && !truthy(returned) && get_key(raw, "message").is_null()) throw AxError("runtime", "assertion failed without message");
-      if (returned.is_bool() && !truthy(returned)) throw AxError("runtime", message);
-      if (returned.is_string()) throw AxError("runtime", str(returned));
+      if (returned.is_bool() && !truthy(returned)) return assertion_outcome("fail", "message", message);
+      if (returned.is_string()) return assertion_outcome("fail", "message", returned);
     }
     Value contains = get_key(raw, "contains");
-    if (!contains.is_null() && str(value).find(str(contains)) == std::string::npos) throw AxError("runtime", message);
+    if (!contains.is_null() && str(value).find(str(contains)) == std::string::npos) return assertion_outcome("fail", "message", message);
     Value equals = get_key(raw, "equals");
-    if (!equals.is_null() && !equal(value, equals)) throw AxError("runtime", message);
+    if (!equals.is_null() && !equal(value, equals)) return assertion_outcome("fail", "message", message);
   }
-  return Value();
+  return assertion_outcome("pass");
 }
 Value Core::axgen_record_trace(Value gen, Value input, Value output, Value status) {
   Value traces = get(gen, "traces", Value::array());
@@ -2113,7 +3526,7 @@ static bool ax_memory_response_meaningful(const Value& response) {
   if (!response.is_object()) return Core::truthy(response);
   Value content = get_key(response, "content");
   if (content.is_string() && !str(Core::string_trim(content)).empty()) return true;
-  for (const auto& key : {"function_calls", "functionCalls", "tool_calls", "toolCalls", "thought_blocks", "thoughtBlocks"}) {
+  for (const auto& key : {"function_calls", "functionCalls", "tool_calls", "toolCalls", "thought_blocks", "thoughtBlocks", "images"}) {
     Value value = get_key(response, key);
     if (value.is_array() && !array_ref(value).empty()) return true;
   }
@@ -2128,10 +3541,13 @@ Value Core::axgen_memory_add_response(Value gen, Value request, Value response) 
   set(gen, "memory", memory);
   return Value();
 }
-Value Core::axgen_memory_add_function_result(Value gen, Value call, Value result, Value ok) {
+// `result` and `result_text` both keep the text the model got.
+Value Core::axgen_memory_add_function_result(Value gen, Value call, Value result, Value ok, Value result_text) {
   Value memory = get(gen, "memory", Value::object());
   Value items = get_key(memory, "items", Value::array());
-  append(items, Value(Object{{"role", "function"}, {"results", Value(Array{Value(Object{{"call", call}, {"result", result}, {"ok", Value(truthy(ok))}})})}, {"tags", Value::array()}}));
+  Object entry{{"call", call}, {"result", result}, {"ok", Value(truthy(ok))}};
+  if (!result_text.is_null()) entry["result_text"] = result_text;
+  append(items, Value(Object{{"role", "function"}, {"results", Value(Array{Value(std::move(entry))})}, {"tags", Value::array()}}));
   set(memory, "items", items);
   set(gen, "memory", memory);
   return Value();
@@ -2340,42 +3756,182 @@ Value parse_json(const std::string& source) {
       if (pos < s.size() && (s[pos] == 'e' || s[pos] == 'E')) { ++pos; if (pos < s.size() && (s[pos] == '+' || s[pos] == '-')) ++pos; while (pos < s.size() && std::isdigit(static_cast<unsigned char>(s[pos]))) ++pos; }
       std::string token = s.substr(start, pos - start);
       // Tolerate malformed/empty numeric tokens (e.g. a model emitting a bare `-` or an
-      // empty value for a number field) instead of throwing std::stod's "no conversion".
-      try {
-        return Value(std::stod(token));
-      } catch (const std::exception&) {
+      // empty value for a number field) as null. strtod, unlike std::stod, also keeps
+      // subnormals such as 5e-324 and gives +-Infinity past the double range, as
+      // JSON.parse does.
+      char* end = nullptr;
+      double parsed = std::strtod(token.c_str(), &end);
+      if (token.empty() || end == token.c_str()) {
         if (pos == start && pos < s.size()) ++pos;  // ensure forward progress
         return Value();
       }
+      return Value(parsed);
     }
   };
   Parser p(source);
   return p.value();
 }
 
-std::string display(const Value& value) {
-  if (auto p = std::get_if<double>(&value.data)) {
-    if (std::floor(*p) == *p) return std::to_string(static_cast<long long>(*p));
-    std::ostringstream ss; ss << *p; return ss.str();
+// Steps a decimal digit string one unit in its last place, up (+1) or down
+// (-1). digits reads d.ddd x 10^exponent; a carry out of the first digit adds
+// a digit and raises exponent. Returns false when stepping down reaches zero.
+static bool step_decimal_digits(std::string& digits, int& exponent, int direction) {
+  std::size_t i = digits.size();
+  if (direction > 0) {
+    while (i > 0 && digits[i - 1] == '9') digits[--i] = '0';
+    if (i == 0) {
+      digits.insert(digits.begin(), '1');
+      ++exponent;
+    } else {
+      ++digits[i - 1];
+    }
+    return true;
   }
+  while (i > 0 && digits[i - 1] == '0') digits[--i] = '9';
+  if (i == 0) return false;
+  --digits[i - 1];
+  if (digits[0] == '0') {
+    digits.erase(digits.begin());
+    --exponent;
+  }
+  return !digits.empty();
+}
+
+// Parses digits read as d.ddd x 10^exponent, written with an integer
+// mantissa so the text has no locale-dependent decimal point.
+static double parse_decimal_digits(const std::string& digits, int exponent) {
+  std::string text = digits + "e" + std::to_string(exponent - static_cast<int>(digits.size()) + 1);
+  return std::strtod(text.c_str(), nullptr);
+}
+
+// The shortest decimal digits that parse back to value (finite, > 0), as
+// JavaScript picks them, with the exponent of the first digit. printf rounds
+// to the nearest decimal of each length; at a power of two the round-trip
+// interval is lopsided, so the neighbour on the other side of value can parse
+// back when the nearest one does not.
+static void shortest_decimal_digits(double value, std::string& digits, int& exponent) {
+  char text[40];
+  for (int precision = 1; precision <= 17; ++precision) {
+    std::snprintf(text, sizeof text, "%.*e", precision - 1, value);
+    digits.clear();
+    const char* c = text;
+    for (; *c && *c != 'e' && *c != 'E'; ++c) {
+      if (*c >= '0' && *c <= '9') digits.push_back(*c);
+    }
+    exponent = *c ? std::atoi(c + 1) : 0;
+    double nearest = std::strtod(text, nullptr);
+    if (nearest == value) break;
+    std::string other = digits;
+    int other_exponent = exponent;
+    if (step_decimal_digits(other, other_exponent, nearest < value ? 1 : -1) &&
+        parse_decimal_digits(other, other_exponent) == value) {
+      digits = other;
+      exponent = other_exponent;
+      break;
+    }
+  }
+  while (digits.size() > 1 && digits.back() == '0') digits.pop_back();
+}
+
+// Number::toString, the text JavaScript's String(x) and JSON.stringify give a
+// number: shortest round-trip digits, plain decimals from 1e-6 up to 1e21,
+// exponent form outside that range (1e-7, 1.5e+21), and 0 for -0.
+static std::string js_number_text(double value) {
+  if (std::isnan(value)) return "NaN";
+  if (std::isinf(value)) return value > 0 ? "Infinity" : "-Infinity";
+  if (value == 0) return "0";
+  // Integral values below 2^53 print exactly as integers (the common case).
+  if (std::floor(value) == value && std::fabs(value) < 9007199254740992.0) return std::to_string(static_cast<long long>(value));
+  std::string digits;
+  int exponent = 0;
+  shortest_decimal_digits(std::fabs(value), digits, exponent);
+  const int k = static_cast<int>(digits.size());
+  const int n = exponent + 1;  // digits before the decimal point
+  std::string out = value < 0 ? "-" : "";
+  if (k <= n && n <= 21) {
+    out += digits + std::string(static_cast<std::size_t>(n - k), '0');
+  } else if (0 < n && n <= 21) {
+    out += digits.substr(0, static_cast<std::size_t>(n)) + "." + digits.substr(static_cast<std::size_t>(n));
+  } else if (-6 < n && n <= 0) {
+    out += "0." + std::string(static_cast<std::size_t>(-n), '0') + digits;
+  } else {
+    out += digits.substr(0, 1);
+    if (k > 1) out += "." + digits.substr(1);
+    out += (n - 1 < 0 ? "e-" : "e+") + std::to_string(std::abs(n - 1));
+  }
+  return out;
+}
+
+// JSON.stringify writes NaN and the infinities as null.
+static std::string json_number_text(double value) {
+  return std::isfinite(value) ? js_number_text(value) : "null";
+}
+
+std::string display(const Value& value) {
+  if (auto p = std::get_if<double>(&value.data)) return js_number_text(*p);
   return str(value);
 }
 
+// JSON string contents (RFC 8259): the quote, the backslash and U+0000-U+001F
+// are escaped (\b \f \n \r \t, else \u00XX); every other byte, including UTF-8
+// sequences, is copied as is.
 static std::string escape_json(const std::string& in) {
+  static const char* digits = "0123456789abcdef";
   std::string out;
-  for (char c : in) {
-    if (c == '"') out += "\\\"";
-    else if (c == '\\') out += "\\\\";
-    else if (c == '\n') out += "\\n";
-    else out.push_back(c);
+  out.reserve(in.size());
+  for (unsigned char c : in) {
+    switch (c) {
+      case '"': out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\b': out += "\\b"; break;
+      case '\f': out += "\\f"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:
+        if (c < 0x20) {
+          out += "\\u00";
+          out.push_back(digits[c >> 4]);
+          out.push_back(digits[c & 0xf]);
+        } else {
+          out.push_back(static_cast<char>(c));
+        }
+    }
   }
   return out;
+}
+
+// The array index a JavaScript property key names: "0" to "4294967294" in
+// canonical form (no sign, no leading zero), else -1.
+static long long js_array_index(const std::string& key) {
+  if (key.empty() || key.size() > 10 || (key.size() > 1 && key[0] == '0')) return -1;
+  for (char c : key) {
+    if (c < '0' || c > '9') return -1;
+  }
+  long long index = std::stoll(key);
+  return index <= 4294967294LL ? index : -1;
+}
+
+// Entries in JavaScript's own-property order, which JSON.stringify follows:
+// array-index keys first in ascending numeric order, then the other keys in
+// insertion order.
+static std::vector<std::pair<std::string, Value>> js_own_key_order(std::vector<std::pair<std::string, Value>> items) {
+  std::vector<std::pair<std::string, Value>> indexed;
+  std::vector<std::pair<std::string, Value>> named;
+  for (auto& item : items) {
+    if (js_array_index(item.first) >= 0) indexed.push_back(std::move(item));
+    else named.push_back(std::move(item));
+  }
+  if (indexed.empty()) return named;
+  std::stable_sort(indexed.begin(), indexed.end(), [](const auto& a, const auto& b) { return js_array_index(a.first) < js_array_index(b.first); });
+  for (auto& item : named) indexed.push_back(std::move(item));
+  return indexed;
 }
 
 std::string stringify(const Value& value) {
   if (value.is_null()) return "null";
   if (auto p = std::get_if<bool>(&value.data)) return *p ? "true" : "false";
-  if (value.is_number()) return display(value);
+  if (auto p = std::get_if<double>(&value.data)) return json_number_text(*p);
   if (auto p = std::get_if<std::string>(&value.data)) return "\"" + escape_json(*p) + "\"";
   if (auto p = std::get_if<std::shared_ptr<Array>>(&value.data)) {
     std::string out = "[";
@@ -2384,14 +3940,14 @@ std::string stringify(const Value& value) {
   }
   std::string out = "{";
   size_t i = 0;
-  for (const auto& kv : entries(value)) { if (i++) out += ","; out += "\"" + escape_json(kv.first) + "\":" + stringify(kv.second); }
+  for (const auto& kv : js_own_key_order(entries(value))) { if (i++) out += ","; out += "\"" + escape_json(kv.first) + "\":" + stringify(kv.second); }
   return out + "}";
 }
 
 static std::string stable_stringify(const Value& value) {
   if (value.is_null()) return "null";
   if (auto p = std::get_if<bool>(&value.data)) return *p ? "true" : "false";
-  if (value.is_number()) return display(value);
+  if (auto p = std::get_if<double>(&value.data)) return json_number_text(*p);
   if (auto p = std::get_if<std::string>(&value.data)) return "\"" + escape_json(*p) + "\"";
   if (auto p = std::get_if<std::shared_ptr<Array>>(&value.data)) {
     std::string out = "[";
@@ -2406,6 +3962,48 @@ static std::string stable_stringify(const Value& value) {
     out += "\"" + escape_json(kv.first) + "\":" + stable_stringify(kv.second);
   }
   return out + "}";
+}
+
+// JSON.stringify(value, null, 2): two-space indentation, keys in insertion
+// order, and {} or [] for empty containers.
+static void write_pretty_json(std::string& out, const Value& value, const std::string& indent) {
+  const std::string inner = indent + "  ";
+  if (value.is_object()) {
+    auto items = js_own_key_order(entries(value));
+    if (items.empty()) {
+      out += "{}";
+      return;
+    }
+    out += "{\n";
+    for (std::size_t i = 0; i < items.size(); ++i) {
+      if (i) out += ",\n";
+      out += inner + "\"" + escape_json(items[i].first) + "\": ";
+      write_pretty_json(out, items[i].second, inner);
+    }
+    out += "\n" + indent + "}";
+    return;
+  }
+  if (auto p = std::get_if<std::shared_ptr<Array>>(&value.data)) {
+    if (!*p || (*p)->empty()) {
+      out += "[]";
+      return;
+    }
+    out += "[\n";
+    for (std::size_t i = 0; i < (*p)->size(); ++i) {
+      if (i) out += ",\n";
+      out += inner;
+      write_pretty_json(out, (**p)[i], inner);
+    }
+    out += "\n" + indent + "]";
+    return;
+  }
+  out += stringify(value);
+}
+
+static std::string pretty_stringify(const Value& value) {
+  std::string out;
+  write_pretty_json(out, value, "");
+  return out;
 }
 
 bool equal(const Value& left, const Value& right) {
@@ -2430,6 +4028,17 @@ bool equal(const Value& left, const Value& right) {
 Value AIClient::chat(Value request) {
   return Core::legacy_response_to_chat_response(complete(std::move(request)));
 }
+Value AIClient::chat(Value request, Value options, const AxCancellationToken* cancellation) {
+  if (cancellation) cancellation->throw_if_cancelled();
+  AxCancellationScope scope(cancellation);
+  try { Value response = chat(std::move(request), std::move(options)); if (cancellation) cancellation->throw_if_cancelled(); return response; }
+  catch (...) { if(cancellation&&cancellation->is_cancelled())throw AxAIServiceAbortedError(cancellation->reason());throw; }
+}
+Value AIClient::speak(Value request, Value options) {
+  (void)request;
+  (void)options;
+  throw AxError("runtime", "Audio speech not supported by this AI client");
+}
 
 std::string AxAIService::get_id() { return get_name() + "-id"; }
 std::string AxAIService::get_name() { return "ai"; }
@@ -2440,10 +4049,24 @@ std::vector<Value> AxAIService::stream(Value request) { return {chat(std::move(r
 void AxAIService::stream_each(Value request, AxStreamHandler handler) {
   for (const auto& event : stream(std::move(request))) if (!handler(event)) break;
 }
+void AxAIService::stream_each(Value request, AxStreamHandler handler, const AxCancellationToken* cancellation) {
+  if (cancellation) cancellation->throw_if_cancelled();
+  AxCancellationScope scope(cancellation);
+  stream_each(std::move(request), [&](Value event) { if (cancellation) cancellation->throw_if_cancelled(); return handler(std::move(event)); });
+}
+std::vector<Value> AxAIService::stream(Value request, Value options) {
+  std::vector<Value> results;
+  stream_each(std::move(request), [&](const Value& event) { results.push_back(event); return true; }, std::move(options));
+  return results;
+}
+void AxAIService::stream_each(Value request, AxStreamHandler handler, Value) { stream_each(std::move(request), std::move(handler)); }
 Value AxAIService::embed(Value request, Value) { return embed(std::move(request)); }
+Value AxAIService::embed(Value request, Value options, const AxCancellationToken* cancellation) { if(cancellation)cancellation->throw_if_cancelled();AxCancellationScope scope(cancellation);Value response=embed(std::move(request),std::move(options));if(cancellation)cancellation->throw_if_cancelled();return response; }
 Value AxAIService::embed(Value request, Value options, const AxRuntimeHooks&) { return embed(std::move(request), std::move(options)); }
 Value AxAIService::transcribe(Value request, Value) { return transcribe(std::move(request)); }
+Value AxAIService::transcribe(Value request, Value options, const AxCancellationToken* cancellation) { if(cancellation)cancellation->throw_if_cancelled();AxCancellationScope scope(cancellation);Value response=transcribe(std::move(request),std::move(options));if(cancellation)cancellation->throw_if_cancelled();return response; }
 Value AxAIService::speak(Value request, Value) { return speak(std::move(request)); }
+Value AxAIService::speak(Value request, Value options, const AxCancellationToken* cancellation) { if(cancellation)cancellation->throw_if_cancelled();AxCancellationScope scope(cancellation);Value response=speak(std::move(request),std::move(options));if(cancellation)cancellation->throw_if_cancelled();return response; }
 Value AxAIService::get_features(Value) {
   return Value(Object{{"functions", true}, {"streaming", true}, {"structured_outputs", true}, {"multi_turn", true}});
 }
@@ -2575,12 +4198,66 @@ AxRuntimeHooks effective_runtime_hooks(const AxRuntimeHooks& call,
   return merge_runtime_hooks({call, service, snapshot_runtime_hooks()});
 }
 
+// A metric's attributes with TypeScript's custom labels (ai_custom_labels):
+// the service's customLabels, then the call's, cut to 100 characters when
+// sanitize is set (TS cuts them for the request duration and errors, not for
+// the request counter).
+static Value with_custom_labels(const Value& attributes, const Value& service_options, const Value& call_options, bool sanitize) {
+  Value out = Core::map_merge(Value::object(), attributes);
+  try {
+    Value labels = Core::ai_custom_labels(service_options.is_object() ? service_options : Value::object(), call_options.is_object() ? call_options : Value::object(), Value(sanitize));
+    for (const auto& key : Core::iter(Core::map_keys(labels))) Core::set(out, key, Core::get(labels, key));
+  } catch (...) {
+    // Labels never fail a request.
+  }
+  return out;
+}
+
+// An AxGen run's custom labels, as TypeScript's getMergedCustomLabels: the AI
+// service's, then the AxGen constructor's with the call's over them, each
+// value cut to 100 characters.
+static Value gen_metric_labels(AIClient& client, const Value& gen_options, const Value& call_options) {
+  try {
+    Value run_labels = Core::ai_custom_labels(gen_options.is_object() ? gen_options : Value::object(), call_options.is_object() ? call_options : Value::object(), Value(false));
+    Value service_options = Value::object();
+    if (auto* service = dynamic_cast<AxAIService*>(&client)) service_options = service->get_options();
+    return Core::ai_custom_labels(service_options.is_object() ? service_options : Value::object(), object({{"customLabels", run_labels}}), Value(true));
+  } catch (...) {
+    return Value::object();
+  }
+}
+
+// Prints a verbose block, as TypeScript's apiCall uses console.log.
+static void verbose_log(const Value& text) {
+  auto& sink = verbose_log_sink();
+  if (sink) sink(display(text)); else std::cout << display(text) << std::endl;
+}
+
+// Whether a call logs its requests: the call's verbose, else the client's
+// (the options are the two merged).
+static bool verbose_enabled(const Value& options) {
+  return options.is_object() && Core::truthy(Core::get(options, "verbose", false));
+}
+
+static void log_verbose_request(const Value& call) {
+  verbose_log(Core::ai_verbose_request_log(Core::get(call, "url", Value("")), Core::get(call, "method", Value("POST")), Core::get(call, "headers", Value::object()), Core::get(call, "json")));
+}
+
+// A transport result's HTTP status.
+static Value transport_status(const Value& raw) {
+  if (raw.is_object() && !Core::get(raw, "status").is_null()) return Core::get(raw, "status");
+  return Value(200.0);
+}
+
 class RuntimeHookScope {
  public:
+  // metric_labels (TS's custom labels) go on the metrics, not the span.
   RuntimeHookScope(const AxRuntimeHooks& call, const AxRuntimeHooks& program,
-                   std::string span_name, std::string metric_prefix, Value attributes)
+                   std::string span_name, std::string metric_prefix, Value attributes,
+                   Value metric_labels = Value::object())
       : metric_prefix_(std::move(metric_prefix)), attributes_(std::move(attributes)),
         started_(std::chrono::steady_clock::now()), exceptions_(std::uncaught_exceptions()) {
+    metric_attributes_ = Core::map_merge(attributes_, metric_labels);
     AxRuntimeHooks inherited;
     AxRuntimeHooks globals = snapshot_runtime_hooks();
     std::shared_ptr<AxSpan> parent;
@@ -2593,14 +4270,14 @@ class RuntimeHookScope {
     effective_ = merge_runtime_hooks({scoped, globals});
     own_span_ = start_runtime_span(effective_, std::move(span_name), "internal", attributes_, parent);
     runtime_hook_frames.push_back(RuntimeHookFrame{scoped, globals, own_span_ ? own_span_ : parent});
-    record_runtime_metric(effective_.meter, "counter", metric_prefix_ + "_requests_total", 1, attributes_);
+    record_runtime_metric(effective_.meter, "counter", metric_prefix_ + "_requests_total", 1, metric_attributes_);
   }
 
   ~RuntimeHookScope() {
     bool failed = std::uncaught_exceptions() > exceptions_;
-    if (failed) record_runtime_metric(effective_.meter, "counter", metric_prefix_ + "_errors_total", 1, attributes_);
+    if (failed) record_runtime_metric(effective_.meter, "counter", metric_prefix_ + "_errors_total", 1, metric_attributes_);
     auto duration = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started_).count();
-    record_runtime_metric(effective_.meter, "histogram", metric_prefix_ + "_duration_ms", duration, attributes_);
+    record_runtime_metric(effective_.meter, "histogram", metric_prefix_ + "_duration_ms", duration, metric_attributes_);
     finish_runtime_span(own_span_, failed);
     if (!runtime_hook_frames.empty()) runtime_hook_frames.pop_back();
   }
@@ -2610,6 +4287,7 @@ class RuntimeHookScope {
   std::shared_ptr<AxSpan> own_span_;
   std::string metric_prefix_;
   Value attributes_;
+  Value metric_attributes_;
   std::chrono::steady_clock::time_point started_;
   int exceptions_;
 };
@@ -2672,6 +4350,500 @@ static Value invoke_runtime_tool(const std::string& name, std::function<Value()>
   return next();
 }
 
+// JS indexOf in the bytes that len and string_slice count.
+Value Core::string_index_of(Value text, Value needle, Value start) {
+  std::string haystack = str(text);
+  double from = start.is_null() ? 0.0 : num(start);
+  size_t offset = !(from > 0.0) ? 0 : from >= static_cast<double>(haystack.size()) ? haystack.size() : static_cast<size_t>(from);
+  size_t found = haystack.find(str(needle), offset);
+  return Value(found == std::string::npos ? -1.0 : static_cast<double>(found));
+}
+
+namespace {
+
+// What a stream's worker and its consumer share: the chunk handed over, the
+// end of the stream, and the error that ended it.
+struct AxChatStreamChannel {
+  std::mutex mutex;
+  std::condition_variable changed;
+  std::deque<Value> chunks;
+  bool finished = false;
+  bool closed = false;
+  std::exception_ptr error;
+};
+
+// An open provider stream. AxAIService streams push chunks to a handler, so
+// stream_each runs on a worker thread whose handler hands each chunk to
+// ai_stream_next as it arrives and waits until it is taken. Closing makes the
+// handler stop the stream, cancels a transport blocked on I/O, and joins the
+// worker, so the client is not used after close returns.
+struct AxChatStream {
+  std::shared_ptr<AxChatStreamChannel> channel = std::make_shared<AxChatStreamChannel>();
+  std::shared_ptr<AxCancellationToken> cancellation;
+  AxCancellationToken::Subscription caller_cancellation;
+  std::thread worker;
+  // A run session's native chat session streams without a worker: next()
+  // pulls its next item on the caller's thread, as the session produces it,
+  // and closing closes the session.
+  std::function<Value()> pull;
+  std::function<void()> pull_close;
+
+  ~AxChatStream() { close(); }
+
+  void close() {
+    {
+      std::lock_guard<std::mutex> lock(channel->mutex);
+      channel->closed = true;
+    }
+    channel->changed.notify_all();
+    if (cancellation) cancellation->cancel("stream closed");
+    if (worker.joinable()) {
+      if (worker.get_id() == std::this_thread::get_id()) worker.detach();
+      else worker.join();
+    }
+    caller_cancellation.reset();
+    if (pull_close) {
+      auto close_source = std::move(pull_close);
+      pull_close = nullptr;
+      try {
+        close_source();
+      } catch (...) {
+        // Closing an abandoned session is best effort.
+      }
+    }
+  }
+};
+
+std::mutex ai_streams_mutex;
+std::map<std::string, std::shared_ptr<AxChatStream>> ai_streams;
+std::atomic<std::uint64_t> next_ai_stream_id{0};
+
+std::shared_ptr<AxChatStream> registered_ai_stream(const Value& handle) {
+  std::lock_guard<std::mutex> lock(ai_streams_mutex);
+  auto it = ai_streams.find(str(get_key(handle, "__ai_stream_id")));
+  return it == ai_streams.end() ? nullptr : it->second;
+}
+
+// Host callables the AxGen streaming IR reaches through markers in its state:
+// the run's delta sink, TypeScript field processors and streaming checks.
+std::mutex axgen_host_mutex;
+std::map<std::string, std::function<void(Value)>> axgen_sinks;
+std::map<std::string, std::function<Value(Value, Value)>> axgen_field_processors;
+std::map<std::string, std::function<Value(Value, bool)>> axgen_streaming_checks;
+std::atomic<std::uint64_t> next_axgen_host_id{0};
+
+std::string next_axgen_host_key(const std::string& kind) {
+  return "__axgen_" + kind + "_" + std::to_string(++next_axgen_host_id);
+}
+
+template <typename Fn>
+Fn find_axgen_host(const std::map<std::string, Fn>& registry, const std::string& id) {
+  std::lock_guard<std::mutex> lock(axgen_host_mutex);
+  auto it = registry.find(id);
+  return it == registry.end() ? Fn{} : it->second;
+}
+
+// Registers one streaming run's sink for the length of the run.
+class AxGenSinkRegistration {
+ public:
+  explicit AxGenSinkRegistration(std::function<void(Value)> sink) : id_(next_axgen_host_key("sink")) {
+    std::lock_guard<std::mutex> lock(axgen_host_mutex);
+    axgen_sinks[id_] = std::move(sink);
+  }
+  ~AxGenSinkRegistration() {
+    std::lock_guard<std::mutex> lock(axgen_host_mutex);
+    axgen_sinks.erase(id_);
+  }
+  AxGenSinkRegistration(const AxGenSinkRegistration&) = delete;
+  AxGenSinkRegistration& operator=(const AxGenSinkRegistration&) = delete;
+  Value marker() const { return object({{"__axgen_sink_id", id_}}); }
+
+ private:
+  std::string id_;
+};
+
+void append_axgen_field_processor(Value& state, const std::string& key, std::string field, std::function<Value(Value, Value)> processor) {
+  std::string id = next_axgen_host_key("field_processor");
+  {
+    std::lock_guard<std::mutex> lock(axgen_host_mutex);
+    axgen_field_processors[id] = std::move(processor);
+  }
+  Value spec = Value::object();
+  Core::set(spec, "field", std::move(field));
+  Core::set(spec, "__field_processor_id", id);
+  Value specs = Core::get(state, key, Value::array());
+  Core::append(specs, spec);
+  Core::set(state, key, specs);
+}
+
+}  // namespace
+
+// How a run session streams a model call (session.inc): under a native chat
+// session, pull yields the session's items (null at the end) and close closes
+// it; otherwise the call streams from service, or, with neither, the session
+// answers it as one chunk through pull.
+struct SessionStreamSource {
+  AxAIService* service = nullptr;
+  std::function<Value()> pull;
+  std::function<void()> close;
+};
+static SessionStreamSource session_stream_source(AIClient* client, Value& request, const Value& options);
+
+// Opens the client's provider stream as a pull handle. An AxAIService streams
+// on a worker thread that inherits the caller's cancellation (through a linked
+// token that closing can cancel alone), runtime hook frames and MCP context;
+// request and options are copied so the worker shares no mutable state with
+// the caller. A run session streams its native session's items as they
+// happen, or from its selected service through its response boundary. Other
+// clients answer with their chat response as one chunk.
+Value Core::ai_stream_open(Value client, Value request, Value options) {
+  AIClient* registered = registered_client(str(get_key(client, "__client_id")));
+  if (registered == nullptr) throw AxError("runtime", "client does not implement AIClient");
+  auto stream = std::make_shared<AxChatStream>();
+  auto channel = stream->channel;
+  AxAIService* service = dynamic_cast<AxAIService*>(registered);
+  if (service == nullptr) {
+    SessionStreamSource source = session_stream_source(registered, request, options);
+    service = source.service;
+    stream->pull = std::move(source.pull);
+    stream->pull_close = std::move(source.close);
+  }
+  if (stream->pull) {
+    // Pulled by ai_stream_next.
+  } else if (service != nullptr) {
+    auto cancellation = std::make_shared<AxCancellationToken>();
+    stream->cancellation = cancellation;
+    if (const AxCancellationToken* caller = current_cancellation_token()) {
+      std::weak_ptr<AxCancellationToken> linked = cancellation;
+      stream->caller_cancellation = caller->subscribe([linked, caller] {
+        if (auto token = linked.lock()) token->cancel(caller->reason());
+      });
+    }
+    std::vector<RuntimeHookFrame> frames = runtime_hook_frames;
+    std::shared_ptr<detail::AgentExecutionContext> mcp_context = detail::MCPRunScope::current();
+    Value worker_request = clone_usage_value(request);
+    Value worker_options = clone_usage_value(options);
+    stream->worker = std::thread([service, worker_request, worker_options, channel, cancellation, frames, mcp_context]() {
+      runtime_hook_frames = frames;
+      try {
+        detail::MCPRunScope mcp_scope(mcp_context);
+        AxCancellationScope scope(cancellation.get());
+        service->stream_each(worker_request, [channel](const Value& chunk) {
+          std::unique_lock<std::mutex> lock(channel->mutex);
+          if (channel->closed) return false;
+          channel->chunks.push_back(chunk);
+          channel->changed.notify_all();
+          channel->changed.wait(lock, [&] { return channel->closed || channel->chunks.empty(); });
+          return !channel->closed;
+        }, worker_options);
+      } catch (...) {
+        std::lock_guard<std::mutex> lock(channel->mutex);
+        channel->error = std::current_exception();
+      }
+      {
+        std::lock_guard<std::mutex> lock(channel->mutex);
+        channel->finished = true;
+      }
+      channel->changed.notify_all();
+      runtime_hook_frames.clear();
+    });
+  } else {
+    channel->chunks.push_back(registered->chat(request, options));
+    channel->finished = true;
+  }
+  std::string id = "__ai_stream_" + std::to_string(++next_ai_stream_id);
+  {
+    std::lock_guard<std::mutex> lock(ai_streams_mutex);
+    ai_streams[id] = stream;
+  }
+  return object({{"__ai_stream_id", id}});
+}
+
+// The next chunk as it arrives, or null at the end; the error that ended the
+// stream is rethrown once, with its original type.
+Value Core::ai_stream_next(Value handle) {
+  auto stream = registered_ai_stream(handle);
+  if (!stream) return Value();
+  if (stream->pull) return stream->pull();
+  auto channel = stream->channel;
+  std::exception_ptr error;
+  {
+    std::unique_lock<std::mutex> lock(channel->mutex);
+    channel->changed.wait(lock, [&] { return !channel->chunks.empty() || channel->finished || channel->closed; });
+    if (!channel->chunks.empty()) {
+      Value chunk = std::move(channel->chunks.front());
+      channel->chunks.pop_front();
+      lock.unlock();
+      channel->changed.notify_all();
+      return chunk;
+    }
+    std::swap(error, channel->error);
+  }
+  if (error) std::rethrow_exception(error);
+  return Value();
+}
+
+Value Core::ai_stream_close(Value handle) {
+  try {
+    std::shared_ptr<AxChatStream> stream;
+    {
+      std::lock_guard<std::mutex> lock(ai_streams_mutex);
+      auto it = ai_streams.find(str(get_key(handle, "__ai_stream_id")));
+      if (it != ai_streams.end()) {
+        stream = it->second;
+        ai_streams.erase(it);
+      }
+    }
+    if (stream) stream->close();
+  } catch (...) {
+    // Closing an abandoned stream is best effort.
+  }
+  return Value();
+}
+
+// Sends one {version, index, delta} envelope to the run's sink; what the sink
+// throws (a consumer that stopped) ends the run.
+Value Core::axgen_emit_delta(Value sink, Value envelope) {
+  if (sink.is_null()) return Value();
+  auto deliver = find_axgen_host(axgen_sinks, str(get_key(sink, "__axgen_sink_id")));
+  if (!deliver) throw AxError("runtime", "AxGen streaming sink is not registered");
+  deliver(clone_usage_value(envelope));
+  return Value();
+}
+
+// TS field processors take (value, {values, sessionId, done}); a
+// transform-style processor gets the value alone.
+Value Core::axgen_call_processor(Value spec, Value value, Value context) {
+  Value call_context = Value::object();
+  Core::set(call_context, "values", clone_usage_value(get(context, "values", Value::object())));
+  Core::set(call_context, "done", Value(truthy(get(context, "done"))));
+  Value processor = get_key(spec, "processor", get_key(spec, "fn"));
+  std::string id = str(get_key(spec, "__field_processor_id", get_key(processor, "__field_processor_id")));
+  if (!id.empty()) {
+    if (auto fn = find_axgen_host(axgen_field_processors, id)) return fn(value, call_context);
+  }
+  std::string transform_id = str(get_key(spec, "__processor_id"));
+  if (!transform_id.empty()) {
+    auto it = processor_registry().find(transform_id);
+    if (it != processor_registry().end()) return it->second(value);
+  }
+  throw AxError("runtime", "field processor must be callable");
+}
+
+// A callable check returns null or true to pass, a message string, or false;
+// a {not_contains} spec fails when the field text contains it. Descriptor
+// failures carry no message: the IR uses the spec's.
+Value Core::axgen_check_streaming_assertion(Value spec, Value value, Value done) {
+  std::string id = str(get_key(spec, "__streaming_assertion_id"));
+  if (!id.empty()) {
+    auto check = find_axgen_host(axgen_streaming_checks, id);
+    if (!check) throw AxError("runtime", "streaming assertion is not callable");
+    Value result = check(value, truthy(done));
+    if (result.is_null() || (result.is_bool() && truthy(result))) return object({{"status", "pass"}});
+    if (result.is_string()) return object({{"status", "fail"}, {"message", result}});
+    return object({{"status", "fail"}});
+  }
+  Value needle = get_key(spec, "not_contains", get_key(spec, "notContains"));
+  if (!needle.is_null() && str(value).find(str(needle)) != std::string::npos) return object({{"status", "fail"}});
+  return object({{"status", "pass"}});
+}
+
+static std::mutex& ai_warnings_mutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+static std::set<std::string>& ai_warnings_shown() {
+  static std::set<std::string> shown;
+  return shown;
+}
+static std::function<void(const std::string&)>& ai_warning_sink() {
+  static std::function<void(const std::string&)> sink;
+  return sink;
+}
+
+// TS console.warn, once per key per process: a setting Ax could not send,
+// such as a sampling parameter the selected model rejects.
+Value Core::ai_warn_once(Value key, Value message) {
+  std::function<void(const std::string&)> sink;
+  {
+    std::lock_guard<std::mutex> lock(ai_warnings_mutex());
+    if (!ai_warnings_shown().insert(str(key)).second) return Value();
+    sink = ai_warning_sink();
+  }
+  if (sink) {
+    sink(str(message));
+  } else {
+    std::cerr << "axllm: " << str(message) << std::endl;
+  }
+  return Value();
+}
+
+void Core::ai_capture_warnings(std::function<void(const std::string&)> sink) {
+  std::lock_guard<std::mutex> lock(ai_warnings_mutex());
+  ai_warnings_shown().clear();
+  ai_warning_sink() = std::move(sink);
+}
+
+static std::mutex& axgen_deprecations_mutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+static std::set<std::string>& axgen_deprecations_shown() {
+  static std::set<std::string> shown;
+  return shown;
+}
+
+static std::function<void(const std::string&)>& axgen_deprecation_sink() {
+  static std::function<void(const std::string&)> sink;
+  return sink;
+}
+
+// Deprecated port behavior warns once per key per process.
+Value Core::axgen_deprecation(Value key, Value message) {
+  try {
+    std::function<void(const std::string&)> sink;
+    {
+      std::lock_guard<std::mutex> lock(axgen_deprecations_mutex());
+      if (!axgen_deprecations_shown().insert(str(key)).second) return Value();
+      sink = axgen_deprecation_sink();
+    }
+    if (sink) {
+      sink(str(message));
+      return Value();
+    }
+    std::cerr << "axllm deprecation: " << str(message) << std::endl;
+  } catch (...) {
+  }
+  return Value();
+}
+
+void Core::axgen_capture_deprecations(std::function<void(const std::string&)> sink) {
+  std::lock_guard<std::mutex> lock(axgen_deprecations_mutex());
+  axgen_deprecations_shown().clear();
+  axgen_deprecation_sink() = std::move(sink);
+}
+
+// Caching functions the AxGen IR reaches through {"__caching_function_id"}
+// markers, as run controls are reached: the registry holds each handle's
+// state weakly, and a handle (the caller's, an AxGen's or the process-wide
+// one) keeps it registered.
+struct AxCachingFunctionHandle::State {
+  std::string id;
+  AxCachingFunction fn;
+};
+
+namespace {
+
+struct CachingFunctionRegistry {
+  std::mutex mutex;
+  std::uint64_t next_id = 0;
+  std::map<std::string, std::weak_ptr<AxCachingFunctionHandle::State>> handles;
+  std::optional<AxCachingFunctionHandle> global;
+};
+
+CachingFunctionRegistry& caching_function_registry() {
+  static CachingFunctionRegistry registry;
+  return registry;
+}
+
+std::shared_ptr<AxCachingFunctionHandle::State> registered_caching_function(const Value& marker) {
+  std::string id = str(get_key(marker, "__caching_function_id"));
+  if (id.empty()) throw AxError("validation", "The caching_function option must be an axllm::caching_function() handle value");
+  auto& registry = caching_function_registry();
+  std::lock_guard<std::mutex> lock(registry.mutex);
+  auto it = registry.handles.find(id);
+  auto state = it == registry.handles.end() ? nullptr : it->second.lock();
+  if (!state) throw AxError("validation", "Caching function handle has expired");
+  return state;
+}
+
+// Calls the caching function outside the registry lock. What it throws that
+// is not a std::exception becomes an AxError, so the IR, which catches
+// std::exception, ignores it where TypeScript ignores a cache error.
+std::optional<Value> call_caching_function(const Value& marker, const Value& key, const Value* value) {
+  auto state = registered_caching_function(marker);
+  try {
+    return state->fn(str(key), value);
+  } catch (const std::exception&) {
+    throw;
+  } catch (...) {
+    throw AxError("runtime", "caching function threw a non-standard exception");
+  }
+}
+
+// The process-wide caching function as a run starts: holding it keeps the
+// function the run resolved registered until the run ends, as TypeScript
+// keeps the function it read.
+std::optional<AxCachingFunctionHandle> global_caching_function() {
+  auto& registry = caching_function_registry();
+  std::lock_guard<std::mutex> lock(registry.mutex);
+  return registry.global;
+}
+
+}  // namespace
+
+AxCachingFunctionHandle::AxCachingFunctionHandle(AxCachingFunction fn) : state_(std::make_shared<State>()) {
+  if (!fn) throw AxError("validation", "Caching function must be callable");
+  state_->fn = std::move(fn);
+  auto& registry = caching_function_registry();
+  std::lock_guard<std::mutex> lock(registry.mutex);
+  state_->id = "__caching_function_" + std::to_string(++registry.next_id);
+  for (auto it = registry.handles.begin(); it != registry.handles.end();) {
+    if (it->second.expired()) it = registry.handles.erase(it);
+    else ++it;
+  }
+  registry.handles[state_->id] = state_;
+}
+
+Value AxCachingFunctionHandle::value() const { return object({{"__caching_function_id", state_->id}}); }
+
+AxCachingFunctionHandle caching_function(AxCachingFunction fn) { return AxCachingFunctionHandle(std::move(fn)); }
+
+// TS: options.cachingFunction ?? this.options.cachingFunction ??
+// axGlobals.cachingFunction.
+Value Core::axgen_caching_function(Value gen, Value options) {
+  Value gen_options = get_key(gen, "options");
+  for (const Value* source : {&options, &gen_options}) {
+    Value marker = get_key(*source, "caching_function", get_key(*source, "cachingFunction"));
+    if (!marker.is_null()) return marker;
+  }
+  auto global = global_caching_function();
+  return global ? global->value() : Value();
+}
+
+// TS AxFlow: options.cachingFunction ?? axGlobals.cachingFunction. A flow's
+// constructor takes none; its AxGen nodes get the call's options, so they
+// cache through the same function.
+Value Core::flow_caching_function(Value options) {
+  Value marker = get_key(options, "caching_function", get_key(options, "cachingFunction"));
+  if (!marker.is_null()) return marker;
+  auto global = global_caching_function();
+  return global ? global->value() : Value();
+}
+
+// fn(key) returns the stored output, or nothing for a miss. A copy comes back,
+// so the caller's output does not share state with the cache.
+Value Core::axgen_cache_read(Value fn, Value key) {
+  std::optional<Value> cached = call_caching_function(fn, key, nullptr);
+  return cached ? clone_usage_value(*cached) : Value();
+}
+
+// fn(key, output) stores a copy of the output; the IR ignores what it throws.
+Value Core::axgen_cache_write(Value fn, Value key, Value value) {
+  Value stored = clone_usage_value(value);
+  call_caching_function(fn, key, &stored);
+  return Value();
+}
+
+void set_caching_function(AxCachingFunction fn) {
+  std::optional<AxCachingFunctionHandle> next;
+  if (fn) next.emplace(std::move(fn));
+  auto& registry = caching_function_registry();
+  std::lock_guard<std::mutex> lock(registry.mutex);
+  registry.global.swap(next);
+}
+
 void set_usage_observer(AxUsageObserver observer) {
   std::lock_guard<std::mutex> lock(usage_observer_mutex);
   usage_observer = std::move(observer);
@@ -2685,6 +4857,11 @@ void set_rate_limiter(AxRateLimiter limiter) {
 void set_tracer(std::shared_ptr<AxTracer> tracer) {
   std::lock_guard<std::mutex> lock(runtime_hooks_mutex);
   global_runtime_hooks.tracer = std::move(tracer);
+}
+
+std::function<void(const std::string&)>& verbose_log_sink() {
+  static std::function<void(const std::string&)> sink;
+  return sink;
 }
 
 void set_meter(std::shared_ptr<AxMeter> meter) {
@@ -2704,18 +4881,30 @@ AxBaseAI::AxBaseAI(std::string name, std::string model, std::string embed_model,
 }
 
 Value AxBaseAI::chat(Value request) {
-  return chat(std::move(request), options_, AxRuntimeHooks{});
+  // No call options: the client options still apply through the merge in
+  // chat(), but they are not call options (the expensive-model gate reads those).
+  return chat(std::move(request), Value::object(), AxRuntimeHooks{});
 }
 
 Value AxBaseAI::chat(Value request, Value call_options) {
   return chat(std::move(request), std::move(call_options), AxRuntimeHooks{});
 }
 
+Value AxBaseAI::resolve_model_key_request(Value request, Value call_options, bool embed) const {
+  return Core::resolve_model_key(options_, std::move(request), std::move(call_options), Value(embed ? embed_model_ : model_), Value(embed));
+}
+
 Value AxBaseAI::chat(Value request, Value call_options, const AxRuntimeHooks& call_hooks) {
-  Value req = Core::coerce_chat_request(std::move(request));
+  check_call_options(call_options);
+  Value resolved = resolve_model_key_request(Core::coerce_chat_request(std::move(request)), call_options, false);
+  Value req = Core::get(resolved, "request");
+  call_options = Core::get(resolved, "options");
   Core::validate_chat_request(req);
   Value merged_options = merge_usage_options(options_, call_options);
   Value selected_model = Core::coalesce(Core::get(req, "model"), model_);
+  // Expensive-model gate, before any request is sent: only the call options (or
+  // the model-key entry) confirm; the client's own options do not.
+  Core::provider_require_expensive_model_confirmation(Value(model_catalog_provider()), Value(display(selected_model)), options_, call_options);
   Value merged_config = Core::merge_model_config(model_config_, Core::get(req, "model_config"), merged_options);
   Core::set(req, "model", selected_model);
   Core::set(req, "model_config", merged_config);
@@ -2727,7 +4916,8 @@ Value AxBaseAI::chat(Value request, Value call_options, const AxRuntimeHooks& ca
   Value attributes = object({{"ax.operation", "chat"}, {"ax.ai", name_}, {"ax.model", display(selected_model)}, {"ax.streaming", streaming}});
   std::shared_ptr<AxSpan> parent = runtime_hook_frames.empty() ? nullptr : runtime_hook_frames.back().span;
   auto span = start_runtime_span(hooks, "ax_llm_chat", "client", attributes, parent);
-  record_runtime_metric(hooks.meter, "counter", "ax_llm_requests_total", 1, attributes);
+  record_runtime_metric(hooks.meter, "counter", "ax_llm_requests_total", 1, with_custom_labels(attributes, options_, call_options, false));
+  attributes = with_custom_labels(attributes, options_, call_options, true);
   auto started = std::chrono::steady_clock::now();
   try {
     AxRequestExecutor next = [&]() { return do_chat(req, merged_options); };
@@ -2768,6 +4958,10 @@ Value AxBaseAI::embed(Value request, Value call_options) {
 }
 
 Value AxBaseAI::embed(Value request, Value call_options, const AxRuntimeHooks& call_hooks) {
+  check_call_options(call_options);
+  Value resolved = resolve_model_key_request(std::move(request), call_options, true);
+  request = Core::get(resolved, "request");
+  call_options = Core::get(resolved, "options");
   Value texts = Core::get(request, "texts");
   if (!texts.is_array() || array_ref(texts).empty()) throw Core::as_error(Core::ai_error_response("Embed texts is empty"));
   Value selected = Core::get(request, "embed_model", Core::get(request, "embedModel", embed_model_));
@@ -2781,7 +4975,8 @@ Value AxBaseAI::embed(Value request, Value call_options, const AxRuntimeHooks& c
   Value attributes = object({{"ax.operation", "embed"}, {"ax.ai", name_}, {"ax.model", display(selected)}, {"ax.streaming", false}});
   std::shared_ptr<AxSpan> parent = runtime_hook_frames.empty() ? nullptr : runtime_hook_frames.back().span;
   auto span = start_runtime_span(hooks, "ax_llm_embed", "client", attributes, parent);
-  record_runtime_metric(hooks.meter, "counter", "ax_llm_requests_total", 1, attributes);
+  record_runtime_metric(hooks.meter, "counter", "ax_llm_requests_total", 1, with_custom_labels(attributes, options_, call_options, false));
+  attributes = with_custom_labels(attributes, options_, call_options, true);
   auto started = std::chrono::steady_clock::now();
   try {
     AxRequestExecutor next = [&]() { return do_embed(req, merged_options); };
@@ -2813,6 +5008,7 @@ Value AxBaseAI::get_features(Value) { return AxAIService::get_features(Value());
 std::string AxBaseAI::get_id() { return name_ + "-id"; }
 std::string AxBaseAI::get_name() { return name_; }
 Value AxBaseAI::get_model_list() {
+  for(const auto& key:{"models","model_list","modelList"})if(Core::truthy(Core::map_contains(options_,key)))return Core::get(options_,key);
   Value out = Value::array();
   if (!model_.empty()) Core::append(out, object({{"key", model_}, {"description", name_ + " chat model"}, {"model", model_}}));
   if (!embed_model_.empty()) Core::append(out, object({{"key", embed_model_}, {"description", name_ + " embed model"}, {"embedModel", embed_model_}}));
@@ -2853,6 +5049,22 @@ static std::string env_or_default(const char* name, const std::string& fallback)
   return value == nullptr ? fallback : std::string(value);
 }
 
+// OPENAI_BASE_URL and OPENAI_API_KEY belong to OpenAI's own profiles and the
+// generic client: any other provider's key never goes to that host, and the
+// OpenAI key never goes to another provider.
+static bool reads_openai_env(const std::string& profile) {
+  return profile == "openai" || profile == "openai-responses" || profile == "openai-compatible";
+}
+
+// Built directly without a base_url (or OPENAI_BASE_URL), the generic client
+// talks to OpenAI, as it does in the other languages.
+static Value with_default_openai_base_url(Value options) {
+  if (!Core::get(options, "base_url").is_null() || !Core::get(options, "baseUrl").is_null() || std::getenv("OPENAI_BASE_URL") != nullptr) return options;
+  Value resolved = Core::map_merge(Value::object(), options);
+  Core::set(resolved, "base_url", "https://api.openai.com/v1");
+  return resolved;
+}
+
 static std::string strip_trailing_slashes(std::string value) {
   while (!value.empty() && value.back() == '/') value.pop_back();
   return value;
@@ -2871,7 +5083,7 @@ static std::string url_component(std::string value) {
 }
 
 OpenAICompatibleClient::OpenAICompatibleClient(Value options, Transport* transport, AxCredentialProvider credential_provider)
-    : OpenAICompatibleClient("openai-compatible", "openai", std::move(options), transport, "gpt-4.1-mini", "text-embedding-3-small", std::move(credential_provider)) {}
+    : OpenAICompatibleClient("openai-compatible", "openai", with_default_openai_base_url(std::move(options)), transport, "gpt-4.1-mini", "text-embedding-3-small", std::move(credential_provider)) {}
 
 OpenAICompatibleClient::OpenAICompatibleClient(std::string profile, std::string name, Value options, Transport* transport, std::string default_model, std::string default_embed_model, AxCredentialProvider credential_provider)
     : AxBaseAI(
@@ -2882,16 +5094,55 @@ OpenAICompatibleClient::OpenAICompatibleClient(std::string profile, std::string 
           Core::map_merge(options, Core::get(options, "options", Value::object()))),
       profile_(std::move(profile)),
       descriptor_(Core::provider_resolve_descriptor(profile_, Core::map_merge(options, Core::get(options, "options", Value::object())))),
-      base_url_(strip_trailing_slashes(option_string(options, "base_url", "baseUrl", env_or_default("OPENAI_BASE_URL", str(Core::get(descriptor_, "baseUrl", "https://api.openai.com/v1")))))),
-      api_key_(option_string(options, "api_key", "apiKey", env_or_default("OPENAI_API_KEY", ""))),
+      base_url_(strip_trailing_slashes(option_string(options, "base_url", "baseUrl", [&]() {
+        std::string descriptor_base = Core::get(descriptor_, "baseUrl").is_null() ? std::string("https://api.openai.com/v1") : str(Core::get(descriptor_, "baseUrl"));
+        return reads_openai_env(profile_) ? env_or_default("OPENAI_BASE_URL", descriptor_base) : descriptor_base;
+      }()))),
+      api_key_(option_string(options, "api_key", "apiKey", (profile_ == "typesafe" ? env_or_default("TYPESAFE_APIKEY", env_or_default("TYPESAFE_API_KEY", "")) : reads_openai_env(profile_) ? env_or_default("OPENAI_API_KEY", "") : std::string()))),
       api_version_(str(Core::get(descriptor_, "apiVersion", option_string(options, "api_version", "apiVersion", "")))),
       timeout_seconds_(Core::get(options, "timeout", 60).is_number() ? num(Core::get(options, "timeout", 60)) : 60.0),
       credential_provider_(std::move(credential_provider)),
       transport_(transport) {
+  // Only the caller's settings: provider_build_chat_request adds the
+  // provider's sampling defaults (as its TS class starts from) under them,
+  // after dropping the explicit ones the model rejects.
+  model_config_ = Core::map_merge(Value::object(), Core::get(options, "model_config", Value::object()));
+  if (profile_ == "openai-decisions") {
+    Core::decisions_require_number(Core::get(options_, "trueThreshold", Core::get(options_, "true_threshold", 0.5)), "trueThreshold", 0, 1);
+  }
+  if (profile_ == "typesafe") {
+    Core::typesafe_require_number(Core::get(options_, "trueThreshold", Core::get(options_, "true_threshold", 0.5)), "trueThreshold", 0, 1);
+  }
+  // TS resolveProfileURL: a profile without a base URL of its own needs the
+  // caller's instead of sending its key to another host. The generic client
+  // also takes OPENAI_BASE_URL, and built directly it defaults to OpenAI.
+  Value url_options = Core::map_merge(Core::get(options, "options", Value::object()), options);
+  std::string env_base_url = reads_openai_env(profile_) ? env_or_default("OPENAI_BASE_URL", "") : std::string();
+  if (!env_base_url.empty() && !Core::truthy(Core::get(url_options, "base_url")) && !Core::truthy(Core::get(url_options, "baseUrl")) && !Core::truthy(Core::get(url_options, "apiURL"))) {
+    Core::set(url_options, "base_url", env_base_url);
+  }
+  Core::provider_require_api_url(profile_, url_options);
   if (transport_ == nullptr) {
-    owned_transport_ = std::make_unique<HttpTransport>();
+    owned_transport_ = std::make_shared<HttpTransport>();
     transport_ = owned_transport_.get();
   }
+}
+
+std::function<std::shared_ptr<AIClient>()> OpenAICompatibleClient::owned_worker_factory() {
+  if(typeid(*this)!=typeid(OpenAICompatibleClient)&&typeid(*this)!=typeid(OpenAIResponsesClient)&&typeid(*this)!=typeid(GoogleGeminiClient)&&typeid(*this)!=typeid(AnthropicClient))return {};
+  if(context_cache_registry_)return {}; // Borrowed registries require an ownership capability.
+  auto transport_factory=transport_?transport_->owned_worker_factory():std::function<std::shared_ptr<Transport>()>{};
+  if(!transport_factory)return {};
+  auto snapshot=std::make_shared<OpenAICompatibleClient>(*this);
+  snapshot->options_=parse_json(stringify(options_));snapshot->model_config_=parse_json(stringify(model_config_));
+  snapshot->descriptor_=parse_json(stringify(descriptor_));snapshot->context_cache_entries_=parse_json(stringify(context_cache_entries_));
+  snapshot->owned_transport_.reset();snapshot->transport_=nullptr;
+  return [snapshot,transport_factory] {
+    auto worker=std::make_shared<OpenAICompatibleClient>(*snapshot);
+    worker->options_=parse_json(stringify(snapshot->options_));worker->model_config_=parse_json(stringify(snapshot->model_config_));
+    worker->descriptor_=parse_json(stringify(snapshot->descriptor_));worker->context_cache_entries_=parse_json(stringify(snapshot->context_cache_entries_));
+    worker->owned_transport_=transport_factory();worker->transport_=worker->owned_transport_.get();return worker;
+  };
 }
 
 OpenAIResponsesClient::OpenAIResponsesClient(Value options, Transport* transport)
@@ -2920,6 +5171,8 @@ GoogleGeminiClient::GoogleGeminiClient(Value options, Transport* transport)
 GoogleGeminiClient::GoogleGeminiClient(std::string profile, Value options, Transport* transport)
     : OpenAICompatibleClient(profile, profile, [&]() {
         Value out = std::move(options);
+        // The Google env vars belong to the google-gemini profile only.
+        if (profile != "google-gemini") return out;
         bool vertex = (!Core::get(out, "project_id").is_null() || !Core::get(out, "projectId").is_null()) && !Core::get(out, "region").is_null();
         if (Core::get(out, "api_key").is_null() && Core::get(out, "apiKey").is_null()) Core::set(out, "api_key", vertex ? env_or_default("GOOGLE_VERTEX_ACCESS_TOKEN", "") : env_or_default("GOOGLE_API_KEY", env_or_default("GEMINI_API_KEY", "")));
         std::string base = env_or_default("GOOGLE_GEMINI_BASE_URL", "");
@@ -2935,6 +5188,9 @@ AnthropicClient::AnthropicClient(Value options, Transport* transport)
 AnthropicClient::AnthropicClient(std::string profile, Value options, Transport* transport)
     : OpenAICompatibleClient(profile, profile, [&]() {
         Value out = std::move(options);
+        // The Anthropic env vars belong to the anthropic profile only: an
+        // Anthropic key never goes to another anthropic-messages host.
+        if (profile != "anthropic") return out;
         bool vertex = (!Core::get(out, "project_id").is_null() || !Core::get(out, "projectId").is_null()) && !Core::get(out, "region").is_null();
         if (Core::get(out, "api_key").is_null() && Core::get(out, "apiKey").is_null()) Core::set(out, "api_key", vertex ? env_or_default("GOOGLE_VERTEX_ACCESS_TOKEN", "") : env_or_default("ANTHROPIC_API_KEY", ""));
         std::string base = env_or_default("ANTHROPIC_BASE_URL", "");
@@ -2970,6 +5226,75 @@ static double ax_context_cache_expiry_ms(Value response) {
   return static_cast<double>(timegm(&tm)) * 1000.0;
 }
 
+// Gives a transport-level provider error the request TypeScript keeps on it:
+// Core's view (the URL, plus the body unless includeRequestBodyInErrors is
+// false), never the headers. An error that already has one keeps it.
+static void attach_error_request(AxError& error, const Value& call, const Value& options) {
+  if (!error.url.empty() || !error.request_body.is_null()) return;
+  Value view = Core::_ai_error_request(call, options);
+  error.url = str(Core::get(view, "url", Value("")));
+  error.request_body = Core::get(view, "json", Core::get(view, "data"));
+}
+
+static std::function<void(double)> ax_request_retry_sleep_hook;
+static std::function<double()> ax_request_retry_random_hook;
+static std::function<double()> ax_request_retry_now_hook;
+
+void set_request_retry_hooks(std::function<void(double)> sleep, std::function<double()> random, std::function<double()> now_ms) {
+  ax_request_retry_sleep_hook = std::move(sleep);
+  ax_request_retry_random_hook = std::move(random);
+  ax_request_retry_now_hook = std::move(now_ms);
+}
+
+static void ax_request_retry_sleep(double delay) {
+  auto token = current_cancellation_token();
+  if (ax_request_retry_sleep_hook) {
+    if (token) token->throw_if_cancelled();
+    ax_request_retry_sleep_hook(delay);
+    return;
+  }
+  if (delay <= 0) return;
+  auto duration = std::chrono::milliseconds(static_cast<long>(delay));
+  if (token && token->wait_for(duration)) token->throw_if_cancelled();
+  else if (!token) std::this_thread::sleep_for(duration);
+}
+
+// TS apiCall's view of a failed request: its HTTP status (with its
+// Retry-After) or a network failure. Anything else is null and not retried.
+static Value ax_request_retry_failure(const AxError& error, const std::string& retry_after) {
+  if (error.type == "AxAIServiceAuthenticationError" || error.type == "AxAIServiceAbortedError") return Value();
+  if (error.status > 0) {
+    Value failure = object({{"status", error.status}});
+    if (!retry_after.empty()) Core::set(failure, "retry_after", retry_after);
+    return failure;
+  }
+  if (error.type == "AxAIServiceNetworkError") return object({{"network", true}});
+  return Value();
+}
+
+// Waits before the failed request goes out again, as TS apiCall does, and
+// says whether it does.
+static bool ax_request_retry_wait(const Value& config, int attempt, const AxError& error, const std::string& retry_after) {
+  Value failure = ax_request_retry_failure(error, retry_after);
+  if (failure.is_null()) return false;
+  double now = ax_request_retry_now_hook ? ax_request_retry_now_hook() : static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+  double random = ax_request_retry_random_hook ? ax_request_retry_random_hook() : static_cast<double>(std::rand()) / (static_cast<double>(RAND_MAX) + 1.0);
+  Value delay = Core::request_retry_delay(config, attempt, failure, now, random);
+  if (delay.is_null()) return false;
+  ax_request_retry_sleep(num(delay));
+  return true;
+}
+
+// A transport's untyped network failure, as TS apiCall reports what fetch
+// throws: AxAIServiceNetworkError, "Network Error: " and the transport's text,
+// with the request a provider error keeps and the failure as its cause.
+static AxError ax_transport_network_error(const AxError& error, const Value& call, const Value& options) {
+  AxError network("network", std::string("Network Error: ") + error.what(), "AxAIServiceNetworkError", 0, "", true);
+  network.set_cause(std::make_shared<AxError>(error));
+  attach_error_request(network, call, options);
+  return network;
+}
+
 Value OpenAICompatibleClient::context_cache_chat(Value request, Value options, Value payload, Value model, const std::string& endpoint) {
   Value cfg_value = Core::get(options, "contextCache", Core::get(options, "context_cache"));
   bool supported = Core::truthy(Core::get(Core::get(Core::get(descriptor_, "features", Value::object()), "caching", Value::object()), "supported", false));
@@ -2978,7 +5303,7 @@ Value OpenAICompatibleClient::context_cache_chat(Value request, Value options, V
   std::string explicit_name = str(Core::get(cfg, "name", Core::get(cfg, "cacheName", Core::get(cfg, "cache_name", ""))));
   if (!explicit_name.empty()) {
     Value cached = payload; Core::set(cached, "cachedContent", explicit_name);
-    return request_json(endpoint, cached, false, "json", false, operation_method("chat"));
+    return request_json_retried(endpoint, cached, operation_method("chat"), options);
   }
   Value prompts = Core::get(request, "chat_prompt", Core::get(request, "chatPrompt", Core::get(request, "messages", Value::array())));
   std::size_t non_system = 0, cached_count = 0;
@@ -3010,7 +5335,7 @@ Value OpenAICompatibleClient::context_cache_chat(Value request, Value options, V
     std::string endpoint = str(Core::get(op, "path"));
     Value op_base = Core::get(op, "base_url");
     if (!op_base.is_null()) endpoint = strip_trailing_slashes(str(op_base)) + endpoint;
-    return request_json(endpoint, Core::get(op, "request", Value::object()), false, "json", false, str(Core::get(op, "method", "POST")));
+    return request_json_retried(endpoint, Core::get(op, "request", Value::object()), str(Core::get(op, "method", "POST")), options);
   };
   auto create = [&]() {
     try {
@@ -3026,14 +5351,14 @@ Value OpenAICompatibleClient::context_cache_chat(Value request, Value options, V
       Value ops = Core::ai_gemini_cache_ops(cache_name, ttl_seconds, api_key_, model, cache_body, options); Value refreshed = call_op(Core::get(ops, "update")); double expires_at = ax_context_cache_expiry_ms(refreshed);
       if (expires_at <= now_ms()) throw AxError("ai_service", "Gemini cache refresh omitted a future expireTime");
       set_entry(object({{"cacheName", cache_name}, {"expiresAt", expires_at}}));
-    } catch (const AxError&) { if (!create()) return request_json(endpoint, payload, false, "json", false, operation_method("chat")); }
+    } catch (const AxError&) { if (!create()) return request_json_retried(endpoint, payload, operation_method("chat"), options); }
   } else if (action == "create") {
-    if (!create()) return request_json(endpoint, payload, false, "json", false, operation_method("chat"));
+    if (!create()) return request_json_retried(endpoint, payload, operation_method("chat"), options);
   } else if (action == "none") return Value();
   if (cache_name.empty()) return Value();
   Value cached = payload; object_mut(cached).erase("systemInstruction"); object_mut(cached).erase("tools"); object_mut(cached).erase("toolConfig");
   Value suffix = Value::array(); for (std::size_t i = std::min(cached_count, contents.size()); i < contents.size(); ++i) Core::append(suffix, contents[i]); Core::set(cached, "contents", suffix); Core::set(cached, "cachedContent", cache_name);
-  try { return request_json(endpoint, cached, false, "json", false, operation_method("chat")); }
+  try { return request_json_retried(endpoint, cached, operation_method("chat"), options); }
   catch (const AxError& error) {
     if (!Core::truthy(Core::ai_context_cache_rejection(error.status, error.response_body))) throw;
     Value recovery = Core::ai_context_cache_recovery(get_entry(), cache_name, external);
@@ -3041,16 +5366,18 @@ Value OpenAICompatibleClient::context_cache_chat(Value request, Value options, V
       if (external) context_cache_registry_->set(tenant_namespace, cache_key, Core::get(recovery, "externalEntry", Value::object()));
       else if (Core::truthy(Core::get(recovery, "deleteInMemory", false))) object_mut(context_cache_entries_).erase(cache_key);
     }
-    return request_json(endpoint, payload, false, "json", false, operation_method("chat"));
+    return request_json_retried(endpoint, payload, operation_method("chat"), options);
   }
 }
 
 Value OpenAICompatibleClient::do_chat(Value request, Value options) {
+  AxCallOptionsScope call_scope(options);
   Value realtime_model = Core::coalesce(Core::get(request, "model"), Value(model_));
   if (Core::truthy(Core::provider_should_use_realtime(profile_, realtime_model, request, options))) {
     return realtime_chat(request, nullptr);
   }
   Value payload = Core::provider_build_chat_request(profile_, request, options);
+  Value response_context = Core::provider_response_context(payload, Core::get(request, "model_config", Value::object()), options);
   bool stream = Core::truthy(Core::get(
       payload,
       "stream",
@@ -3064,23 +5391,22 @@ Value OpenAICompatibleClient::do_chat(Value request, Value options) {
     double initial_delay = num(Core::get(retry_cfg, "initial_delay_ms", 1000));
     double max_delay = num(Core::get(retry_cfg, "max_delay_ms", 60000));
     double backoff = num(Core::get(retry_cfg, "backoff_factor", 2));
-    int attempt = 0;
+    int start_attempt = 0;
     while (true) {
-      Value raw = request_json(operation_path("stream_chat", model), payload, true, "json", false, operation_method("stream_chat"));
+      Value raw = request_json_retried(operation_path("stream_chat", model), payload, operation_method("stream_chat"), options, true);
       std::vector<Value> events = iter_sse_json(raw);
       if (!events.empty()) {
         Value status = Core::provider_classify_stream_error_status(profile_, events[0]);
-        if (!status.is_null() && Core::truthy(Core::is_retryable_status(status)) && attempt < max_retries) {
-          ++attempt;
-          double delay = std::min(initial_delay * std::pow(backoff, attempt - 1), max_delay);
-          if (delay > 0) std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<long>(delay)));
+        if (!status.is_null() && Core::truthy(Core::retry_status_listed(retry_cfg, status)) && start_attempt < max_retries) {
+          ++start_attempt;
+          ax_request_retry_sleep(std::min(initial_delay * std::pow(backoff, start_attempt - 1), max_delay));
           continue;
         }
       }
       Value state = Value::object();
       Value results = Value::array();
       for (const auto& event : events) {
-        Core::append(results, Core::provider_normalize_stream_delta(profile_, event, state, name_, model));
+        Core::append(results, Core::provider_normalize_stream_delta(profile_, event, state, name_, model, response_context));
       }
       return Value(Object{{"results", results}});
     }
@@ -3088,14 +5414,27 @@ Value OpenAICompatibleClient::do_chat(Value request, Value options) {
   Value model = Core::coalesce(Core::get(request, "model"), Core::coalesce(Core::get(payload, "model"), model_));
   std::string endpoint = operation_path("chat", model);
   Value raw = context_cache_chat(request, options, payload, model, endpoint);
-  if (raw.is_null()) raw = request_json(endpoint, payload, false, "json", false, operation_method("chat"));
-  return Core::provider_normalize_chat_response(profile_, raw, name_, model);
+  if (raw.is_null()) raw = request_json_retried(endpoint, payload, operation_method("chat"), options);
+  return Core::provider_normalize_chat_response(profile_, raw, name_, model, profile_ == "openai-decisions" ? Core::decisions_response_context(payload, options, request) : profile_ == "typesafe" ? Core::typesafe_response_context(payload, options, request) : response_context);
+}
+
+void OpenAICompatibleClient::validate_chat_request(Value request) const {
+  Value req = Core::get(resolve_model_key_request(Core::coerce_chat_request(parse_json(stringify(request))), Value(), false), "request");
+  Core::set(req, "model", Core::coalesce(Core::get(req, "model"), model_));
+  Core::set(req, "model_config", Core::merge_model_config(model_config_, Core::get(req, "model_config"), options_));
+  Core::provider_validate_chat_request(profile_, req, options_);
+}
+static bool service_accepts_request_cpp(const std::shared_ptr<AxAIService>& service, Value request) {
+  try { service->validate_chat_request(request); return true; }
+  catch (const AxError&) { return false; }
 }
 
 Value OpenAICompatibleClient::do_embed(Value request, Value options) {
+  AxCallOptionsScope call_scope(options);
   Value payload = Core::provider_build_embed_request(profile_, request, options);
   Value model = Core::coalesce(Core::get(request, "embed_model"), Core::coalesce(Core::get(request, "embedModel"), Core::coalesce(Core::get(payload, "model"), embed_model_)));
-  Value raw = request_json(operation_path("embed", model), payload, false, "json", false, operation_method("embed"));
+  std::string embed_url = str(Core::provider_embed_url(profile_, model, options));
+  Value raw = request_json_retried(embed_url.empty() ? operation_path("embed", model) : embed_url, payload, operation_method("embed"), options);
   return Core::provider_normalize_embed_response(profile_, raw, name_, model);
 }
 
@@ -3173,38 +5512,63 @@ class IncrementalSSEDecoder {
 };
 
 static bool stream_error_retryable(const AxError& error) {
-  if (error.type == "AxAIServiceAuthenticationError") return false;
+  if(auto token=current_cancellation_token();token&&token->is_cancelled())return false;
+  if (error.type == "AxAIServiceAuthenticationError" || error.type == "AxAIServiceAbortedError") return false;
   if (error.type == "AxAIServiceStatusError") return Core::truthy(Core::is_retryable_status(error.status));
   return error.retryable || error.category == "network" || error.type == "AxAIServiceNetworkError" || error.type == "AxAIServiceResponseError" || error.type == "AxAIServiceStreamTerminatedError" || error.type == "AxAIServiceTimeoutError";
 }
 
 void OpenAICompatibleClient::stream_each(Value request, AxStreamHandler handler) {
+  stream_each(std::move(request), std::move(handler), Value());
+}
+
+// options are the stream call options; null means none (stream_each(request, handler)).
+void OpenAICompatibleClient::stream_each(Value request, AxStreamHandler handler, Value options) {
+  if (options.is_object()) check_call_options(options);
+  Value resolved = resolve_model_key_request(Core::coerce_chat_request(std::move(request)), options, false);
+  request = Core::get(resolved, "request");
+  Value call_options = Core::get(resolved, "options");
+  bool has_call_options = options.is_object() || !object_ref(call_options).empty();
+  if(!Core::truthy(Core::get(get_features(Core::get(request,"model")),"streaming",true))) { handler(has_call_options ? chat(request, Core::map_merge(call_options, object({{"stream", false}}))) : chat(request)); return; }
+  Value stream_options = Core::map_merge(call_options, object({{"stream", true}}));
   Value req = Core::coerce_chat_request(std::move(request));
-  Value config = Core::merge_model_config(model_config_, Core::get(req, "model_config"), Value(Object{{"stream", true}}));
+  Value config = Core::merge_model_config(model_config_, Core::get(req, "model_config"), stream_options);
   Core::set(config, "stream", true);
   Value model = Core::coalesce(Core::get(req, "model"), model_);
   Core::set(req, "model", model);
   Core::set(req, "model_config", config);
   Core::validate_chat_request(req);
+  // Expensive-model gate, as in chat(), before any request: only the stream call
+  // options (or the model-key entry) confirm; the client's own options do not.
+  Core::provider_require_expensive_model_confirmation(Value(model_catalog_provider()), Value(display(model)), options_, call_options);
   last_used_chat_model_ = model;
   last_used_model_config_ = config;
-  Value merged_options = merge_usage_options(options_, object({{"stream", true}}));
+  Value merged_options = merge_usage_options(options_, stream_options);
   AxRuntimeHooks hooks = effective_runtime_hooks({}, *std::atomic_load(&runtime_hooks_));
   Value attributes = object({{"ax.operation", "chat"}, {"ax.ai", name_}, {"ax.model", display(model)}, {"ax.streaming", true}});
   std::shared_ptr<AxSpan> parent = runtime_hook_frames.empty() ? nullptr : runtime_hook_frames.back().span;
   auto span = start_runtime_span(hooks, "ax_llm_chat", "client", attributes, parent);
-  record_runtime_metric(hooks.meter, "counter", "ax_llm_requests_total", 1, attributes);
+  record_runtime_metric(hooks.meter, "counter", "ax_llm_requests_total", 1, with_custom_labels(attributes, options_, call_options, false));
+  attributes = with_custom_labels(attributes, options_, call_options, true);
   auto started = std::chrono::steady_clock::now();
   bool cancelled = false;
   try {
     AxRequestExecutor next = [&]() {
+      AxCallOptionsScope call_scope(merged_options);
+      if (Core::truthy(Core::provider_should_use_realtime(profile_, model, req, merged_options))) {
+        Value final = realtime_chat(req, nullptr, [&](Value event) { if (!handler(event)) { cancelled = true; return false; } return true; });
+        if (!cancelled) handler(Core::provider_realtime_terminal_response(final));
+        return final;
+      }
       Value payload = Core::provider_build_chat_request(profile_, req, merged_options);
+      Value response_context = Core::provider_response_context(payload, Core::get(req, "model_config", Value::object()), merged_options);
       Value retry_cfg = Core::resolve_stream_retry(merged_options);
       int max_retries = static_cast<int>(num(Core::get(retry_cfg, "max_retries", 3)));
       double initial_delay = num(Core::get(retry_cfg, "initial_delay_ms", 1000));
       double max_delay = num(Core::get(retry_cfg, "max_delay_ms", 60000));
       double backoff = num(Core::get(retry_cfg, "backoff_factor", 2));
-      int attempt = 0;
+      int start_attempt = 0;
+      int open_attempt = 0;
       while (true) {
         Value results = Value::array();
         Value state = Value::object();
@@ -3212,28 +5576,61 @@ void OpenAICompatibleClient::stream_each(Value request, AxStreamHandler handler)
         bool first_event = true;
         bool received_event = false;
         bool delivered = false;
+        bool provider_error = false;
         bool retry_requested = false;
+        bool response_started = false;
+        std::string retry_after;
+        ax_transport_response_started = false;
+        ax_transport_retry_after.clear();
         Value call = build_request(operation_path("stream_chat", model), payload, true, "json", false, operation_method("stream_chat"));
         IncrementalSSEDecoder decoder([&](Value event) {
           received_event = true;
           if (first_event) {
             first_event = false;
+            // TS retryTransientStreamStart: a first event with a listed
+            // status goes out again, with its own budget and without jitter.
             Value status = Core::provider_classify_stream_error_status(profile_, event);
-            if (!status.is_null() && Core::truthy(Core::is_retryable_status(status)) && attempt < max_retries) {
+            if (!status.is_null() && Core::truthy(Core::retry_status_listed(retry_cfg, status)) && start_attempt < max_retries) {
               retry_requested = true;
               return false;
             }
           }
-          Value normalized = Core::provider_normalize_stream_delta(profile_, event, state, name_, model);
+          Value normalized;
+          try {
+            normalized = Core::provider_normalize_stream_delta(profile_, event, state, name_, model, response_context);
+          } catch (const AxError&) {
+            provider_error = true;
+            throw;
+          }
           Core::append(results, normalized);
           if (!Core::get(normalized, "model_usage", Core::get(normalized, "modelUsage")).is_null()) last_usage_response = normalized;
           delivered = true;
           if (!handler(normalized)) { cancelled = true; return false; }
           return true;
         });
+        // As TS's apiCall, a verbose call logs the request and that its stream
+        // started (with the first chunk).
+        bool verbose = verbose_enabled(merged_options);
+        bool stream_logged = false;
+        if (verbose) log_verbose_request(call);
         auto consume = [&](Value chunk) {
           Value raw = chunk;
-          if (raw.is_object() && has_key(raw, "status")) raw = transport_result(raw, call);
+          Value status = transport_status(chunk);
+          if (raw.is_object() && has_key(raw, "status")) {
+            if (num(Core::get(raw, "status", 200)) >= 400) {
+              for (const auto& entry : object_ref(Core::get(raw, "headers", Value::object()))) {
+                std::string name = entry.first;
+                for (char& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (name == "retry-after") retry_after = display(entry.second);
+              }
+            }
+            raw = transport_result(raw, call, merged_options);
+          }
+          response_started = true;
+          if (verbose && !stream_logged) {
+            stream_logged = true;
+            verbose_log(Core::ai_verbose_stream_log(status));
+          }
           if (raw.is_array()) {
             for (const auto& event : array_ref(raw)) {
               if (display(event) == "[DONE]") return false;
@@ -3245,20 +5642,37 @@ void OpenAICompatibleClient::stream_each(Value request, AxStreamHandler handler)
           return decoder.feed(display(raw));
         };
         try {
-          transport_->stream(call, consume);
+          transport_->stream(call, consume, current_cancellation_token());
           if (!retry_requested && !cancelled && !decoder.done_marker()) decoder.finish();
-        } catch (const AxError& error) {
-          // Retry transport/open failures before any SSE event. Once a provider
-          // event exists, its normalized error is authoritative unless the
-          // explicit transient-status classifier above requested a retry.
-          if (!received_event && !delivered && stream_error_retryable(error) && attempt < max_retries) retry_requested = true;
-          else if (delivered) throw AxError("response", error.what(), "AxAIServiceStreamTerminatedError", error.status, error.code, true, error.response_body);
-          else throw;
+        } catch (AxError& caught) {
+          if (caught.type == "AxAIServiceAbortedError") throw;
+          if (auto token = current_cancellation_token(); token && token->is_cancelled()) throw AxAIServiceAbortedError(token->reason());
+          if (provider_error) throw;
+          // A custom transport's untyped network failure is TS's network
+          // error, as request_json makes it. The HTTP transport's own status,
+          // network and timeout errors keep the request as TypeScript's do.
+          AxError error = caught.category == "network" && caught.type.empty() ? ax_transport_network_error(caught, call, merged_options) : caught;
+          attach_error_request(error, call, merged_options);
+          // The stream's request goes through apiCall's request-layer retry.
+          // Once its response began, a failure to read it surfaces, as TS
+          // reads a stream's body after apiCall returns.
+          bool started = response_started || received_event || delivered || ax_transport_response_started;
+          if (retry_after.empty()) retry_after = ax_transport_retry_after;
+          if (!started && ax_request_retry_wait(retry_cfg, open_attempt, error, retry_after)) {
+            ++open_attempt;
+            continue;
+          }
+          if (delivered) {
+            AxError terminated("response", error.what(), "AxAIServiceStreamTerminatedError", error.status, error.code, true, error.response_body);
+            terminated.url = error.url;
+            terminated.request_body = error.request_body;
+            throw terminated;
+          }
+          throw error;
         }
         if (retry_requested) {
-          ++attempt;
-          double delay = std::min(initial_delay * std::pow(backoff, attempt - 1), max_delay);
-          if (delay > 0) std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<long>(delay)));
+          ++start_attempt;
+          ax_request_retry_sleep(std::min(initial_delay * std::pow(backoff, start_attempt - 1), max_delay));
           continue;
         }
         Value response = object({{"results", results}});
@@ -3297,22 +5711,63 @@ std::vector<Value> OpenAICompatibleClient::stream(Value request) {
 
 Value OpenAICompatibleClient::transcribe(Value request) {
   Value payload = Core::provider_build_transcribe_request(profile_, request);
-  Value model = Core::get(request, "model", model_);
-  std::string body_key = str(Core::get(Core::provider_operation_descriptor(profile_, "transcribe"), "body", "json")) == "multipart" ? "data" : "json";
-  Value raw = request_json(operation_path("transcribe", model), payload, false, body_key, false, operation_method("transcribe"));
-  return Core::provider_normalize_transcribe_response(profile_, raw);
+  Value descriptor = Core::provider_operation_descriptor(profile_, "transcribe");
+  Value model = Core::get(request, "model", Core::get(descriptor, "defaultModel", model_));
+  std::string body_key = str(Core::get(descriptor, "body", "json")) == "multipart" ? "data" : "json";
+  std::string endpoint = operation_path("transcribe", model);
+  Value query = Core::get(payload, "query");
+  if (!query.is_null()) {
+    std::string session = str(Core::get(query, "sessionId", Value("")));
+    if (!session.empty()) endpoint += (endpoint.find('?') == std::string::npos ? "?" : "&") + std::string("sessionId=") + session;
+    object_mut(payload).erase("query");
+  }
+  Value raw = request_json(endpoint, payload, false, body_key, false, operation_method("transcribe"));
+  if (profile_ == "meta" && raw.is_string()) raw = object({{"events", Value(iter_sse_json(raw))}});
+  return Core::provider_normalize_transcribe_response(profile_, raw, request);
 }
 
 Value OpenAICompatibleClient::speak(Value request) {
   Value payload = Core::provider_build_speak_request(profile_, request);
-  Value model = Core::get(request, "model", model_);
   Value descriptor = Core::provider_operation_descriptor(profile_, "speak");
+  Value model = Core::get(request, "model", Core::get(descriptor, "defaultModel", model_));
   std::string body_key = str(Core::get(descriptor, "body", "json")) == "multipart" ? "data" : "json";
   // OpenAI /audio/speech returns raw binary audio (mp3); the transport returns
-  // it as base64 instead of JSON-parsing, and the normalizer reads raw["audio"].
+  // it as base64 with its Content-Type, as TS's axFetchJsonSpeech reads it,
+  // and a JSON body (by its Content-Type) parsed.
   bool binary = str(Core::get(descriptor, "response", Value(""))) == "binary";
-  Value raw = request_json(operation_path("speak", model), payload, false, body_key, binary, operation_method("speak"));
-  return Core::provider_normalize_speak_response(profile_, raw, request);
+  Value call = build_request(operation_path("speak", model), payload, false, body_key, binary, operation_method("speak"));
+  if (transport_ == nullptr) throw Core::as_error(Core::ai_error_unsupported("C++ HTTP transport is not available; build with AXLLM_ENABLE_CURL=ON or pass a custom Transport"));
+  Value result;
+  try {
+    result = transport_->call(call, current_cancellation_token());
+  } catch (AxError& error) {
+    // A transport failure keeps the request as TypeScript's network and
+    // timeout errors do.
+    if (error.category == "network" && error.type.empty()) throw ax_transport_network_error(error, call, options_);
+    if (error.category == "network" || error.type == "AxAIServiceNetworkError" || error.type == "AxAIServiceTimeoutError") attach_error_request(error, call, options_);
+    throw;
+  }
+  std::string content_type = transport_content_type(result);
+  Value raw = transport_result(result, call, options_);
+  if (raw.is_string() && content_type.find("application/json") != std::string::npos) raw = Core::json_parse(raw);
+  return Core::provider_normalize_speak_response(profile_, raw, request, content_type.empty() ? Value() : Value(content_type));
+}
+
+// The Content-Type a transport response names: the curl transport's
+// contentType, or a Content-Type header.
+std::string OpenAICompatibleClient::transport_content_type(Value result) {
+  if (!result.is_object()) return "";
+  Value direct = Core::get(result, "contentType");
+  if (direct.is_string() && !str(direct).empty()) return str(direct);
+  Value headers = Core::get(result, "headers");
+  if (!headers.is_object()) return "";
+  for (const auto& entry : object_ref(headers)) {
+    if (entry.first == "__order") continue;
+    std::string key = entry.first;
+    for (auto& ch : key) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    if (key == "content-type") return str(entry.second);
+  }
+  return "";
 }
 
 std::vector<Value> OpenAICompatibleClient::realtime(Value events) {
@@ -3334,7 +5789,8 @@ namespace {
 
 bool realtime_event_is_ready(const Value& event) {
   std::string type = str(Core::get(event, "type", Value("")));
-  if (type == "session.created" || type == "session.updated" || type == "transcription_session.created" || type == "transcription_session.updated") return true;
+  if (type.empty() && !Core::get(event, "sessionId").is_null()) return true;
+  if (type == "session.created" || type == "session.updated" || type == "transcription_session.created" || type == "transcription_session.updated" || type == "ready" || type == "sessionStarted") return true;
   return !Core::get(event, "setupComplete").is_null();
 }
 
@@ -3342,7 +5798,9 @@ bool realtime_event_is_done(const Value& event) {
   std::string type = str(Core::get(event, "type", Value("")));
   if (type == "response.done" || type == "response.completed") return true;
   Value server_content = Core::get(event, "serverContent");
-  return !server_content.is_null() && Core::truthy(Core::get(server_content, "turnComplete", Value(false)));
+  // Extended thinking ends an acknowledgement turn IN_PROGRESS and answers in the next turn.
+  return !server_content.is_null() && Core::truthy(Core::get(server_content, "turnComplete", Value(false))) &&
+         str(Core::get(server_content, "interactionStatus", Value(""))) != "IN_PROGRESS";
 }
 
 struct RealtimeWsTarget {
@@ -3350,10 +5808,10 @@ struct RealtimeWsTarget {
   std::vector<std::pair<std::string, std::string>> headers;
 };
 
-RealtimeWsTarget realtime_ws_target(const std::string& profile, const std::string& api_key, const std::string& model) {
+RealtimeWsTarget realtime_ws_target(const std::string& profile, const std::string& api_key, const std::string& model, const Value& options) {
   // Grammar-specific URL + auth construction lives in Core so the client stays
   // provider-agnostic.
-  Value result = Core::provider_realtime_ws_url(Value(profile), Value(model), Value(api_key));
+  Value result = Core::provider_realtime_ws_url(Value(profile), Value(model), Value(api_key), options);
   RealtimeWsTarget target;
   target.url = str(Core::get(result, "url", Value("")));
   Value headers = Core::get(result, "headers");
@@ -3369,7 +5827,7 @@ RealtimeWsTarget realtime_ws_target(const std::string& profile, const std::strin
 // thread (mirrors the Transport/HTTP split, gated by AXLLM_ENABLE_REALTIME).
 class WsRealtimeTransport : public RealtimeTransport {
  public:
-  WsRealtimeTransport(const std::string& url, const std::vector<std::pair<std::string, std::string>>& headers) {
+  WsRealtimeTransport(const std::string& url, const std::vector<std::pair<std::string, std::string>>& headers, bool idle_timeout = true) : idle_timeout_(idle_timeout) {
     socket_.setUrl(url);
     ix::WebSocketHttpHeaders ws_headers;
     for (const auto& header : headers) ws_headers[header.first] = header.second;
@@ -3378,51 +5836,103 @@ class WsRealtimeTransport : public RealtimeTransport {
     socket_.setOnMessageCallback([this](const ix::WebSocketMessagePtr& message) {
       std::lock_guard<std::mutex> lock(mutex_);
       if (message->type == ix::WebSocketMessageType::Message) queue_.push_back(message->str);
-      else if (message->type == ix::WebSocketMessageType::Close || message->type == ix::WebSocketMessageType::Error) closed_ = true;
+      else if (message->type == ix::WebSocketMessageType::Open) opened_ = true;
+      else if (message->type == ix::WebSocketMessageType::Close) {
+        closed_ = true;
+        if (message->closeInfo.code != 1000) error_ = "realtime WebSocket closed abnormally";
+      } else if (message->type == ix::WebSocketMessageType::Error) {
+        closed_ = true;
+        error_ = message->errorInfo.reason;
+      }
       cv_.notify_one();
     });
     socket_.start();
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (!cv_.wait_for(lock, std::chrono::seconds(10), [this] { return opened_ || closed_; }) || !opened_) {
+      lock.unlock();
+      socket_.stop();
+      throw Core::as_error(Core::ai_error_response("realtime WebSocket connection failed"));
+    }
   }
-  void send(const Value& event) override { socket_.send(str(Core::json_stringify(event))); }
+  void send(const Value& event) override {
+    if (str(Core::get(event, "type", Value(""))) == "binary") {
+      if (!socket_.sendBinary(axir_base64_decode(str(Core::get(event, "data", Value(""))))).success) throw AxError("network", "WebSocket send failed");
+    } else {
+      if (!socket_.send(str(Core::json_stringify(event))).success) throw AxError("network", "WebSocket send failed");
+    }
+  }
   bool recv(Value& out) override {
     std::unique_lock<std::mutex> lock(mutex_);
-    if (!cv_.wait_for(lock, std::chrono::seconds(30), [this] { return !queue_.empty() || closed_; })) return false;
-    if (queue_.empty()) return false;
+    if (!idle_timeout_) cv_.wait(lock, [this] { return !queue_.empty() || closed_; });
+    else if (!cv_.wait_for(lock, std::chrono::seconds(30), [this] { return !queue_.empty() || closed_; })) throw Core::as_error(Core::ai_error_response("realtime WebSocket timed out"));
+    if (queue_.empty()) {
+      if (!error_.empty()) throw Core::as_error(Core::ai_error_response(error_));
+      return false;
+    }
     std::string raw = queue_.front();
     queue_.pop_front();
     lock.unlock();
     out = parse_json(raw);
     return true;
   }
-  void close() override { socket_.stop(); }
+  void close() override { {std::lock_guard<std::mutex> lock(mutex_);closed_=true;cv_.notify_all();} socket_.stop(); }
 
  private:
+  bool idle_timeout_;
   ix::WebSocket socket_;
   std::mutex mutex_;
   std::condition_variable cv_;
   std::deque<std::string> queue_;
   bool closed_ = false;
+  bool opened_ = false;
+  std::string error_;
 };
 #endif
 
 }  // namespace
 
-ScriptedRealtimeTransport::ScriptedRealtimeTransport(std::vector<Value> inbound) : inbound_(std::move(inbound)) {}
-void ScriptedRealtimeTransport::send(const Value& event) { sent.push_back(event); }
+std::shared_ptr<RealtimeTransport> make_web_socket_transport(const std::string& url) {
+#if defined(AXLLM_ENABLE_REALTIME)
+  return std::make_shared<WsRealtimeTransport>(url,std::vector<std::pair<std::string,std::string>>{},false);
+#else
+  (void)url;
+  throw AxError("mcp","Build with AXLLM_ENABLE_REALTIME=ON or provide a WebSocket factory");
+#endif
+}
+
+ScriptedRealtimeTransport::ScriptedRealtimeTransport(std::vector<Value> inbound) : inbound_(std::move(inbound)) {
+  for (const auto& event : inbound_) if (!Core::get(event, "sessionId").is_null() && Core::get(event, "type").is_null()) meta_ = true;
+}
+void ScriptedRealtimeTransport::send(const Value& event) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  sent.push_back(event);
+  if (str(Core::get(event, "type", Value(""))) == "endStream") { ended_ = true; cv_.notify_all(); }
+}
+void ScriptedRealtimeTransport::close() { std::lock_guard<std::mutex> lock(mutex_); ended_ = true; cv_.notify_all(); }
 bool ScriptedRealtimeTransport::recv(Value& out) {
-  if (index_ >= inbound_.size()) return false;
+  if (index_ >= inbound_.size()) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (meta_ && !cv_.wait_for(lock, std::chrono::seconds(30), [&] { return ended_; })) throw Core::as_error(Core::ai_error_response("scripted realtime input did not finish"));
+    return false;
+  }
   out = inbound_[index_++];
   return true;
 }
 
-Value OpenAICompatibleClient::realtime_chat(Value request, RealtimeTransport* transport) {
+Value OpenAICompatibleClient::realtime_chat(Value request, RealtimeTransport* transport, AxStreamHandler handler) {
   std::string model = str(Core::get(request, "model", Value(model_)));
   Value setup = Core::provider_build_realtime_audio_setup(profile_, request, options_);
   Value inputs = Core::provider_build_realtime_audio_input(profile_, request);
+  if (profile_ == "meta" && credential_provider_) {
+    auto target = Core::provider_realtime_ws_url(profile_, model, api_key_, options_);
+    Value fresh = Value::object();
+    for (const auto& [key, value] : credential_provider_(AxCredentialRequest{profile_, "realtime", "WS", str(Core::get(target, "url"))})) Core::set(fresh, key, value);
+    setup = Core::provider_apply_realtime_credentials(setup, fresh);
+  }
   std::unique_ptr<RealtimeTransport> owned;
   if (transport == nullptr) {
 #if defined(AXLLM_ENABLE_REALTIME)
-    RealtimeWsTarget target = realtime_ws_target(profile_, api_key_, model);
+    RealtimeWsTarget target = realtime_ws_target(profile_, api_key_, model, options_);
     owned = std::make_unique<WsRealtimeTransport>(target.url, target.headers);
     transport = owned.get();
 #else
@@ -3432,32 +5942,82 @@ Value OpenAICompatibleClient::realtime_chat(Value request, RealtimeTransport* tr
   std::vector<Value> events;
   Value event;
   bool input_sent = false;
+  Value state = object({{"partial_mode", Core::get(setup, "partialMode")}});
+  std::atomic<bool> stop_sending{false};
+  std::atomic<bool> end_stream_sent{false};
+  bool output_cancelled = false;
+  std::thread sender;
+  std::exception_ptr send_error;
+  std::mutex pacing_mutex;
+  std::condition_variable pacing_cv;
+  auto stop_sender = [&] {
+    stop_sending = true;
+    pacing_cv.notify_all();
+    if (owned) transport->close();
+    if (sender.joinable()) sender.join();
+  };
   try {
     transport->send(setup);
     while (transport->recv(event)) {
       if (str(Core::get(event, "type", Value(""))) == "error") {
         Value error = Core::get(event, "error");
-        std::string message = error.is_null() ? "realtime error" : str(Core::get(error, "message", Value("realtime error")));
+        std::string nested = error.is_null() ? "realtime error" : str(Core::get(error, "message", Value("realtime error")));
+        std::string message = str(Core::get(event, "message", Value(nested)));
         throw Core::as_error(Core::ai_error_response(message));
       }
       if (realtime_event_is_ready(event)) {
+        Value session = Core::get(event, "sessionId");
+        if (!session.is_null()) Core::set(state, "session_id", session);
         if (!input_sent) {
           input_sent = true;
-          for (const auto& item : array_ref(inputs)) transport->send(item);
+          auto send_inputs = [&] {
+          try {
+          for (const auto& item : array_ref(inputs)) {
+            if (stop_sending) return;
+            if (!Core::get(setup, "audioEncoding").is_null() && str(Core::get(item, "type", Value(""))) == "binary") {
+              int rate = str(Core::get(setup, "audioEncoding", Value(""))) == "PCM_16KHZ" ? 16000 : 24000;
+              auto bytes = axir_base64_decode(str(Core::get(item, "data", Value(""))));
+              if (bytes.size() % 2 != 0) throw Core::as_error(Core::ai_error_response("PCM16 audio must contain complete 16-bit samples"));
+              std::size_t chunk_size = rate * 2 * 80 / 1000;
+              for (std::size_t offset = 0; offset < bytes.size(); offset += chunk_size) {
+                if (stop_sending) return;
+                auto chunk = bytes.substr(offset, chunk_size);
+                transport->send(object({{"type", "binary"}, {"data", axir_base64_encode(chunk)}}));
+                std::unique_lock<std::mutex> lock(pacing_mutex);
+                if (pacing_cv.wait_for(lock, std::chrono::duration<double>(chunk.size() / double(rate * 2)), [&] { return stop_sending.load(); })) return;
+              }
+            } else {
+              if (str(Core::get(item, "type", Value(""))) == "endStream") end_stream_sent = true;
+              transport->send(item);
+            }
+          }
+          } catch (...) {
+            send_error = std::current_exception();
+            transport->close();
+          }
+          };
+          if (!Core::get(setup, "audioEncoding").is_null()) sender = std::thread(send_inputs);
+          else send_inputs();
         }
         continue;
       }
+      if (!Core::get(setup, "audioEncoding").is_null() && !input_sent) throw Core::as_error(Core::ai_error_response("Meta Voice server did not acknowledge setup"));
       bool done = realtime_event_is_done(event);
-      events.push_back(event);
+      Value normalized = Core::provider_normalize_realtime_event(profile_, event, state, name_, model);
+      events.push_back(normalized);
+      if (handler && !handler(normalized)) { output_cancelled = true; break; }
       if (done) break;
     }
   } catch (...) {
-    if (owned) transport->close();
+    stop_sender();
+    if (send_error) std::rethrow_exception(send_error);
     throw;
   }
-  if (owned) transport->close();
+  stop_sender();
+  if (send_error) std::rethrow_exception(send_error);
 
-  Value state = Value::object();
+  if (!Core::get(setup, "audioEncoding").is_null() && !input_sent) throw Core::as_error(Core::ai_error_response("Meta Voice closed before acknowledging setup"));
+  if (!Core::get(setup, "audioEncoding").is_null() && !end_stream_sent && !output_cancelled) throw Core::as_error(Core::ai_error_response("Meta Voice closed before audio upload completed"));
   std::string content;
   std::string audio_bytes;
   bool has_audio = false;
@@ -3465,8 +6025,7 @@ Value OpenAICompatibleClient::realtime_chat(Value request, RealtimeTransport* tr
   std::string response_id;
   std::string finish_reason;
   Value model_usage;
-  for (const auto& folded_event : events) {
-    Value normalized = Core::provider_normalize_realtime_event(profile_, folded_event, state, name_, model);
+  for (const auto& normalized : events) {
     Array results = array_ref(Core::get(normalized, "results", Value::array()));
     if (results.empty()) continue;
     Value result_value = results[0];
@@ -3509,7 +6068,7 @@ Value OpenAICompatibleClient::realtime_chat(Value request, RealtimeTransport* tr
   Core::set(response, "results", results_array);
   Core::set(response, "remote_id", Value(response_id));
   Core::set(response, "model_usage", model_usage);
-  return response;
+  return Core::provider_finalize_realtime_response(profile_, state, response);
 }
 
 Value OpenAICompatibleClient::headers() const {
@@ -3518,9 +6077,8 @@ Value OpenAICompatibleClient::headers() const {
   if (str(Core::get(descriptor_, "auth")) == "bearer") Core::set(headers, "Authorization", "Bearer " + api_key_);
   if (str(Core::get(descriptor_, "auth")) == "anthropic_key" || str(Core::get(descriptor_, "auth")) == "x-api-key") Core::set(headers, "x-api-key", api_key_);
   if (str(Core::get(descriptor_, "auth")) == "api_key_header") Core::set(headers, str(Core::get(descriptor_, "apiKeyHeader", "api-key")), api_key_);
-  for (const auto& entry : object_ref(Core::get(descriptor_, "headers", Value::object()))) {
-    Core::set(headers, entry.first, str(entry.second));
-  }
+  headers = Core::provider_merge_headers(headers, Core::get(descriptor_, "headers", Value::object()));
+  headers = Core::provider_merge_headers(headers, Core::get(options_, "headers", Value::object()));
   return headers;
 }
 
@@ -3542,34 +6100,118 @@ std::string OpenAICompatibleClient::operation_method(const std::string& operatio
 }
 
 Value OpenAICompatibleClient::request_json(const std::string& endpoint, Value payload, bool stream, const std::string& body_key, bool binary_response, const std::string& method) {
+  return request_json(endpoint, std::move(payload), stream, body_key, binary_response, method, options_);
+}
+
+Value OpenAICompatibleClient::request_json(const std::string& endpoint, Value payload, bool stream, const std::string& body_key, bool binary_response, const std::string& method, Value error_options) {
+  return request_json_attempt(endpoint, std::move(payload), stream, body_key, binary_response, method, std::move(error_options), nullptr);
+}
+
+Value OpenAICompatibleClient::request_json_attempt(const std::string& endpoint, Value payload, bool stream, const std::string& body_key, bool binary_response, const std::string& method, Value error_options, std::string* retry_after) {
   Value call = build_request(endpoint, std::move(payload), stream, body_key, binary_response, method);
-  if (transport_ != nullptr) return transport_result(transport_->call(call), call);
-  throw Core::as_error(Core::ai_error_unsupported("C++ HTTP transport is not available; build with AXLLM_ENABLE_CURL=ON or pass a custom Transport"));
+  if (transport_ == nullptr) throw Core::as_error(Core::ai_error_unsupported("C++ HTTP transport is not available; build with AXLLM_ENABLE_CURL=ON or pass a custom Transport"));
+  // As TS's apiCall, a verbose call logs the request, then its JSON response
+  // or the stream's start.
+  bool verbose = verbose_enabled(error_options.is_object() ? error_options : options_);
+  if (verbose) log_verbose_request(call);
+  Value raw;
+  ax_transport_response_started = false;
+  try {
+    raw = transport_->call(call, current_cancellation_token());
+  } catch (AxError& error) {
+    // A transport failure keeps the request as TypeScript's network and
+    // timeout errors do.
+    if (error.category == "network" && error.type.empty()) throw ax_transport_network_error(error, call, error_options);
+    if (error.category == "network" || error.type == "AxAIServiceNetworkError" || error.type == "AxAIServiceTimeoutError") attach_error_request(error, call, error_options);
+    throw;
+  }
+  if (retry_after != nullptr) {
+    for (const auto& entry : object_ref(Core::get(raw, "headers", Value::object()))) {
+      std::string name = entry.first;
+      for (char& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      if (name == "retry-after") *retry_after = display(entry.second);
+    }
+  }
+  Value result = transport_result(raw, call, error_options);
+  if (verbose) verbose_log(stream ? Core::ai_verbose_stream_log(transport_status(raw)) : Core::ai_verbose_response_log(transport_status(raw), result));
+  return result;
+}
+
+// TS apiCall's request-layer retry around one request: a listed status or a
+// network failure goes out again after its jittered backoff (or its
+// Retry-After), under the call's retry options, else the client's. Each
+// retry builds the request again, as apiCall resolves its headers again. A
+// stream whose response began before its body failed is not retried: TS
+// reads a stream's body after apiCall returns.
+Value OpenAICompatibleClient::request_json_retried(const std::string& endpoint, Value payload, const std::string& method, Value error_options, bool stream) {
+  Value config = Core::resolve_stream_retry(error_options);
+  for (int attempt = 0; ; ++attempt) {
+    std::string retry_after;
+    try {
+      return request_json_attempt(endpoint, payload, stream, "json", false, method, error_options, &retry_after);
+    } catch (const AxError& error) {
+      if (auto token = current_cancellation_token(); token && token->is_cancelled()) throw;
+      if (stream && ax_transport_response_started) throw;
+      if (!ax_request_retry_wait(config, attempt, error, retry_after)) throw;
+    }
+  }
+}
+
+// The call's options can move the provider's base URL (a Vertex beta selects
+// v1beta1), as TS resolves it for each call. An explicit base_url or
+// OPENAI_BASE_URL still wins.
+static std::string ax_call_base_url(const std::string& profile, const Value& descriptor, const std::string& base_url) {
+  if (ax_current_call_options == nullptr || !ax_current_call_options->is_object()) return base_url;
+  Value descriptor_base = Core::get(descriptor, "baseUrl");
+  if (descriptor_base.is_null() || strip_trailing_slashes(str(descriptor_base)) != base_url) return base_url;
+  Value resolved = Core::get(Core::provider_resolve_descriptor(profile, *ax_current_call_options), "baseUrl");
+  return resolved.is_null() ? base_url : strip_trailing_slashes(str(resolved));
+}
+
+void OpenAICompatibleClient::check_call_options(const Value& call_options) {
+  (void)call_options;
 }
 
 Value OpenAICompatibleClient::build_request(const std::string& endpoint, Value payload, bool stream, const std::string& body_key, bool binary_response, const std::string& method) {
   Value call = Value::object();
   Core::set(call, "method", method.empty() ? "POST" : method);
   bool absolute = endpoint.rfind("http://", 0) == 0 || endpoint.rfind("https://", 0) == 0;
-  Core::set(call, "url", absolute ? endpoint : base_url_ + endpoint);
+  Core::set(call, "url", absolute ? endpoint : ax_call_base_url(profile_, descriptor_, base_url_) + endpoint);
   Value resolved_headers = headers();
+  if (profile_ == "typesafe") resolved_headers = Core::provider_merge_headers(resolved_headers, Core::typesafe_image_headers(payload));
+  if (profile_ == "meta" && body_key == "data" && !binary_response) Core::set(resolved_headers, "Accept", "text/event-stream");
   std::string request_url = str(Core::get(call, "url"));
   std::string operation = stream ? "stream_chat" : "chat";
   if (!stream && body_key == "data") operation = binary_response ? "speak" : "transcribe";
   if (!stream && endpoint.find("embedding") != std::string::npos) operation = "embed";
   if (!stream && str(Core::get(descriptor_, "transport")) == "openai-responses") operation = "responses";
+  if (profile_ == "typesafe" && endpoint == "/v1/models") operation = "models";
   if (credential_provider_) {
-    for (const auto& [key, value] : credential_provider_(AxCredentialRequest{profile_, operation, method, request_url})) {
-      Core::set(resolved_headers, key, value);
-    }
+    Value fresh = Value::object();
+    for (const auto& [key, value] : credential_provider_(AxCredentialRequest{profile_, operation, method, request_url})) Core::set(fresh, key, value);
+    resolved_headers = Core::provider_merge_headers(resolved_headers, fresh);
   }
   Core::set(call, "headers", resolved_headers);
-  Core::set(call, body_key.empty() ? "json" : body_key, payload);
+  if (method != "GET" && method != "HEAD") Core::set(call, body_key.empty() ? "json" : body_key, payload);
   Core::set(call, "stream", stream);
   // Signals the transport to return the raw body as base64 instead of JSON.
   if (binary_response) Core::set(call, "binary", Value(true));
   Core::set(call, "timeout", timeout_seconds_);
-  if ((api_key_.empty() || api_key_ == "null") && !credential_provider_) throw Core::as_error(Core::ai_error_auth("api_key or credential_provider is required", Value(), Value(), Value(), call));
+  // The chat, stream or embed call's timeoutMs (TS's per-call timeout, in
+  // milliseconds) bounds the wait for the response headers.
+  if (ax_current_call_options != nullptr) {
+    Value timeout_ms = Core::provider_call_timeout_ms(*ax_current_call_options);
+    if (!timeout_ms.is_null()) Core::set(call, "timeout_ms", timeout_ms);
+  }
+  if ((api_key_.empty() || api_key_ == "null") && !credential_provider_) {
+    // A credential provider can still be attached after construction, so a
+    // missing key fails here, before anything is sent. The error carries no
+    // request, so no credentials.
+    std::string message = Core::truthy(Core::get(descriptor_, "authRequired", false))
+        ? str(Core::provider_missing_api_key_message(profile_))
+        : std::string("api_key or credential_provider is required");
+    throw Core::as_error(Core::ai_error_auth(message, Value(), Value(), Value(), Value()));
+  }
   return call;
 }
 
@@ -3579,7 +6221,7 @@ std::string OpenAICompatibleClient::operation_path(const std::string& operation)
 
 std::string OpenAICompatibleClient::operation_path(const std::string& operation, Value model) const {
   Value operation_descriptor = Core::get(Core::get(descriptor_, "operations", Value::object()), operation, Value::object());
-  std::string path = str(Core::get(operation_descriptor, "path", "/" + operation));
+  std::string path = str(Core::provider_chat_operation_path(profile_, model, operation, Core::get(operation_descriptor, "path", "/" + operation)));
   if (!model.is_null()) {
     std::string token = "{model}";
     std::string::size_type pos = 0;
@@ -3588,21 +6230,19 @@ std::string OpenAICompatibleClient::operation_path(const std::string& operation,
       pos += str(model).size();
     }
   }
-  if (str(Core::get(descriptor_, "auth")) == "api_key_query") {
-    std::string key = str(Core::get(descriptor_, "apiKeyQuery", "key"));
-    path += (path.find('?') == std::string::npos ? "?" : "&") + url_component(key) + "=" + url_component(api_key_);
-  }
   if (!api_version_.empty() && api_version_ != "null") {
     path += (path.find('?') == std::string::npos ? "?" : "&") + std::string("api-version=") + url_component(api_version_);
   }
   return path;
 }
 
-Value OpenAICompatibleClient::transport_result(Value result, Value request) {
-  if (result.is_object() && has_key(result, "status")) {
+// The request is not passed on: its headers hold the API key or credential
+// tokens, and a thrown AxError has no request field.
+Value OpenAICompatibleClient::transport_result(Value result, Value request, Value options) {
+  if (result.is_object() && Core::get(result, "status").is_number()) {
     int status = static_cast<int>(num(Core::get(result, "status", 200)));
     Value body = Core::get(result, "json", Core::get(result, "body", Core::get(result, "data")));
-    if (status >= 400) throw Core::as_error(Core::openai_normalize_error(status, body, request));
+    if (status >= 400) throw Core::as_error(Core::openai_normalize_error(status, body, request, options));
     return body;
   }
   return result;
@@ -3660,19 +6300,32 @@ std::vector<Value> OpenAICompatibleClient::iter_sse_json(Value raw) {
 }
 
 Tool::Tool(std::string name_, std::string description_, Value parameters_, std::function<Value(Value)> handler_, Value args_, Value returns_)
-    : id(pointer_id(this)),
+    : id(next_tool_id()),
       name(std::move(name_)),
       description(std::move(description_)),
       parameters(std::move(parameters_)),
       args(std::move(args_)),
       returns(std::move(returns_)),
       handler(std::move(handler_)) {
+  std::lock_guard<std::mutex> lock(tool_registry_mutex());
   tool_registry()[id] = handler ? handler : [](Value) { return Value(); };
+}
+
+Tool& Tool::context_handler(std::function<Value(Value,const AxToolContext&)> callback){
+  std::lock_guard<std::mutex> lock(tool_registry_mutex());
+  contextual_tool_registry()[id]=callback;
+  handler=[callback](Value args){return callback(args,AxToolContext{std::make_shared<std::atomic<bool>>(false),""});};
+  tool_registry()[id]=handler;return *this;
+}
+Tool& Tool::execution(const std::string& mode) {
+  if (mode != "blocking" && mode != "background") throw std::invalid_argument("Tool execution must be blocking or background");
+  execution_mode = mode; return *this;
 }
 
 Value Tool::value() const {
   return Value(Object{
       {"__tool_id", id},
+      {"execution", execution_mode},
       {"name", name},
       {"description", description},
       {"parameters", parameters},
@@ -3695,7 +6348,17 @@ AxMemory& AxMemory::add_response(Value response) {
   Core::set(items_, "items", items);
   return *this;
 }
-AxMemory& AxMemory::update_result(Value response) { return add_response(std::move(response)); }
+AxMemory& AxMemory::update_result(Value response) {
+  auto items = array_ref(Core::get(items_, "items", Value::array()));
+  for (auto it = items.rbegin(); it != items.rend(); ++it) {
+    if (str(Core::get(*it, "role", "")) == "assistant") {
+      Core::set(*it, "response", Core::ai_merge_replay_metadata(Core::get(*it, "response"), response));
+      Core::set(items_, "items", Value(items));
+      return *this;
+    }
+  }
+  return add_response(std::move(response));
+}
 AxMemory& AxMemory::add_function_results(Value results) {
   Value items = Core::get(items_, "items", Value::array());
   Core::append(items, Value(Object{{"role", "function"}, {"results", results.is_array() ? results : Value(Array{results})}, {"tags", Value::array()}}));
@@ -3768,6 +6431,8 @@ AxGen::AxGen(Value signature, Value options, AxRuntimeHooks hooks)
   Core::set(state_, "assertions", Core::get(options, "assertions", Value::array()));
   Core::set(state_, "streaming_assertions", Core::get(options, "streaming_assertions", Core::get(options, "streamingAssertions", Value::array())));
   Core::set(state_, "field_processors", Core::get(options, "field_processors", Core::get(options, "fieldProcessors", Value::array())));
+  Core::set(state_, "feedback_processors", Core::get(options, "feedback_processors", Core::get(options, "feedbackProcessors", Value::array())));
+  Core::set(state_, "streaming_field_processors", Core::get(options, "streaming_field_processors", Core::get(options, "streamingFieldProcessors", Value::array())));
   Core::set(state_, "stop_functions", Core::get(options, "stop_functions", Core::get(options, "stopFunctions", Value::array())));
   Core::set(state_, "program_id", Core::get(options, "id", Core::get(options, "program_id", Core::get(options, "programId", Value("root")))));
   Core::set(state_, "instruction", Core::get(options, "instruction", Value("")));
@@ -3812,12 +6477,42 @@ AxGen& AxGen::set_sample_count(int sample_count) {
   return *this;
 }
 
+// The program's tool result formatter, as TS's functionResultFormatter
+// option; options another AxGen shares are copied, not changed.
+AxGen& AxGen::set_function_result_formatter(AxFunctionResultFormatter formatter) {
+  std::optional<AxFunctionResultFormatterHandle> handle;
+  if (formatter) handle.emplace(std::move(formatter));
+  Value options(object_ref(Core::get(state_, "options", Value::object())));
+  Core::map_delete(options, "functionResultFormatter");
+  Core::map_delete(options, "function_result_formatter");
+  if (handle) Core::set(options, "functionResultFormatter", handle->value());
+  Core::set(state_, "options", options);
+  function_result_formatter_ = std::move(handle);
+  return *this;
+}
+
 AxGen& AxGen::set_result_picker(std::function<int(const Value&)> result_picker) {
   std::string id = pointer_id(this) + ":result_picker:" + std::to_string(result_picker_registry().size());
   result_picker_registry()[id] = std::move(result_picker);
   Value options = Core::get(state_, "options", Value::object());
   Core::set(options, "resultPicker", object({{"__result_picker_id", id}}));
   Core::set(state_, "options", options);
+  return *this;
+}
+
+// The AxGen's own caching function is its options' caching_function, as the
+// TypeScript constructor option; options another AxGen shares are copied, not
+// changed.
+AxGen& AxGen::set_caching_function(AxCachingFunction fn) {
+  std::optional<AxCachingFunctionHandle> handle;
+  if (fn) handle.emplace(std::move(fn));
+  Value options(object_ref(Core::get(state_, "options", Value::object())));
+  Core::map_delete(options, "cachingFunction");
+  Core::map_delete(options, "caching_function");
+  if (handle) Core::set(options, "caching_function", handle->value());
+  Core::set(state_, "options", options);
+  caching_function_ = std::move(handle);
+  refresh_prompt_template();
   return *this;
 }
 
@@ -3836,6 +6531,17 @@ AxGen& AxGen::add_assert(std::function<Value(Value)> assertion) {
   return add_assert(spec);
 }
 
+// A false result fails with the message and is retried with a correction, as
+// TypeScript addAssert(fn, message) is; without a message it surfaces at once.
+AxGen& AxGen::add_assert(std::function<Value(Value)> assertion, std::string message) {
+  std::string id = pointer_id(this) + ":assert:" + std::to_string(assertion_registry().size());
+  assertion_registry()[id] = std::move(assertion);
+  Value spec = Value::object();
+  Core::set(spec, "__assertion_id", id);
+  Core::set(spec, "message", message);
+  return add_assert(spec);
+}
+
 AxGen& AxGen::add_streaming_assert(Value assertion) {
   Value assertions = Core::get(state_, "streaming_assertions", Value::array());
   Core::append(assertions, assertion);
@@ -3851,7 +6557,52 @@ AxGen& AxGen::add_streaming_assert(std::string field, std::string not_contains, 
   return add_streaming_assert(spec);
 }
 
-AxGen& AxGen::add_field_processor(std::string field, std::string op) {
+namespace {
+
+// The type name of the signature's output field (empty when it has none), or
+// nullopt when the signature has no such output field.
+std::optional<std::string> axgen_output_type(const Value& state, const std::string& field) {
+  for (const auto& item : array_ref(Core::get(Core::get(state, "signature"), "output_fields", Value::array()))) {
+    if (str(get_key(item, "name")) == field) return str(get_key(get_key(item, "type"), "name"));
+  }
+  return std::nullopt;
+}
+
+bool axgen_text_type(const std::string& type) { return type.empty() || type == "string" || type == "code"; }
+
+// The host form of an AxFieldProcessor: (value, {values, done}).
+std::function<Value(Value, Value)> axgen_field_processor_host(AxFieldProcessor processor) {
+  if (!processor) throw AxError("runtime", "addFieldProcessor: processor must be callable");
+  return [processor = std::move(processor)](Value value, Value context) {
+    AxFieldProcessorContext call_context;
+    call_context.values = Core::get(context, "values", Value::object());
+    call_context.done = Core::truthy(Core::get(context, "done"));
+    return processor(value, call_context);
+  };
+}
+
+}  // namespace
+
+// As TypeScript addStreamingAssert, the field must be a string or code output
+// field.
+AxGen& AxGen::add_streaming_assert(std::string field, std::function<Value(const std::string& text, bool done)> assertion, std::string message) {
+  auto type = axgen_output_type(state_, field);
+  if (!type) throw AxError("signature", "addStreamingAssert: field " + field + " not found in output signature");
+  if (!axgen_text_type(*type)) throw AxError("signature", "addStreamingAssert: field " + field + " must be a string field for streaming assertions");
+  if (!assertion) throw AxError("runtime", "addStreamingAssert: assertion must be callable");
+  std::string id = next_axgen_host_key("streaming_assertion");
+  {
+    std::lock_guard<std::mutex> lock(axgen_host_mutex);
+    axgen_streaming_checks[id] = [assertion = std::move(assertion)](Value text, bool done) { return assertion(str(text), done); };
+  }
+  Value spec = Value::object();
+  Core::set(spec, "field", std::move(field));
+  Core::set(spec, "__streaming_assertion_id", id);
+  if (!message.empty()) Core::set(spec, "message", std::move(message));
+  return add_streaming_assert(spec);
+}
+
+AxGen& AxGen::add_field_transform(std::string field, std::string op) {
   Value processors = Core::get(state_, "field_processors", Value::array());
   Value spec = Value::object();
   Core::set(spec, "field", std::move(field));
@@ -3861,15 +6612,32 @@ AxGen& AxGen::add_field_processor(std::string field, std::string op) {
   return *this;
 }
 
-AxGen& AxGen::add_field_processor(std::string field, std::function<Value(Value)> processor) {
+AxGen& AxGen::add_field_transform(std::string field, std::function<Value(Value)> transform) {
   std::string id = pointer_id(this) + ":processor:" + std::to_string(processor_registry().size());
-  processor_registry()[id] = std::move(processor);
+  processor_registry()[id] = std::move(transform);
   Value processors = Core::get(state_, "field_processors", Value::array());
   Value spec = Value::object();
   Core::set(spec, "field", std::move(field));
   Core::set(spec, "__processor_id", id);
   Core::append(processors, spec);
   Core::set(state_, "field_processors", processors);
+  return *this;
+}
+
+// As TypeScript addFieldProcessor, the field must be an output field.
+AxGen& AxGen::add_field_processor(std::string field, AxFieldProcessor processor, AxFieldProcessorMode mode) {
+  if (!axgen_output_type(state_, field)) throw AxError("signature", "addFieldProcessor: field " + field + " not found");
+  const char* key = mode == AxFieldProcessorMode::Feedback ? "feedback_processors" : "field_processors";
+  append_axgen_field_processor(state_, key, std::move(field), axgen_field_processor_host(std::move(processor)));
+  return *this;
+}
+
+// As in TypeScript, streaming processors run on string and code fields.
+AxGen& AxGen::add_streaming_field_processor(std::string field, AxFieldProcessor processor) {
+  auto type = axgen_output_type(state_, field);
+  if (!type) throw AxError("signature", "addFieldProcessor: field " + field + " not found");
+  if (!axgen_text_type(*type)) throw AxError("signature", "addFieldProcessor: field " + field + " must be a text field");
+  append_axgen_field_processor(state_, "streaming_field_processors", std::move(field), axgen_field_processor_host(std::move(processor)));
   return *this;
 }
 
@@ -4174,6 +6942,48 @@ static std::vector<Value> gepa_component_group(Value target, const std::vector<V
   return out;
 }
 
+// First non-null value among `keys`.
+static Value gepa_option(const Value& options, std::initializer_list<const char*> keys) {
+  for (const char* key : keys) {
+    Value value = Core::get(options, key);
+    if (!value.is_null()) return value;
+  }
+  return Value();
+}
+
+// options teacherOptions/teacher_options as an object ({} when unset).
+static Value gepa_teacher_options(const Value& options) {
+  Value teacher_options = gepa_option(options, {"teacherOptions", "teacher_options"});
+  return teacher_options.is_object() ? teacher_options : Value::object();
+}
+
+// Where a failed GEPA teacher call is reported: nowhere when options verbose is
+// false; else options logger, a register_agent_observer() marker since a Value
+// cannot hold a callable; else the student client's logger when the options carry
+// a Core::client_ref under studentAI/student_ai/student/client/ai; else nowhere.
+static std::function<void(Value)> gepa_teacher_logger(const Value& options) {
+  Value verbose = gepa_option(options, {"verbose"});
+  if (verbose.is_bool() && !Core::truthy(verbose)) return {};
+  Value logger = gepa_option(options, {"logger"});
+  if (!logger.is_null()) {
+    auto it = agent_observer_registry().find(str(Core::get(logger, "__agent_observer_id", Value(""))));
+    if (it != agent_observer_registry().end() && it->second) return it->second;
+    return {};
+  }
+  Value student = gepa_option(options, {"studentAI", "student_ai", "student", "client", "ai"});
+  if (auto* service = dynamic_cast<AxAIService*>(registered_client(str(Core::get(student, "__client_id", Value("")))))) {
+    std::function<void(std::string)> log = service->get_logger();
+    if (log) return [log](Value notification) { log(stringify(notification)); };
+  }
+  return {};
+}
+
+static void gepa_log_teacher_failure(const std::string& action, const std::string& error, const Value& options) {
+  std::function<void(Value)> logger = gepa_teacher_logger(options);
+  if (!logger) return;
+  logger(object({{"name", "Notification"}, {"id", "gepa_teacher"}, {"value", Value("GEPA teacher call failed while " + action + ": " + error)}}));
+}
+
 AxBootstrapFewShot::AxBootstrapFewShot(Value options) : options_(std::move(options)) {}
 std::string AxBootstrapFewShot::name() const { return "BootstrapFewShot"; }
 std::string AxBootstrapFewShot::version() const { return "axir-bootstrap-fewshot-v1"; }
@@ -4188,6 +6998,11 @@ Value AxBootstrapFewShot::optimize(Value request, OptimizerEvaluator* evaluator)
   int max_examples = std::max(1, gepa_int(Core::get(options, "maxExamples", Core::get(options, "max_examples", Value(16))), 16));
   int max_demos = std::max(1, gepa_int(Core::get(options, "maxDemos", Core::get(options, "max_demos", Value(4))), 4));
   int batch_size = std::max(1, gepa_int(Core::get(options, "batchSize", Core::get(options, "batch_size", Value(1))), 1));
+  // Demo runs forward with teacherOptions; explicit forward_options win.
+  Value teacher_options = gepa_teacher_options(options);
+  bool has_teacher_options = !Core::iter(Core::map_keys(teacher_options)).empty();
+  Value explicit_forward_options = Core::get(options, "forward_options");
+  if (!explicit_forward_options.is_object()) explicit_forward_options = Value::object();
   if (static_cast<int>(train.size()) > max_examples) train.resize(static_cast<size_t>(max_examples));
   Value base_cfg = gepa_current_map(Value(components));
   Value demos = Value::array();
@@ -4200,15 +7015,14 @@ Value AxBootstrapFewShot::optimize(Value request, OptimizerEvaluator* evaluator)
         std::string example_key = stable_stringify(train[static_cast<size_t>(i)]);
         if (accepted.count(example_key)) continue;
         Value eval_options = object({{"dataset", object({{"train", array({train[static_cast<size_t>(i)]})}, {"validation", Value::array()}})}, {"phase", "bootstrap"}, {"round", static_cast<double>(round)}});
+        if (has_teacher_options) Core::set(eval_options, "forward_options", Core::map_merge(teacher_options, explicit_forward_options));
         Value result = evaluator->evaluate(base_cfg, eval_options);
         std::vector<Value> rows = Core::iter(Core::get(result, "rows", Value::array()));
         total_calls += gepa_int(Core::get(result, "count", Value(static_cast<double>(rows.empty() ? 1 : rows.size()))), rows.empty() ? 1 : static_cast<int>(rows.size()));
         if (rows.empty()) continue;
         if (gepa_num(Core::get(rows[0], "scalar", Value(0)), 0) >= threshold) {
           accepted.insert(example_key);
-          Value traces = Value::array();
-          Core::append(traces, Core::get(rows[0], "prediction", Core::get(rows[0], "input", Value::object())));
-          Core::append(demos, object({{"programId", "root"}, {"traces", traces}}));
+          Core::append(demos, Core::_optimization_bootstrap_demo(rows[0]));
         }
       }
     }
@@ -4258,7 +7072,7 @@ Value AxGEPA::optimize(Value request, OptimizerEvaluator* evaluator) {
   int minibatch_size = std::max(1, gepa_int(Core::get(options, "minibatchSize", Core::get(options, "minibatch_size", Value(20))), 20));
   int early_stop = std::max(1, gepa_int(Core::get(options, "earlyStoppingTrials", Core::get(options, "early_stopping_trials", Value(5))), 5));
   double min_improvement = gepa_num(Core::get(options, "minImprovementThreshold", Core::get(options, "min_improvement_threshold", Value(0))), 0.0);
-  int pareto_size = std::min(1000, std::max(1, gepa_int(Core::get(options, "paretoSetSize", Core::get(options, "pareto_set_size", Value(std::max(10, std::min(200, minibatch_size * 3))))), 10)));
+  int pareto_size = gepa_int(Core::_gepa_pareto_set_size(options), 60);
   double tie_eps = gepa_num(Core::get(options, "tieEpsilon", Core::get(options, "tie_epsilon", Value(0))), 0.0);
   Value base_cfg = gepa_current_map(components);
   std::vector<Value> pareto_set(validation.begin(), validation.begin() + std::min(validation.size(), static_cast<size_t>(pareto_size)));
@@ -4276,22 +7090,28 @@ Value AxGEPA::optimize(Value request, OptimizerEvaluator* evaluator) {
   }
 
   int total_calls = 0;
-  auto evaluate = [&](Value cfg, const std::vector<Value>& examples, const std::string& phase, bool required, bool capture) -> Value {
-    if (total_calls + static_cast<int>(examples.size()) > max_calls) {
-      if (required) throw AxError("runtime", "AxGEPA: options.maxMetricCalls=" + std::to_string(max_calls) + " is too small to evaluate the initial Pareto set; need at least " + std::to_string(examples.size()) + " metric calls");
+  Value active_demos = Value::array();
+  auto evaluate = [&](Value cfg, const std::vector<Value>& examples, const std::string& phase, bool required, bool capture, int* separate_calls = nullptr, int separate_limit = 0) -> Value {
+    int& calls = separate_calls == nullptr ? total_calls : *separate_calls;
+    int limit = separate_calls == nullptr ? max_calls : separate_limit;
+    if (calls + static_cast<int>(examples.size()) > limit) {
+      if (required) throw AxError("runtime", "AxGEPA: options.maxMetricCalls=" + std::to_string(limit) + " is too small for " + phase + "; need at least " + std::to_string(calls + examples.size()) + " metric calls");
       return Value();
     }
     Value eval_options = Value::object();
     Core::set(eval_options, "dataset", gepa_dataset_for(examples));
     Core::set(eval_options, "phase", Value(phase));
     Core::set(eval_options, "captureTraces", Value(capture));
+    if (!Core::iter(active_demos).empty()) Core::set(eval_options, "demos", active_demos);
     Value result = evaluator->evaluate(cfg, eval_options);
-    total_calls += static_cast<int>(gepa_num(Core::get(result, "count", Value(static_cast<int>(examples.size()))), examples.size()));
+    int count = static_cast<int>(gepa_num(Core::get(result, "count", Value(static_cast<int>(examples.size()))), examples.size()));
+    calls += count;
     Value rows = Core::get(result, "rows", Value::array());
     Value scalars = Value::array();
     for (const auto& row : Core::iter(rows)) Core::append(scalars, Core::get(row, "scalar", Value(0)));
     Value out = Value::object();
     Core::set(out, "rows", rows);
+    Core::set(out, "count", count);
     Core::set(out, "avgScores", gepa_avg_vec(rows));
     Core::set(out, "avg", Core::get(result, "avg", Value(0)));
     Core::set(out, "sum", Core::get(result, "sum", Value(0)));
@@ -4299,7 +7119,13 @@ Value AxGEPA::optimize(Value request, OptimizerEvaluator* evaluator) {
     return out;
   };
 
-  Value demos = Value::array();
+  Value baseline_eval = Core::get(options, "_baselineEvaluation", Value());
+  if (baseline_eval.is_null()) baseline_eval = evaluate(base_cfg, pareto_set, "baseline evaluation", true, false);
+  else total_calls = gepa_int(Core::get(baseline_eval, "count", static_cast<int>(pareto_set.size())), static_cast<int>(pareto_set.size()));
+  baseline_evaluation_ = baseline_eval;
+  Value baseline_report = Core::_gepa_baseline_report(baseline_eval, options);
+  int bootstrap_calls = gepa_int(Core::get(options, "_bootstrapMetricCalls", 0), 0);
+  Value demos = Core::get(options, "_bootstrapDemos", Value::array());
   if (Core::truthy(Core::get(options, "bootstrap", Value(false)))) {
     Value bootstrap = Core::get(options, "bootstrap", Value::object());
     double threshold = gepa_num(Core::get(bootstrap, "scoreThreshold", Core::get(bootstrap, "score_threshold", Value(0.8))), 0.8);
@@ -4308,22 +7134,22 @@ Value AxGEPA::optimize(Value request, OptimizerEvaluator* evaluator) {
     int boot_calls = 0;
     for (const auto& example : train) {
       if (boot_calls >= max_boot_calls || static_cast<int>(Core::iter(demos).size()) >= max_demos) break;
-      Value boot_eval = evaluate(base_cfg, std::vector<Value>{example}, "bootstrap", false, false);
+      Value boot_eval = evaluate(base_cfg, std::vector<Value>{example}, "bootstrap", false, false, &bootstrap_calls, max_boot_calls);
       boot_calls += 1;
       if (boot_eval.is_null()) break;
       std::vector<Value> rows = Core::iter(Core::get(boot_eval, "rows", Value::array()));
       if (!rows.empty() && gepa_num(Core::get(rows[0], "scalar", Value(0)), 0.0) >= threshold) {
-        Value demo = Value::object();
-        Core::set(demo, "programId", Value("root"));
-        Value traces = Value::array();
-        Core::append(traces, Core::get(rows[0], "prediction", Core::get(rows[0], "input", Value::object())));
-        Core::set(demo, "traces", traces);
-        Core::append(demos, demo);
+        Core::append(demos, Core::_optimization_bootstrap_demo(rows[0]));
       }
     }
   }
 
-  Value base_eval = evaluate(base_cfg, pareto_set, "initial Pareto evaluation", true, false);
+  // Reflection calls run with teacherOptions (e.g. useExpensiveModel); stream stays off.
+  Value reflection_chat_options = Core::map_merge(Value::object(), gepa_teacher_options(options));
+  Core::set(reflection_chat_options, "stream", false);
+
+  active_demos = demos;
+  Value base_eval = Core::iter(demos).empty() ? baseline_eval : evaluate(base_cfg, pareto_set, "bootstrapped Pareto evaluation", true, false);
   std::vector<GepCandidate> candidates{{base_cfg, Core::get(base_eval, "avgScores", Value::object()), -1}};
   std::vector<std::vector<double>> per_instance;
   std::vector<double> base_scalars;
@@ -4384,7 +7210,10 @@ Value AxGEPA::optimize(Value request, OptimizerEvaluator* evaluator) {
       std::string current = display(Core::get(proposed, target_id, Value("")));
       std::string candidate_text = current;
       Value previous;
+      std::string last_error;
+      bool last_attempt_failed = false;
       for (int attempt = 0; attempt < 2; ++attempt) {
+        last_attempt_failed = false;
         Value payload = Value::object();
         Core::set(payload, "componentKey", Value(target_id));
         Core::set(payload, "componentKind", Core::get(group_target, "kind", Value("component")));
@@ -4399,10 +7228,28 @@ Value AxGEPA::optimize(Value request, OptimizerEvaluator* evaluator) {
         Core::set(message, "content", Core::json_stringify(payload));
         Core::append(messages, message);
         Core::set(request_chat, "chatPrompt", messages);
-        candidate_text = gepa_extract_text(reflection_client_->chat(request_chat));
+        // A failed teacher call uses up this attempt; cancellation still propagates.
+        Value response;
+        try {
+          response = reflection_client_->chat(request_chat, reflection_chat_options);
+        } catch (const AxAIServiceAbortedError&) {
+          throw;
+        } catch (const std::exception& error) {
+          const auto* ax_error = dynamic_cast<const AxError*>(&error);
+          if (ax_error != nullptr && (ax_error->type == "AxAIServiceAbortedError" || ax_error->category == "aborted")) throw;
+          if (auto token = current_cancellation_token(); token && token->is_cancelled()) throw AxAIServiceAbortedError(token->reason());
+          last_error = error.what();
+          last_attempt_failed = true;
+          continue;
+        }
+        candidate_text = gepa_extract_text(response);
         Value validation = gepa_validate_value(group_target, candidate_text);
         if (Core::truthy(Core::eq(validation, Value(true)))) break;
         previous = validation;
+        candidate_text = current;
+      }
+      if (last_attempt_failed) {
+        gepa_log_teacher_failure("proposing a new value for " + target_id + "; keeping the current value", last_error, options);
         candidate_text = current;
       }
       Core::set(proposed, target_id, Value(candidate_text));
@@ -4457,7 +7304,10 @@ Value AxGEPA::optimize(Value request, OptimizerEvaluator* evaluator) {
   Core::set(metadata, "selectorState", selector_state_);
   Core::set(metadata, "paretoFront", front);
   Core::set(metadata, "bestScore", Value(best_score == -1e100 ? 0.0 : best_score));
+  metadata = Core::map_merge(metadata, baseline_report);
   Core::set(metadata, "totalMetricCalls", Value(total_calls));
+  Core::set(metadata, "bootstrapMetricCalls", Value(bootstrap_calls));
+  Core::set(metadata, "totalCalls", Value(total_calls + bootstrap_calls));
   Core::set(metadata, "candidatesExplored", Value(static_cast<int>(candidates.size())));
   Value report = Value::object();
   Core::set(report, "summary", Value("GEPA Multi-Objective Optimization Complete"));
@@ -4471,6 +7321,7 @@ Value AxGEPA::optimize(Value request, OptimizerEvaluator* evaluator) {
   Core::set(artifact, "artifactVersion", Value("axir-optimized-artifact-v1"));
   Core::set(artifact, "optimizerName", Value("GEPA"));
   Core::set(artifact, "optimizerVersion", Value(version()));
+  artifact = Core::map_merge(artifact, baseline_report);
   Core::set(artifact, "componentMap", candidates[static_cast<size_t>(best_idx)].cfg);
   Core::set(artifact, "demos", demos);
   Core::set(artifact, "metadata", metadata);
@@ -4506,7 +7357,7 @@ AxACE::AxACE(Value options) {
     if (!value.is_null()) Core::set(config_, key, value);
   }
   Value now_value = Core::get(options, "now");
-  now_ = now_value.is_null() ? std::string("1970-01-01T00:00:00.000Z") : display(now_value);
+  now_ = now_value.is_null() ? std::string() : display(now_value);
   initial_playbook_ = Core::get(options, "initialPlaybook");
   playbook_ = initial_playbook_.is_null() ? empty_playbook() : initial_playbook_;
 }
@@ -4521,7 +7372,23 @@ void AxACE::set_callables(AceCallable reflector, AceCallable curator, AceCallabl
 std::string AxACE::name() const { return "ACE"; }
 std::string AxACE::version() const { return "axir-ace-v1"; }
 
-Value AxACE::empty_playbook() const { return Core::_ace_empty_playbook(Value(), Value(now_)); }
+Value AxACE::empty_playbook() const { return Core::_ace_empty_playbook(Value(), Value(now())); }
+
+// The injected clock (the `now` option), else the wall clock at each call, as
+// TS's new Date().toISOString() stamps each playbook change.
+std::string AxACE::now() const {
+  if (!now_.empty()) return now_;
+  auto current = std::chrono::system_clock::now();
+  std::time_t seconds = std::chrono::system_clock::to_time_t(current);
+  auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(current.time_since_epoch()).count() % 1000;
+  std::tm parts{};
+  gmtime_r(&seconds, &parts);
+  char text[32];
+  std::strftime(text, sizeof(text), "%Y-%m-%dT%H:%M:%S", &parts);
+  char out[40];
+  std::snprintf(out, sizeof(out), "%s.%03dZ", text, static_cast<int>(millis));
+  return out;
+}
 
 int AxACE::int_config(const std::string& key, int fallback) const {
   Value value = Core::get(config_, key);
@@ -4565,6 +7432,8 @@ void AxACE::hydrate(const Value& state) {
 }
 
 Value AxACE::get_playbook() const { return playbook_; }
+
+Value AxACE::get_config() const { return config_; }
 
 Value AxACE::get_artifact() const {
   Value out = Value::object();
@@ -4654,7 +7523,7 @@ std::vector<Value> AxACE::apply_operations(std::vector<Value>& resolved, Value& 
   Core::set(options, "allowDynamicSections", Core::get(config_, "allowDynamicSections"));
   Core::set(options, "enableAutoPrune", Value(true));
   Core::set(options, "protectedBulletIds", protected_ids);
-  Value result = Core::_ace_apply_curator_operations(playbook_, Value(resolved), options, Value(now_));
+  Value result = Core::_ace_apply_curator_operations(playbook_, Value(resolved), options, Value(now()));
   playbook_ = Core::get(result, "playbook");
   std::vector<Value> applied_ids;
   for (const auto& item : Core::iter(Core::get(result, "updatedBulletIds", Value::array()))) applied_ids.push_back(item);
@@ -4669,7 +7538,7 @@ std::vector<Value> AxACE::apply_operations(std::vector<Value>& resolved, Value& 
 
 void AxACE::apply_bullet_tags(const Value& reflection) {
   for (const auto& tag : Core::iter(Core::_ace_normalize_reflection_bullet_tags(reflection))) {
-    playbook_ = Core::_ace_update_bullet_feedback(playbook_, Core::get(tag, "id"), Core::get(tag, "tag"), Value(now_));
+    playbook_ = Core::_ace_update_bullet_feedback(playbook_, Core::get(tag, "id"), Core::get(tag, "tag"), Value(now()));
   }
 }
 
@@ -4718,7 +7587,7 @@ Value AxACE::compile(const std::vector<Value>& examples, const AceCallable& metr
       Core::set(feedback_event, "generatorOutput", generator_out);
       Core::set(feedback_event, "reflection", reflection);
       Core::set(feedback_event, "curator", curator_result);
-      Core::set(feedback_event, "timestamp", Value(now_));
+      Core::set(feedback_event, "timestamp", Value(now()));
       generator_history_.push_back(feedback_event);
       bool has_ops = !curator_result.is_null() && !Core::iter(Core::get(curator_result, "operations", Value::array())).empty();
       if (!applied_ids.empty() && has_ops) {
@@ -4771,7 +7640,7 @@ Value AxACE::apply_online_update(Value args) {
   Core::set(feedback_event, "generatorOutput", generator_out);
   Core::set(feedback_event, "reflection", reflection);
   Core::set(feedback_event, "curator", curator_result);
-  Core::set(feedback_event, "timestamp", Value(now_));
+  Core::set(feedback_event, "timestamp", Value(now()));
   generator_history_.push_back(feedback_event);
   bool has_ops = !curator_result.is_null() && !Core::iter(Core::get(curator_result, "operations", Value::array())).empty();
   if (!applied_ids.empty() && has_ops) {
@@ -4786,41 +7655,93 @@ Value AxACE::apply_online_update(Value args) {
   return curator_result;
 }
 
-static const char* kAceReflectorSignature =
-    "question:string \"Original task input serialized as JSON\", "
-    "generator_answer:string \"Generator output serialized as JSON\", "
-    "generator_reasoning?:string \"Generator reasoning trace\", "
-    "playbook:string \"Current context playbook rendered as markdown\", "
-    "expected_answer?:string \"Expected output when ground truth is available\", "
-    "feedback?:string \"External feedback or reward signal\", "
-    "previous_reflection?:string \"Most recent reflection JSON when running multi-round refinement\" "
-    "-> reasoning:string \"Step-by-step analysis of generator performance\", "
-    "errorIdentification:string \"Specific mistakes detected\", "
-    "rootCauseAnalysis:string \"Underlying cause of the error\", "
-    "correctApproach:string \"What the generator should do differently\", "
-    "keyInsight:string \"Reusable insight to remember\", "
-    "bulletTags:json \"Array of {id, tag} entries referencing playbook bullets\"";
+// The reflector and curator signatures TS builds (src/ax/dsp/optimizers/ace.ts),
+// assembled from Field records: a signature string cannot carry a description
+// with double quotes, as the curator's operations description has.
+static Value ace_field(const std::string& name, const std::string& type, const std::string& description, bool optional = false) {
+  return Core::record_new("Field", Value(Object{{"name", name},
+                                                {"type", Core::record_new("FieldType", Value(Object{{"name", type}}))},
+                                                {"description", description},
+                                                {"isOptional", optional}}));
+}
 
-static const char* kAceCuratorSignature =
-    "playbook:string \"Current playbook serialized as JSON\", "
-    "reflection:string \"Latest reflection output serialized as JSON\", "
-    "question_context:string \"Original task input serialized as JSON\", "
-    "token_budget?:number \"Approximate token budget for curator response\" "
-    "-> reasoning:string \"Justification for the proposed updates\", "
-    "operations:json \"List of operations with type/section/content fields\"";
+static Value ace_signature(Array inputs, Array outputs) {
+  Value sig(Object{{"description", Value()}, {"inputs", Value(std::move(inputs))}, {"outputs", Value(std::move(outputs))}});
+  Core::validate_signature(sig);
+  return sig;
+}
 
-static const char* kAgentPlaybookWeaknessMinerSignature =
-    "clusterSignature:string \"Shared error signature of the cluster\", "
-    "taskSummaries:string \"One line per failing task\", "
-    "actionLogExcerpts:string \"Excerpts of failing runs centered on the failure\", "
-    "functionCallSummary?:string \"Digest of runtime/tool calls\", "
-    "toolErrors?:string \"Tool errors observed\", "
-    "currentPlaybook?:string \"Current failure-avoidance playbook\" "
-    "-> weaknessDescription:string \"Recurring weakness\", "
-    "rootCause:string \"Mechanical root cause\", "
-    "proposedGuidance:string \"One concise imperative avoidance rule\", "
-    "evidenceQuotes:json \"Verbatim substrings copied from actionLogExcerpts\", "
-    "configRecommendations?:json \"Setup suggestions no prompt text can fix\"";
+static Value ace_reflector_signature() {
+  return ace_signature(
+      {ace_field("question", "string", "Original task input serialized as JSON"),
+       ace_field("generator_answer", "string", "Generator output serialized as JSON"),
+       ace_field("generator_reasoning", "string", "Generator reasoning trace", true),
+       ace_field("playbook", "string", "Current context playbook rendered as markdown"),
+       ace_field("expected_answer", "string", "Expected output when ground truth is available", true),
+       ace_field("feedback", "string", "External feedback or reward signal", true),
+       ace_field("previous_reflection", "string", "Most recent reflection JSON when running multi-round refinement", true)},
+      {ace_field("reasoning", "string", "Step-by-step analysis of generator performance"),
+       ace_field("errorIdentification", "string", "Specific mistakes detected"),
+       ace_field("rootCauseAnalysis", "string", "Underlying cause of the error"),
+       ace_field("correctApproach", "string", "What the generator should do differently"),
+       ace_field("keyInsight", "string", "Reusable insight to remember"),
+       ace_field("bulletTags", "json", "Array of {id, tag} entries referencing playbook bullets")});
+}
+
+static const char* kAceCuratorOperationsDescription =
+    "List of operations, each {type: \"ADD\"|\"UPDATE\"|\"REMOVE\", section, content}. "
+    "Emit an operation ONLY when the playbook should actually change. "
+    "If nothing should change, return an empty array \xE2\x80\x94 never emit an ADD whose content "
+    "just acknowledges that no change is needed (e.g. \"No update required\", "
+    "\"Keep the existing rule unchanged\"). "
+    "Each ADD content must be a standalone, reusable rule.";
+
+static Value ace_curator_signature() {
+  return ace_signature(
+      {ace_field("playbook", "string", "Current playbook serialized as JSON"),
+       ace_field("reflection", "string", "Latest reflection output serialized as JSON"),
+       ace_field("question_context", "string", "Original task input serialized as JSON"),
+       ace_field("token_budget", "number", "Approximate token budget for curator response", true)},
+      {ace_field("reasoning", "string", "Justification for the proposed updates"),
+       ace_field("operations", "json", kAceCuratorOperationsDescription)});
+}
+
+// The weakness miner's description and signature, as TS builds them
+// (src/ax/agent/agentInternal/playbookEvolve/weaknessMiner.ts).
+static const char* kAgentPlaybookWeaknessMinerDescription =
+    "You are a failure analyst for an LLM agent harness. You receive one "
+    "cluster of failed agent runs sharing an error signature, with excerpts "
+    "of what the agent actually did. Identify the single recurring weakness, "
+    "its root cause, and one narrow, durable avoidance rule the agent should "
+    "recall while acting. Ground every claim: evidenceQuotes must be verbatim "
+    "substrings copied from the excerpts. Keep proposedGuidance concise, "
+    "imperative, and general to the failure mode (not one task). Use "
+    "configRecommendations only for setup problems no prompt text can fix "
+    "(missing tools, timeouts, model choice).";
+
+static Value ace_array_field(const std::string& name, const std::string& type, const std::string& description, bool optional = false) {
+  return Core::record_new("Field", Value(Object{{"name", name},
+                                                {"type", Core::record_new("FieldType", Value(Object{{"name", type}, {"is_array", true}}))},
+                                                {"description", description},
+                                                {"isOptional", optional}}));
+}
+
+static Value agent_playbook_weakness_miner_signature() {
+  Value sig = ace_signature(
+      {ace_field("clusterSignature", "string", "Shared error signature of the cluster."),
+       ace_field("taskSummaries", "string", "One line per failing task."),
+       ace_field("actionLogExcerpts", "string", "Excerpts of the failing runs, centered on the failure."),
+       ace_field("functionCallSummary", "string", "Digest of runtime/tool calls in the failing runs.", true),
+       ace_field("toolErrors", "string", "Tool errors observed.", true),
+       ace_field("currentPlaybook", "string", "The failure-avoidance playbook currently applied.", true)},
+      {ace_field("weaknessDescription", "string", "The recurring weakness, one sentence."),
+       ace_field("rootCause", "string", "Why the runs fail, mechanically."),
+       ace_field("proposedGuidance", "string", "The avoidance rule to add to the playbook \xE2\x80\x94 concise, imperative."),
+       ace_array_field("evidenceQuotes", "string", "Verbatim substrings from actionLogExcerpts proving the weakness."),
+       ace_array_field("configRecommendations", "string", "Setup/config suggestions no prompt text can fix.", true)});
+  Core::set(sig, "description", Value(kAgentPlaybookWeaknessMinerDescription));
+  return sig;
+}
 
 static std::string playbook_compose_instruction(const std::string& base, const std::string& rendered) {
   std::vector<std::string> parts;
@@ -4846,10 +7767,83 @@ static std::string playbook_compose_instruction(const std::string& base, const s
   return out;
 }
 
-static std::string playbook_stringify(const Value& value) {
-  if (value.is_null()) return std::string();
-  if (value.is_string()) return display(value);
-  return stringify(value);
+// The reflector and curator inputs are TS JSON.stringify text: compact, with
+// object keys in insertion order. stringify() is that serializer: it writes
+// keys in their Core::set / JSON parse order (__order), where the stable
+// stringify sorts them.
+
+// The byte offset that ends the first `units` UTF-16 code units of UTF-8 text
+// (JS string.slice); a surrogate pair the cut would split is left out.
+static size_t playbook_utf16_cut(const std::string& text, size_t units) {
+  size_t end = 0;
+  size_t taken = 0;
+  while (end < text.size()) {
+    unsigned char lead = static_cast<unsigned char>(text[end]);
+    size_t width = lead >= 0xf0 ? 4 : lead >= 0xe0 ? 3 : lead >= 0xc0 ? 2 : 1;
+    size_t cost = width == 4 ? 2 : 1;
+    if (taken + cost > units) break;
+    taken += cost;
+    end += width;
+  }
+  return end;
+}
+
+// TS truncateSerializedString: strings longer than maxSerializedFieldChars
+// (JS length, in UTF-16 code units) keep their head plus "...[truncated]".
+static std::string playbook_truncate(const std::string& value, size_t max_chars) {
+  static const std::string suffix = "...[truncated]";
+  if (playbook_utf16_cut(value, max_chars) >= value.size()) return value;
+  if (max_chars <= suffix.size()) return value.substr(0, playbook_utf16_cut(value, max_chars));
+  return value.substr(0, playbook_utf16_cut(value, max_chars - suffix.size())) + suffix;
+}
+
+static Value playbook_bound(const Value& value, size_t max_chars) {
+  if (value.is_string()) return Value(playbook_truncate(display(value), max_chars));
+  if (value.is_array()) {
+    Value out = Value::array();
+    for (const auto& entry : Core::iter(value)) Core::append(out, playbook_bound(entry, max_chars));
+    return out;
+  }
+  if (value.is_object()) {
+    Value out = Value::object();
+    for (const auto& entry : entries(value)) Core::set(out, entry.first, playbook_bound(entry.second, max_chars));
+    return out;
+  }
+  return value;
+}
+
+// TS stringifyBounded: JSON of the value with every string bounded.
+static std::string playbook_stringify_bounded(const Value& value, size_t max_chars) {
+  return stringify(playbook_bound(value, max_chars));
+}
+
+// TS extractFieldValues: the example's values for the bound program's input or
+// output fields ("inputs" / "outputs"), in field order.
+static Value playbook_field_values(const Value& example, const AxGen* program, const char* fields) {
+  Value out = Value::object();
+  if (program == nullptr || !example.is_object()) return out;
+  Value signature = Core::get(program->value(), "signature");
+  const Object& values = *std::get<std::shared_ptr<Object>>(example.data);
+  for (const auto& field : Core::iter(Core::get(signature, fields, Value::array()))) {
+    std::string name = display(Core::get(field, "name", Value("")));
+    auto found = values.find(name);
+    if (name != "__order" && found != values.end()) Core::set(out, name, found->second);
+  }
+  return out;
+}
+
+// The ACE config's maxSerializedFieldChars (TS default 2000).
+static size_t playbook_max_serialized_chars(const AxACE& engine) {
+  Value max_chars = Core::get(engine.get_config(), "maxSerializedFieldChars");
+  if (!max_chars.is_number()) return 2000;
+  return static_cast<size_t>(std::max(0.0, std::floor(num(max_chars))));
+}
+
+// As in TS, the reflector and curator get the playbook as
+// JSON.stringify({markdown, structured}): the rendered markdown and the
+// playbook itself.
+static std::string playbook_input(const Value& rendered, const Value& structured) {
+  return stringify(object({{"markdown", rendered}, {"structured", structured}}));
 }
 
 static Value playbook_option(const Value& options, std::initializer_list<const char*> keys) {
@@ -4877,6 +7871,9 @@ static std::string playbook_error_signature(const std::string& value) {
 }
 
 static std::string playbook_record_signature(const Value& record) {
+  // TS's record of a thrown run has only its error.
+  Value record_error = Core::get(record, "error");
+  if (Core::truthy(record_error)) return playbook_error_signature(display(record_error));
   Value prediction = Core::get(record, "prediction", Value::object());
   std::vector<std::pair<std::string, int>> counts;
   for (const auto& signal : Core::iter(Core::get(prediction, "failureSignals", Value::array()))) {
@@ -4905,7 +7902,8 @@ static std::string playbook_record_signature(const Value& record) {
   }
   Value error = Core::get(record, "error");
   if (!error.is_null()) return playbook_error_signature(display(error));
-  std::string action_log = display(Core::get(prediction, "actionLog", Value("")));
+  // The action log as TS's prediction carries it: the executor's code steps as text.
+  std::string action_log = display(Core::_agent_playbook_action_log_text(Core::get(prediction, "actionLog")));
   std::smatch match;
   if (std::regex_search(action_log, match, std::regex("^\\s*(\\w+Error:\\s*.{0,60})", std::regex_constants::multiline))) {
     return playbook_error_signature(match[1].str());
@@ -4913,22 +7911,12 @@ static std::string playbook_record_signature(const Value& record) {
   return "behavioral:no_error";
 }
 
-static std::string playbook_failure_excerpt(const Value& record, const std::string& signature) {
-  Value error = Core::get(record, "error");
-  if (!error.is_null()) return "Run threw: " + display(error);
-  std::string action_log = display(Core::get(Core::get(record, "prediction", Value::object()), "actionLog", Value("")));
-  if (action_log.size() <= 2000) return action_log;
-  std::string needle = signature.substr(0, std::min<size_t>(40, signature.size()));
-  size_t hit = action_log.find(needle);
-  if (hit == std::string::npos) return action_log.substr(action_log.size() - 2000);
-  size_t start = hit > 1000 ? hit - 1000 : 0;
-  return action_log.substr(start, std::min<size_t>(2000, action_log.size() - start));
-}
-
 AxPlaybook::AxPlaybook(AxGen& program, AIClient& student, AIClient* teacher, Value options)
     : program_(&program), engine_(Value::object()), student_(&student), teacher_(teacher == nullptr ? &student : teacher) {
   if (!options.is_object()) options = Value::object();
   verbose_ = Core::truthy(Core::get(options, "verbose", Value(false)));
+  Value teacher_options = playbook_option(options, {"teacherOptions", "teacher_options"});
+  teacher_options_ = Core::map_merge(Value::object(), teacher_options.is_object() ? teacher_options : Value::object());
   Value engine_options = Value::object();
   Value now_value = Core::get(options, "now");
   if (!now_value.is_null()) Core::set(engine_options, "now", now_value);
@@ -4968,20 +7956,26 @@ Value AxPlaybook::run_generator(const Value& example) {
 }
 
 // The real LLM reflector: a focused AxGen sub-program driven by the teacher.
+// As in TS, the question holds the example's input fields and the expected
+// answer its output fields.
 Value AxPlaybook::run_reflector(const Value& payload) {
-  if (!reflector_program_) reflector_program_ = std::make_unique<AxGen>(s(kAceReflectorSignature));
+  if (!reflector_program_) reflector_program_ = std::make_unique<AxGen>(ace_reflector_signature());
+  size_t max_chars = playbook_max_serialized_chars(engine_);
+  Value example = Core::get(payload, "question");
   Value request = Value::object();
-  Core::set(request, "question", Value(playbook_stringify(Core::get(payload, "question"))));
-  Core::set(request, "generator_answer", Value(playbook_stringify(Core::get(payload, "generator_answer"))));
-  Core::set(request, "playbook", Core::get(payload, "playbook", Value("")));
+  Core::set(request, "question", Value(playbook_stringify_bounded(playbook_field_values(example, program_, "inputs"), max_chars)));
+  Core::set(request, "generator_answer", Value(playbook_stringify_bounded(Core::get(payload, "generator_answer"), max_chars)));
   Value reasoning = Core::get(payload, "generator_reasoning");
   if (!reasoning.is_null()) Core::set(request, "generator_reasoning", reasoning);
+  Core::set(request, "playbook", Value(playbook_input(Core::get(payload, "playbook", Value("")), engine_.get_playbook())));
+  Value expected_answer = playbook_field_values(example, program_, "outputs");
+  if (!Core::iter(expected_answer).empty()) Core::set(request, "expected_answer", Value(playbook_stringify_bounded(expected_answer, max_chars)));
   Value feedback = Core::get(payload, "feedback");
   if (!feedback.is_null()) Core::set(request, "feedback", feedback);
   Value previous = Core::get(payload, "previous_reflection");
-  if (!previous.is_null()) Core::set(request, "previous_reflection", Value(playbook_stringify(previous)));
+  if (!previous.is_null()) Core::set(request, "previous_reflection", Value(stringify(previous)));
   try {
-    return reflector_program_->forward(*teacher_, request);
+    return reflector_program_->forward(*teacher_, request, Core::map_merge(Value::object(), teacher_options_));
   } catch (const std::exception& e) {
     if (verbose_) std::cerr << "[AxPlaybook] reflector error: " << e.what() << "\n";
     return Value();
@@ -4990,14 +7984,15 @@ Value AxPlaybook::run_reflector(const Value& payload) {
 
 // The real LLM curator: a focused AxGen sub-program driven by the teacher.
 Value AxPlaybook::run_curator(const Value& payload) {
-  if (!curator_program_) curator_program_ = std::make_unique<AxGen>(s(kAceCuratorSignature));
+  if (!curator_program_) curator_program_ = std::make_unique<AxGen>(ace_curator_signature());
+  Value question_context = playbook_field_values(Core::get(payload, "question_context"), program_, "inputs");
   Value request = Value::object();
-  Core::set(request, "playbook", Core::get(payload, "playbook", Value("")));
-  Core::set(request, "reflection", Value(playbook_stringify(Core::get(payload, "reflection"))));
-  Core::set(request, "question_context", Value(playbook_stringify(Core::get(payload, "question_context"))));
+  Core::set(request, "playbook", Value(playbook_input(Core::get(payload, "playbook", Value("")), engine_.get_playbook())));
+  Core::set(request, "reflection", Value(stringify(Core::get(payload, "reflection"))));
+  Core::set(request, "question_context", Value(playbook_stringify_bounded(question_context, playbook_max_serialized_chars(engine_))));
   Core::set(request, "token_budget", Core::get(payload, "token_budget", Value(1024)));
   try {
-    return curator_program_->forward(*teacher_, request);
+    return curator_program_->forward(*teacher_, request, Core::map_merge(Value::object(), teacher_options_));
   } catch (const std::exception& e) {
     if (verbose_) std::cerr << "[AxPlaybook] curator error: " << e.what() << "\n";
     return Value();
@@ -5039,6 +8034,11 @@ Value AxPlaybook::update(Value args) {
   Value result = engine_.apply_online_update(args.is_null() ? Value::object() : args);
   inject();
   return result;
+}
+
+void AxPlaybook::rebind_program(AxGen& program) {
+  program_ = &program;
+  base_instruction_ = display(program.get_instruction());
 }
 
 void AxPlaybook::apply_to(AxGen* program) {
@@ -5102,6 +8102,11 @@ Value AxPlaybook::evolve(Value dataset, Value options) {
   int runs_per_task = std::max(1, static_cast<int>(num(Core::get(options, "runsPerTask", Core::get(options, "runs_per_task", Value(1))))));
   int dataset_size = static_cast<int>(train.size() + validation.size()) * runs_per_task;
   int max_metric_calls = std::max(1, static_cast<int>(num(Core::get(options, "maxMetricCalls", Core::get(options, "max_metric_calls", Value(std::max(100, (static_cast<int>(max_proposals) + 1) * dataset_size)))))));
+  // The weakness miner runs on this playbook's teacher, so its options are the
+  // evolve teacherOptions when given, else the playbook's own teacherOptions.
+  Value miner_options = playbook_option(options, {"teacherOptions", "teacher_options"});
+  if (miner_options.is_null()) miner_options = teacher_options_;
+  if (!miner_options.is_object()) miner_options = Value::object();
   int remaining = max_metric_calls;
   auto run_batch = [&](const std::vector<Value>& tasks) {
     Array records;
@@ -5120,7 +8125,17 @@ Value AxPlaybook::evolve(Value dataset, Value options) {
         --remaining;
         double score = 0;
         try {
-          prediction = agent_->evaluate_optimization_task(*student_, task, options);
+          Value candidate = agent_->evaluate_optimization_task(*student_, task, options);
+          if (display(Core::get(candidate, "completionType", Value(""))) == "error") {
+            // TS's harness sees a thrown run: a zero score with no metric
+            // call, and its message as the error.
+            Value error_value = Core::get(candidate, "error");
+            last_error = error_value.is_object() ? display(Core::get(error_value, "message", Value(""))) : display(error_value);
+            score_sum += 0;
+            ++completed_runs;
+            continue;
+          }
+          prediction = candidate;
           Value default_score = Core::truthy(Core::eq(Core::get(prediction, "completionType", Value("")), Value("error"))) ? Value(0) : Value(1);
           Value raw_score = Core::get(task, "metric_score", Core::get(task, "scores", Core::get(task, "score", default_score)));
           score = num(Core::_scalarize_optimization_scores(Core::_normalize_optimization_metric_scores(raw_score), options));
@@ -5139,7 +8154,9 @@ Value AxPlaybook::evolve(Value dataset, Value options) {
       weight_sum += weight;
       Value record = object({{"task", task}, {"index", Value(static_cast<double>(task_index))}, {"score", Value(score)}, {"passed", Value(score >= threshold && display(Core::get(prediction, "completionType", Value(""))) == "final")}});
       if (!prediction.is_null()) Core::set(record, "prediction", prediction);
-      else if (!last_error.empty()) Core::set(record, "error", Value(last_error));
+      else if (!last_error.empty()) {
+        Core::set(record, "error", Value(last_error));
+      }
       records.push_back(record);
       if (completed_runs < runs_per_task) break;
     }
@@ -5174,60 +8191,15 @@ Value AxPlaybook::evolve(Value dataset, Value options) {
   size_t index = 0;
   for (const auto& cluster : ranked) {
     ++index;
-    std::vector<Value> selected(cluster.second.begin(), cluster.second.begin() + std::min<size_t>(4, cluster.second.size()));
-    std::vector<std::string> bodies;
-    std::string excerpts;
-    std::string task_summaries;
-    std::vector<std::string> function_calls;
-    std::vector<std::string> tool_errors;
-    for (size_t record_index = 0; record_index < selected.size(); ++record_index) {
-      const Value& record = selected[record_index];
-      std::string body = playbook_failure_excerpt(record, cluster.first);
-      bodies.push_back(body);
-      if (!excerpts.empty()) excerpts += "\n\n";
-      excerpts += "--- run " + std::to_string(record_index + 1) + " ---\n" + body;
-      Value task = Core::get(record, "task", Value::object());
-      std::string label = Core::get(task, "id").is_null() ? "#" + std::to_string(record_index + 1) : display(Core::get(task, "id"));
-      std::string input = stringify(Core::get(task, "input"));
-      if (input.size() > 240) input.resize(240);
-      if (!task_summaries.empty()) task_summaries += "\n";
-      std::ostringstream score_text;
-      score_text << std::fixed << std::setprecision(2) << num(Core::get(record, "score", Value(0)));
-      task_summaries += "- " + label + " (score " + score_text.str() + "): " + input;
-      Value prediction = Core::get(record, "prediction", Value::object());
-      for (const auto& call : Core::iter(Core::get(prediction, "functionCalls", Value::array()))) {
-        if (function_calls.size() < 20) function_calls.push_back(stringify(call));
-      }
-      for (const auto& error : Core::iter(Core::get(prediction, "toolErrors", Value::array()))) {
-        if (tool_errors.size() < 10) tool_errors.push_back(display(error));
-      }
-    }
-    bool has_body = std::any_of(bodies.begin(), bodies.end(), [](const std::string& body) { return !playbook_collapse(body).empty(); });
-    if (!has_body) continue;
-    Value miner_request = object({
-        {"clusterSignature", Value(cluster.first)},
-        {"taskSummaries", Value(task_summaries)},
-        {"actionLogExcerpts", Value(excerpts)},
-    });
-    if (!function_calls.empty()) {
-      std::string joined;
-      for (const auto& call : function_calls) { if (!joined.empty()) joined += "\n"; joined += call; }
-      Core::set(miner_request, "functionCallSummary", Value(joined));
-    }
-    if (!tool_errors.empty()) {
-      std::string joined;
-      for (const auto& error : tool_errors) { if (!joined.empty()) joined += "\n"; joined += error; }
-      Core::set(miner_request, "toolErrors", Value(joined));
-    }
-    std::string current_playbook = render();
-    if (!playbook_collapse(current_playbook).empty()) Core::set(miner_request, "currentPlaybook", Value(current_playbook));
+    // TS's miner inputs: task summaries, action-log excerpts, function calls
+    // and tool errors of up to four records; none without an excerpt.
+    Value miner_request = Core::_agent_playbook_miner_inputs(Value(cluster.first), Value(Array(cluster.second.begin(), cluster.second.end())), Value(render()));
+    if (!miner_request.is_object()) continue;
+    std::string excerpts = display(Core::get(miner_request, "actionLogExcerpts", Value("")));
     Value mined;
     try {
-      AxGen miner(s(kAgentPlaybookWeaknessMinerSignature), object({
-          {"id", "agent.playbook.weakness-miner"},
-          {"instruction", "Identify one recurring weakness and one narrow durable avoidance rule. Every evidence quote must be copied verbatim from actionLogExcerpts."},
-      }));
-      mined = miner.forward(*teacher_, miner_request);
+      AxGen miner(agent_playbook_weakness_miner_signature(), object({{"id", "agent.playbook.weakness-miner"}}));
+      mined = miner.forward(*teacher_, miner_request, Core::map_merge(Value::object(), miner_options));
     } catch (...) {
       continue;
     }
@@ -5344,6 +8316,8 @@ AxPlaybook playbook(AxGen& program, AIClient& student, Value options, AIClient* 
 }
 
 Value AxGen::evaluate_optimization(AIClient& client, Value dataset, Value candidate_map, Value options) {
+  Value demos = Core::get(options, "demos", Value::array());
+  if (!Core::iter(demos).empty()) set_demos(demos);
   Value normalized = Core::_normalize_optimization_dataset(dataset.is_null() ? Value::array() : dataset);
   Value rows = Value::array();
   Value original = Core::_optimization_component_current_map(get_optimizable_components());
@@ -5425,15 +8399,175 @@ AxMemory& AxGen::get_memory() {
   return memory_;
 }
 
+#include "session.inc"
+
 Value AxGen::forward(AIClient& client, Value values, Value options) {
   return forward(client, std::move(values), std::move(options), AxRuntimeHooks{});
 }
 
+Value AxGen::forward(AIClient& client, Value values, Value options, const AxCancellationToken* cancellation) {
+  if(cancellation)cancellation->throw_if_cancelled();AxCancellationScope scope(cancellation);return forward(client,std::move(values),std::move(options));
+}
+
+// A forward with run control, or with background tools unless asyncMode is
+// "off", runs through a session.
+static bool axgen_runs_in_session(const Value& state, const Value& run_options) {
+  bool eligible = !Core::get(run_options,"control").is_null();
+  for(const auto& tool:array_ref(Core::get(state,"functions",Value::array()))) if(display(Core::get(tool,"execution","blocking"))=="background") eligible=true;
+  return eligible && (!Core::get(run_options,"control").is_null() || display(Core::get(run_options,"asyncMode",Core::get(run_options,"async_mode","auto")))!="off");
+}
+
+AxGen& AxGen::set_cancellation(AxCancellationToken token) {
+  cancellation_ = std::move(token);
+  return *this;
+}
+
 Value AxGen::forward(AIClient& client, Value values, Value options, const AxRuntimeHooks& hooks) {
+  // The program's cancellation token covers a run that has none from its
+  // call or from a run around it.
+  std::optional<AxCancellationScope> program_cancellation;
+  if (cancellation_ && current_cancellation_token() == nullptr) program_cancellation.emplace(&*cancellation_);
+  auto global_cache = global_caching_function();  // held for the run
+  // As in TS, the cache is read before the run's span and metrics, so a hit
+  // records neither; a read error propagates. A miss hands the lookup to the
+  // run, which then only stores.
+  options = Core::map_merge(Value::object(), options);
+  Core::set(options, "_evidence_cache_identity", std::to_string(reinterpret_cast<std::uintptr_t>(&client)));
+  Value lookup = Core::_cache_lookup_impl(state_, values, options, Value(false));
+  // A stored output's audio outputs are rendered, as TS does.
+  if (Core::truthy(Core::get(lookup, "hit", false))) return Core::_render_audio_outputs_impl(state_, Core::client_ref(client), Core::get(lookup, "value"), options);
+  options = Core::map_merge(Value::object(), options);
+  Core::set(options, "_ax_cache_lookup", lookup);
   AxRuntimeHooks program_hooks = *std::atomic_load(&runtime_hooks_);
   RuntimeHookScope scope(hooks, program_hooks, "ax_gen_forward", "ax_gen_generation",
-                         object({{"ax.program.id", Core::get(state_, "program_id", "root")}, {"ax.program.type", "AxGen"}}));
+                         object({{"ax.program.id", Core::get(state_, "program_id", "root")}, {"ax.program.type", "AxGen"}}),
+                         gen_metric_labels(client, Core::get(state_, "options", Value::object()), options));
+  Value run_options = Core::map_merge(Core::get(state_, "options", Value::object()), options);
+  if(axgen_runs_in_session(state_, run_options)) {
+    SessionRun session(state_,client,run_options);
+    Core::set(run_options,"infraRetries",0);
+    try {Value output=Core::_forward_impl(state_,Core::client_ref(session),std::move(values),run_options);session.finish();return output;}
+    catch(const std::exception& error){session.finish(error.what());throw;}
+  }
   return Core::_forward_impl(state_, Core::client_ref(client), std::move(values), std::move(options));
+}
+
+namespace {
+
+// What a streaming_forward caller holds: its handler, the deltas merged as a
+// TypeScript consumer merges them (per index, started over when the version
+// changes), and why the run stopped. The run's sink throws an aborted error to
+// stop the run, which the run raises without a retry.
+struct AxGenDeltaConsumer {
+  AxGenDeltaHandler handler;
+  int64_t version = 0;
+  std::vector<std::pair<int64_t, Value>> samples;
+  bool stopped = false;
+  std::exception_ptr error;
+
+  explicit AxGenDeltaConsumer(AxGenDeltaHandler on_delta) : handler(std::move(on_delta)) {}
+
+  void deliver(const Value& envelope) {
+    AxGenDelta delta;
+    delta.version = static_cast<int64_t>(num(get_key(envelope, "version", Value(0))));
+    delta.index = static_cast<int64_t>(num(get_key(envelope, "index", Value(0))));
+    delta.delta = get_key(envelope, "delta", Value::object());
+    merge(delta);
+    bool keep_streaming = false;
+    try {
+      keep_streaming = handler(delta);
+    } catch (...) {
+      error = std::current_exception();
+    }
+    if (error || !keep_streaming) {
+      stopped = true;
+      throw AxAIServiceAbortedError("streaming consumer stopped");
+    }
+  }
+
+  void merge(const AxGenDelta& delta) {
+    if (delta.version != version) {
+      samples.clear();
+      version = delta.version;
+    }
+    Value* view = nullptr;
+    for (auto& sample : samples) {
+      if (sample.first == delta.index) view = &sample.second;
+    }
+    if (view == nullptr) {
+      samples.emplace_back(delta.index, Value::object());
+      view = &samples.back().second;
+    }
+    for (const auto& key : Core::iter(delta.delta)) {
+      std::string name = str(key);
+      Value merged = Core::_stream_merge_value_impl(get_key(*view, name), Value(has_key(*view, name)), clone_usage_value(get_key(delta.delta, name)));
+      Core::set(*view, name, merged);
+    }
+  }
+
+  // Without a result picker the run returns the first sample of the last
+  // version; a stopped run returns that sample as merged so far.
+  Value result() const { return samples.empty() ? Value::object() : samples.front().second; }
+};
+
+}  // namespace
+
+Value AxGen::streaming_forward(AIClient& client, Value values, Value options, AxGenDeltaHandler handler) {
+  if (!handler) throw AxError("runtime", "AxGen::streaming_forward: handler must be callable");
+  std::optional<AxCancellationScope> program_cancellation;
+  if (cancellation_ && current_cancellation_token() == nullptr) program_cancellation.emplace(&*cancellation_);
+  auto global_cache = global_caching_function();  // held for the run
+  // As in TS, the cache is read before the run's span and metrics, and a
+  // read error is ignored: a hit is one {version 0, index 0} delta with no
+  // telemetry. A miss hands the lookup to the run, which then only stores.
+  options = Core::map_merge(Value::object(), options);
+  Core::set(options, "_evidence_cache_identity", std::to_string(reinterpret_cast<std::uintptr_t>(&client)));
+  Value lookup = Core::_cache_lookup_impl(state_, values, options, Value(true));
+  if (Core::truthy(Core::get(lookup, "hit", false))) {
+    // A stored output's audio outputs are rendered, as TS does.
+    Value cached = Core::_render_audio_outputs_impl(state_, Core::client_ref(client), Core::get(lookup, "value"), options);
+    AxGenDelta delta;
+    delta.delta = clone_usage_value(cached);
+    handler(delta);
+    return cached;
+  }
+  options = Core::map_merge(Value::object(), options);
+  Core::set(options, "_ax_cache_lookup", lookup);
+  AxRuntimeHooks program_hooks = *std::atomic_load(&runtime_hooks_);
+  RuntimeHookScope scope(AxRuntimeHooks{}, program_hooks, "ax_gen_forward", "ax_gen_generation",
+                         object({{"ax.program.id", Core::get(state_, "program_id", "root")}, {"ax.program.type", "AxGen"}, {"ax.streaming", true}}),
+                         gen_metric_labels(client, Core::get(state_, "options", Value::object()), options));
+  AxGenDeltaConsumer consumer(std::move(handler));
+  AxGenSinkRegistration registration([&consumer](Value envelope) { consumer.deliver(envelope); });
+  Value run_options = Core::map_merge(Core::get(state_, "options", Value::object()), options);
+  try {
+    if (axgen_runs_in_session(state_, run_options)) {
+      SessionRun session(state_, client, run_options);
+      Core::set(run_options, "infraRetries", 0);
+      try {
+        Value output = Core::_streaming_forward_impl(state_, Core::client_ref(session), std::move(values), run_options, registration.marker());
+        session.finish();
+        return output;
+      } catch (const std::exception& error) {
+        // A handler that stops the run early, returning false or throwing,
+        // ends it as aborted, as control.abort() does, not as failed.
+        if (consumer.stopped) session.finish(std::nullopt, true);
+        else session.finish(error.what());
+        throw;
+      }
+    }
+    return Core::_streaming_forward_impl(state_, Core::client_ref(client), std::move(values), std::move(options), registration.marker());
+  } catch (...) {
+    if (consumer.error) std::rethrow_exception(consumer.error);
+    if (!consumer.stopped) throw;
+  }
+  return consumer.result();
+}
+
+Value AxGen::streaming_forward(AIClient& client, Value values, Value options, AxGenDeltaHandler handler, const AxCancellationToken* cancellation) {
+  if (cancellation) cancellation->throw_if_cancelled();
+  AxCancellationScope scope(cancellation);
+  return streaming_forward(client, std::move(values), std::move(options), std::move(handler));
 }
 
 AxGen& AxGen::set_rate_limiter(AxRateLimiter limiter) {
@@ -5449,11 +8583,25 @@ AxGen& AxGen::set_meter(std::shared_ptr<AxMeter> meter) {
   std::atomic_store(&runtime_hooks_, std::make_shared<const AxRuntimeHooks>(std::move(hooks))); return *this;
 }
 
+std::function<std::shared_ptr<AxProgram>()> AxGen::owned_worker_factory() const {
+  auto options=Core::get(state_,"options",Value::object());
+  if(!Core::get(options,"execution_context",Core::get(options,"executionContext")).is_null())return {};
+  auto snapshot=stringify(state_);auto hooks=runtime_hooks_;auto cache=caching_function_;auto cancellation=cancellation_;
+  return [snapshot,hooks,cache,cancellation] {auto state=parse_json(snapshot);auto worker=std::make_shared<AxGen>(Core::get(state,"signature"),Core::get(state,"options"),*hooks);worker->state_=state;worker->caching_function_=cache;worker->cancellation_=cancellation;worker->memory_.value_ref()=Core::get(state,"memory",Value::array());worker->refresh_prompt_template();return worker;};
+}
+std::function<std::shared_ptr<AxProgram>()> AxFlow::owned_worker_factory() const {
+  std::vector<std::pair<std::size_t,std::function<std::shared_ptr<AxProgram>()>>> factories;
+  const auto& steps=array_ref(Core::get(state_,"steps",Value::array()));
+  for(std::size_t i=0;i<steps.size();++i){auto program=Core::get(steps[i],"program");if(program.is_null())continue;auto* stage=registered_stage(display(Core::get(program,"__agent_stage_id")));if(!stage)return {};auto factory=stage->owned_worker_factory();if(!factory)return {};factories.emplace_back(i,std::move(factory));}
+  auto snapshot=stringify(state_);auto hooks=runtime_hooks_;
+  return [snapshot,hooks,factories]{auto worker=std::make_shared<AxFlow>(Value::object(),*hooks);worker->state_=parse_json(snapshot);register_owned_flow(worker->state_,worker->owned_programs_);auto steps=Core::get(worker->state_,"steps");for(const auto& [i,factory]:factories){auto program=factory();worker->owned_programs_->push_back(program);auto step=Core::get(steps,static_cast<int>(i));Core::set(step,"program",Core::agent_stage_ref(*program));}return worker;};
+}
 Value AxGen::value() const { return state_; }
 
 AxFlow::AxFlow(Value options, AxRuntimeHooks hooks)
     : runtime_hooks_(std::make_shared<const AxRuntimeHooks>(std::move(hooks))) {
   state_ = Core::_flow_factory(std::move(options));
+  register_owned_flow(state_,owned_programs_);
   Core::set(state_, "mermaidPercent", "%");
   Core::set(state_, "mermaidOpenBrace", "{");
   Core::set(state_, "mermaidCloseBrace", "}");
@@ -5462,6 +8610,7 @@ AxFlow::AxFlow(Value options, AxRuntimeHooks hooks)
 AxFlow::AxFlow(std::string mermaid, Value bindings, AxRuntimeHooks hooks)
     : runtime_hooks_(std::make_shared<const AxRuntimeHooks>(std::move(hooks))) {
   state_ = Core::_flow_from_mermaid(Value(std::move(mermaid)), bindings);
+  register_owned_flow(state_,owned_programs_);
   Core::set(state_, "mermaidPercent", "%");
   Core::set(state_, "mermaidOpenBrace", "{");
   Core::set(state_, "mermaidCloseBrace", "}");
@@ -5607,11 +8756,35 @@ Value AxFlow::forward(AIClient& client, Value values, Value options) {
   return forward(client, std::move(values), std::move(options), AxRuntimeHooks{});
 }
 
+Value AxFlow::forward(AIClient& client, Value values, Value options, const AxCancellationToken* cancellation) {
+  if(cancellation)cancellation->throw_if_cancelled();AxCancellationScope scope(cancellation);return forward(client,std::move(values),std::move(options));
+}
+
 Value AxFlow::forward(AIClient& client, Value values, Value options, const AxRuntimeHooks& hooks) {
-  AxRuntimeHooks program_hooks = *std::atomic_load(&runtime_hooks_);
-  RuntimeHookScope scope(hooks, program_hooks, "ax_gen_flow_forward", "ax_gen_flow",
-                         object({{"ax.program.id", Core::get(state_, "program_id", "root.flow")}, {"ax.program.type", "AxFlow"}}));
-  return Core::_flow_forward(state_, Core::client_ref(client), std::move(values), std::move(options));
+  // As in TS, the flow reads its cache before its span and metrics, so a hit
+  // records neither (and streaming_forward sends it as its one delta). A miss
+  // hands the lookup to the run, which then only stores.
+  Value lookup = Core::_flow_cache_lookup_impl(state_, values, options);
+  if (Core::truthy(Core::get(lookup, "hit", false))) return Core::get(lookup, "value");
+  options = Core::map_merge(Value::object(), options);
+  Core::set(options, "_ax_flow_cache_lookup", lookup);
+  // As TypeScript's AxFlow.forward does, a run control hears the flow's own
+  // lifecycle at its path; each node reports at <path>/<node>.
+  auto control = resolve_control(options);
+  std::string run_path = display(Core::get(options, "execution_path", Core::get(options, "executionPath", "root")));
+  if (control) control->emit(object({{"type", "started"}, {"path", run_path}}));
+  Value output;
+  try {
+    AxRuntimeHooks program_hooks = *std::atomic_load(&runtime_hooks_);
+    RuntimeHookScope scope(hooks, program_hooks, "ax_gen_flow_forward", "ax_gen_flow",
+                           object({{"ax.program.id", Core::get(state_, "program_id", "root.flow")}, {"ax.program.type", "AxFlow"}}));
+    output = Core::_flow_forward(state_, Core::client_ref(client), std::move(values), std::move(options));
+  } catch (const std::exception& error) {
+    if (control) control->emit(object({{"type", "failed"}, {"path", run_path}, {"error", std::string(error.what())}}));
+    throw;
+  }
+  if (control) control->emit(object({{"type", "completed"}, {"path", run_path}}));
+  return output;
 }
 
 AxFlow& AxFlow::set_rate_limiter(AxRateLimiter limiter) {
@@ -5648,6 +8821,8 @@ AxFlow& AxFlow::apply_optimization(Value artifact) {
   return apply_optimized_components(Core::get(map, "componentMap", Value::object()));
 }
 Value AxFlow::evaluate_optimization(AIClient& client, Value dataset, Value candidate_map, Value options) {
+  Value demos = Core::get(options, "demos", Value::array());
+  if (!Core::iter(demos).empty()) set_demos(demos);
   return Core::_flow_evaluate_optimization(state_, Core::client_ref(client), std::move(dataset), std::move(candidate_map), std::move(options));
 }
 struct AxFlowOptimizerEvaluator : OptimizerEvaluator {
@@ -5698,20 +8873,83 @@ AxAgent::AxAgent(Value signature, Value options, AxRuntimeHooks hooks)
   playbook_config_ = Core::get(options, "playbook", Value());
   state_ = Core::_agent_factory(std::move(signature), options);
   Value actor_validation_retries = Core::get(options, "validation_retries", Core::get(options, "validationRetries", 1));
-  distiller_ = std::make_unique<AxGen>(s(str(Core::get(state_, "distiller_signature"))), object({{"validation_retries", actor_validation_retries}, {"id", "ctx.root.actor"}, {"instruction", Core::get(state_, "distiller_description", "")}}));
-  executor_ = std::make_unique<AxGen>(s(str(Core::get(state_, "executor_signature"))), object({{"validation_retries", actor_validation_retries}, {"id", "task.root.actor"}, {"instruction", Core::get(state_, "executor_description", "")}}));
-  responder_ = std::make_unique<AxGen>(s(str(Core::get(state_, "responder_signature"))), object({{"validation_retries", Core::get(options, "validation_retries", 2)}, {"id", "task.root.responder"}, {"instruction", Core::get(state_, "responder_description", "")}}));
+  distiller_ = std::make_unique<AxGen>(s(str(Core::get(state_, "distiller_signature"))), object({{"validation_retries", actor_validation_retries}, {"id", "ctx.root.actor"}, {"includeOptionalInputFieldsInSystemPrompt", true}, {"instruction", Core::get(state_, "distiller_description", "")}}));
+  executor_ = std::make_unique<AxGen>(s(str(Core::get(state_, "executor_signature"))), object({{"validation_retries", actor_validation_retries}, {"id", "task.root.actor"}, {"includeOptionalInputFieldsInSystemPrompt", true}, {"instruction", Core::get(state_, "executor_description", "")}}));
+  responder_ = make_responder(options);
   llm_query_ = std::make_unique<AxGen>(s(str(Core::get(state_, "llm_query_signature", Value("task:string, context:json -> answer:string")))), object({{"validation_retries", 1}, {"id", "rlm.llmquery"}, {"instruction", Core::get(state_, "llm_query_description", "")}}));
+  reset_stage_sets();
+  attach_configured_playbook();
+}
+
+// The stages just built are the set in use, for the mode the agent was built in.
+void AxAgent::reset_stage_sets() {
+  stage_mode_ = Core::truthy(Core::get(state_, "runtime_enabled", false)) ? "runtime" : "plain";
+  stage_sets_.clear();
+  optimized_components_ = Value::object();
+}
+
+// A run's stages follow its runtime: the constructor's, else the forward
+// call's; without one, the runtime-less stages run. A set coming back into use
+// takes the instructions from the agent's state (a standing instruction set
+// since) and the optimized components again.
+void AxAgent::use_stage_mode(const Value& options) {
+  Value record = Core::_agent_use_stage_mode(state_, options);
+  std::string mode = str(Core::get(record, "mode", Value("plain")));
+  if (mode == stage_mode_) return;
+  StageSet incoming;
+  auto cached = stage_sets_.find(mode);
+  if (cached != stage_sets_.end()) {
+    incoming = std::move(cached->second);
+    stage_sets_.erase(cached);
+    incoming.distiller->set_instruction(Core::get(record, "distiller_description", Value("")));
+    incoming.executor->set_instruction(Core::get(record, "executor_description", Value("")));
+    incoming.responder->set_instruction(Core::get(record, "responder_description", Value("")));
+  } else {
+    Value actor_validation_retries = Core::get(options_, "validation_retries", Core::get(options_, "validationRetries", 1));
+    incoming.distiller = std::make_unique<AxGen>(s(str(Core::get(record, "distiller_signature"))), object({{"validation_retries", actor_validation_retries}, {"id", "ctx.root.actor"}, {"includeOptionalInputFieldsInSystemPrompt", true}, {"instruction", Core::get(record, "distiller_description", "")}}));
+    incoming.executor = std::make_unique<AxGen>(s(str(Core::get(record, "executor_signature"))), object({{"validation_retries", actor_validation_retries}, {"id", "task.root.actor"}, {"includeOptionalInputFieldsInSystemPrompt", true}, {"instruction", Core::get(record, "executor_description", "")}}));
+    incoming.responder = make_responder(options_);
+  }
+  incoming.distiller->apply_optimized_components(optimized_components_);
+  incoming.executor->apply_optimized_components(optimized_components_);
+  incoming.responder->apply_optimized_components(optimized_components_);
+  StageSet outgoing;
+  outgoing.distiller = std::move(distiller_);
+  outgoing.executor = std::move(executor_);
+  outgoing.responder = std::move(responder_);
+  stage_sets_[stage_mode_] = std::move(outgoing);
+  distiller_ = std::move(incoming.distiller);
+  executor_ = std::move(incoming.executor);
+  responder_ = std::move(incoming.responder);
+  stage_mode_ = mode;
+  rebind_playbook();
+}
+
+// The responder stage. As in TypeScript, its validation budget is maxRetries
+// unless validation_retries is set, and with citations on it asserts that the
+// cited ids exist in the run's evidence.
+std::unique_ptr<AxGen> AxAgent::make_responder(const Value& options) {
+  Value responder_options = object({{"id", "task.root.responder"}, {"instruction", Core::get(state_, "responder_description", "")}});
+  Value retries = Core::get(options, "validation_retries");
+  if (!retries.is_null()) Core::set(responder_options, "validation_retries", retries);
+  auto responder = std::make_unique<AxGen>(s(str(Core::get(state_, "responder_signature"))), responder_options);
+  if (Core::truthy(Core::get(Core::get(state_, "citations", Value::object()), "enabled", false))) {
+    Value state = state_;
+    responder->add_assert([state](Value output) { return Core::_agent_citation_assert(state, output); });
+  }
+  return responder;
 }
 
 AxAgent& AxAgent::set_signature(Value signature) {
-  Value options = Core::get(state_, "options", Value::object());
+  Value options = options_;
   state_ = Core::_agent_factory(std::move(signature), options);
   Value actor_validation_retries = Core::get(options, "validation_retries", Core::get(options, "validationRetries", 1));
-  distiller_ = std::make_unique<AxGen>(s(str(Core::get(state_, "distiller_signature"))), object({{"validation_retries", actor_validation_retries}, {"id", "ctx.root.actor"}, {"instruction", Core::get(state_, "distiller_description", "")}}));
-  executor_ = std::make_unique<AxGen>(s(str(Core::get(state_, "executor_signature"))), object({{"validation_retries", actor_validation_retries}, {"id", "task.root.actor"}, {"instruction", Core::get(state_, "executor_description", "")}}));
-  responder_ = std::make_unique<AxGen>(s(str(Core::get(state_, "responder_signature"))), object({{"validation_retries", Core::get(options, "validation_retries", 2)}, {"id", "task.root.responder"}, {"instruction", Core::get(state_, "responder_description", "")}}));
+  distiller_ = std::make_unique<AxGen>(s(str(Core::get(state_, "distiller_signature"))), object({{"validation_retries", actor_validation_retries}, {"id", "ctx.root.actor"}, {"includeOptionalInputFieldsInSystemPrompt", true}, {"instruction", Core::get(state_, "distiller_description", "")}}));
+  executor_ = std::make_unique<AxGen>(s(str(Core::get(state_, "executor_signature"))), object({{"validation_retries", actor_validation_retries}, {"id", "task.root.actor"}, {"includeOptionalInputFieldsInSystemPrompt", true}, {"instruction", Core::get(state_, "executor_description", "")}}));
+  responder_ = make_responder(options);
   llm_query_ = std::make_unique<AxGen>(s(str(Core::get(state_, "llm_query_signature", Value("task:string, context:json -> answer:string")))), object({{"validation_retries", 1}, {"id", "rlm.llmquery"}, {"instruction", Core::get(state_, "llm_query_description", "")}}));
+  reset_stage_sets();
+  rebind_playbook();
   return *this;
 }
 
@@ -5719,13 +8957,13 @@ Value AxAgent::get_instruction() const { return Core::get(state_, "stage_instruc
 
 AxAgent& AxAgent::set_instruction(Value instruction) {
   Value composed = Core::_agent_set_instruction(state_, display(instruction));
-  executor_->set_instruction(composed);
+  set_stage_instruction(*executor_, composed);
   return *this;
 }
 
 AxAgent& AxAgent::add_actor_instruction(Value addendum) {
   Value composed = Core::_agent_add_actor_instruction(state_, display(addendum));
-  executor_->set_instruction(composed);
+  set_stage_instruction(*executor_, composed);
   return *this;
 }
 
@@ -5733,15 +8971,51 @@ Value AxAgent::forward(AIClient& client, Value values, Value options) {
   return forward(client, std::move(values), std::move(options), AxRuntimeHooks{});
 }
 
+Value AxAgent::forward(AIClient& client, Value values, Value options, const AxCancellationToken* cancellation) {
+  if(cancellation)cancellation->throw_if_cancelled();AxCancellationScope scope(cancellation);return forward(client,std::move(values),std::move(options));
+}
+
 Value AxAgent::forward(AIClient& client, Value values, Value options, const AxRuntimeHooks& hooks) {
+  return run(client, std::move(values), std::move(options), hooks, Value(), nullptr);
+}
+
+Value AxAgent::streaming_forward(AIClient& client, Value values, Value options, AxGenDeltaHandler handler) {
+  if (!handler) throw AxError("runtime", "AxAgent::streaming_forward: handler must be callable");
+  AxGenDeltaConsumer consumer(std::move(handler));
+  AxGenSinkRegistration registration([&consumer](Value envelope) { consumer.deliver(envelope); });
+  try {
+    return run(client, std::move(values), std::move(options), AxRuntimeHooks{}, registration.marker(), &consumer.stopped);
+  } catch (...) {
+    if (consumer.error) std::rethrow_exception(consumer.error);
+    if (!consumer.stopped) throw;
+  }
+  return consumer.result();
+}
+
+// forward, and with a sink the streaming forward.
+Value AxAgent::run(AIClient& client, Value values, Value options, const AxRuntimeHooks& hooks, Value sink, const bool* consumer_stopped) {
   AxRuntimeHooks program_hooks = *std::atomic_load(&runtime_hooks_);
-  RuntimeHookScope scope(hooks, program_hooks, "ax_gen_agent_forward", "ax_gen_agent",
-                         object({{"ax.program.id", "root.agent"}, {"ax.program.type", "AxAgent"}}));
-  ensure_configured_playbook(client);
+  Value attributes = object({{"ax.program.id", "root.agent"}, {"ax.program.type", "AxAgent"}});
+  if (!sink.is_null()) Core::set(attributes, "ax.streaming", true);
+  RuntimeHookScope scope(hooks, program_hooks, "ax_gen_agent_forward", "ax_gen_agent", attributes);
+  use_stage_mode(options);
+  auto call_context=execution_context_ ? execution_context_ : detail::MCPRunScope::current();
+  detail::MCPRunScope context_scope(call_context);
+  if(call_context || Core::truthy(Core::get(state_,"mcp_run_context_active",false))) {
+    Value modules=call_context ? call_context->agent_modules() : Value::array();
+    Core::_agent_apply_run_context(state_,options_,options,modules);
+    if(Core::truthy(Core::get(state_,"runtime_enabled",false))) {
+      set_stage_instruction(*distiller_, Core::get(state_,"distiller_description"));
+      set_stage_instruction(*executor_, Core::get(state_,"executor_description"));
+      set_stage_instruction(*responder_, Core::get(state_,"responder_description"));
+    }
+  }
   // Wire the built-in llmQuery primitive onto the runtime carried in agent
   // options (the same runtime the actor loop will create sessions on),
   // mirroring the Go/Python/Rust/Java wrappers. The logic lives in the
   // AxIR-generated helper; this only registers the host callable.
+  auto invocation_binding = std::make_shared<std::pair<Value, std::thread::id>>(state_, std::this_thread::get_id());
+  std::weak_ptr<std::pair<Value, std::thread::id>> weak_binding = invocation_binding;
   Value runtime_ref = Core::get(options, "runtime", Value());
   if (runtime_ref.is_null()) {
     runtime_ref = Core::get(Core::get(state_, "options", Value::object()), "runtime", Value());
@@ -5750,21 +9024,61 @@ Value AxAgent::forward(AIClient& client, Value values, Value options, const AxRu
   if (!runtime_id.empty()) {
     auto it = code_runtime_registry().find(runtime_id);
     if (it != code_runtime_registry().end() && it->second != nullptr) {
+      for (Value raw_name : Core::iter(Core::_agent_runtime_callable_names(state_))) {
+        std::string qualified = str(raw_name);
+        it->second->register_host_callable(qualified, [weak_binding, qualified](Value arguments) -> Value {
+          auto binding = weak_binding.lock();
+          if (!binding) throw AxError("runtime", "Agent invocation belongs to a closed run");
+          if (binding->second != std::this_thread::get_id()) throw AxError("runtime", "Agent runtime callbacks must execute on the owning run thread");
+          return Core::_agent_runtime_invoke_callable(binding->first, qualified, arguments);
+        });
+      }
       AxGen* sub = llm_query_.get();
       AIClient* client_ptr = &client;
-      it->second->register_host_callable("llmQuery", [sub, client_ptr](Value params) -> Value {
-        return Core::_agent_run_llm_query(Core::agent_stage_ref(*sub), Core::client_ref(*client_ptr), std::move(params));
+      it->second->register_host_callable("llmQuery", [weak_binding, sub, client_ptr, options](Value params) -> Value {
+        auto binding = weak_binding.lock();
+        if (!binding) throw AxError("runtime", "Agent invocation belongs to a closed run");
+        if (binding->second != std::this_thread::get_id()) throw AxError("runtime", "Agent runtime callbacks must execute on the owning run thread");
+        return Core::_agent_run_llm_query(Core::agent_stage_ref(*sub), Core::client_ref(*client_ptr), std::move(params), options);
       });
     }
   }
-  Value output = Core::_agent_forward(
-      state_,
-      Core::agent_stage_ref(*distiller_),
-      Core::agent_stage_ref(*executor_),
-      Core::agent_stage_ref(*responder_),
-      Core::client_ref(client),
-      std::move(values),
-      std::move(options));
+  // As TypeScript's forward and streamingForward do, a run control hears the
+  // run's own lifecycle at its path; each stage reports at <path>/<stage>.
+  auto control = resolve_control(options);
+  std::string run_path = display(Core::get(options, "execution_path", Core::get(options, "executionPath", "root")));
+  if (control) control->emit(object({{"type", "started"}, {"path", run_path}}));
+  Value output;
+  try {
+    if (sink.is_null()) {
+      output = Core::_agent_forward(
+          state_,
+          Core::agent_stage_ref(*distiller_),
+          Core::agent_stage_ref(*executor_),
+          Core::agent_stage_ref(*responder_),
+          Core::client_ref(client),
+          std::move(values),
+          std::move(options));
+    } else {
+      output = Core::_agent_streaming_forward(
+          state_,
+          Core::agent_stage_ref(*distiller_),
+          Core::agent_stage_ref(*executor_),
+          Core::agent_stage_ref(*responder_),
+          Core::client_ref(client),
+          std::move(values),
+          std::move(options),
+          sink);
+    }
+  } catch (const std::exception& error) {
+    if (control) {
+      // A consumer that stopped the stream early ended the run on purpose, as
+      // control.abort() does.
+      if (consumer_stopped && *consumer_stopped) control->emit(object({{"type", "aborted"}, {"path", run_path}}));
+      else control->emit(object({{"type", "failed"}, {"path", run_path}, {"error", std::string(error.what())}}));
+    }
+    throw;
+  }
   if (citations_observer_) {
     try {
       citations_observer_(Core::get(state_, "last_citations", Value::array()));
@@ -5772,7 +9086,10 @@ Value AxAgent::forward(AIClient& client, Value values, Value options, const AxRu
       // Citation observers are informational and must not fail forward().
     }
   }
-  learn_playbook_failures(output);
+  // TS learns from the responder's answer after forward; a stream has no
+  // single answer to hand the playbook.
+  learn_playbook_failures(sink.is_null() ? output : Value::object());
+  if (control) control->emit(object({{"type", "completed"}, {"path", run_path}}));
   return output;
 }
 
@@ -5799,22 +9116,39 @@ AxAgent& AxAgent::set_playbook_observer(std::function<void(Value)> observer) {
   return *this;
 }
 
+AxAgent& AxAgent::add_child_agent(std::string namespace_name, std::string name, std::shared_ptr<AxAgent> child) {
+  if (!child) throw std::invalid_argument("Child agent is required");
+  std::vector<const AxAgent*> pending{child.get()};
+  std::set<const AxAgent*> visited;
+  while (!pending.empty()) {
+    const AxAgent* candidate = pending.back(); pending.pop_back();
+    if (candidate == this) throw std::invalid_argument("Child agent ownership cannot contain a cycle");
+    if (!visited.insert(candidate).second) continue;
+    for (const auto& descendant : candidate->child_agents_) pending.push_back(descendant.get());
+  }
+  Value updated = Core::_agent_register_child(options_, namespace_name, name, Core::agent_stage_ref(*child), Core::get(child->state_, "signature"));
+  options_ = updated;
+  Core::set(state_, "options", updated);
+  child_agents_.push_back(std::move(child));
+  return set_signature(Core::get(state_, "signature"));
+}
+
 AxAgent& AxAgent::add_tool_module(std::string name, const std::vector<Tool>& tools) {
   Array functions;
   for (const auto& tool : tools) {
     functions.push_back(tool.value());
   }
-  Value options = Core::get(state_, "options", Value::object());
-  Value modules = Core::get(options, "functions", Value::array());
-  Core::append(modules, object({{"name", std::move(name)}, {"functions", Value(functions)}}));
-  Core::set(options, "functions", modules);
+  Value options = options_;
+  options = Core::_agent_append_runtime_modules(options, Value(Array{object({{"name", std::move(name)}, {"functions", Value(functions)}})}));
   options_ = options;
   state_ = Core::_agent_factory(Core::get(state_, "signature"), options);
   Value actor_validation_retries = Core::get(options, "validation_retries", Core::get(options, "validationRetries", 1));
-  distiller_ = std::make_unique<AxGen>(s(str(Core::get(state_, "distiller_signature"))), object({{"validation_retries", actor_validation_retries}, {"id", "ctx.root.actor"}, {"instruction", Core::get(state_, "distiller_description", "")}}));
-  executor_ = std::make_unique<AxGen>(s(str(Core::get(state_, "executor_signature"))), object({{"validation_retries", actor_validation_retries}, {"id", "task.root.actor"}, {"instruction", Core::get(state_, "executor_description", "")}}));
-  responder_ = std::make_unique<AxGen>(s(str(Core::get(state_, "responder_signature"))), object({{"validation_retries", Core::get(options, "validation_retries", 2)}, {"id", "task.root.responder"}, {"instruction", Core::get(state_, "responder_description", "")}}));
+  distiller_ = std::make_unique<AxGen>(s(str(Core::get(state_, "distiller_signature"))), object({{"validation_retries", actor_validation_retries}, {"id", "ctx.root.actor"}, {"includeOptionalInputFieldsInSystemPrompt", true}, {"instruction", Core::get(state_, "distiller_description", "")}}));
+  executor_ = std::make_unique<AxGen>(s(str(Core::get(state_, "executor_signature"))), object({{"validation_retries", actor_validation_retries}, {"id", "task.root.actor"}, {"includeOptionalInputFieldsInSystemPrompt", true}, {"instruction", Core::get(state_, "executor_description", "")}}));
+  responder_ = make_responder(options);
   llm_query_ = std::make_unique<AxGen>(s(str(Core::get(state_, "llm_query_signature", Value("task:string, context:json -> answer:string")))), object({{"validation_retries", 1}, {"id", "rlm.llmquery"}, {"instruction", Core::get(state_, "llm_query_description", "")}}));
+  reset_stage_sets();
+  rebind_playbook();
   return *this;
 }
 
@@ -5895,11 +9229,13 @@ Value AxAgent::get_optimizable_components() const {
 }
 AxAgent& AxAgent::apply_optimized_components(Value component_map) {
   Core::_validate_optimization_component_map(get_optimizable_components(), component_map);
+  // Kept for the other stage set, which gets them when a run switches to it.
+  optimized_components_ = Core::map_merge(optimized_components_, component_map);
   distiller_->apply_optimized_components(component_map);
   executor_->apply_optimized_components(component_map);
   responder_->apply_optimized_components(component_map);
   Value composed = Core::_agent_apply_optimized_components(state_, component_map);
-  executor_->set_instruction(composed);
+  set_stage_instruction(*executor_, composed);
   return *this;
 }
 AxAgent& AxAgent::apply_optimization(Value artifact) {
@@ -5909,17 +9245,35 @@ AxAgent& AxAgent::apply_optimization(Value artifact) {
 }
 Value AxAgent::evaluate_optimization_task(AIClient& client, Value task, Value options) {
   Value input = Core::get(task, "input", task);
-  Value forward_options = Core::get(options, "forward_options", Value::object());
+  // A runtime on the evolve or optimize call runs each task, as it runs a
+  // forward call (the agent may hold only a runtime descriptor), unless
+  // forward_options names one. A copy: the caller's options stay as they are.
+  Value forward_options = Core::map_merge(Value::object(), Core::get(options, "forward_options", Value::object()));
+  Value call_runtime = Core::get(options, "runtime");
+  if (!call_runtime.is_null() && Core::get(forward_options, "runtime").is_null()) Core::set(forward_options, "runtime", call_runtime);
+  // As TS evaluates each task from a fresh state, the prediction carries only
+  // this run's share of the agent's logs.
+  Value marks = Core::_agent_eval_marks(state_);
+  Value completion;
+  // TS's evaluation path runs no playbook run-end learning.
+  Core::set(state_, "playbook_learning_paused", Value(true));
+  struct ResumeLearning {
+    Value& state;
+    ~ResumeLearning() { Core::map_delete(state, Value("playbook_learning_paused")); }
+  } resume_learning{state_};
   try {
     Value output = forward(client, input, forward_options);
-    return Core::_build_agent_eval_prediction(output, get_action_log(), get_usage(), export_trace());
+    completion = object({{"type", Value("final")}, {"output", output}});
+  } catch (const AxAgentClarificationError& e) {
+    completion = object({{"type", Value("askClarification")}, {"clarification", e.clarification}});
   } catch (const AxError& e) {
     if (e.category == "AxAgentClarificationError") {
-      return object({{"completionType", Value("askClarification")}, {"clarification", Value(std::string(e.what()))}, {"actionLog", get_action_log()}, {"functionCalls", Core::get(state_, "function_call_traces", Value::array())}, {"toolErrors", Value::array()}, {"turnCount", Value(0)}, {"usage", get_usage()}, {"trace", export_trace()}});
+      completion = object({{"type", Value("askClarification")}, {"clarification", Value(std::string(e.what()))}});
+    } else {
+      completion = object({{"type", Value("error")}, {"message", Value(std::string(e.what()))}});
     }
-    Value err = object({{"message", Value(std::string(e.what()))}});
-    return object({{"completionType", Value("error")}, {"error", err}, {"actionLog", get_action_log()}, {"functionCalls", Core::get(state_, "function_call_traces", Value::array())}, {"toolErrors", array({Value(std::string(e.what()))})}, {"turnCount", Value(0)}, {"usage", get_usage()}, {"trace", export_trace()}});
   }
+  return Core::_build_agent_run_prediction(state_, marks, completion, get_usage(), export_trace());
 }
 Value AxAgent::evaluate_optimization(AIClient& client, Value dataset, Value candidate_map, Value options) {
   Value normalized = Core::_normalize_optimization_dataset(dataset.is_null() ? Value::array() : dataset);
@@ -5989,50 +9343,105 @@ Value AxAgent::optimize(Value dataset, Value options) {
 // stage by default; pass {"target":"responder"} for the responder). As the
 // playbook evolves it is injected into the live stage prompt unless {"apply"} is
 // false. The evolution engine (ACE) is an implementation detail.
-AxPlaybook& AxAgent::playbook(AIClient& student, Value options) {
+AxPlaybook& AxAgent::playbook(AIClient& student, Value options, AIClient* teacher) {
   if (playbook_handle_) {
-    if (options.is_object() && !Core::iter(Core::map_keys(options)).empty()) {
+    if (teacher != nullptr || (options.is_object() && !Core::iter(Core::map_keys(options)).empty())) {
       throw AxError("validation", "AxAgent.playbook(): this agent already has a playbook; call playbook() without options to use it.");
     }
+    // A moved agent leaves the handle's back-pointer on the old object.
+    playbook_handle_->bind_agent(*this);
     return *playbook_handle_;
   }
   if (!options.is_object()) options = Value::object();
-  std::string target = display(Core::get(options, "target", Value("actor")));
-  AxGen* stage = target == "responder" ? responder_.get() : executor_.get();
-  auto handle = std::make_unique<AxPlaybook>(*stage, student, nullptr, options);
-  if (Core::truthy(Core::eq(Core::get(options, "apply"), Value(false)))) {
-    handle->set_apply_hook([](const std::string&) {});
-  } else {
-    std::string base = display(stage->get_instruction());
-    AxGen* stage_ptr = stage;
-    handle->set_apply_hook([stage_ptr, base](const std::string& rendered) {
-      stage_ptr->set_instruction(Value(playbook_compose_instruction(base, rendered)));
-    });
-  }
+  playbook_target_ = display(Core::get(options, "target", Value("actor")));
+  playbook_apply_ = !Core::truthy(Core::eq(Core::get(options, "apply"), Value(false)));
+  AxGen* stage = playbook_stage();
+  auto handle = std::make_unique<AxPlaybook>(*stage, student, teacher, options);
+  bind_playbook_stage(*handle, stage);
   handle->bind_agent(*this);
   playbook_handle_ = std::move(handle);
   return *playbook_handle_;
 }
 
-AxPlaybook* AxAgent::get_playbook() const { return playbook_handle_.get(); }
+// The stage the playbook targets: the actor, or the responder.
+AxGen* AxAgent::playbook_stage() const { return playbook_target_ == "responder" ? responder_.get() : executor_.get(); }
 
-void AxAgent::ensure_configured_playbook(AIClient& client) {
+// Point the playbook at an agent stage: the program it runs and the hook that
+// writes the rendered playbook into the stage prompt.
+void AxAgent::bind_playbook_stage(AxPlaybook& handle, AxGen* stage) {
+  handle.rebind_program(*stage);
+  if (!playbook_apply_) {
+    handle.set_apply_hook([](const std::string&) {});
+    return;
+  }
+  std::string base = display(stage->get_instruction());
+  handle.set_apply_hook([stage, base](const std::string& rendered) {
+    stage->set_instruction(Value(playbook_compose_instruction(base, rendered)));
+  });
+}
+
+// Point the playbook at its stage again and write it into that stage's prompt:
+// set_signature and add_tool_module replace the stage AxGen objects (the old
+// ones are freed), and set_stage_instruction rewrites the stage's instruction.
+void AxAgent::rebind_playbook() {
+  if (!playbook_handle_) return;
+  bind_playbook_stage(*playbook_handle_, playbook_stage());
+  playbook_handle_->apply_to();
+}
+
+// Write an agent stage's instruction. The stage the playbook targets gets the
+// rendered playbook composed on top, as TS keeps it in the stage prompt, so a
+// stage instruction, an actor addendum, optimized components or the run-context
+// refresh never drop it.
+void AxAgent::set_stage_instruction(AxGen& stage, Value instruction) {
+  stage.set_instruction(std::move(instruction));
+  if (playbook_handle_ && playbook_stage() == &stage) rebind_playbook();
+}
+
+AxPlaybook* AxAgent::get_playbook() const {
+  // The playbook is attached at construction, so a moved agent leaves the
+  // handle's back-pointer on the old object: point it here again.
+  if (playbook_handle_) playbook_handle_->bind_agent(const_cast<AxAgent&>(*this));
+  return playbook_handle_.get();
+}
+
+// The configured playbook's client under one of keys, a Core::client_ref.
+static AIClient* playbook_config_client(const Value& options, std::initializer_list<const char*> keys) {
+  for (const char* key : keys) {
+    Value ref = Core::get(options, key);
+    if (ref.is_null()) continue;
+    if (AIClient* client = registered_client(str(Core::get(ref, "__client_id", Value(""))))) return client;
+  }
+  return nullptr;
+}
+
+// Attach the `playbook` config's playbook at construction, as TS, Python and
+// Java do, so get_playbook() has it before the first forward. Its student is
+// the config's studentAI, else the agent's ai or client (Core::client_ref
+// values); a config without one is invalid, as in TS.
+void AxAgent::attach_configured_playbook() {
   if (playbook_handle_ || playbook_config_.is_null() || (playbook_config_.is_bool() && !Core::truthy(playbook_config_))) return;
-  Value config = playbook_config_.is_object() ? playbook_config_ : Value::object();
+  // A copy: the caller's config Value is shared and must not change.
+  Value config = Core::map_merge(Value::object(), playbook_config_.is_object() ? playbook_config_ : Value::object());
   if (Core::get(config, "maxReflectorRounds", Value()).is_null() && Core::get(config, "max_reflector_rounds", Value()).is_null()) {
     Core::set(config, "maxReflectorRounds", 1);
   }
-  Value seed = Core::get(config, "seed", Value());
-  if (seed.is_null() && (!Core::get(config, "playbook", Value()).is_null() || !Core::get(config, "artifact", Value()).is_null())) seed = config;
-  AxPlaybook& handle = playbook(client, config);
-  if (seed.is_object()) {
-    if (!Core::get(seed, "playbook", Value()).is_null()) handle.load(seed);
-    else handle.load(object({{"playbook", seed}}));
+  AIClient* student = playbook_config_client(config, {"studentAI", "student_ai", "student", "client", "ai"});
+  if (student == nullptr) student = playbook_config_client(options_, {"ai", "client"});
+  if (student == nullptr) {
+    throw AxError("validation", "AxAgent: the `playbook` config option requires studentAI when the agent has no default ai.");
   }
+  AIClient* teacher = playbook_config_client(config, {"teacherAI", "teacher_ai", "teacher"});
+  // TS's `playbook` seed (a snapshot or a bare playbook). Numeric `seed` is reserved for the optimizer.
+  Value seed = Core::_agent_playbook_config_seed(config);
+  AxPlaybook& handle = playbook(*student, config, teacher);
+  if (seed.is_object()) handle.load(seed);
 }
 
 void AxAgent::learn_playbook_failures(Value output) {
   if (!playbook_handle_ || playbook_config_.is_null()) return;
+  // An evaluated run learns nothing, as TS's evaluation path.
+  if (Core::truthy(Core::get(state_, "playbook_learning_paused", Value(false)))) return;
   Value config = playbook_config_.is_object() ? playbook_config_ : Value::object();
   Value learn = Core::get(config, "learn", Value(true));
   if (learn.is_bool() && !Core::truthy(learn)) return;
@@ -6114,15 +9523,31 @@ template <typename Program>
 static Value optimize_impl(Program& program, AIClient& student, Value dataset, Value options, AIClient* teacher) {
   AIClient* reflection = teacher == nullptr ? &student : teacher;
   Value bootstrap_setting = Core::get(options, "bootstrap", Value(static_cast<bool>(Core::iter(dataset).size() <= 8)));
+  Value normalized = Core::_normalize_optimization_dataset(dataset);
+  Value train = Core::get(normalized, "train", Value::array());
+  bootstrap_setting = Core::get(options, "bootstrap", Value(Core::iter(train).size() <= 8));
+  Value validation = Core::get(options, "validationExamples", Core::get(options, "validation_examples", Core::get(normalized, "validation", Value::array())));
+  if (Core::iter(validation).empty()) validation = train;
+  Value gepa_options = optimize_set_common_gepa_options(options);
+  Core::set(gepa_options, "maxMetricCalls", Core::_gepa_helper_metric_budget(options, static_cast<int>(Core::iter(validation).size()), optimize_bootstrap_enabled(bootstrap_setting)));
   Value demos = Value::array();
+  int bootstrap_calls = 0;
   if (optimize_bootstrap_enabled(bootstrap_setting)) {
+    Value baseline_options = Core::map_merge(Value::object(), gepa_options);
+    Core::set(baseline_options, "numTrials", 0);
+    AxGEPA baseline(reflection, baseline_options);
+    program.optimize_with(baseline, student, dataset, baseline_options);
+    Core::set(gepa_options, "_baselineEvaluation", baseline.baseline_evaluation());
     Value bootstrap_options = optimize_set_apply_false(optimize_options_merge(options, bootstrap_setting));
     AxBootstrapFewShot bootstrap(bootstrap_options);
     Value bootstrap_artifact = program.optimize_with(bootstrap, *reflection, dataset, bootstrap_options);
     demos = Core::get(bootstrap_artifact, "demos", Value::array());
+    if (Core::iter(demos).empty()) throw AxError("runtime", "No demonstrations found. Either provide more examples or improve the existing ones.");
+    bootstrap_calls = gepa_int(Core::get(Core::get(bootstrap_artifact, "metadata", Value::object()), "totalMetricCalls", 0), 0);
     if (!Core::iter(demos).empty()) optimize_apply_demos(program, demos);
   }
-  Value gepa_options = optimize_set_common_gepa_options(options);
+  Core::set(gepa_options, "_bootstrapDemos", demos);
+  Core::set(gepa_options, "_bootstrapMetricCalls", bootstrap_calls);
   AxGEPA gepa(reflection, gepa_options);
   Value artifact = program.optimize_with(gepa, student, dataset, gepa_options);
   if (!Core::iter(demos).empty()) Core::set(artifact, "demos", demos);
@@ -6310,6 +9735,102 @@ AxFlow flow(Value options) { return AxFlow(std::move(options)); }
 AxFlow flow(Value options, AxRuntimeHooks hooks) { return AxFlow(std::move(options), std::move(hooks)); }
 AxFlow flow(const std::string& mermaid, Value bindings) { return AxFlow(mermaid, std::move(bindings)); }
 AxFlow flow(const std::string& mermaid, Value bindings, AxRuntimeHooks hooks) { return AxFlow(mermaid, std::move(bindings), std::move(hooks)); }
+AxBox AxBox::from_value(Value value) {
+  Core::_box_validate_impl(value, "box");
+  return {Core::number(Core::get(value,"top")),Core::number(Core::get(value,"bottom")),Core::number(Core::get(value,"left")),Core::number(Core::get(value,"right"))};
+}
+TypesafeResponse TypesafeResponse::from_value(Value value) {
+  auto raw_usage=Core::get(value,"usage");
+  TypesafeResponse response{display(Core::get(value,"model")),{}, {static_cast<std::uint64_t>(Core::number(Core::get(raw_usage,"input_tokens"))),static_cast<std::uint64_t>(Core::number(Core::get(raw_usage,"output_tokens")))}};
+  auto answers=Core::get(value,"answers");
+  for(auto key:Core::iter(Core::map_keys(answers))) {
+    auto answer=Core::get(answers,key);auto type=display(Core::get(answer,"type"));
+    std::map<std::string,double> probabilities;auto raw=Core::get(answer,"probabilities");for(auto label:Core::iter(Core::map_keys(raw)))probabilities[display(label)]=Core::number(Core::get(raw,label));
+    if(type=="noul")response.answers.emplace(display(key),TypesafeNoul{Core::number(Core::get(answer,"noul"))});
+    else if(type=="box")response.answers.emplace(display(key),TypesafeBox{AxBox::from_value(Core::get(answer,"box")),Core::number(Core::get(answer,"confidence"))});
+    else if(type=="choice")response.answers.emplace(display(key),TypesafeChoice{display(Core::get(answer,"choice")),probabilities,Core::number(Core::get(answer,"confidence"))});
+    else response.answers.emplace(display(key),TypesafeScore{Core::number(Core::get(answer,"score")),probabilities,Core::number(Core::get(answer,"confidence")),Core::get(answer,"legend")});
+  }
+  return response;
+}
+Value TypesafeResponse::to_value() const {
+  Value result=Value(Object{{"model",model},{"usage",Value(Object{{"input_tokens",static_cast<double>(usage.input_tokens)},{"output_tokens",static_cast<double>(usage.output_tokens)}})}});
+  Value values=Value::object();
+  for(const auto& entry:answers) {
+    Value answer;
+    if(auto value=std::get_if<TypesafeNoul>(&entry.second))answer=Value(Object{{"type","noul"},{"noul",value->noul}});
+    else if(auto value=std::get_if<TypesafeBox>(&entry.second))answer=Value(Object{{"type","box"},{"box",value->box.to_value()},{"confidence",value->confidence}});
+    else {
+      Value probabilities=Value::object();
+      if(auto value=std::get_if<TypesafeChoice>(&entry.second)){for(const auto& item:value->probabilities)Core::set(probabilities,item.first,item.second);answer=Value(Object{{"type","choice"},{"choice",value->choice},{"confidence",value->confidence},{"probabilities",probabilities}});}
+      else {const auto& score=std::get<TypesafeScore>(entry.second);for(const auto& item:score.probabilities)Core::set(probabilities,item.first,item.second);answer=Value(Object{{"type","score"},{"score",score.score},{"confidence",score.confidence},{"probabilities",probabilities},{"legend",score.legend}});}
+    }
+    Core::set(values,entry.first,answer);
+  }
+  Core::set(result,"answers",values);return result;
+}
+
+AxAIOpenAIDecisionsClient::AxAIOpenAIDecisionsClient(Value options, Transport* transport, AxCredentialProvider credential_provider)
+    : options_(parse_json(stringify(options))), transport_(transport), credential_provider_(std::move(credential_provider)) {
+  OpenAICompatibleClient client("openai-decisions", "OpenAI Decisions", options_, transport_, "gpt-6-luna", "", credential_provider_);
+}
+Value AxAIOpenAIDecisionsClient::create(Value request, Value options, const AxCancellationToken* cancellation) {
+  Value payload = parse_json(stringify(request));
+  if (Core::get(payload, "model").is_null()) Core::set(payload, "model", Core::get(options_, "model", "gpt-6-luna"));
+  Core::decisions_validate_request(payload);
+  Value resolved = Core::provider_normalize_call_options(options);
+  for (const auto& entry : object_ref(options_)) if (Core::get(resolved, entry.first).is_null()) Core::set(resolved, entry.first, entry.second);
+  OpenAICompatibleClient client("openai-decisions", "OpenAI Decisions", resolved, transport_, "gpt-6-luna", "", credential_provider_);
+  const AxCancellationToken* parent = current_cancellation_token();
+  AxCancellationToken combined;
+  std::vector<AxCancellationToken::Subscription> subscriptions;
+  const AxCancellationToken* active = cancellation ? cancellation : parent;
+  if (parent && cancellation && parent != cancellation) {
+    auto inherited = *parent;
+    auto per_call = *cancellation;
+    subscriptions.push_back(parent->subscribe([combined, inherited]() mutable { combined.cancel(inherited.reason()); }));
+    subscriptions.push_back(cancellation->subscribe([combined, per_call]() mutable { combined.cancel(per_call.reason()); }));
+    active = &combined;
+  }
+  AxCancellationScope call_scope(active);
+  if (active) active->throw_if_cancelled();
+  Value raw = client.request_json_retried("/decisions", payload, "POST", resolved);
+  return Core::decisions_decode_response(raw, Core::get(payload, "questions"));
+}
+AxAIOpenAIDecisionsClient openai_decisions(Value options, Transport* transport, AxCredentialProvider credential_provider) {
+  return AxAIOpenAIDecisionsClient(std::move(options), transport, std::move(credential_provider));
+}
+
+AxAITypesafeClient::AxAITypesafeClient(Value options, Transport* transport, AxCredentialProvider credential_provider)
+    : options_(std::move(options)), transport_(transport), credential_provider_(std::move(credential_provider)) {
+  if (Core::get(options_, "api_key").is_null() && Core::get(options_, "apiKey").is_null()) Core::set(options_, "api_key", env_or_default("TYPESAFE_APIKEY", env_or_default("TYPESAFE_API_KEY", "")));
+  Core::typesafe_require_string(Core::get(options_, "model", "jev-latest"), "model", true);
+  if (option_string(options_, "api_key", "apiKey", "").empty() && !credential_provider_)
+    throw AxError("authentication", "Typesafe requires api_key or credential_provider");
+}
+TypesafeResponse AxAITypesafeClient::system_one(Value request, Value options, const AxCancellationToken* cancellation) {
+  Value payload = parse_json(stringify(request));
+  if (Core::get(payload, "model").is_null()) Core::set(payload, "model", Core::get(options_, "model", "jev-latest"));
+  Core::typesafe_validate_request(payload);
+  Value raw = call("POST", "/v1/systemone", payload, std::move(options), cancellation);
+  return TypesafeResponse::from_value(Core::typesafe_decode_response(raw, Core::get(payload, "questions")));
+}
+std::vector<TypesafeModelCard> AxAITypesafeClient::list_models(Value options, const AxCancellationToken* cancellation) {
+  auto models=Core::typesafe_decode_models(call("GET", "/v1/models", Value(), std::move(options), cancellation));
+  std::vector<TypesafeModelCard> cards;for(auto model:Core::iter(models))cards.push_back({display(Core::get(model,"name")),display(Core::get(model,"description")),display(Core::get(model,"release_date"))});return cards;
+}
+Value AxAITypesafeClient::call(const std::string& method, const std::string& path, Value payload, Value options, const AxCancellationToken* cancellation) {
+  AxCancellationScope scope(cancellation);
+  Value resolved = Core::map_merge(options_, options);
+  OpenAICompatibleClient client("typesafe", "Typesafe", resolved, transport_, "jev-latest", "", credential_provider_);
+  if (cancellation) cancellation->throw_if_cancelled();
+  // TS apiCall's request-layer retry, as the client's chat requests use.
+  return client.request_json_retried(path, payload, method, resolved);
+}
+AxAITypesafeClient typesafe(Value options, Transport* transport, AxCredentialProvider credential_provider) {
+  return AxAITypesafeClient(std::move(options), transport, std::move(credential_provider));
+}
+
 std::shared_ptr<AxAIService> ai(const std::string& provider, Value options) {
   Value resolved = Core::provider_resolve_profile(provider.empty() ? "openai" : provider);
   if (!Core::truthy(Core::get(resolved, "known"))) {
@@ -6327,7 +9848,7 @@ std::shared_ptr<AxAIService> ai(const std::string& provider, Value options) {
   if (transport == "anthropic-messages") {
     return std::make_shared<AnthropicClient>(canonical, std::move(options));
   }
-  if (transport == "openai-chat") {
+  if (transport == "openai-chat" || transport == "typesafe-system-one" || transport == "openai-decisions") {
     return std::make_shared<OpenAICompatibleClient>(canonical,
         canonical, std::move(options), nullptr,
         display(Core::get(descriptor, "defaultModel", "")),
@@ -6351,6 +9872,7 @@ static Value balancer_base_features_cpp() {
       {"functions", false},
       {"streaming", false},
       {"thinking", false},
+      {"asyncTools", false}, {"nativeSteering", false}, {"reasoningUpdates", false},
       {"multiTurn", false},
       {"structuredOutputs", false},
       {"media", object({
@@ -6391,6 +9913,24 @@ static Value balancer_base_metrics_cpp() {
       {"latency", object({{"chat", metric_bucket_cpp()}, {"embed", metric_bucket_cpp()}})},
       {"errors", object({{"chat", error_bucket_cpp()}, {"embed", error_bucket_cpp()}})}
   });
+}
+
+std::function<std::shared_ptr<AIClient>()> MultiServiceRouter::owned_worker_factory() {
+  std::map<std::string,std::function<std::shared_ptr<AIClient>()>> factories;
+  for(const auto& [key,entry]:services_){auto factory=entry.service->owned_worker_factory();if(!factory)return {};factories[key]=factory;}
+  auto snapshot=*this;auto options=stringify(options_);
+  return [snapshot,factories,options]{auto worker=std::make_shared<MultiServiceRouter>(snapshot);worker->options_=parse_json(options);worker->last_used_service_.reset();for(auto& [key,entry]:worker->services_){entry.service=std::dynamic_pointer_cast<AxAIService>(factories.at(key)());if(!entry.service)throw AxError("runtime","Owned router worker must implement AxAIService");entry.model=parse_json(stringify(entry.model));entry.embed_model=parse_json(stringify(entry.embed_model));}return worker;};
+}
+std::function<std::shared_ptr<AIClient>()> ProviderRouter::owned_worker_factory() {
+  std::vector<std::function<std::shared_ptr<AIClient>()>> factories;for(auto& provider:providers_){auto factory=provider->owned_worker_factory();if(!factory)return {};factories.push_back(factory);}
+  auto routing=stringify(routing_),processing=stringify(processing_);auto extractor=file_to_text_;
+  return [factories,routing,processing,extractor]{std::vector<std::shared_ptr<AxAIService>> providers;for(auto& factory:factories){auto provider=std::dynamic_pointer_cast<AxAIService>(factory());if(!provider)throw AxError("runtime","Owned provider worker must implement AxAIService");providers.push_back(provider);}auto worker=std::make_shared<ProviderRouter>(providers,parse_json(routing),parse_json(processing));worker->file_to_text_=extractor;return worker;};
+}
+std::function<std::shared_ptr<AIClient>()> AxBalancer::owned_worker_factory() {
+  std::vector<std::function<std::shared_ptr<AIClient>()>> factories;std::vector<std::string> keys;std::vector<size_t> indices;
+  for(auto& service:services_){auto factory=service->owned_worker_factory();if(!factory)return {};factories.push_back(factory);if(adaptive_){keys.push_back(adaptive_route_keys_.at(service.get()));indices.push_back(adaptive_indices_.at(service.get()));}}
+  auto snapshot=*this;auto policy=stringify(policy_);
+  return [snapshot,factories,keys,indices,policy]{auto worker=std::make_shared<AxBalancer>(snapshot);worker->policy_=parse_json(policy);worker->services_.clear();worker->adaptive_route_keys_.clear();worker->adaptive_indices_.clear();for(size_t i=0;i<factories.size();++i){auto service=std::dynamic_pointer_cast<AxAIService>(factories[i]());if(!service)throw AxError("runtime","Owned balancer worker must implement AxAIService");worker->services_.push_back(service);if(worker->adaptive_){worker->adaptive_route_keys_[service.get()]=keys[i];worker->adaptive_indices_[service.get()]=indices[i];}}worker->current_service_=worker->services_.at(worker->current_service_index_);return worker;};
 }
 
 AxBalancer::AxBalancer() = default;
@@ -6478,31 +10018,36 @@ void AxBalancer::validate_models() {
 }
 
 bool AxBalancer::can_retry_service(const std::shared_ptr<AxAIService>& service) const {
-  return service_failures_.find(service->get_id()) == service_failures_.end();
+  return failure_count(service) == 0;
 }
 
+int AxBalancer::failure_count(const std::shared_ptr<AxAIService>& service) const { std::lock_guard<std::mutex> lock(service_failures_->mutex); auto found=service_failures_->counts.find(service->get_id()); return found==service_failures_->counts.end()?0:found->second; }
+
 void AxBalancer::handle_failure(const std::shared_ptr<AxAIService>& service) {
-  service_failures_[service->get_id()] += 1;
+  std::lock_guard<std::mutex> lock(service_failures_->mutex); service_failures_->counts[service->get_id()] += 1;
 }
 
 void AxBalancer::handle_success(const std::shared_ptr<AxAIService>& service) {
-  service_failures_.erase(service->get_id());
+  std::lock_guard<std::mutex> lock(service_failures_->mutex); service_failures_->counts.erase(service->get_id());
 }
 
 bool AxBalancer::retryable(const AxError& error) const {
+  if(auto token=current_cancellation_token();token&&token->is_cancelled())return false;
   if (error.category != "ai") return false;
-  if (error.type == "AxAIServiceAuthenticationError") return false;
+  if (error.type == "AxAIServiceAuthenticationError" || error.type == "AxAIServiceAbortedError") return false;
   if (error.type == "AxAIServiceStatusError") {
     return error.status == 408 || error.status == 429 || error.status == 500 || error.status == 502 || error.status == 503 || error.status == 504 || error.status == 529;
   }
   return error.type == "AxAIServiceNetworkError" || error.type == "AxAIServiceResponseError" || error.type == "AxAIServiceStreamTerminatedError" || error.type == "AxAIServiceTimeoutError";
 }
 
-std::vector<std::shared_ptr<AxAIService>> AxBalancer::candidate_services(Value request) {
+void AxBalancer::validate_chat_request(Value request) const { (void)candidate_services(std::move(request)); }
+
+std::vector<std::shared_ptr<AxAIService>> AxBalancer::candidate_services(Value request) const {
   std::vector<std::shared_ptr<AxAIService>> out;
   Value model = Core::get(request, "model");
   for (const auto& service : services_) {
-    if (Core::truthy(Core::provider_balancer_candidate_allowed(service->get_features(model), request))) out.push_back(service);
+    if (service_accepts_request_cpp(service, request) && Core::truthy(Core::provider_balancer_candidate_allowed(service->get_features(model), request))) out.push_back(service);
   }
   if (!out.empty()) return out;
   std::vector<std::string> requirements;
@@ -6531,16 +10076,28 @@ Value AxBalancer::get_model_list() {
   return Value();
 }
 
-Value AxBalancer::get_features(Value model) {
+std::shared_ptr<AxChatSession> AxBalancer::open_chat_session(Value request,Value options){return pin_chat_run(request,options)->open_chat_session(request,options);}
+std::shared_ptr<AIClient> AxBalancer::pin_chat_run(Value request,Value options) {
+  std::shared_ptr<AxAIService> selected;
+  if(adaptive_){auto ranked=rank_adaptive(request,options);if(!ranked.empty())selected=ranked.front().service;}
+  else{for(const auto& service:candidate_services(request)){if(can_retry_service(service)){selected=service;break;}}}
+  if(!selected)throw AxError("runtime","No eligible service for this run");current_service_=selected;return selected;
+}
+
+static Value merge_service_features_cpp(const std::vector<std::shared_ptr<AxAIService>>& services,Value model) {
   Value features = balancer_base_features_cpp();
+  bool all_require_schema = !services.empty();
+  for (const auto& service : services) { Value raw = service->get_features(model); all_require_schema = all_require_schema && Core::truthy(Core::get(raw, "requiresStructuredOutput", Core::get(raw, "requires_structured_output", false))); }
+  if (all_require_schema) Core::set(features, "requiresStructuredOutput", true);
   Value structured_output_modes = Value::array();
-  bool all_modes_advertised = !services_.empty();
-  for (const auto& service : services_) {
+  bool all_modes_advertised = !services.empty();
+  for (const auto& service : services) {
     Value raw = service->get_features(model);
+    features = Core::provider_merge_audio_output(features, raw);
     Value raw_modes = Core::get(raw, "structuredOutputModes", Core::get(raw, "structured_output_modes", Value()));
     if (raw_modes.is_null()) all_modes_advertised = false;
     else append_unique_cpp(structured_output_modes, raw_modes);
-    for (const auto& pair : std::vector<std::pair<std::string, std::string>>{{"functions", ""}, {"streaming", ""}, {"thinking", ""}, {"multiTurn", "multi_turn"}, {"structuredOutputs", "structured_outputs"}, {"functionCot", "function_cot"}, {"hasThinkingBudget", "has_thinking_budget"}, {"hasShowThoughts", "has_show_thoughts"}}) {
+    for (const auto& pair : std::vector<std::pair<std::string, std::string>>{{"functions", ""}, {"streaming", ""}, {"thinking", ""}, {"multiTurn", "multi_turn"}, {"structuredOutputs", "structured_outputs"}, {"functionCot", "function_cot"}, {"hasThinkingBudget", "has_thinking_budget"}, {"hasShowThoughts", "has_show_thoughts"}, {"asyncTools", ""}, {"nativeSteering", ""}, {"reasoningUpdates", ""}}) {
       if (feature_truthy_cpp(raw, pair.first, pair.second)) Core::set(features, pair.first, true);
     }
     Value media = Core::get(features, "media", Value::object());
@@ -6576,6 +10133,8 @@ Value AxBalancer::get_features(Value model) {
   if (all_modes_advertised) Core::set(features, "structured_output_modes", structured_output_modes);
   return features;
 }
+
+Value AxBalancer::get_features(Value model) {return merge_service_features_cpp(services_,model);}
 
 Value AxBalancer::get_metrics() {
   double chat_error_count = 0, chat_error_total = 0, embed_error_count = 0, embed_error_total = 0;
@@ -6701,7 +10260,7 @@ Value AxBalancer::chat(Value request, Value options) {
     } catch (const AxError& error) {
       if (!retryable(error)) throw;
       handle_failure(service);
-      if (service_failures_[service->get_id()] >= max_retries_) {
+      if (failure_count(service) >= max_retries_) {
         ++index;
         if (index >= candidates.size()) throw;
         service = candidates.at(index);
@@ -6718,15 +10277,20 @@ std::vector<Value> AxBalancer::stream(Value request) {
 }
 
 void AxBalancer::stream_each(Value request, AxStreamHandler handler) {
+  stream_each(std::move(request), std::move(handler), Value());
+}
+
+// options (the stream call options, or null) go to the selected service's stream.
+void AxBalancer::stream_each(Value request, AxStreamHandler handler, Value options) {
   if (!adaptive_) {
     auto candidates = candidate_services(request);
     std::exception_ptr last;
     for (auto& service : candidates) {
       current_service_ = service;
-      while (service_failures_[service->get_id()] < max_retries_) {
+      while (failure_count(service) < max_retries_) {
         bool delivered = false;
         try {
-          service->stream_each(request, [&](const Value& event) { delivered = true; return handler(event); });
+          service->stream_each(request, [&](const Value& event) { delivered = true; return handler(event); }, options);
           handle_success(service);
           return;
         } catch (const AxError& error) {
@@ -6739,7 +10303,7 @@ void AxBalancer::stream_each(Value request, AxStreamHandler handler) {
     if (last) std::rethrow_exception(last);
     throw AxError("runtime", "All candidate services exhausted (tried " + std::to_string(candidates.size()) + " service(s))");
   }
-  auto ranked = rank_adaptive(request, Value::object()); std::exception_ptr last;
+  auto ranked = rank_adaptive(request, options.is_object() ? options : Value::object()); std::exception_ptr last;
   for (size_t index = 0; index < ranked.size(); ++index) {
     auto& candidate = ranked[index]; current_service_ = candidate.service;
     emit_routing_event(object({{"type", "selected"}, {"namespace", Core::get(candidate.stats_key, "namespace", "")}, {"slice", Core::get(candidate.stats_key, "slice", "")}, {"logicalModel", Core::get(candidate.stats_key, "logicalModel", "")}, {"routeKey", candidate.route_key}, {"serviceName", candidate.service->get_name()}, {"attempt", static_cast<double>(index + 1)}}));
@@ -6755,7 +10319,7 @@ void AxBalancer::stream_each(Value request, AxStreamHandler handler) {
         }
         delivered = true;
         return handler(event);
-      });
+      }, options);
       if (!observed) {
         double latency = std::max(1.0, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
         observe_adaptive(candidate, object({{"outcome", "success"}, {"latencyMs", latency}}), true);
@@ -6793,7 +10357,7 @@ Value AxBalancer::embed(Value request, Value options) {
     } catch (const AxError& error) {
       if (!retryable(error)) throw;
       handle_failure(current_service_);
-      if (service_failures_[current_service_->get_id()] >= max_retries_) {
+      if (failure_count(current_service_) >= max_retries_) {
         ++index;
         if (index >= services_.size()) throw;
         current_service_ = services_.at(index);
@@ -6904,9 +10468,17 @@ Value MultiServiceRouter::get_model_list() {
 Value MultiServiceRouter::get_features(Value model) {
   if (!model.is_null()) {
     auto it = services_.find(display(model));
-    if (it != services_.end()) return it->second.service->get_features(model);
+    if (it != services_.end()) return it->second.service->get_features(it->second.model);
   }
   return router_default_features_cpp();
+}
+
+std::shared_ptr<AxChatSession> MultiServiceRouter::open_chat_session(Value request,Value options) {
+  auto it=services_.find(display(Core::get(request,"model")));
+  if(it==services_.end())throw AxError("validation","No service found for requested model key");
+  Value entry=object({{"model",it->second.model}});Value resolved=Core::provider_session_route(entry,request,options);
+  last_used_service_=it->second.service;
+  return last_used_service_->open_chat_session(Core::get(resolved,"request"),Core::get(resolved,"options"));
 }
 
 Value MultiServiceRouter::chat(Value request) { return chat(std::move(request), Value::object()); }
@@ -6923,6 +10495,10 @@ Value MultiServiceRouter::chat(Value request, Value options) {
 }
 
 void MultiServiceRouter::stream_each(Value request, AxStreamHandler handler) {
+  stream_each(std::move(request), std::move(handler), Value());
+}
+
+void MultiServiceRouter::stream_each(Value request, AxStreamHandler handler, Value options) {
   Value model_key = Core::get(request, "model");
   if (model_key.is_null()) throw AxError("runtime", "Model key must be specified for multi-service");
   auto it = services_.find(display(model_key));
@@ -6931,7 +10507,7 @@ void MultiServiceRouter::stream_each(Value request, AxStreamHandler handler) {
   Value req(object_ref(request));
   if (Core::get(req, "model_config").is_null() && !Core::get(req, "modelConfig").is_null()) Core::set(req, "model_config", Core::get(req, "modelConfig"));
   if (it->second.model.is_null()) Core::map_delete(req, "model");
-  last_used_service_->stream_each(std::move(req), std::move(handler));
+  last_used_service_->stream_each(std::move(req), std::move(handler), std::move(options));
 }
 
 std::vector<Value> MultiServiceRouter::stream(Value request) {
@@ -6947,11 +10523,7 @@ Value MultiServiceRouter::embed(Value request, Value options) {
   auto it = services_.find(display(model_key));
   if (it == services_.end()) throw AxError("runtime", "No service found for embed model key: " + display(model_key));
   last_used_service_ = it->second.service;
-  Value req(object_ref(request));
-  if (it->second.model.is_null()) {
-    Core::map_delete(req, "embedModel");
-    Core::map_delete(req, "embed_model");
-  }
+  Value req = Core::router_embed_request(request, it->second.model, it->second.embed_model);
   return last_used_service_->embed(req, options);
 }
 
@@ -7003,6 +10575,43 @@ Value MultiServiceRouter::get_last_used_embed_model() { return last_used_service
 Value MultiServiceRouter::get_last_used_model_config() { return last_used_service_ ? last_used_service_->get_last_used_model_config() : Value(); }
 Value MultiServiceRouter::complete(Value request) { return Core::chat_response_to_completion(chat(Core::coerce_chat_request(std::move(request)))); }
 
+static Value preprocess_provider_files(Value features, Value request, Value processing, const ProviderRouter::FileToText& extractor) {
+  Value prepared = Core::map_merge(Value::object(), processing);
+  Core::map_delete(prepared, "file_texts");
+  if (extractor) {
+    Value texts = Value::object();
+    for (const auto& task : array_ref(Core::provider_route_file_extractions(features, request))) {
+      try { Core::set(texts, Core::get(task,"slot"), extractor(str(Core::get(task,"data")),str(Core::get(task,"mime_type")))); }
+      catch (const std::exception& error) { throw AxError("content_processing", std::string("File content processing failed: ")+error.what()); }
+    }
+    Core::set(prepared,"file_texts",texts);
+  }
+  return Core::provider_route_preprocess_request(features,request,prepared);
+}
+ProviderRouter& ProviderRouter::file_to_text(FileToText extractor) { file_to_text_=std::move(extractor);return *this; }
+
+class PinnedProviderClient final:public AIClient {
+  std::shared_ptr<AIClient> client_;
+  Value processing_;
+  ProviderRouter::FileToText extractor_;
+  Value request(Value value){return preprocess_provider_files(features_for_run(Core::get(value,"model")),value,processing_,extractor_);}
+ public:
+  explicit PinnedProviderClient(std::shared_ptr<AIClient> client,Value processing,ProviderRouter::FileToText extractor):client_(std::move(client)),processing_(std::move(processing)),extractor_(std::move(extractor)){}
+  Value features_for_run(Value model)override{if(auto* service=dynamic_cast<AxAIService*>(client_.get()))return service->get_features(model);return client_->features_for_run(model);}
+  Value complete(Value value)override{return Core::chat_response_to_completion(chat(value,Value::object()));}
+  Value chat(Value value,Value options)override{return client_->chat(request(value),options);}
+  std::shared_ptr<AxChatSession> open_chat_session(Value value,Value options)override{return client_->open_chat_session(request(value),options);}
+};
+Value ProviderRouter::features_for_run(Value model){return merge_service_features_cpp(providers_,model);}
+Value ProviderRouter::complete(Value request){return Core::chat_response_to_completion(Core::get(chat(request,Value::object()),"response"));}
+std::shared_ptr<AIClient> ProviderRouter::pin_chat_run(Value request,Value options){
+  Value recommendation=get_routing_recommendation(request);std::shared_ptr<AIClient> selected=service_for_name(Core::get(recommendation,"providerName"));
+  if(!selected)throw AxError("runtime","No provider selected");std::set<AIClient*> visited;
+  while(true){if(!visited.insert(selected.get()).second)throw AxError("runtime","Cyclic run routing");auto next=selected->pin_chat_run(request,options);if(!next)break;selected=std::move(next);}
+  return std::make_shared<PinnedProviderClient>(selected,processing_,file_to_text_);
+}
+std::shared_ptr<AxChatSession> ProviderRouter::open_chat_session(Value request,Value options){return pin_chat_run(request,options)->open_chat_session(request,options);}
+
 ProviderRouter::ProviderRouter(Value config) {
   Value providers = Core::get(config, "providers", Value::object());
   routing_ = Core::get(Core::get(config, "routing", Value::object()), "capability", Value::object());
@@ -7013,10 +10622,10 @@ ProviderRouter::ProviderRouter(Value config) {
 ProviderRouter::ProviderRouter(std::vector<std::shared_ptr<AxAIService>> providers, Value routing, Value processing)
     : providers_(std::move(providers)), routing_(std::move(routing)), processing_(std::move(processing)) {}
 
-Value ProviderRouter::provider_records() const {
+Value ProviderRouter::provider_records(Value model, Value request) const {
   Value out = Value::array();
   for (const auto& provider : providers_) {
-    Core::append(out, object({{"name", provider->get_name()}, {"id", provider->get_id()}, {"features", provider->get_features(Value())}}));
+    Core::append(out, object({{"name", provider->get_name()}, {"id", provider->get_id()}, {"features", provider->get_features(model)}, {"requestCompatible", request.is_null() || service_accepts_request_cpp(provider, request)}}));
   }
   return out;
 }
@@ -7027,21 +10636,25 @@ std::shared_ptr<AxAIService> ProviderRouter::service_for_name(Value name) const 
 }
 
 Value ProviderRouter::get_routing_recommendation(Value request) {
-  Value rec = Core::provider_route_recommendation(provider_records(), Core::coerce_chat_request(request), routing_);
+  Value rec = Core::provider_route_recommendation(provider_records(Core::get(request,"model"), request), Core::coerce_chat_request(request), routing_);
   return rec;
 }
 
 Value ProviderRouter::validate_request(Value request) {
-  return Core::provider_route_validation(provider_records(), Core::coerce_chat_request(request), processing_, routing_);
+  return Core::provider_route_validation(provider_records(Core::get(request,"model"), request), Core::coerce_chat_request(request), processing_, routing_);
 }
 
+Value ProviderRouter::get_compatibility_report(Value request) { return Core::provider_compatibility_report(provider_records(Core::get(request,"model"),request),Core::coerce_chat_request(request)); }
 Value ProviderRouter::get_routing_stats() { return Core::provider_routing_stats(provider_records()); }
 Value ProviderRouter::chat(Value request, Value options) {
+  return chat(std::move(request), std::move(options), nullptr);
+}
+Value ProviderRouter::chat(Value request, Value options, const AxCancellationToken* cancellation) {
   Value rec = get_routing_recommendation(request);
   auto provider = service_for_name(Core::get(rec, "providerName"));
   if (!provider) throw Core::as_error(Core::ai_error_unsupported("No provider selected"));
-  Value processed_request = Core::provider_route_preprocess_request(provider->get_features(Value()), request);
-  return object({{"response", provider->chat(processed_request, options)}, {"routing", rec}});
+  Value processed_request = preprocess_provider_files(provider->get_features(Core::get(request,"model")), request, processing_, file_to_text_);
+  return object({{"response", provider->chat(processed_request, options, cancellation)}, {"routing", rec}});
 }
 
 std::vector<Value> ProviderRouter::stream(Value request) {
@@ -7051,32 +10664,44 @@ std::vector<Value> ProviderRouter::stream(Value request) {
 }
 
 void ProviderRouter::stream_each(Value request, AxStreamHandler handler) {
+  stream_each(std::move(request), std::move(handler), nullptr);
+}
+void ProviderRouter::stream_each(Value request, AxStreamHandler handler, const AxCancellationToken* cancellation) {
   Value rec = get_routing_recommendation(request);
   auto provider = service_for_name(Core::get(rec, "providerName"));
   if (!provider) throw Core::as_error(Core::ai_error_unsupported("No provider selected"));
-  Value processed_request = Core::provider_route_preprocess_request(provider->get_features(Value()), request);
-  provider->stream_each(std::move(processed_request), std::move(handler));
+  Value processed_request = preprocess_provider_files(provider->get_features(Core::get(request,"model")), request, processing_, file_to_text_);
+  provider->stream_each(std::move(processed_request), std::move(handler), cancellation);
 }
 
 Value ProviderRouter::embed(Value request, Value options) {
+  return embed(std::move(request), std::move(options), nullptr);
+}
+Value ProviderRouter::embed(Value request, Value options, const AxCancellationToken* cancellation) {
   Value rec = get_routing_recommendation(request);
   auto provider = service_for_name(Core::get(rec, "providerName"));
   if (!provider) throw Core::as_error(Core::ai_error_unsupported("No provider selected"));
-  return provider->embed(std::move(request), std::move(options));
+  return provider->embed(std::move(request), std::move(options), cancellation);
 }
 
 Value ProviderRouter::transcribe(Value request, Value options) {
+  return transcribe(std::move(request), std::move(options), nullptr);
+}
+Value ProviderRouter::transcribe(Value request, Value options, const AxCancellationToken* cancellation) {
   Value rec = get_routing_recommendation(request);
   auto provider = service_for_name(Core::get(rec, "providerName"));
   if (!provider) throw Core::as_error(Core::ai_error_unsupported("No provider selected"));
-  return provider->transcribe(std::move(request), std::move(options));
+  return provider->transcribe(std::move(request), std::move(options), cancellation);
 }
 
 Value ProviderRouter::speak(Value request, Value options) {
+  return speak(std::move(request), std::move(options), nullptr);
+}
+Value ProviderRouter::speak(Value request, Value options, const AxCancellationToken* cancellation) {
   Value rec = get_routing_recommendation(request);
   auto provider = service_for_name(Core::get(rec, "providerName"));
   if (!provider) throw Core::as_error(Core::ai_error_unsupported("No provider selected"));
-  return provider->speak(std::move(request), std::move(options));
+  return provider->speak(std::move(request), std::move(options), cancellation);
 }
 
 Value to_json_schema(Value fields, const std::string& title, Value options) { return Core::to_json_schema(fields, title, options); }

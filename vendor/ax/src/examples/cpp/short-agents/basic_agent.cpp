@@ -21,9 +21,9 @@ int main() {
     return 2;
   }
   const char* model = std::getenv("AX_OPENAI_MODEL");
-  axllm::OpenAICompatibleClient client(axllm::object({
+  auto client = axllm::ai("openai", axllm::object({
       {"api_key", key},
-      {"model", model == nullptr || std::string(model).empty() ? "gpt-5.4-mini" : model},
+      {"model", model == nullptr || std::string(model).empty() ? "gpt-6-luna" : model},
       {"model_config", axllm::object({{"temperature", 0}})},
   }));
 
@@ -56,12 +56,11 @@ int main() {
       // Keep the handbook in the runtime, out of the prompt.
       axllm::object({
           {"contextFields", axllm::array({"handbook"})},
-          {"runtime", axllm::object({{"language", "JavaScript"}})},
       }));
 
   axllm::runtime::quickjs::QuickJsCodeRuntime runtime;
   axllm::Value result = assistant.forward(
-      client,
+      *client,
       axllm::object({
           {"question", "A customer downgraded their plan today. When does it take effect, and can they get a refund for the current cycle?"},
           {"handbook", handbook},

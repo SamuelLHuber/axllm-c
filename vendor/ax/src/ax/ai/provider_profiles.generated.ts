@@ -32,6 +32,9 @@ export const axAIProviderProfiles = {
         "function",
         "json_object"
       ],
+      "files": {
+        "uploadMethod": "upload"
+      },
       "serviceTiers": [
         "standard",
         "flex",
@@ -97,11 +100,71 @@ export const axAIProviderProfiles = {
         }
       }
     },
-    "modelRules": [],
+    "modelRules": [
+      {
+        "match": {
+          "prefix": [
+            "gpt-6-astra"
+          ]
+        },
+        "request": {
+          "unsupportedThinkingLevels": {
+            "none": "GPT-6 Astra requires reasoning; use low or higher"
+          }
+        },
+        "capabilities": {
+          "audio": false,
+          "audioOutput": false,
+          "functions": true,
+          "structuredOutputModes": [
+            "native",
+            "json_object"
+          ]
+        }
+      },
+      {
+        "match": {
+          "prefix": [
+            "gpt-6.1-sol"
+          ]
+        },
+        "request": {
+          "unsupportedThinkingLevels": {
+            "none": "GPT-6.1 Sol requires reasoning; use low or higher"
+          }
+        },
+        "capabilities": {
+          "audio": false,
+          "audioOutput": false,
+          "functions": true,
+          "structuredOutputModes": [
+            "native",
+            "json_object"
+          ]
+        }
+      },
+      {
+        "match": {
+          "prefix": [
+            "gpt-6-sol",
+            "gpt-6-luna"
+          ]
+        },
+        "capabilities": {
+          "audio": false,
+          "audioOutput": false,
+          "functions": true,
+          "structuredOutputModes": [
+            "native",
+            "json_object"
+          ]
+        }
+      }
+    ],
     "sources": [
       "https://platform.openai.com/docs/api-reference/chat"
     ],
-    "reviewedAt": "2026-08-17",
+    "reviewedAt": "2026-09-23",
     "request": {
       "serviceTierMap": {
         "auto": "auto",
@@ -189,6 +252,9 @@ export const axAIProviderProfiles = {
         "function",
         "json_object"
       ],
+      "files": {
+        "uploadMethod": "upload"
+      },
       "serviceTiers": [
         "standard",
         "flex",
@@ -254,11 +320,56 @@ export const axAIProviderProfiles = {
         }
       }
     },
-    "modelRules": [],
+    "modelRules": [
+      {
+        "match": {
+          "prefix": [
+            "gpt-6-astra"
+          ]
+        },
+        "request": {
+          "unsupportedThinkingLevels": {
+            "none": "GPT-6 Astra requires reasoning; use low or higher"
+          }
+        },
+        "capabilities": {
+          "audio": false,
+          "audioOutput": false
+        }
+      },
+      {
+        "match": {
+          "prefix": [
+            "gpt-6.1-sol"
+          ]
+        },
+        "request": {
+          "unsupportedThinkingLevels": {
+            "none": "GPT-6.1 Sol requires reasoning; use low or higher"
+          }
+        },
+        "capabilities": {
+          "audio": false,
+          "audioOutput": false
+        }
+      },
+      {
+        "match": {
+          "prefix": [
+            "gpt-6-sol",
+            "gpt-6-luna"
+          ]
+        },
+        "capabilities": {
+          "audio": false,
+          "audioOutput": false
+        }
+      }
+    ],
     "sources": [
       "https://platform.openai.com/docs/api-reference/responses"
     ],
-    "reviewedAt": "2026-08-17",
+    "reviewedAt": "2026-09-23",
     "request": {
       "serviceTierMap": {
         "auto": "auto",
@@ -287,7 +398,7 @@ export const axAIProviderProfiles = {
       "anthropic-beta": "structured-outputs-2025-11-13, web-search-2025-03-05"
     },
     "defaults": {
-      "model": "claude-sonnet-4-5"
+      "model": "claude-sonnet-5"
     },
     "capabilities": {
       "functions": true,
@@ -313,11 +424,30 @@ export const axAIProviderProfiles = {
         "dialect": "anthropic-messages"
       }
     },
-    "modelRules": [],
+    "modelRules": [
+      {
+        "match": {
+          "contains": [
+            "claude-opus-5-5",
+            "claude-fable-5-1",
+            "claude-sonnet-5-5"
+          ]
+        },
+        "request": {
+          "toolChoice": "unforced"
+        },
+        "capabilities": {
+          "structuredOutputs": true,
+          "structuredOutputModes": [
+            "native"
+          ]
+        }
+      }
+    ],
     "sources": [
       "https://docs.anthropic.com/en/api/messages"
     ],
-    "reviewedAt": "2026-08-17"
+    "reviewedAt": "2026-09-23"
   },
   "google-gemini": {
     "id": "google-gemini",
@@ -336,7 +466,7 @@ export const axAIProviderProfiles = {
       "required": true
     },
     "defaults": {
-      "model": "gemini-3.5-flash",
+      "model": "gemini-3.6-flash",
       "embedModel": "gemini-embedding-2"
     },
     "capabilities": {
@@ -381,16 +511,24 @@ export const axAIProviderProfiles = {
       },
       "transcribe": {
         "path": "/models/{model}:generateContent",
-        "dialect": "gemini-generate-content"
+        "dialect": "gemini-generate-content",
+        "defaultModel": "gemini-3.5-transcribe",
+        "body": "json"
       },
       "speak": {
         "path": "/models/{model}:generateContent",
-        "dialect": "gemini-generate-content"
+        "dialect": "gemini-generate-content",
+        "defaultModel": "gemini-3.8-flash-tts",
+        "response": "json"
       },
       "realtime": {
         "path": "/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent",
         "dialect": "gemini-live-bidi",
         "modelMatch": {
+          "exact": [
+            "gemini-3.8-live",
+            "gemini-3.8-live-extended-thinking"
+          ],
           "prefix": [
             "gemini-live"
           ],
@@ -401,7 +539,7 @@ export const axAIProviderProfiles = {
         },
         "url": "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent",
         "grammar": "gemini_live_bidi",
-        "defaultModel": "gemini-2.5-flash-native-audio-preview-12-2025",
+        "defaultModel": "gemini-3.8-live",
         "audio": {
           "input": {
             "formats": [
@@ -437,7 +575,7 @@ export const axAIProviderProfiles = {
       "https://ai.google.dev/api/generate-content",
       "https://ai.google.dev/gemini-api/docs/optimization"
     ],
-    "reviewedAt": "2026-08-17",
+    "reviewedAt": "2026-09-23",
     "request": {
       "serviceTierMap": {
         "auto": null,
@@ -751,6 +889,244 @@ export const axAIProviderProfiles = {
       "https://api-docs.deepseek.com/api/create-chat-completion"
     ],
     "reviewedAt": "2026-08-17"
+  },
+  "meta": {
+    "id": "meta",
+    "name": "Meta Model API",
+    "aliases": [
+      "meta",
+      "meta-responses",
+      "meta_responses"
+    ],
+    "transport": "openai-responses",
+    "baseURL": "https://api.meta.ai/v1",
+    "requiresApiURL": false,
+    "auth": {
+      "type": "bearer",
+      "required": true
+    },
+    "defaults": {
+      "model": "muse-spark-1.3"
+    },
+    "capabilities": {
+      "functions": true,
+      "streaming": true,
+      "structuredOutputs": true,
+      "thinking": true,
+      "multiTurn": true,
+      "images": true,
+      "audio": true,
+      "files": {
+        "uploadMethod": "inline"
+      },
+      "caching": {
+        "types": [
+          "ephemeral"
+        ],
+        "cacheBreakpoints": false
+      },
+      "structuredOutputModes": [
+        "native",
+        "function",
+        "json_object"
+      ],
+      "serviceTiers": []
+    },
+    "operations": {
+      "chat": {
+        "path": "/responses",
+        "dialect": "openai-responses"
+      },
+      "transcribe": {
+        "path": "/asr/transcribe",
+        "dialect": "meta-transcription"
+      },
+      "realtime": {
+        "path": "/asr/realtime",
+        "dialect": "meta-realtime",
+        "modelMatch": {
+          "exact": [
+            "muse-voice-transcribe-1.0"
+          ]
+        },
+        "url": "wss://api.meta.ai/v1/asr/realtime",
+        "grammar": "meta_asr_realtime",
+        "defaultModel": "muse-voice-transcribe-1.0",
+        "audio": {
+          "input": {
+            "formats": [
+              "pcm16",
+              "pcm"
+            ],
+            "sampleRate": 24000
+          }
+        }
+      }
+    },
+    "request": {
+      "toolChoice": "no-named",
+      "reasoningObjectFields": [
+        "effort",
+        "summary"
+      ],
+      "unsupportedThinkingLevels": {
+        "none": "Meta Muse Spark does not support reasoning level none"
+      }
+    },
+    "modelRules": [
+      {
+        "match": {
+          "exact": [
+            "muse-image-1.0"
+          ]
+        },
+        "capabilities": {
+          "functions": false,
+          "functionEmulation": false,
+          "structuredOutputs": false,
+          "thinking": false,
+          "audio": false,
+          "structuredOutputModes": []
+        }
+      },
+      {
+        "match": {
+          "exact": [
+            "muse-voice-transcribe-1.0"
+          ]
+        },
+        "capabilities": {
+          "functions": false,
+          "functionEmulation": false,
+          "structuredOutputs": false,
+          "thinking": false,
+          "images": false,
+          "structuredOutputModes": []
+        }
+      }
+    ],
+    "sources": [
+      "https://dev.meta.ai/docs/protocols/responses"
+    ],
+    "reviewedAt": "2026-09-03"
+  },
+  "meta-chat": {
+    "id": "meta-chat",
+    "name": "Meta Model API Chat Completions",
+    "aliases": [
+      "meta-chat",
+      "meta_chat"
+    ],
+    "transport": "openai-chat",
+    "baseURL": "https://api.meta.ai/v1",
+    "requiresApiURL": false,
+    "auth": {
+      "type": "bearer",
+      "required": true
+    },
+    "defaults": {
+      "model": "muse-spark-1.3"
+    },
+    "capabilities": {
+      "functions": true,
+      "streaming": true,
+      "structuredOutputs": true,
+      "thinking": true,
+      "multiTurn": true,
+      "images": true,
+      "audio": true,
+      "files": {
+        "uploadMethod": "inline"
+      },
+      "caching": {
+        "types": [
+          "ephemeral"
+        ],
+        "cacheBreakpoints": false
+      },
+      "structuredOutputModes": [
+        "native",
+        "function",
+        "json_object"
+      ],
+      "serviceTiers": []
+    },
+    "operations": {
+      "chat": {
+        "path": "/chat/completions",
+        "dialect": "openai-chat"
+      }
+    },
+    "request": {
+      "toolChoice": "no-named",
+      "effortMap": {
+        "minimal": "minimal",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "highest": "xhigh"
+      },
+      "unsupportedThinkingLevels": {
+        "none": "Meta Muse Spark does not support reasoning level none"
+      }
+    },
+    "modelRules": [],
+    "sources": [
+      "https://dev.meta.ai/docs/protocols/chat-completions"
+    ],
+    "reviewedAt": "2026-09-03"
+  },
+  "meta-messages": {
+    "id": "meta-messages",
+    "name": "Meta Model API Messages",
+    "aliases": [
+      "meta-messages",
+      "meta_messages"
+    ],
+    "transport": "anthropic-messages",
+    "baseURL": "https://api.meta.ai/v1",
+    "requiresApiURL": false,
+    "auth": {
+      "type": "bearer",
+      "required": true
+    },
+    "defaults": {
+      "model": "muse-spark-1.3"
+    },
+    "capabilities": {
+      "functions": true,
+      "streaming": true,
+      "structuredOutputs": true,
+      "thinking": true,
+      "multiTurn": true,
+      "images": true,
+      "audio": true,
+      "files": {
+        "uploadMethod": "inline"
+      },
+      "structuredOutputModes": [
+        "native",
+        "function"
+      ],
+      "serviceTiers": []
+    },
+    "operations": {
+      "chat": {
+        "path": "/messages",
+        "dialect": "anthropic-messages"
+      }
+    },
+    "request": {
+      "toolChoice": "no-named",
+      "unsupportedThinkingLevels": {
+        "none": "Meta Muse Spark does not support reasoning level none"
+      }
+    },
+    "modelRules": [],
+    "sources": [
+      "https://dev.meta.ai/docs/protocols/messages"
+    ],
+    "reviewedAt": "2026-09-03"
   },
   "mistral": {
     "id": "mistral",
@@ -1082,14 +1458,48 @@ export const axAIProviderProfiles = {
             "stop"
           ]
         }
+      },
+      {
+        "match": {
+          "exact": [
+            "grok-3-mini",
+            "grok-3-mini-latest",
+            "grok-3-mini-beta",
+            "grok-3-mini-fast",
+            "grok-3-mini-fast-latest",
+            "grok-3-mini-fast-beta"
+          ]
+        },
+        "capabilities": {
+          "thinking": true,
+          "thinkingBudget": true
+        },
+        "request": {
+          "reasoning": "effort",
+          "defaultThinkingLevel": "low",
+          "effortMap": {
+            "none": null,
+            "minimal": "low",
+            "low": "low",
+            "medium": "high",
+            "high": "high",
+            "highest": "high",
+            "xhigh": "high",
+            "max": "high"
+          },
+          "unsupportedThinkingLevels": {
+            "none": "xAI Grok 3 Mini reasoning cannot be disabled"
+          }
+        }
       }
     ],
     "sources": [
       "https://docs.x.ai/developers/model-capabilities/text/reasoning",
+      "https://docs.x.ai/developers/rest-api-reference/management/auth",
       "https://docs.x.ai/developers/models/grok-4.5",
       "https://docs.x.ai/developers/advanced-api-usage/priority-processing"
     ],
-    "reviewedAt": "2026-08-18"
+    "reviewedAt": "2026-08-30"
   },
   "reka": {
     "id": "reka",
@@ -1531,12 +1941,99 @@ export const axAIProviderProfiles = {
         "dialect": "openai-chat"
       }
     },
-    "modelRules": [],
+    "modelRules": [
+      {
+        "match": {
+          "contains": [
+            "openai.gpt-6-astra",
+            "openai.gpt-6.1-sol"
+          ]
+        },
+        "capabilities": {
+          "structuredOutputs": true,
+          "structuredOutputModes": [
+            "native"
+          ],
+          "serviceTiers": [
+            "standard"
+          ],
+          "thinking": true,
+          "thinkingBudget": true,
+          "functions": false,
+          "functionEmulation": false
+        },
+        "request": {
+          "reasoning": "effort",
+          "unsupportedThinkingLevels": {
+            "none": "This Bedrock model does not support disabling reasoning; use low or higher"
+          },
+          "effortMap": {
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "highest": "xhigh",
+            "xhigh": "xhigh",
+            "max": "xhigh"
+          },
+          "dropFields": [
+            "temperature",
+            "top_p",
+            "stop"
+          ]
+        }
+      },
+      {
+        "match": {
+          "contains": [
+            "openai.gpt-6-sol",
+            "openai.gpt-6-luna",
+            "openai.gpt-5.6-sol"
+          ]
+        },
+        "capabilities": {
+          "structuredOutputs": true,
+          "structuredOutputModes": [
+            "native",
+            "function"
+          ],
+          "serviceTiers": [
+            "standard"
+          ],
+          "thinking": true,
+          "thinkingBudget": true
+        },
+        "request": {
+          "reasoning": "effort",
+          "effortMap": {
+            "none": "none",
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "highest": "xhigh",
+            "xhigh": "xhigh",
+            "max": "xhigh"
+          },
+          "functionToolsRequireEffort": "none",
+          "dropFields": [
+            "temperature",
+            "top_p",
+            "stop"
+          ]
+        }
+      }
+    ],
     "sources": [
       "https://docs.aws.amazon.com/bedrock/latest/userguide/inference-chat-completions-mantle.html",
-      "https://docs.aws.amazon.com/bedrock/latest/userguide/service-tiers-inference.html"
+      "https://docs.aws.amazon.com/bedrock/latest/userguide/service-tiers-inference.html",
+      "https://developers.openai.com/api/docs/guides/amazon-bedrock",
+      "https://developers.openai.com/api/docs/guides/reasoning",
+      "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-6-sol.html",
+      "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-6-luna.html",
+      "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-6-astra.html"
     ],
-    "reviewedAt": "2026-08-17",
+    "reviewedAt": "2026-10-26",
     "request": {
       "serviceTierMap": {
         "auto": null,
@@ -2867,6 +3364,92 @@ export const axAIProviderProfiles = {
       "https://docs.baseten.co/development/model/deployment/inference"
     ],
     "reviewedAt": "2026-08-17"
+  },
+  "typesafe": {
+    "id": "typesafe",
+    "name": "Typesafe",
+    "aliases": [
+      "typesafe"
+    ],
+    "transport": "typesafe-system-one",
+    "baseURL": "https://api.typesafe.ai",
+    "requiresApiURL": false,
+    "auth": {
+      "type": "bearer",
+      "required": true
+    },
+    "defaults": {
+      "model": "jev-latest"
+    },
+    "capabilities": {
+      "functions": false,
+      "functionEmulation": false,
+      "streaming": false,
+      "structuredOutputs": true,
+      "structuredOutputModes": [
+        "native"
+      ],
+      "requiresStructuredOutput": true,
+      "thinking": false,
+      "multiTurn": false,
+      "images": true,
+      "serviceTiers": []
+    },
+    "operations": {
+      "chat": {
+        "path": "/v1/systemone",
+        "dialect": "typesafe-system-one"
+      }
+    },
+    "modelRules": [],
+    "sources": [
+      "https://github.com/typesafe-ai/typesafe-sdk-js",
+      "https://docs.typesafe.ai/sdk/javascript"
+    ],
+    "reviewedAt": "2026-10-15"
+  },
+  "openai-decisions": {
+    "id": "openai-decisions",
+    "name": "OpenAI Decisions",
+    "aliases": [
+      "openai-decisions"
+    ],
+    "transport": "openai-decisions",
+    "baseURL": "https://api.openai.com/v1",
+    "requiresApiURL": false,
+    "auth": {
+      "type": "bearer",
+      "required": true
+    },
+    "defaults": {
+      "model": "gpt-6-luna"
+    },
+    "capabilities": {
+      "functions": false,
+      "functionEmulation": false,
+      "streaming": false,
+      "structuredOutputs": true,
+      "structuredOutputModes": [
+        "native"
+      ],
+      "requiresStructuredOutput": true,
+      "thinking": false,
+      "multiTurn": false,
+      "images": true,
+      "serviceTiers": []
+    },
+    "operations": {
+      "chat": {
+        "path": "/decisions",
+        "dialect": "openai-decisions"
+      }
+    },
+    "modelRules": [],
+    "sources": [
+      "https://developers.openai.com/api/docs/guides/decisions",
+      "https://github.com/openai/openai-node/blob/master/src/resources/decisions.ts"
+    ],
+    "reviewedAt": "2026-10-07"
   }
 } as const;
 
@@ -2891,6 +3474,13 @@ export const axAIProviderAliases = {
   "deepseek": "deepseek",
   "deepseek-responses": "deepseek-responses",
   "deepseek_responses": "deepseek-responses",
+  "meta": "meta",
+  "meta-responses": "meta",
+  "meta_responses": "meta",
+  "meta-chat": "meta-chat",
+  "meta_chat": "meta-chat",
+  "meta-messages": "meta-messages",
+  "meta_messages": "meta-messages",
   "mistral": "mistral",
   "cohere": "cohere",
   "grok": "grok",
@@ -2952,7 +3542,9 @@ export const axAIProviderAliases = {
   "localai": "localai",
   "local-ai": "localai",
   "baseten-engine": "baseten-engine",
-  "truss": "baseten-engine"
+  "truss": "baseten-engine",
+  "typesafe": "typesafe",
+  "openai-decisions": "openai-decisions"
 } as const;
 
 // biome-ignore format: generated file
@@ -2966,6 +3558,9 @@ export const axAIProviderProfileIds = [
   "azure-openai",
   "deepseek",
   "deepseek-responses",
+  "meta",
+  "meta-chat",
+  "meta-messages",
   "mistral",
   "cohere",
   "grok",
@@ -3002,5 +3597,7 @@ export const axAIProviderProfileIds = [
   "lm-studio",
   "llama-cpp",
   "localai",
-  "baseten-engine"
+  "baseten-engine",
+  "typesafe",
+  "openai-decisions"
 ] as const;

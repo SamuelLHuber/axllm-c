@@ -1,7 +1,7 @@
 ---
 name: "ax-cpp-agent-context"
 description: "Use when writing C++ code with `axllm` for deciding between context maps, trajectory context policy, offline optimization (ACE/GEPA), and memory recall for long-context agents."
-version: "24.0.14"
+version: "25.4.9"
 ---
 # AxAgent Context Selection For C++
 
@@ -33,7 +33,7 @@ auto out = helper.forward(llm, { {"question", "How should I proceed?"} });
 
 ## Relevant API Surface
 
-- Agents And RLM: `axllm::agent`, `axllm::AxAgent`
+- Agents And RLM: `axllm::agent`, `axllm::AxAgent`, `axllm::AxAgent::add_child_agent`, `axllm::AxAgent::streaming_forward`
 - Runtime Profiles: `axllm::ProcessCodeRuntime`, `axllm::RuntimeCapabilities`, `axllm::RuntimeEnvelope`, `javascript-quickjs`, `python-pyodide`
 - Optimizers: `axllm::optimize`, `axllm::playbook`, `axllm::AxPlaybook`, `axllm::AxBootstrapFewShot`, `axllm::AxGEPA`, `axllm::OptimizerEngine`, `axllm::OptimizerEvaluator`
 

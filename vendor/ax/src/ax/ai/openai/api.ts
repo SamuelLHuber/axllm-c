@@ -58,8 +58,13 @@ import {
   AxAIOpenAIModel,
 } from './chat_types.js';
 import { axResolveOpenAIChatReasoningEffort } from './effort.js';
-import { axModelInfoOpenAI } from './info.js';
-import { axIsGPT56Family } from './model_family.js';
+import { axModelInfoOpenAI, openAIOSeriesSamplingModelInfo } from './info.js';
+import {
+  axIsGPT6Family,
+  axRefusesOpenAIChatTools,
+  axRequiresOpenAIReasoning,
+  axSupportsOpenAIBreakpointCaching,
+} from './model_family.js';
 import {
   axAIOpenAIRealtimeDefaultConfig,
   axAIOpenAIRealtimeTranscriptionDefaultConfig,
@@ -76,27 +81,6 @@ export {
   axAIOpenAIAudioDefaultConfig,
   axAIOpenAIRealtimeDefaultConfig,
   axAIOpenAIRealtimeTranscriptionDefaultConfig,
-};
-
-/**
- * Checks if the given OpenAI model is a thinking/reasoning model.
- * Thinking models (o1, o3, o4 series) have different parameter restrictions.
- */
-export const isOpenAIThinkingModel = (model: string): boolean => {
-  const thinkingModels = [
-    AxAIOpenAIModel.O1,
-    AxAIOpenAIModel.O1Mini,
-    AxAIOpenAIModel.O3,
-    AxAIOpenAIModel.O3Mini,
-    AxAIOpenAIModel.O4Mini,
-    // Pro models (string values since they're not in the regular chat enum)
-    'o1-pro',
-    'o3-pro',
-  ];
-  return (
-    thinkingModels.includes(model as AxAIOpenAIModel) ||
-    thinkingModels.includes(model)
-  );
 };
 
 export const axAIOpenAIDefaultConfig = (): AxAIOpenAIConfig<
@@ -297,9 +281,14 @@ export interface AxAIOpenAIBaseArgs<
    * Opt in to OpenAI prompt caching on GPT-5.6+ models. Off by default because
    * this request builder is shared: Azure OpenAI is typed on the same model
    * enum, so a `gpt-5.6-*` deployment would otherwise pick up parameters its API
-   * version may reject. Only `AxAIOpenAI` sets it today.
+   * version may reject. Official OpenAI and explicitly compatible named
+   * profiles opt in deliberately.
    */
   promptCaching?: boolean;
+  /** Apply the compatible prompt-cache wire format without OpenAI model-family gating. */
+  promptCachingAllModels?: boolean;
+  /** Whether the compatible API accepts explicit per-content cache breakpoints. */
+  promptCacheBreakpoints?: boolean;
   supportFor: AxAIFeatures | ((model: TModel) => AxAIFeatures);
 }
 
@@ -330,6 +319,8 @@ class AxAIOpenAIImpl<
     private readonly chatStreamRespProcessor?: ChatStreamRespProcessor,
     private readonly realtime?: RealtimeAdapter<TModel>,
     private readonly promptCaching: boolean = false,
+    private readonly promptCachingAllModels: boolean = false,
+    private readonly promptCacheBreakpoints: boolean = true,
     private readonly reasoningContentMode: AxOpenAIReasoningContentMode = 'none',
     private readonly supportFor?:
       | AxAIFeatures
@@ -345,7 +336,8 @@ class AxAIOpenAIImpl<
    * providers throwing exactly as they do today.
    */
   supportsImplicitCaching = (model: TModel): boolean =>
-    this.promptCaching && axIsGPT56Family(model);
+    this.promptCaching &&
+    (this.promptCachingAllModels || axSupportsOpenAIBreakpointCaching(model));
 
   getTokenUsage(): AxTokenUsage | undefined {
     return this.tokensUsed;
@@ -367,11 +359,45 @@ class AxAIOpenAIImpl<
     };
   }
 
+  /** OpenAI's info for an o-series name, for profiles without model info. */
+  samplingModelInfo(model: TModel): Readonly<AxModelInfo> | undefined {
+    return openAIOSeriesSamplingModelInfo(String(model));
+  }
+
+  /** The `reasoning_effort` createChatReq will send for this model. */
+  resolveReasoningEffort(
+    model: TModel,
+    config: Readonly<AxAIServiceOptions>
+  ): string | undefined {
+    return config.thinkingTokenBudget
+      ? axResolveOpenAIChatReasoningEffort(model, config.thinkingTokenBudget)
+      : this.config.reasoningEffort;
+  }
+
+  validateChatReq = (req: Readonly<AxInternalChatRequest<TModel>>): void => {
+    if (
+      this.promptCaching &&
+      axRefusesOpenAIChatTools(req.model) &&
+      (req.functions?.length ||
+        (req.functionCall && req.functionCall !== 'none') ||
+        req.chatPrompt?.some(
+          (m) =>
+            m.role === 'function' ||
+            (m.role === 'assistant' && m.functionCalls?.length)
+        ))
+    ) {
+      throw new Error(
+        `${String(req.model)} tool calling requires openai-responses`
+      );
+    }
+  };
+
   createChatReq = (
     req: Readonly<AxInternalChatRequest<TModel>>,
     config: Readonly<AxAIServiceOptions>
   ): [AxAPI, AxAIOpenAIChatRequest<TModel>] => {
     const model = req.model;
+    this.validateChatReq(req);
     const realtimeAudio = (
       this.realtime?.resolveAudioConfig ?? axResolveOpenAIRealtimeAudioConfig
     )(this.config.audio, req.modelConfig?.audio);
@@ -442,17 +468,21 @@ class AxAIOpenAIImpl<
     const promptCachingEnabled = axIsOpenAIPromptCachingEnabled(
       req,
       config,
-      this.promptCaching
+      this.promptCaching &&
+        (this.promptCachingAllModels ||
+          axSupportsOpenAIBreakpointCaching(req.model))
     );
     let promptCacheKey: string | undefined;
     let breakpointCount = 0;
     if (promptCachingEnabled) {
-      const applied = axApplyOpenAIPromptCacheBreakpoints(
-        messages,
-        req.chatPrompt
-      );
-      messages = applied.messages;
-      breakpointCount = applied.markerCount;
+      if (this.promptCacheBreakpoints) {
+        const applied = axApplyOpenAIPromptCacheBreakpoints(
+          messages,
+          req.chatPrompt
+        );
+        messages = applied.messages;
+        breakpointCount = applied.markerCount;
+      }
       // The key helps implicit matching too, so it is sent whenever caching was
       // asked for — even when no message could take a marker.
       promptCacheKey = axResolveOpenAIPromptCacheKey(config, this.options);
@@ -466,14 +496,14 @@ class AxAIOpenAIImpl<
       }
     }
 
-    const frequencyPenalty =
-      req.modelConfig?.frequencyPenalty ?? this.config.frequencyPenalty;
+    // The penalties come only from the merged modelConfig (which carries the
+    // AI's config): the base layer removes them there when the model rejects
+    // them, and a fallback to this.config would put them back.
+    const frequencyPenalty = req.modelConfig?.frequencyPenalty;
 
     const stream = req.modelConfig?.stream ?? this.config.stream;
 
     const store = this.config.store;
-
-    const isThinkingModel = isOpenAIThinkingModel(model as string);
 
     let reqValue: AxAIOpenAIChatRequest<TModel> = {
       model,
@@ -493,37 +523,29 @@ class AxAIOpenAIImpl<
           : {}),
       ...(tools ? { tools } : {}),
       ...(toolsChoice ? { tool_choice: toolsChoice } : {}),
-      // For thinking models, don't set these parameters as they're not supported
-      ...(isThinkingModel
-        ? {}
-        : {
-            ...((req.modelConfig?.maxTokens ?? this.config.maxTokens) !==
-            undefined
-              ? {
-                  max_completion_tokens: (req.modelConfig?.maxTokens ??
-                    this.config.maxTokens)!,
-                }
-              : {}),
-            ...(req.modelConfig?.temperature !== undefined
-              ? { temperature: req.modelConfig.temperature }
-              : {}),
-            ...(req.modelConfig?.topP !== undefined
-              ? { top_p: req.modelConfig.topP }
-              : {}),
-            ...((req.modelConfig?.n ?? this.config.n) !== undefined
-              ? { n: (req.modelConfig?.n ?? this.config.n)! }
-              : {}),
-            ...((req.modelConfig?.presencePenalty ??
-              this.config.presencePenalty) !== undefined
-              ? {
-                  presence_penalty: (req.modelConfig?.presencePenalty ??
-                    this.config.presencePenalty)!,
-                }
-              : {}),
-            ...(frequencyPenalty !== undefined
-              ? { frequency_penalty: frequencyPenalty }
-              : {}),
-          }),
+      // Model info decides which sampling parameters the model accepts; the
+      // base layer has already removed the rest from modelConfig.
+      ...((req.modelConfig?.maxTokens ?? this.config.maxTokens) !== undefined
+        ? {
+            max_completion_tokens: (req.modelConfig?.maxTokens ??
+              this.config.maxTokens)!,
+          }
+        : {}),
+      ...(req.modelConfig?.temperature !== undefined
+        ? { temperature: req.modelConfig.temperature }
+        : {}),
+      ...(req.modelConfig?.topP !== undefined
+        ? { top_p: req.modelConfig.topP }
+        : {}),
+      ...((req.modelConfig?.n ?? this.config.n) !== undefined
+        ? { n: (req.modelConfig?.n ?? this.config.n)! }
+        : {}),
+      ...(req.modelConfig?.presencePenalty !== undefined
+        ? { presence_penalty: req.modelConfig.presencePenalty }
+        : {}),
+      ...(frequencyPenalty !== undefined
+        ? { frequency_penalty: frequencyPenalty }
+        : {}),
       ...((req.modelConfig?.stopSequences ?? this.config.stop) &&
       (req.modelConfig?.stopSequences ?? this.config.stop)!.length > 0
         ? { stop: (req.modelConfig?.stopSequences ?? this.config.stop)! }
@@ -538,7 +560,12 @@ class AxAIOpenAIImpl<
       // user/tool message: that entry covers the volatile trailing message and
       // so is written but never read back.
       ...(breakpointCount > 0
-        ? { prompt_cache_options: { mode: 'explicit' as const } }
+        ? {
+            prompt_cache_options: {
+              mode: 'explicit' as const,
+              ...(axIsGPT6Family(model) ? { ttl: '30m' as const } : {}),
+            },
+          }
         : {}),
       ...(promptCacheKey ? { prompt_cache_key: promptCacheKey } : {}),
       ...(store ? { store: store } : {}),
@@ -618,6 +645,28 @@ class AxAIOpenAIImpl<
         model,
         config.thinkingTokenBudget
       );
+    }
+
+    if (this.promptCaching && axIsGPT6Family(model)) {
+      if (
+        axRequiresOpenAIReasoning(model) &&
+        reqValue.reasoning_effort === 'none'
+      )
+        throw new Error(
+          `${String(model)} requires reasoning; use low or higher`
+        );
+      if (reqValue.reasoning_effort === 'minimal')
+        reqValue.reasoning_effort = 'low';
+      delete reqValue.temperature;
+      delete reqValue.top_p;
+      // Chat Completions refuses function tools on GPT-6 while it reasons, and
+      // an omitted effort means `medium`. Models that cannot disable reasoning
+      // at all are refused earlier, in validateChatReq.
+      if (reqValue.tools?.length && reqValue.reasoning_effort !== 'none') {
+        throw new Error(
+          `${String(model)} supports function tools on Chat Completions only with reasoning disabled; use the openai-responses provider or set thinkingTokenBudget to 'none'`
+        );
+      }
     }
 
     if (this.chatReqUpdater) {
@@ -851,7 +900,7 @@ function createMessages<TModel>(
                   const url = `data:${c.mimeType};base64,${c.image}`;
                   return {
                     type: 'image_url' as const,
-                    image_url: { url, details: c.details ?? 'auto' },
+                    image_url: { url, detail: c.details ?? 'auto' },
                   };
                 }
                 case 'audio': {
@@ -859,6 +908,46 @@ function createMessages<TModel>(
                     allowPcm16: allowRealtimeAudio,
                   });
                 }
+                case 'file': {
+                  const fileUri = 'fileUri' in c ? c.fileUri : undefined;
+                  if (c.mimeType.startsWith('image/')) {
+                    return {
+                      type: 'image_url' as const,
+                      image_url: {
+                        url:
+                          fileUri ??
+                          `data:${c.mimeType};base64,${'data' in c ? c.data : ''}`,
+                        detail: 'auto' as const,
+                      },
+                    };
+                  }
+                  if (fileUri && c.mimeType.startsWith('video/')) {
+                    return {
+                      type: 'video_url' as const,
+                      video_url: { url: fileUri },
+                    };
+                  }
+                  return {
+                    type: 'file' as const,
+                    file: {
+                      ...(fileUri
+                        ? { file_url: fileUri }
+                        : {
+                            file_data: `data:${c.mimeType};base64,${'data' in c ? c.data : ''}`,
+                          }),
+                      filename: c.filename,
+                    },
+                  };
+                }
+                case 'url':
+                  return {
+                    type: 'text' as const,
+                    text:
+                      c.cachedContent ??
+                      [c.title, c.description, c.url]
+                        .filter(Boolean)
+                        .join('\n'),
+                  };
                 default:
                   throw new Error('Invalid content type');
               }
@@ -1024,6 +1113,8 @@ export class AxAIOpenAIBase<
     chatStreamRespProcessor,
     realtime,
     promptCaching,
+    promptCachingAllModels,
+    promptCacheBreakpoints,
     reasoningContentMode,
     supportFor,
   }: Readonly<
@@ -1045,6 +1136,8 @@ export class AxAIOpenAIBase<
       chatStreamRespProcessor,
       realtime,
       promptCaching ?? false,
+      promptCachingAllModels ?? false,
+      promptCacheBreakpoints ?? true,
       reasoningContentMode ?? 'none',
       supportFor
     );
@@ -1137,7 +1230,8 @@ export class AxAIOpenAIBase<
         model,
         input: req.text,
         voice,
-        response_format: format === 'pcm' ? 'pcm16' : format,
+        // OpenAI's `pcm` is 16-bit PCM; it rejects `pcm16`.
+        response_format: format === 'pcm16' ? 'pcm' : format,
         ...(req.speed !== undefined ? { speed: req.speed } : {}),
       },
       format,
@@ -1201,7 +1295,7 @@ export class AxAIOpenAI<TModelKey = string> extends AxAIOpenAIBase<
           ? (['native', 'function', 'json_object'] as const)
           : (['function', 'json_object'] as const));
       return {
-        functions: true,
+        functions: !axRefusesOpenAIChatTools(model),
         streaming: true,
         hasThinkingBudget: mi?.supported?.thinkingBudget ?? false,
         hasShowThoughts: mi?.supported?.showThoughts ?? false,
@@ -1219,7 +1313,7 @@ export class AxAIOpenAI<TModelKey = string> extends AxAIOpenAIBase<
             )[],
           },
           audio: {
-            supported: true,
+            supported: !axIsGPT6Family(model),
             formats:
               isAudioModel || isRealtimeModel
                 ? ['wav', 'mp3', 'pcm16']
@@ -1269,8 +1363,8 @@ export class AxAIOpenAI<TModelKey = string> extends AxAIOpenAIBase<
           // predate the parameters entirely. `cacheBreakpoints` is inert today
           // (callers only test for `=== false`) but records that this provider
           // needs positional markers rather than Anthropic's auto-lookback.
-          supported: axIsGPT56Family(model),
-          types: axIsGPT56Family(model)
+          supported: axSupportsOpenAIBreakpointCaching(model),
+          types: axSupportsOpenAIBreakpointCaching(model)
             ? (['ephemeral'] as ('ephemeral' | 'persistent')[])
             : [],
           cacheBreakpoints: true,
@@ -1363,5 +1457,6 @@ export class AxAIOpenAI<TModelKey = string> extends AxAIOpenAIBase<
     });
 
     super.setName('OpenAI');
+    this.setExplicitModelConfigKeys(config);
   }
 }

@@ -10,8 +10,7 @@
     "answer": "good"
   },
   "expected_request_contains": [
-    "answer must contain good",
-    "Return only corrected JSON"
+    "Follow these instructions: answer must contain good."
   ],
   "expected_request_count": 2,
   "input": {
@@ -21,10 +20,10 @@
   "name": "assertion-retry",
   "responses": [
     {
-      "content": "{\"answer\":\"bad\"}"
+      "content": "Answer: bad"
     },
     {
-      "content": "{\"answer\":\"good\"}"
+      "content": "Answer: good"
     }
   ],
   "signature": "question:string -> answer:string"

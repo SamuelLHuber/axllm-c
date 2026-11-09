@@ -1,7 +1,11 @@
 import type { AxFunctionJSONSchema } from '../ai/types.js';
+import { boxSchema } from './box.js';
+import { decisionEvidenceSchema, isDecisionField } from './decision.js';
 import type { AxField } from './sig.js';
+import { describeFieldValues } from './valueDescriptions.js';
 
 type ToJsonSchemaOptions = {
+  decisionMode?: 'request' | 'result';
   /**
    * Native structured-output providers often reject flexible JSON unions. When
    * enabled, json and unshaped object fields are represented as JSON strings.
@@ -226,9 +230,126 @@ function fieldToSchema(
   options?: ToJsonSchemaOptions
 ): any {
   const type = field.type;
+  if (type && isDecisionField(field)) {
+    let schema: any = decisionEvidenceSchema(type);
+    if (options?.decisionMode === 'result') {
+      if (!type.evidence)
+        schema =
+          type.name === 'box'
+            ? boxSchema()
+            : {
+                type: 'number',
+                minimum: 0,
+                maximum: type.options!.length - 1,
+              };
+      else {
+        const provenance = {
+          type: 'object',
+          properties: {
+            source: { type: 'string', enum: ['native', 'elicited'] },
+            provider: { type: 'string' },
+            model: { type: 'string' },
+          },
+          required: ['source', 'provider'],
+          additionalProperties: false,
+        };
+        const props: Record<string, unknown> = {
+          value:
+            type.name === 'boolean'
+              ? { type: 'boolean' }
+              : type.name === 'box'
+                ? boxSchema()
+                : type.name === 'class'
+                  ? { type: 'string', enum: type.options }
+                  : {
+                      type: 'number',
+                      minimum: 0,
+                      maximum: type.options!.length - 1,
+                    },
+          provenance,
+        };
+        if (type.name === 'boolean') {
+          props.probability = { type: 'number', minimum: 0, maximum: 1 };
+          props.threshold = { type: 'number', minimum: 0, maximum: 1 };
+        } else if (type.name === 'score') {
+          props.levels = { type: 'array', items: { type: 'string' } };
+          props.probabilities = {
+            type: 'array',
+            items: { type: 'number', minimum: 0, maximum: 1 },
+          };
+        } else if (type.name !== 'box')
+          props.probabilities = {
+            type: 'object',
+            properties: Object.fromEntries(
+              type.options!.map((k) => [
+                k,
+                { type: 'number', minimum: 0, maximum: 1 },
+              ])
+            ),
+            required: type.options,
+            additionalProperties: false,
+          };
+        schema = {
+          type: 'object',
+          properties: props,
+          required: Object.keys(props),
+          additionalProperties: false,
+        };
+        if (type.name !== 'boolean')
+          schema.properties.confidence = {
+            type: 'number',
+            minimum: 0,
+            maximum: 1,
+          };
+        if (type.evidence.onRefusal === 'return')
+          schema = {
+            anyOf: [
+              {
+                ...schema,
+                properties: {
+                  ...props,
+                  status: { type: 'string', enum: ['answered'] },
+                },
+                required: [...schema.required, 'status'],
+              },
+              {
+                type: 'object',
+                properties: {
+                  status: { type: 'string', enum: ['refused'] },
+                  provenance,
+                },
+                required: ['status', 'provenance'],
+                additionalProperties: false,
+              },
+            ],
+          };
+      }
+    }
+    const guidance =
+      type.name === 'boolean'
+        ? 'Return the probability of true.'
+        : type.name === 'box'
+          ? 'Return normalized top, bottom, left and right edges in [0, 1], measured from the image top-left; top < bottom and left < right.'
+          : type.name === 'score'
+            ? `Return probabilities in the declared rubric order, from lowest to highest: ${type.options!.map((label, i) => `${i}: ${label}`).join('; ')}.`
+            : 'Return a probability for every declared class.';
+    schema.description = [
+      describeFieldValues(field),
+      options?.decisionMode === 'result' ? '' : guidance,
+    ]
+      .filter(Boolean)
+      .join(' ');
+    if (type.isArray) schema = { type: 'array', items: schema };
+    if (field.isOptional && options?.strictStructuredOutputs)
+      schema = { anyOf: [schema, { type: 'null' }] };
+    return schema;
+  }
 
   // Enhance description with validation constraints
-  const description = enhanceDescriptionWithValidation(field.description, type);
+  const description = enhanceDescriptionWithValidation(
+    describeFieldValues(field),
+    type
+  );
 
   // Validate that media types are not used in nested objects
   if (
@@ -277,6 +398,8 @@ function fieldToSchema(
             maximum: fieldType.maximum,
             pattern: fieldType.pattern,
             patternDescription: fieldType.patternDescription,
+            valueDescriptions: fieldType.valueDescriptions,
+            evidence: fieldType.evidence,
             format: fieldType.format,
           },
           isOptional: fieldType.isOptional,
@@ -295,12 +418,16 @@ function fieldToSchema(
       schema.items = {
         type: 'string',
         enum: type.options,
+        ...(type.valueDescriptions ? { description } : {}),
       };
     } else {
       // Array of primitives
       // Enhance description for array items
       const itemDescription = enhanceDescriptionWithValidation(
-        type.description || field.description,
+        describeFieldValues({
+          ...field,
+          description: type.description || field.description,
+        }),
         type
       );
 
@@ -368,6 +495,8 @@ function fieldToSchema(
           maximum: fieldType.maximum,
           pattern: fieldType.pattern,
           patternDescription: fieldType.patternDescription,
+          valueDescriptions: fieldType.valueDescriptions,
+          evidence: fieldType.evidence,
           format: fieldType.format,
         },
         isOptional: fieldType.isOptional,

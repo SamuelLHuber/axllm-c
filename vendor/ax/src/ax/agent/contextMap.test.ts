@@ -21,12 +21,12 @@ const contextMapRuntime: AxCodeRuntime = {
       execute: async (code: string) => {
         if (code.startsWith(AX_HOST_SNIPPET_MARKER)) return 'host-snippet';
         if (code.includes('final("distilled"')) {
-          (globals?.final as (...args: unknown[]) => void)('distilled', {
+          (globals!.final as (...args: unknown[]) => void)('distilled', {
             section: 'billing',
           });
         }
         if (code.includes('final("done"')) {
-          (globals?.final as (...args: unknown[]) => void)('done', {
+          (globals!.final as (...args: unknown[]) => void)('done', {
             answer: 'ok',
           });
         }
@@ -532,5 +532,37 @@ describe('AxAgentContextMap', () => {
     expect(distillerPrompts[0]).not.toContain('Late billing orientation');
     expect(distillerUserPrompts[0]).toContain('Context Map:');
     expect(distillerUserPrompts[0]).toContain('Late billing orientation');
+  });
+});
+
+describe('AxAgentContextMap update options', () => {
+  it('stops an update on the abortSignal in its options', async () => {
+    const calls: string[] = [];
+    const map = new AxAgentContextMap();
+    const ai = new AxMockAIService({
+      features: { functions: false, streaming: false },
+      chatResponse: async () => {
+        calls.push('chat');
+        return {
+          results: [
+            {
+              index: 0,
+              content: 'Diagnosis: ok',
+              finishReason: 'stop' as const,
+            },
+          ],
+        };
+      },
+    });
+    const controller = new AbortController();
+    controller.abort('agent run stopped');
+    await expect(
+      map.update(ai, {
+        task: 'Understand invoices',
+        trajectory: 'The agent found invoice records.',
+        options: { abortSignal: controller.signal },
+      })
+    ).rejects.toThrow('agent run stopped');
+    expect(calls).toEqual([]);
   });
 });

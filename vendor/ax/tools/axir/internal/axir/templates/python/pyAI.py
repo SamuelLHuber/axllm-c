@@ -9,22 +9,138 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 import hashlib
+import http.client
 import json
 import math
+import re
 import os
 import random
 import threading
 import time
 import uuid
 import urllib.error
+import warnings
 import urllib.parse
 import urllib.request
-from typing import Any, Callable, Iterable, Protocol
+from typing import Any, Callable, Iterable, Protocol, TypedDict, Literal
 # AXIR_CORE_IMPORTS
+from .signature import _core_string_utf8_length
+
+def _core_string_index_of(value, needle, start=0):
+    return str(value).find(str(needle), max(0, int(start)))
+
+from .signature import _core_record_new, _core_regex_match, _js_json_dumps, _js_number_text, _js_format, _js_text
+import warnings
+
+_CORE_DEPRECATIONS_SHOWN: set[str] = set()
+_CORE_DEPRECATION_SINK = None
+
+
+def _core_axgen_deprecation(key, message):
+    # Deprecated port behavior warns once per process.
+    if key in _CORE_DEPRECATIONS_SHOWN:
+        return None
+    _CORE_DEPRECATIONS_SHOWN.add(key)
+    if _CORE_DEPRECATION_SINK is not None:
+        _CORE_DEPRECATION_SINK(str(message))
+        return None
+    warnings.warn(str(message), DeprecationWarning, stacklevel=4)
+    return None
+
+
+def _core_axgen_capture_deprecations(sink):
+    # Conformance hook: forgets the deprecations already shown and sends new
+    # ones to sink (None warns again).
+    global _CORE_DEPRECATION_SINK
+    _CORE_DEPRECATIONS_SHOWN.clear()
+    _CORE_DEPRECATION_SINK = sink
+
+def _core_validation_error(message):
+    return ValueError(str(message))
+
+def _core_math_is_finite(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _core_string_split_once(value, sep):
+    left, marker, right = str(value).partition(str(sep))
+    return {"left": left, "right": right, "found": bool(marker)}
+
+
+def _core_regex_replace(pattern, repl, value):
+    return re.sub(str(pattern), str(repl), str(value))
+
+
+def _core_string_split(value, sep):
+    return str(value).split(str(sep))
 
 AxUsageContext = dict[str, Any]
 AxUsageEvent = dict[str, Any]
 AxUsageObserver = Callable[[AxUsageEvent], Any]
+
+
+class AxCancellationToken:
+    """Thread-safe, one-shot cancellation shared by providers and event clocks."""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._event = threading.Event()
+        self._reason: str | None = None
+        self._subscriptions: dict[int, Callable[[], Any]] = {}
+        self._next_subscription = 0
+
+    @property
+    def cancelled(self) -> bool:
+        return self._event.is_set()
+
+    @property
+    def reason(self) -> str | None:
+        with self._lock:
+            return self._reason
+
+    def cancel(self, reason: str = "cancelled") -> bool:
+        with self._lock:
+            if self._event.is_set():
+                return False
+            self._reason = reason
+            self._event.set()
+            callbacks = list(self._subscriptions.values())
+            self._subscriptions.clear()
+        for callback in callbacks:
+            callback()
+        return True
+
+    def wait(self, timeout: float | None = None) -> bool:
+        return self._event.wait(timeout)
+
+    def subscribe(self, callback: Callable[[], Any]) -> Callable[[], None]:
+        with self._lock:
+            if self._event.is_set():
+                immediate = True
+                subscription_id = -1
+            else:
+                immediate = False
+                self._next_subscription += 1
+                subscription_id = self._next_subscription
+                self._subscriptions[subscription_id] = callback
+        if immediate:
+            callback()
+            return lambda: None
+
+        def remove() -> None:
+            with self._lock:
+                self._subscriptions.pop(subscription_id, None)
+
+        return remove
+
+    def throw_if_cancelled(self) -> None:
+        if self.cancelled:
+            raise AxAIServiceAbortedError(self.reason)
+
+    @property
+    def subscription_count(self) -> int:
+        with self._lock:
+            return len(self._subscriptions)
 
 
 @dataclass(frozen=True)
@@ -141,6 +257,47 @@ def set_meter(meter: AxMeter | None) -> None:
 def _snapshot_global_runtime_hooks() -> AxRuntimeHooks:
     with _runtime_hooks_lock:
         return _global_runtime_hooks
+
+
+_global_caching_function: Callable[..., Any] | None = None
+
+
+def set_caching_function(caching_function: Callable[..., Any] | None) -> None:
+    """Set the process-wide AxGen caching function; pass None to clear it.
+
+    AxGen uses it when neither the forward call nor the constructor sets
+    ``caching_function``: ``fn(key)`` returns a stored output or None, and
+    ``fn(key, output)`` stores one.
+    """
+    global _global_caching_function
+    with _runtime_hooks_lock:
+        _global_caching_function = caching_function
+
+
+def _snapshot_global_caching_function() -> Callable[..., Any] | None:
+    with _runtime_hooks_lock:
+        return _global_caching_function
+
+
+_global_function_result_formatter: Callable[[Any], Any] | None = None
+
+
+def set_function_result_formatter(formatter: Callable[[Any], Any] | None) -> None:
+    """Set the process-wide tool result formatter, as TS's
+    ``axGlobals.functionResultFormatter``; pass None to restore the default.
+
+    AxGen uses it when neither the forward call nor the program sets
+    ``function_result_formatter``: ``formatter(result)`` returns the text the
+    model gets for a tool result, and an empty text goes as ``done``.
+    """
+    global _global_function_result_formatter
+    with _runtime_hooks_lock:
+        _global_function_result_formatter = formatter
+
+
+def _snapshot_global_function_result_formatter() -> Callable[[Any], Any] | None:
+    with _runtime_hooks_lock:
+        return _global_function_result_formatter
 
 
 def _coerce_runtime_hooks(value: Any) -> AxRuntimeHooks:
@@ -284,7 +441,9 @@ def _runtime_hook_scope(
     span_kind: str = "internal",
     attributes: dict[str, Any] | None = None,
     metric_prefix: str = "ax_gen_generation",
+    metric_labels: dict[str, Any] | None = None,
 ):
+    # metric_labels (TS's custom labels) go on the metrics, not the span.
     parent = _runtime_frame.get()
     hooks = _merge_runtime_hooks(
         _coerce_runtime_hooks(call_hooks),
@@ -295,18 +454,19 @@ def _runtime_hook_scope(
     effective = _merge_runtime_hooks(hooks, globals_snapshot)
     attrs = dict(attributes or {})
     span = _start_runtime_span(effective, span_name, span_kind, attrs)
+    metric_attrs = {**attrs, **(metric_labels or {})}
     token = _runtime_frame.set(_AxRuntimeFrame(hooks, globals_snapshot, span or (parent.span if parent else None)))
     started = time.perf_counter()
     error = None
-    _record_runtime_metric(effective.meter, "counter", f"{metric_prefix}_requests_total", 1, attrs)
+    _record_runtime_metric(effective.meter, "counter", f"{metric_prefix}_requests_total", 1, metric_attrs)
     try:
         yield effective
     except BaseException as exc:
         error = exc
-        _record_runtime_metric(effective.meter, "counter", f"{metric_prefix}_errors_total", 1, attrs)
+        _record_runtime_metric(effective.meter, "counter", f"{metric_prefix}_errors_total", 1, metric_attrs)
         raise
     finally:
-        _record_runtime_metric(effective.meter, "histogram", f"{metric_prefix}_duration_ms", (time.perf_counter() - started) * 1000, attrs)
+        _record_runtime_metric(effective.meter, "histogram", f"{metric_prefix}_duration_ms", (time.perf_counter() - started) * 1000, metric_attrs)
         _finish_runtime_span(span, error)
         _runtime_frame.reset(token)
 
@@ -347,14 +507,17 @@ def _usage_observed_stream(
     values: Iterable[dict[str, Any]],
     options: dict[str, Any],
 ):
+    cancellation = _cancellation_token(options)
     last_usage_response = None
     completed = False
     try:
         for value in values:
+            if cancellation is not None: cancellation.throw_if_cancelled()
             model_usage = value.get("model_usage") or value.get("modelUsage")
             if isinstance(model_usage, dict) and model_usage.get("tokens"):
                 last_usage_response = value
             yield value
+            if cancellation is not None: cancellation.throw_if_cancelled()
         completed = True
     finally:
         if completed and last_usage_response is not None:
@@ -371,6 +534,23 @@ def _invoke_rate_limiter(limiter: AxRateLimiter | None, next_request: Callable[[
     if callable(run):
         return run(next_request, info)
     return limiter(next_request, info)
+
+
+def _labeled(attributes: dict[str, Any], service_options: Any, call_options: Any, sanitize: bool) -> dict[str, Any]:
+    # A metric's attributes with TS's custom labels: the service's, then the
+    # call's (ai_custom_labels). TS cuts their values for the request
+    # duration and errors (sanitize) but not for the request counter.
+    labels = ai_custom_labels(service_options or {}, call_options or {}, sanitize)
+    return {**attributes, **labels} if labels else attributes
+
+
+def _gen_metric_labels(client: Any, gen_options: Any, call_options: Any) -> dict[str, Any]:
+    # An AxGen run's custom labels, as TS's getMergedCustomLabels: the AI
+    # service's, then the AxGen constructor's with the call's over them, each
+    # value cut to 100 characters.
+    run_labels = ai_custom_labels(gen_options or {}, call_options or {}, False)
+    service_options = getattr(client, "options", None)
+    return ai_custom_labels(service_options if isinstance(service_options, dict) else {}, {"customLabels": run_labels}, True)
 
 
 def _runtime_observed_stream(
@@ -441,6 +621,128 @@ class AxAIServiceAuthenticationError(AxAIServiceError):
     pass
 
 
+class AxAIServiceAbortedError(AxAIServiceError):
+    def __init__(self, reason: str | None = None):
+        message = "Request aborted" + (f": {reason}" if reason and reason != "cancelled" else "")
+        super().__init__(message, retryable=False)
+        self.reason = reason
+
+
+def _call_timeout_error(timeout_ms: Any, request: Any) -> AxAIServiceTimeoutError:
+    # TS's AxAIServiceTimeoutError for a call's timeoutMs. As in TS apiCall, the
+    # request layer does not retry it; AxGen still retries it as an
+    # infrastructure error.
+    error = AxAIServiceTimeoutError(provider_call_timeout_message(timeout_ms), request=request, retryable=True)
+    error.timeout_ms = timeout_ms
+    return error
+
+
+def _client_timeout_error(timeout_seconds: Any, exc: BaseException, request: Any) -> AxAIServiceError:
+    # The client's own timeout (in seconds here) in TS's words, in milliseconds.
+    # Like a call's timeoutMs, the request layer does not retry it. Without a
+    # client timeout the operating system's timed out, which TS reports as a
+    # network error.
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
+        return _network_error(exc, request)
+    return AxAIServiceTimeoutError(provider_call_timeout_message(round(float(timeout_seconds) * 1000)), request=request, retryable=True)
+
+
+# Conformance hooks for the request-layer retry: a sleep that records the
+# delay instead of waiting, and fixed random and clock sources.
+_REQUEST_RETRY_HOOKS: dict[str, Any] = {"sleep": None, "random": None, "now_ms": None}
+
+
+def _retry_after_header(headers: Any) -> Any:
+    if not isinstance(headers, dict):
+        getter = getattr(headers, "get", None)
+        return getter("Retry-After") if callable(getter) else None
+    for key, value in headers.items():
+        if str(key).lower() == "retry-after":
+            return value
+    return None
+
+
+def _retry_failure(error: BaseException) -> dict[str, Any] | None:
+    # TS apiCall's view of a failed request: its HTTP status (with its
+    # Retry-After) or a network failure. Anything else is not retried.
+    if isinstance(error, (AxAIServiceAuthenticationError, AxAIServiceAbortedError)):
+        return None
+    status = getattr(error, "status", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        return {"status": status, "retry_after": getattr(error, "retry_after", None)}
+    if isinstance(error, AxAIServiceNetworkError):
+        return {"network": True}
+    return None
+
+
+def _request_retry_sleep(delay_ms: float, cancellation: AxCancellationToken | None) -> None:
+    sleep = _REQUEST_RETRY_HOOKS["sleep"]
+    if sleep is not None:
+        if cancellation is not None: cancellation.throw_if_cancelled()
+        sleep(delay_ms)
+        return
+    _wait_backoff(delay_ms, cancellation)
+
+
+def _request_retry_wait(config: dict[str, Any], attempt: int, error: BaseException, cancellation: AxCancellationToken | None) -> bool:
+    # Wait before the failed request goes out again, as TS apiCall does, and
+    # say whether it does.
+    failure = _retry_failure(error)
+    if failure is None:
+        return False
+    now_ms = _REQUEST_RETRY_HOOKS["now_ms"]
+    rand = _REQUEST_RETRY_HOOKS["random"]
+    delay = request_retry_delay(
+        config,
+        attempt,
+        failure,
+        now_ms() if now_ms is not None else time.time() * 1000,
+        rand() if rand is not None else random.random(),
+    )
+    if delay is None:
+        return False
+    _request_retry_sleep(delay, cancellation)
+    return True
+
+
+def _is_transport_timeout(error: BaseException) -> bool:
+    # A timeout the request itself ran out of (the client's own, a call's
+    # timeoutMs). TS apiCall does not retry it. A 408 or 504 response, which
+    # the ports type as a timeout, carries its status and is retried by it.
+    return isinstance(error, AxAIServiceTimeoutError) and getattr(error, "status", None) is None
+
+
+def _network_error(exc: BaseException, request: Any) -> AxAIServiceNetworkError:
+    # TS's AxAIServiceNetworkError: "Network Error: " and the transport's message.
+    return AxAIServiceNetworkError(f"Network Error: {exc}", request=request, retryable=True)
+
+
+def _cancellation_token(options: dict[str, Any] | None) -> AxCancellationToken | None:
+    if not isinstance(options, dict):
+        return None
+    token = options.get("cancellation") or options.get("cancellation_token") or options.get("cancellationToken")
+    if token is not None and not isinstance(token, AxCancellationToken):
+        raise TypeError("cancellation must be an AxCancellationToken")
+    return token
+
+
+def _check_cancelled(options: dict[str, Any] | None) -> AxCancellationToken | None:
+    token = _cancellation_token(options)
+    if token is not None:
+        token.throw_if_cancelled()
+    return token
+
+
+def _wait_backoff(milliseconds: float, token: AxCancellationToken | None) -> None:
+    if milliseconds <= 0:
+        if token is not None: token.throw_if_cancelled()
+        return
+    if token is not None and token.wait(milliseconds / 1000.0):
+        token.throw_if_cancelled()
+    elif token is None:
+        time.sleep(milliseconds / 1000.0)
+
+
 class AxAIRefusalError(AxAIServiceError):
     pass
 
@@ -452,9 +754,19 @@ class AxUnsupportedCapabilityError(AxAIServiceError):
 def ai(provider: str = "openai", **options):
     resolved = provider_resolve_profile(provider or "openai")
     if not resolved.get("known"):
-        raise ValueError(f"unsupported AxAI provider: {provider}")
+        if isinstance(provider, str):
+            raise ValueError(f"unsupported AxAI provider: {provider}")
+        # Name only the type: a config dict passed by mistake carries its apiKey.
+        raise ValueError(f"unsupported AxAI provider: expected a provider name, got {type(provider).__name__}")
     canonical = resolved.get("id")
     descriptor = provider_descriptor(canonical)
+    # A profile without a base URL of its own needs the caller's (TS
+    # resolveProfileURL); the generic client also takes OPENAI_BASE_URL.
+    url_options = {**(options.get("options") or {}), **options}
+    env_base_url = os.environ.get("OPENAI_BASE_URL")
+    if canonical == "openai-compatible" and env_base_url and not any(url_options.get(key) for key in ("base_url", "baseUrl", "apiURL")):
+        url_options["base_url"] = env_base_url
+    provider_require_api_url(canonical, url_options)
     transport = descriptor.get("transport")
     if transport == "openai-responses":
         return OpenAIResponsesClient(_profile=canonical, **options)
@@ -462,6 +774,15 @@ def ai(provider: str = "openai", **options):
         return GoogleGeminiClient(_profile=canonical, **options)
     if transport == "anthropic-messages":
         return AnthropicClient(_profile=canonical, **options)
+    if transport == "openai-decisions":
+        options.setdefault("model", descriptor["defaultModel"])
+        options.setdefault("base_url", descriptor["baseUrl"])
+        return ProviderOperationClient(canonical, descriptor["name"], **options)
+    if transport == "typesafe-system-one":
+        options.setdefault("model", descriptor["defaultModel"])
+        options.setdefault("api_key", options.pop("apiKey", None) or os.environ.get("TYPESAFE_APIKEY") or os.environ.get("TYPESAFE_API_KEY"))
+        options.setdefault("base_url", descriptor["baseUrl"])
+        return ProviderOperationClient(canonical, descriptor["name"], **options)
     if transport == "openai-chat":
         return OpenAICompatibleClient(_profile=canonical, **options)
     raise ValueError(f"profile {canonical} uses unsupported transport: {transport}")
@@ -501,7 +822,7 @@ def _encode_multipart(payload: dict[str, Any]) -> tuple[bytes, str]:
     """Encode a request payload as multipart/form-data.
 
     Multipart operations (e.g. OpenAI /audio/transcriptions) carry the audio as a
-    binary `file` part; every other field is a plain form field. The `file` value is
+    binary `file` or `audio` part; every other field is a plain form field. Its value is
     a base64 string (optionally a data: URL) or a dict {data, mimeType?, filename?}.
     """
     boundary = "----axllmFormBoundary" + uuid.uuid4().hex
@@ -510,7 +831,7 @@ def _encode_multipart(payload: dict[str, Any]) -> tuple[bytes, str]:
     for key, value in payload.items():
         if value is None:
             continue
-        if key == "file":
+        if key in ("file", "audio"):
             if isinstance(value, dict):
                 data = str(value.get("data", ""))
                 filename = str(value.get("filename") or "audio.wav")
@@ -527,24 +848,31 @@ def _encode_multipart(payload: dict[str, Any]) -> tuple[bytes, str]:
                 file_bytes = data.encode()
             parts.append(b"--" + boundary.encode() + crlf)
             parts.append(
-                ('Content-Disposition: form-data; name="file"; filename="' + filename + '"').encode() + crlf
+                ('Content-Disposition: form-data; name="' + str(key) + '"; filename="' + filename + '"').encode() + crlf
             )
             parts.append(("Content-Type: " + content_type).encode() + crlf + crlf)
             parts.append(file_bytes + crlf)
         else:
             parts.append(b"--" + boundary.encode() + crlf)
-            parts.append(('Content-Disposition: form-data; name="' + str(key) + '"').encode() + crlf + crlf)
+            parts.append(('Content-Disposition: form-data; name="' + str(key) + '"').encode() + crlf)
+            if key == "request":
+                parts.append(b"Content-Type: application/json" + crlf)
+            parts.append(crlf)
             parts.append(str(value).encode() + crlf)
     parts.append(b"--" + boundary.encode() + b"--" + crlf)
     return b"".join(parts), "multipart/form-data; boundary=" + boundary
 
 
 def _realtime_event_is_ready(event: dict[str, Any]) -> bool:
+    if not event.get("type") and event.get("sessionId"):
+        return True
     if event.get("type") in (
         "session.created",
         "session.updated",
         "transcription_session.created",
         "transcription_session.updated",
+        "ready",
+        "sessionStarted",
     ):
         return True
     return "setupComplete" in event
@@ -554,7 +882,12 @@ def _realtime_event_is_done(event: dict[str, Any]) -> bool:
     if event.get("type") in ("response.done", "response.completed"):
         return True
     server_content = event.get("serverContent")
-    return bool(server_content and server_content.get("turnComplete"))
+    # Extended thinking ends an acknowledgement turn IN_PROGRESS and answers in the next turn.
+    return bool(
+        server_content
+        and server_content.get("turnComplete")
+        and server_content.get("interactionStatus") != "IN_PROGRESS"
+    )
 
 
 class ScriptedRealtimeTransport:
@@ -565,15 +898,23 @@ class ScriptedRealtimeTransport:
     def __init__(self, inbound: Iterable[dict[str, Any]]):
         self._inbound = list(inbound)
         self.sent: list[dict[str, Any]] = []
+        self._meta = any('sessionId' in event and 'type' not in event for event in self._inbound)
+        self._ended = threading.Event()
 
     def send(self, event: dict[str, Any]) -> None:
         self.sent.append(event)
+        if event.get('type') == 'endStream':
+            self._ended.set()
 
     def recv(self) -> dict[str, Any] | None:
-        return self._inbound.pop(0) if self._inbound else None
+        if self._inbound:
+            return self._inbound.pop(0)
+        if self._meta and not self._ended.wait(30):
+            raise AxAIServiceError('scripted realtime input did not finish')
+        return None
 
     def close(self) -> None:
-        pass
+        self._ended.set()
 
 
 class _WebSocketRealtimeTransport:
@@ -594,15 +935,20 @@ class _WebSocketRealtimeTransport:
 
     def send(self, event: dict[str, Any]) -> None:
         self.sent.append(event)
-        self._ws.send(json.dumps(event))
+        if event.get("type") == "binary":
+            self._ws.send(base64.b64decode(str(event.get("data") or "")), opcode=self._websocket.ABNF.OPCODE_BINARY)
+        else:
+            self._ws.send(_js_json_dumps(event))
 
     def recv(self) -> dict[str, Any] | None:
-        try:
-            raw = self._ws.recv()
-        except self._websocket.WebSocketTimeoutException:
+        opcode, raw = self._ws.recv_data(control_frame=True)
+        if opcode == self._websocket.ABNF.OPCODE_CLOSE:
+            code = int.from_bytes(raw[:2], "big") if len(raw) >= 2 else 1005
+            if code != 1000:
+                raise AxAIServiceError(f"realtime WebSocket closed abnormally (code {code})")
             return None
-        if not raw:
-            return None
+        if opcode in (self._websocket.ABNF.OPCODE_PING, self._websocket.ABNF.OPCODE_PONG):
+            return self.recv()
         if isinstance(raw, (bytes, bytearray)):
             raw = raw.decode("utf-8")
         return json.loads(raw)
@@ -626,6 +972,9 @@ class AxAIService(ABC):
     @abstractmethod
     def get_features(self, model: str | None = None) -> dict[str, Any]:
         ...
+
+    def validate_chat_request(self, request: dict[str, Any]) -> None:
+        """Optional side-effect-free validation before routing or transport."""
 
     def get_model_list(self):
         return []
@@ -696,7 +1045,9 @@ class AxAIService(ABC):
 
 
 class AIClient(AxAIService):
-    pass
+    def owned_worker_factory(self):
+        """Optional factory for an independently owned concurrent client."""
+        return None
 
 
 class AxBaseAI(AIClient):
@@ -721,6 +1072,7 @@ class AxBaseAI(AIClient):
         self.options = _strip_runtime_hooks(options)
         self.features = copy.deepcopy(features or default_features())
         self.metrics = default_metrics()
+        self._metrics_lock = threading.RLock()
         self.last_used_chat_model = None
         self.last_used_embed_model = None
         self.last_used_model_config = None
@@ -736,6 +1088,8 @@ class AxBaseAI(AIClient):
         return copy.deepcopy(self.features)
 
     def get_model_list(self):
+        for key in ("models", "model_list", "modelList"):
+            if key in self.options: return copy.deepcopy(self.options[key])
         models = []
         if self.model:
             models.append({"key": self.model, "description": f"{self.name} chat model", "model": self.model})
@@ -744,7 +1098,7 @@ class AxBaseAI(AIClient):
         return models
 
     def get_metrics(self) -> dict[str, Any]:
-        return copy.deepcopy(self.metrics)
+        with self._metrics_lock: return copy.deepcopy(self.metrics)
 
     def get_last_used_chat_model(self):
         return self.last_used_chat_model
@@ -775,6 +1129,9 @@ class AxBaseAI(AIClient):
     def get_options(self) -> dict[str, Any]:
         return copy.deepcopy(self.options)
 
+    def _model_catalog_provider(self) -> str:
+        return str(self.name)
+
     def _merged_options(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
         call_options = _strip_runtime_hooks(options)
         merged = {**self.options, **call_options}
@@ -786,6 +1143,12 @@ class AxBaseAI(AIClient):
             merged["usageContext"] = context
         return merged
 
+    def _resolve_model_key(self, request: dict[str, Any], options: dict[str, Any] | None, embed: bool = False):
+        # A key from the client's model list stands for that entry's model and
+        # brings the entry's defaults underneath the caller's settings.
+        resolved = resolve_model_key(self.options, request, options, self.embed_model if embed else self.model, embed)
+        return resolved["request"], resolved["options"]
+
     def chat(self, request: dict[str, Any], options: dict[str, Any] | None = None):
         started = time.perf_counter()
         is_error = False
@@ -793,10 +1156,12 @@ class AxBaseAI(AIClient):
         stream_returned = False
         hooks = _effective_runtime_hooks(options, self.runtime_hooks)
         try:
-            req = _coerce_chat_request(request)
+            _check_cancelled(options)
+            req, options = self._resolve_model_key(_coerce_chat_request(request), options)
             validate_chat_request(req)
             merged_options = self._merged_options(options)
             model = req.get("model") or self.model
+            provider_require_expensive_model_confirmation(self._model_catalog_provider(), str(model or ""), self.options, _strip_runtime_hooks(options))
             model_config = merge_model_config(self.model_config, req.get("model_config"), merged_options)
             if merged_options.get("stream") is not None:
                 model_config["stream"] = bool(merged_options["stream"])
@@ -806,13 +1171,13 @@ class AxBaseAI(AIClient):
             streaming = bool(model_config.get("stream"))
             attributes = {"ax.operation": "chat", "ax.ai": self.name, "ax.model": str(model), "ax.streaming": streaming}
             span = _start_runtime_span(hooks, "ax_llm_chat", "client", attributes)
-            _record_runtime_metric(hooks.meter, "counter", "ax_llm_requests_total", 1, attributes)
+            _record_runtime_metric(hooks.meter, "counter", "ax_llm_requests_total", 1, _labeled(attributes, self.options, options, False))
             info = AxRateLimitInfo("chat", self.name, str(model), streaming, copy.deepcopy(self.last_model_usage))
             response = _invoke_rate_limiter(hooks.rate_limiter, lambda: self._chat(req, merged_options), info)
             if isinstance(response, dict):
                 self.last_model_usage = copy.deepcopy(response.get("model_usage") or response.get("modelUsage"))
                 _emit_usage_event("chat", response, merged_options, False)
-                _record_runtime_metric(hooks.meter, "histogram", "ax_llm_request_duration_ms", (time.perf_counter() - started) * 1000, attributes)
+                _record_runtime_metric(hooks.meter, "histogram", "ax_llm_request_duration_ms", (time.perf_counter() - started) * 1000, _labeled(attributes, self.options, options, True))
                 _finish_runtime_span(span)
                 return response
             stream_returned = True
@@ -821,8 +1186,8 @@ class AxBaseAI(AIClient):
             is_error = True
             if span is not None:
                 attributes = {"ax.operation": "chat", "ax.ai": self.name, "ax.model": str(self.last_used_chat_model or self.model), "ax.streaming": bool((options or {}).get("stream"))}
-                _record_runtime_metric(hooks.meter, "counter", "ax_llm_errors_total", 1, attributes)
-                _record_runtime_metric(hooks.meter, "histogram", "ax_llm_request_duration_ms", (time.perf_counter() - started) * 1000, attributes)
+                _record_runtime_metric(hooks.meter, "counter", "ax_llm_errors_total", 1, _labeled(attributes, self.options, options, True))
+                _record_runtime_metric(hooks.meter, "histogram", "ax_llm_request_duration_ms", (time.perf_counter() - started) * 1000, _labeled(attributes, self.options, options, True))
                 _finish_runtime_span(span, exc)
             raise
         finally:
@@ -834,6 +1199,8 @@ class AxBaseAI(AIClient):
         span = None
         hooks = _effective_runtime_hooks(options, self.runtime_hooks)
         try:
+            _check_cancelled(options)
+            request, options = self._resolve_model_key(request, options, True)
             texts = request.get("texts")
             if not texts:
                 raise AxAIServiceResponseError("Embed texts is empty")
@@ -845,19 +1212,19 @@ class AxBaseAI(AIClient):
             merged_options = self._merged_options(options)
             attributes = {"ax.operation": "embed", "ax.ai": self.name, "ax.model": str(embed_model), "ax.streaming": False}
             span = _start_runtime_span(hooks, "ax_llm_embed", "client", attributes)
-            _record_runtime_metric(hooks.meter, "counter", "ax_llm_requests_total", 1, attributes)
+            _record_runtime_metric(hooks.meter, "counter", "ax_llm_requests_total", 1, _labeled(attributes, self.options, options, False))
             info = AxRateLimitInfo("embed", self.name, str(embed_model), False, copy.deepcopy(self.last_model_usage))
             response = _invoke_rate_limiter(hooks.rate_limiter, lambda: self._embed(req, merged_options), info)
             self.last_model_usage = copy.deepcopy(response.get("model_usage") or response.get("modelUsage")) if isinstance(response, dict) else None
             _emit_usage_event("embed", response, merged_options, False)
-            _record_runtime_metric(hooks.meter, "histogram", "ax_llm_request_duration_ms", (time.perf_counter() - started) * 1000, attributes)
+            _record_runtime_metric(hooks.meter, "histogram", "ax_llm_request_duration_ms", (time.perf_counter() - started) * 1000, _labeled(attributes, self.options, options, True))
             _finish_runtime_span(span)
             return response
         except Exception as exc:
             is_error = True
             attributes = {"ax.operation": "embed", "ax.ai": self.name, "ax.model": str(self.last_used_embed_model or self.embed_model or ""), "ax.streaming": False}
-            _record_runtime_metric(hooks.meter, "counter", "ax_llm_errors_total", 1, attributes)
-            _record_runtime_metric(hooks.meter, "histogram", "ax_llm_request_duration_ms", (time.perf_counter() - started) * 1000, attributes)
+            _record_runtime_metric(hooks.meter, "counter", "ax_llm_errors_total", 1, _labeled(attributes, self.options, options, True))
+            _record_runtime_metric(hooks.meter, "histogram", "ax_llm_request_duration_ms", (time.perf_counter() - started) * 1000, _labeled(attributes, self.options, options, True))
             _finish_runtime_span(span, exc)
             raise
         finally:
@@ -872,21 +1239,41 @@ class AxBaseAI(AIClient):
         ...
 
     def _record_metrics(self, kind: str, duration_seconds: float, is_error: bool):
-        bucket = self.metrics["latency"][kind]
-        bucket["samples"].append(duration_seconds * 1000)
-        samples = bucket["samples"]
-        bucket["mean"] = sum(samples) / len(samples)
-        ordered = sorted(samples)
-        bucket["p95"] = ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))]
-        bucket["p99"] = ordered[min(len(ordered) - 1, int(len(ordered) * 0.99))]
-        errors = self.metrics["errors"][kind]
-        errors["total"] += 1
-        if is_error:
-            errors["count"] += 1
-        errors["rate"] = errors["count"] / errors["total"] if errors["total"] else 0.0
+        with self._metrics_lock:
+            bucket = self.metrics["latency"][kind]
+            bucket["samples"].append(duration_seconds * 1000)
+            samples = bucket["samples"]
+            bucket["mean"] = sum(samples) / len(samples)
+            ordered = sorted(samples)
+            bucket["p95"] = ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))]
+            bucket["p99"] = ordered[min(len(ordered) - 1, int(len(ordered) * 0.99))]
+            errors = self.metrics["errors"][kind]
+            errors["total"] += 1
+            if is_error:
+                errors["count"] += 1
+            errors["rate"] = errors["count"] / errors["total"] if errors["total"] else 0.0
+
+
+_OPENAI_ENV_PROFILES = frozenset({"openai", "openai-responses", "openai-compatible"})
 
 
 class ProviderOperationClient(AxBaseAI):
+    def owned_worker_factory(self):
+        transport_factory = None
+        if self.transport is not None:
+            method = getattr(self.transport, "owned_worker_factory", None)
+            transport_factory = method() if callable(method) else None
+            if transport_factory is None: return None
+        memo = {id(self.runtime_hooks):self.runtime_hooks, id(self.metrics):self.metrics, id(self._metrics_lock):self._metrics_lock}
+        if self.transport is not None: memo[id(self.transport)] = self.transport
+        if self.credential_provider is not None: memo[id(self.credential_provider)] = self.credential_provider
+        try: snapshot = copy.deepcopy(self, dict(memo))
+        except (TypeError, ValueError): return None
+        def factory():
+            owned = copy.deepcopy(snapshot, dict(memo))
+            if transport_factory is not None: owned.transport = transport_factory()
+            return owned
+        return factory
     def __init__(
         self,
         profile: str,
@@ -923,14 +1310,29 @@ class ProviderOperationClient(AxBaseAI):
             features=descriptor.get("features") or default_features(),
         )
         self.profile = profile
+        # Only the caller's settings: provider_build_chat_request adds the
+        # provider's sampling defaults (as its TS class starts from) under them,
+        # after dropping the explicit ones the model rejects.
+        self.model_config = copy.deepcopy(model_config or {})
+        if profile == "openai-decisions":
+            decisions_require_number(self.options.get("trueThreshold", self.options.get("true_threshold", 0.5)), "trueThreshold", 0, 1)
+        if profile == "typesafe":
+            typesafe_require_number(self.options.get("trueThreshold", self.options.get("true_threshold", 0.5)), "trueThreshold", 0, 1)
         self.descriptor = descriptor
-        self.base_url = (base_url or os.environ.get("OPENAI_BASE_URL") or descriptor.get("baseUrl") or "https://api.openai.com/v1").rstrip("/")
-        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        # OPENAI_BASE_URL and OPENAI_API_KEY belong to OpenAI's own profiles and
+        # the generic client; any other provider's key never goes to that host,
+        # and the OpenAI key never goes to another provider.
+        reads_openai_env = profile in _OPENAI_ENV_PROFILES
+        self.base_url = (base_url or (os.environ.get("OPENAI_BASE_URL") if reads_openai_env else None) or descriptor.get("baseUrl") or "https://api.openai.com/v1").rstrip("/")
+        self.base_url_override = base_url.rstrip("/") if base_url else None
+        if profile == "typesafe":
+            env_api_key = os.environ.get("TYPESAFE_APIKEY") or os.environ.get("TYPESAFE_API_KEY")
+        else:
+            env_api_key = os.environ.get("OPENAI_API_KEY") if reads_openai_env else None
+        self.api_key = api_key or env_api_key
         self.credential_provider = credential_provider or credentialProvider
         if self.descriptor.get("authRequired") and not self.api_key and not self.credential_provider:
-            raise AxAIServiceAuthenticationError(
-                f"{self.profile} requires api_key or credential_provider"
-            )
+            raise AxAIServiceAuthenticationError(provider_missing_api_key_message(self.profile))
         self.api_version = descriptor.get("apiVersion") or api_version
         self.timeout = timeout
         self.transport = transport
@@ -946,6 +1348,9 @@ class ProviderOperationClient(AxBaseAI):
         model_info = self.options.get("modelInfo", self.options.get("model_info"))
         return float(provider_estimate_cost(model_usage or {}, model_info))
 
+    def _model_catalog_provider(self) -> str:
+        return str(self.profile)
+
     def get_features(self, model: str | None = None) -> dict[str, Any]:
         return copy.deepcopy(
             provider_resolve_features(
@@ -954,6 +1359,43 @@ class ProviderOperationClient(AxBaseAI):
                 self.options,
             )
         )
+
+    def chat(self, request: dict[str, Any], options: dict[str, Any] | None = None):
+        if self.profile != "openai-decisions":
+            return super().chat(request, options)
+        inherited = _check_cancelled(self.options)
+        per_call = _check_cancelled(options)
+        cancellation = inherited or per_call
+        subscriptions = []
+        try:
+            if inherited is not None and per_call is not None and inherited is not per_call:
+                cancellation = AxCancellationToken()
+                subscriptions.append(inherited.subscribe(lambda: cancellation.cancel(inherited.reason or "cancelled")))
+                subscriptions.append(per_call.subscribe(lambda: cancellation.cancel(per_call.reason or "cancelled")))
+            resolved = dict(options or {})
+            if cancellation is not None:
+                resolved["cancellation"] = cancellation
+            return super().chat(request, resolved)
+        finally:
+            for unsubscribe in subscriptions:
+                unsubscribe()
+
+    def embed(self, request: dict[str, Any], options: dict[str, Any] | None = None):
+        return super().embed(request, options)
+
+    def open_chat_session(self, request: dict[str, Any], options: dict[str, Any] | None = None):
+        request, options = self._resolve_model_key(request, options)
+        model = str(request.get("model") or self.model)
+        if self.profile not in ("openai", "openai-responses") or not model.startswith("gpt-6-astra"):
+            raise AxUnsupportedCapabilityError("Selected provider/model does not support chat sessions")
+        from .session import _ResponsesChatSession
+        return _ResponsesChatSession(self, request, options)
+
+    def validate_chat_request(self, request: dict[str, Any]) -> None:
+        req, _ = self._resolve_model_key(_coerce_chat_request(copy.deepcopy(request)), None)
+        req["model"] = req.get("model") or self.model
+        req["model_config"] = merge_model_config(self.model_config, req.get("model_config"), self.options)
+        provider_validate_chat_request(self.profile, req, self.options)
 
     def _chat(self, request: dict[str, Any], options: dict[str, Any]):
         realtime_model = request.get("model") or self.model
@@ -967,10 +1409,11 @@ class ProviderOperationClient(AxBaseAI):
         raw = self._context_cache_chat(request, payload, model, endpoint, options)
         if raw is None:
             operation = "responses" if self.descriptor.get("transport") == "openai-responses" else "chat"
-            raw = self._request_json(endpoint, payload, stream=False, method=self._operation_method("chat"), operation=operation)
-        return provider_normalize_chat_response(self.profile, raw, self.name, model)
+            raw = self._request_json_retried(endpoint, payload, stream=False, method=self._operation_method("chat"), operation=operation, base_url=self._call_base_url(options), cancellation=_cancellation_token(options), error_options=options, retry_options=options, timeout_ms=self._call_timeout_ms(options))
+        return provider_normalize_chat_response(self.profile, raw, self.name, model, decisions_response_context(payload, options, request) if self.profile == "openai-decisions" else typesafe_response_context(payload, options, request) if self.profile == "typesafe" else provider_response_context(payload, request.get("model_config") or {}, options))
 
     def _context_cache_chat(self, request, payload, model, endpoint, options):
+        cancellation = _check_cancelled(options)
         cfg = (options or {}).get("contextCache", (options or {}).get("context_cache"))
         supported = bool((((self.descriptor.get("features") or {}).get("caching") or {}).get("supported")))
         if self.profile != "google-gemini" or not supported or not cfg:
@@ -979,11 +1422,13 @@ class ProviderOperationClient(AxBaseAI):
             cfg = {}
         if not isinstance(cfg, dict):
             return None
+        call_base_url = self._call_base_url(options)
+        timeout_ms = self._call_timeout_ms(options)
         explicit = str(cfg.get("name") or cfg.get("cacheName") or cfg.get("cache_name") or "")
         if explicit:
             cached_payload = copy.deepcopy(payload)
             cached_payload["cachedContent"] = explicit
-            return self._request_json(endpoint, cached_payload, stream=False, method=self._operation_method("chat"))
+            return self._request_json_retried(endpoint, cached_payload, stream=False, method=self._operation_method("chat"), base_url=call_base_url, cancellation=cancellation, error_options=options, retry_options=options, timeout_ms=timeout_ms)
 
         prompts = request.get("chat_prompt") or request.get("chatPrompt") or request.get("messages") or []
         non_system_seen = 0
@@ -1004,7 +1449,7 @@ class ProviderOperationClient(AxBaseAI):
         if not cache_body.get("systemInstruction") and not cache_body.get("contents"):
             return None
         min_tokens = int(cfg.get("minTokens", cfg.get("min_tokens", 2048)))
-        encoded = json.dumps(cache_body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        encoded = _js_json_dumps(cache_body, sort_keys=True)
         eligible = math.ceil(len(encoded) / 4) >= min_tokens
         ttl_seconds = int(cfg.get("ttlSeconds", cfg.get("ttl_seconds", 3600)))
         refresh_window_ms = int(float(cfg.get("refreshWindowSeconds", cfg.get("refresh_window_seconds", 300))) * 1000)
@@ -1046,33 +1491,37 @@ class ProviderOperationClient(AxBaseAI):
         try:
             if plan.get("action") == "refresh":
                 ops = ai_gemini_cache_ops(cache_name, ttl_seconds, api_key, str(model), cache_body, options)
-                refreshed = self._request_json(ops["update"]["path"], ops["update"]["request"], stream=False, method=ops["update"]["method"], base_url=ops["update"].get("base_url"))
+                refreshed = self._request_json_retried(ops["update"]["path"], ops["update"]["request"], stream=False, method=ops["update"]["method"], base_url=ops["update"].get("base_url"), cancellation=cancellation, error_options=options, retry_options=options, timeout_ms=timeout_ms)
                 expires_at = expiry(refreshed)
                 if not expires_at:
                     raise AxAIServiceResponseError("Gemini cache refresh omitted a future expireTime", response_body=refreshed)
                 save({"cacheName": cache_name, "expiresAt": expires_at})
             if plan.get("action") in ("create", "refresh") and (plan.get("action") == "create" or not cache_name):
                 ops = ai_gemini_cache_ops("", ttl_seconds, api_key, str(model), cache_body, options)
-                created = self._request_json(ops["create"]["path"], ops["create"]["request"], stream=False, method=ops["create"]["method"], base_url=ops["create"].get("base_url"))
+                created = self._request_json_retried(ops["create"]["path"], ops["create"]["request"], stream=False, method=ops["create"]["method"], base_url=ops["create"].get("base_url"), cancellation=cancellation, error_options=options, retry_options=options, timeout_ms=timeout_ms)
                 cache_name = str((created or {}).get("name") or "")
                 expires_at = expiry(created)
                 if not cache_name or not expires_at:
                     raise AxAIServiceResponseError("Gemini cache creation omitted name or future expireTime", response_body=created)
                 save({"cacheName": cache_name, "expiresAt": expires_at})
+        except AxAIServiceAbortedError:
+            raise
         except AxAIServiceError:
             if plan.get("action") == "refresh":
                 try:
                     ops = ai_gemini_cache_ops("", ttl_seconds, api_key, str(model), cache_body, options)
-                    created = self._request_json(ops["create"]["path"], ops["create"]["request"], stream=False, method=ops["create"]["method"], base_url=ops["create"].get("base_url"))
+                    created = self._request_json_retried(ops["create"]["path"], ops["create"]["request"], stream=False, method=ops["create"]["method"], base_url=ops["create"].get("base_url"), cancellation=cancellation, error_options=options, retry_options=options, timeout_ms=timeout_ms)
                     cache_name = str((created or {}).get("name") or "")
                     expires_at = expiry(created)
                     if not cache_name or not expires_at:
                         raise AxAIServiceResponseError("Gemini cache recreation omitted name or future expireTime", response_body=created)
                     save({"cacheName": cache_name, "expiresAt": expires_at})
+                except AxAIServiceAbortedError:
+                    raise
                 except AxAIServiceError:
-                    return self._request_json(endpoint, payload, stream=False, method=self._operation_method("chat"))
+                    return self._request_json_retried(endpoint, payload, stream=False, method=self._operation_method("chat"), base_url=call_base_url, cancellation=cancellation, error_options=options, retry_options=options, timeout_ms=timeout_ms)
             else:
-                return self._request_json(endpoint, payload, stream=False, method=self._operation_method("chat"))
+                return self._request_json_retried(endpoint, payload, stream=False, method=self._operation_method("chat"), base_url=call_base_url, cancellation=cancellation, error_options=options, retry_options=options, timeout_ms=timeout_ms)
         if not cache_name:
             return None
         cached_payload = copy.deepcopy(payload)
@@ -1082,7 +1531,7 @@ class ProviderOperationClient(AxBaseAI):
         cached_payload.pop("toolConfig", None)
         cached_payload["cachedContent"] = cache_name
         try:
-            return self._request_json(endpoint, cached_payload, stream=False, method=self._operation_method("chat"))
+            return self._request_json_retried(endpoint, cached_payload, stream=False, method=self._operation_method("chat"), base_url=call_base_url, cancellation=cancellation, error_options=options, retry_options=options, timeout_ms=timeout_ms)
         except AxAIServiceError as error:
             if not ai_context_cache_rejection(error.status or 0, error.response_body):
                 raise
@@ -1093,87 +1542,95 @@ class ProviderOperationClient(AxBaseAI):
                     registry_call("set", namespace, cache_key, recovery.get("externalEntry"))
                 elif recovery.get("deleteInMemory"):
                     self._context_cache_entries.pop(cache_key, None)
-            return self._request_json(endpoint, payload, stream=False, method=self._operation_method("chat"))
+            return self._request_json_retried(endpoint, payload, stream=False, method=self._operation_method("chat"), base_url=call_base_url, cancellation=cancellation, error_options=options, retry_options=options, timeout_ms=timeout_ms)
 
     def stream(self, request: dict[str, Any], options: dict[str, Any] | None = None):
+        request, options = self._resolve_model_key(_coerce_chat_request(request), options)
+        if self.get_features(request.get("model")).get("streaming") is False:
+            yield self.chat(request, {**(options or {}), "stream": False})
+            return
+        _check_cancelled(options)
         req = _coerce_chat_request(request)
         req.setdefault("model_config", {})["stream"] = True
         validate_chat_request(req)
         merged_options = {**self._merged_options(options), "stream": True}
         model = req.get("model") or self.model
+        provider_require_expensive_model_confirmation(self._model_catalog_provider(), str(model or ""), self.options, _strip_runtime_hooks(options))
         model_config = merge_model_config(self.model_config, req.get("model_config"), merged_options)
         model_config["stream"] = True
         req = {**req, "model": model, "model_config": model_config}
         self.last_used_chat_model = model
         self.last_used_model_config = copy.deepcopy(model_config)
+        if provider_should_use_realtime(self.profile, str(model), req, merged_options):
+            yield from self._realtime_events(req, merged_options, terminal_delta=True)
+            return
         payload = provider_build_chat_request(self.profile, req, merged_options)
         hooks = _effective_runtime_hooks(options, self.runtime_hooks)
         attributes = {"ax.operation": "chat", "ax.ai": self.name, "ax.model": str(model), "ax.streaming": True}
         span = _start_runtime_span(hooks, "ax_llm_chat", "client", attributes)
-        _record_runtime_metric(hooks.meter, "counter", "ax_llm_requests_total", 1, attributes)
+        _record_runtime_metric(hooks.meter, "counter", "ax_llm_requests_total", 1, _labeled(attributes, self.options, options, False))
         started = time.perf_counter()
         info = AxRateLimitInfo("chat", self.name, str(model), True, copy.deepcopy(self.last_model_usage))
         try:
             result = _invoke_rate_limiter(hooks.rate_limiter, lambda: self._stream_chat(payload, req, merged_options), info)
         except BaseException as exc:
-            _record_runtime_metric(hooks.meter, "counter", "ax_llm_errors_total", 1, attributes)
-            _record_runtime_metric(hooks.meter, "histogram", "ax_llm_request_duration_ms", (time.perf_counter() - started) * 1000, attributes)
+            _record_runtime_metric(hooks.meter, "counter", "ax_llm_errors_total", 1, _labeled(attributes, self.options, options, True))
+            _record_runtime_metric(hooks.meter, "histogram", "ax_llm_request_duration_ms", (time.perf_counter() - started) * 1000, _labeled(attributes, self.options, options, True))
             _finish_runtime_span(span, exc)
             raise
-        yield from _runtime_observed_stream(result, merged_options, span, hooks.meter, attributes, started)
+        yield from _runtime_observed_stream(result, merged_options, span, hooks.meter, _labeled(attributes, self.options, options, True), started)
 
     def _embed(self, request: dict[str, Any], options: dict[str, Any]):
         payload = provider_build_embed_request(self.profile, request, options)
         model = request.get("embed_model") or request.get("embedModel") or payload.get("model") or self.embed_model
-        endpoint = self._operation_path("embed", model)
-        raw = self._request_json(endpoint, payload, stream=False, method=self._operation_method("embed"), operation="embed")
+        # The client pops base_url out of its options; the embed route still honors an explicit one.
+        route_options = {**options, "base_url": self.base_url_override} if self.base_url_override else options
+        endpoint = provider_embed_url(self.profile, str(model or ""), route_options) or self._operation_path("embed", model)
+        raw = self._request_json_retried(endpoint, payload, stream=False, method=self._operation_method("embed"), operation="embed", base_url=self._call_base_url(options), cancellation=_cancellation_token(options), error_options=options, retry_options=options, timeout_ms=self._call_timeout_ms(options))
         return provider_normalize_embed_response(self.profile, raw, self.name, model)
 
     def _stream_chat(self, payload: dict[str, Any], request: dict[str, Any], options: dict[str, Any] | None = None):
+        cancellation = _check_cancelled(options)
         model = request.get("model") or payload.get("model") or self.model
         endpoint = self._operation_path("stream_chat", model)
+        call_base_url = self._call_base_url(options)
+        timeout_ms = self._call_timeout_ms(options)
         cfg = resolve_stream_retry(options or {})
         max_retries = int(cfg["max_retries"])
         initial_delay = float(cfg["initial_delay_ms"])
         max_delay = float(cfg["max_delay_ms"])
         backoff = float(cfg["backoff_factor"])
-        attempt = 0
+        start_attempt = 0
         sentinel = object()
         while True:
-            # Pre-content streaming retry: peek the first raw SSE event before any stateful
+            # The stream's request goes through apiCall's request-layer retry.
+            # Its first event is read once, as TS reads it after apiCall
+            # returns: a failure to read it surfaces.
+            raw = self._request_json_retried(endpoint, payload, stream=True, method=self._operation_method("stream_chat"), operation="stream_chat", base_url=call_base_url, cancellation=cancellation, error_options=options, retry_options=options, timeout_ms=timeout_ms)
+            events = _iter_sse_json(raw)
+            first = next(events, sentinel)
+            # TS retryTransientStreamStart: peek the first raw SSE event before any stateful
             # normalize runs (so peeking has no side effects). If the provider classifies it as
-            # a retryable transient status (e.g. Anthropic's HTTP-200 overloaded_error event),
-            # re-issue with the same exponential backoff apiCall uses for a 529 before surfacing.
-            events = None
-            try:
-                raw = self._request_json(endpoint, payload, stream=True, method=self._operation_method("stream_chat"), operation="stream_chat")
-                events = _iter_sse_json(raw)
-                first = next(events, sentinel)
-            except AxAIServiceError as error:
-                if _is_retryable_ai_error(error) and attempt < max_retries:
-                    attempt += 1
-                    delay = min(initial_delay * (backoff ** (attempt - 1)), max_delay)
-                    if delay > 0:
-                        time.sleep(delay / 1000.0)
-                    continue
-                raise
+            # a listed transient status (e.g. Anthropic's HTTP-200 overloaded_error event),
+            # re-issue it with its own budget and backoff, without jitter.
             if first is not sentinel:
                 status = provider_classify_stream_error_status(self.profile, first)
-                if status is not None and is_retryable_status(status) and attempt < max_retries:
+                if status is not None and retry_status_listed(cfg, status) and start_attempt < max_retries:
                     close = getattr(events, "close", None)
                     if callable(close):
                         close()
-                    attempt += 1
-                    delay = min(initial_delay * (backoff ** (attempt - 1)), max_delay)
-                    if delay > 0:
-                        time.sleep(delay / 1000.0)
+                    start_attempt += 1
+                    delay = min(initial_delay * (backoff ** (start_attempt - 1)), max_delay)
+                    _request_retry_sleep(delay, cancellation)
                     continue
             state: dict[str, Any] = {}
             try:
                 if first is not sentinel:
-                    yield provider_normalize_stream_delta(self.profile, first, state, self.name, model)
+                    if cancellation is not None: cancellation.throw_if_cancelled()
+                    yield provider_normalize_stream_delta(self.profile, first, state, self.name, model, provider_response_context(payload, request.get("model_config") or {}, options))
                     for event in events:
-                        yield provider_normalize_stream_delta(self.profile, event, state, self.name, model)
+                        if cancellation is not None: cancellation.throw_if_cancelled()
+                        yield provider_normalize_stream_delta(self.profile, event, state, self.name, model, provider_response_context(payload, request.get("model_config") or {}, options))
             finally:
                 close = getattr(events, "close", None)
                 if callable(close):
@@ -1181,21 +1638,35 @@ class ProviderOperationClient(AxBaseAI):
             return
 
     def transcribe(self, request: dict[str, Any], options: dict[str, Any] | None = None):
+        cancellation = _check_cancelled(options)
         payload = provider_build_transcribe_request(self.profile, request)
-        model = request.get("model") or self.model
         descriptor = provider_operation_descriptor(self.profile, "transcribe")
+        model = request.get("model") or descriptor.get("defaultModel") or self.model
         body_key = "data" if descriptor.get("body") == "multipart" else "json"
-        raw = self._request_json(self._operation_path("transcribe", model), payload, stream=False, body_key=body_key, method=self._operation_method("transcribe"), operation="transcribe")
-        return provider_normalize_transcribe_response(self.profile, raw)
+        query = payload.pop("query", None) or {}
+        endpoint = self._operation_path("transcribe", model)
+        if query:
+            endpoint += ("&" if "?" in endpoint else "?") + urllib.parse.urlencode(query)
+        event_stream = self.profile == "meta" and (request.get("partialMode") is not None or request.get("partial_mode") is not None or request.get("emitAudioProgress") is True or request.get("emit_audio_progress") is True)
+        raw = self._request_json(endpoint, payload, stream=False, body_key=body_key, method=self._operation_method("transcribe"), operation="transcribe", accept="text/event-stream" if event_stream else None, cancellation=cancellation, error_options=self._merged_options(options))
+        if event_stream and isinstance(raw, (str, bytes, bytearray)):
+            raw = {"events": list(_iter_sse_json(raw))}
+        return provider_normalize_transcribe_response(self.profile, raw, request)
 
     def speak(self, request: dict[str, Any], options: dict[str, Any] | None = None):
+        cancellation = _check_cancelled(options)
         payload = provider_build_speak_request(self.profile, request)
-        model = request.get("model") or self.model
         descriptor = provider_operation_descriptor(self.profile, "speak")
+        model = request.get("model") or descriptor.get("defaultModel") or self.model
         body_key = "data" if descriptor.get("body") == "multipart" else "json"
         binary_response = descriptor.get("response") == "binary"
-        raw = self._request_json(self._operation_path("speak", model), payload, stream=False, body_key=body_key, binary_response=binary_response, method=self._operation_method("speak"), operation="speak")
-        return provider_normalize_speak_response(self.profile, raw, request)
+        raw = self._request_json(self._operation_path("speak", model), payload, stream=False, body_key=body_key, binary_response=binary_response, method=self._operation_method("speak"), operation="speak", cancellation=cancellation, error_options=self._merged_options(options))
+        # As TS's axFetchJsonSpeech: a JSON body arrives parsed, and a binary
+        # one as base64 with its Content-Type, which names its mime type.
+        content_type = None
+        if isinstance(raw, _BinaryBody):
+            raw, content_type = raw.data, raw.content_type
+        return provider_normalize_speak_response(self.profile, raw, request, content_type)
 
     def realtime(self, events: Iterable[dict[str, Any]], model: str | None = None):
         state: dict[str, Any] = {}
@@ -1203,24 +1674,66 @@ class ProviderOperationClient(AxBaseAI):
             yield provider_normalize_realtime_event(self.profile, event, state, self.name, model or self.model)
 
     def realtime_audio_setup(self, request: dict[str, Any], options: dict[str, Any] | None = None):
-        return provider_build_realtime_audio_setup(self.profile, request, self._merged_options(options))
+        setup_options = {"api_key": self.api_key or "", **self._merged_options(options)}
+        return provider_build_realtime_audio_setup(self.profile, request, setup_options)
 
     def realtime_audio_input(self, request: dict[str, Any]):
         return provider_build_realtime_audio_input(self.profile, request)
 
     def realtime_chat(self, request: dict[str, Any], options: dict[str, Any] | None = None, *, transport: Any = None):
+        final = None
+        for final in self._realtime_events(request, options, transport=transport):
+            pass
+        return final
+
+    def _realtime_events(self, request, options=None, *, transport=None, terminal_delta=False):
         """Drive a realtime audio turn over a WebSocket transport: send the
         Core-built session setup + input events, fold the inbound event stream
         through the shared realtime codec, and return the final response. Pass a
         ScriptedRealtimeTransport to exercise the loop offline without a socket."""
         model = request.get("model") or self.model
-        setup = provider_build_realtime_audio_setup(self.profile, request, self._merged_options(options))
+        setup = self.realtime_audio_setup(request, options)
         inputs = provider_build_realtime_audio_input(self.profile, request)
+        if self.profile == "meta" and self.credential_provider:
+            url, _ = self._realtime_ws_target(model, self._merged_options(options))
+            fresh = self.credential_provider({"profile": self.profile, "operation": "realtime", "method": "WS", "url": url})
+            setup = provider_apply_realtime_credentials(setup, fresh)
         own_transport = transport is None
         if transport is None:
-            url, headers = self._realtime_ws_target(model)
+            url, headers = self._realtime_ws_target(model, self._merged_options(options))
             transport = _WebSocketRealtimeTransport(url, headers, self.timeout)
         events: list[dict[str, Any]] = []
+        state: dict[str, Any] = {"partial_mode": setup.get("partialMode")}
+        stopped = threading.Event()
+        end_stream_sent = threading.Event()
+        sender = None
+        send_errors: list[BaseException] = []
+
+        def send_inputs():
+            try:
+                for item in inputs:
+                    if stopped.is_set():
+                        return
+                    if setup.get("audioEncoding") and item.get("type") == "binary":
+                        rate = 16000 if setup.get("audioEncoding") == "PCM_16KHZ" else 24000
+                        audio = base64.b64decode(str(item.get("data") or ""), validate=True)
+                        if len(audio) % 2:
+                            raise AxAIServiceError("PCM16 audio must contain complete 16-bit samples")
+                        chunk_size = rate * 2 * 80 // 1000
+                        for offset in range(0, len(audio), chunk_size):
+                            if stopped.is_set():
+                                return
+                            chunk = audio[offset:offset + chunk_size]
+                            transport.send({"type": "binary", "data": base64.b64encode(chunk).decode()})
+                            if stopped.wait(len(chunk) / float(rate * 2)):
+                                return
+                    else:
+                        if item.get("type") == "endStream":
+                            end_stream_sent.set()
+                        transport.send(item)
+            except BaseException as error:
+                send_errors.append(error)
+                transport.close()  # Wake a receiver blocked on the socket.
         try:
             transport.send(setup)
             input_sent = False
@@ -1230,31 +1743,47 @@ class ProviderOperationClient(AxBaseAI):
                     break
                 if event.get("type") == "error":
                     detail = event.get("error") or {}
-                    raise AxAIServiceError(detail.get("message") or "realtime error", code=detail.get("code"))
+                    raise AxAIServiceError(event.get("message") or detail.get("message") or "realtime error", code=detail.get("code"))
                 if _realtime_event_is_ready(event):
+                    if event.get("sessionId"):
+                        state["session_id"] = event["sessionId"]
                     if not input_sent:
                         input_sent = True
-                        for item in inputs:
-                            transport.send(item)
+                        if setup.get("audioEncoding"):
+                            sender = threading.Thread(target=send_inputs, daemon=True)
+                            sender.start()
+                        else:
+                            send_inputs()
                     continue
-                events.append(event)
+                if setup.get("audioEncoding") and not input_sent:
+                    raise AxAIServiceError("Meta Voice server did not acknowledge setup")
+                normalized = provider_normalize_realtime_event(self.profile, event, state, self.name, model)
+                events.append(normalized)
+                yield normalized
                 if _realtime_event_is_done(event):
                     break
         finally:
+            stopped.set()
             if own_transport:
                 transport.close()
+            if sender is not None:
+                sender.join()
+            if send_errors:
+                raise send_errors[0]
         # Fold the per-delta normalize results into one turn response: concat the
         # transcript/text content and base64-concat the audio chunks (mirrors the
         # TS makeChatResponse; base64 join can't live in Core, so it stays here).
-        state: dict[str, Any] = {}
+        if setup.get("audioEncoding") and not input_sent:
+            raise AxAIServiceError("Meta Voice closed before acknowledging setup")
+        if setup.get("audioEncoding") and not end_stream_sent.is_set():
+            raise AxAIServiceError("Meta Voice closed before audio upload completed")
         contents: list[str] = []
         audio_chunks: list[str] = []
         function_calls: list[Any] = []
         response_id = None
         finish_reason = None
         model_usage = None
-        for event in events:
-            out = provider_normalize_realtime_event(self.profile, event, state, self.name, model)
+        for out in events:
             result = out["results"][0]
             if result.get("content"):
                 contents.append(result["content"])
@@ -1281,24 +1810,22 @@ class ProviderOperationClient(AxBaseAI):
         if audio_chunks:
             combined = base64.b64encode(b"".join(base64.b64decode(chunk) for chunk in audio_chunks)).decode()
             merged["audio"] = {"data": combined, "format": "pcm16", "transcript": text}
-        return {"results": [merged], "remote_id": response_id, "model_usage": model_usage}
+        final = provider_finalize_realtime_response(self.profile, state, {"results": [merged], "remote_id": response_id, "model_usage": model_usage})
+        yield provider_realtime_terminal_response(final) if terminal_delta else final
 
-    def _realtime_ws_target(self, model: str | None):
+    def _realtime_ws_target(self, model: str | None, options: dict[str, Any] | None = None):
         # Grammar-specific URL + auth construction lives in Core so the client
         # stays provider-agnostic.
-        target = provider_realtime_ws_url(self.profile, str(model or ""), self.api_key or "")
+        target_options = {"base_url": self.base_url, **(options or {})}
+        target = provider_realtime_ws_url(self.profile, str(model or ""), self.api_key or "", target_options)
         headers = [f"{key}: {value}" for key, value in (target.get("headers") or {}).items()]
         return target.get("url", ""), headers
 
     def _operation_path(self, operation: str, model: str | None = None):
         descriptor = (self.descriptor.get("operations") or {}).get(operation) or provider_operation_descriptor(self.profile, operation)
-        path = str(descriptor.get("path", "/" + operation))
+        path = provider_chat_operation_path(self.profile, str(model or self.model), operation, str(descriptor.get("path", "/" + operation)))
         if model is not None:
             path = path.replace("{model}", urllib.parse.quote(str(model), safe=""))
-        if self.descriptor.get("auth") == "api_key_query":
-            key_name = self.descriptor.get("apiKeyQuery") or "key"
-            separator = "&" if "?" in path else "?"
-            path += separator + urllib.parse.quote(str(key_name), safe="") + "=" + urllib.parse.quote(self.api_key or "", safe="")
         if self.api_version:
             separator = "&" if "?" in path else "?"
             path += separator + "api-version=" + urllib.parse.quote(str(self.api_version), safe="")
@@ -1308,11 +1835,100 @@ class ProviderOperationClient(AxBaseAI):
         descriptor = (self.descriptor.get("operations") or {}).get(operation) or provider_operation_descriptor(self.profile, operation)
         return str(descriptor.get("method") or "POST").upper()
 
-    def _request_json(self, endpoint: str, payload: dict[str, Any], *, stream: bool, body_key: str = "json", binary_response: bool = False, method: str = "POST", base_url: str | None = None, operation: str = "chat"):
+    def _call_timeout_ms(self, options):
+        # The call's timeoutMs: TS's per-call timeout, in milliseconds.
+        return provider_call_timeout_ms(options or {})
+
+    def _call_base_url(self, options):
+        # The call's options can move the provider's base URL (a Vertex beta
+        # selects v1beta1), as TS resolves it for each call. An explicit base_url
+        # or OPENAI_BASE_URL still wins.
+        descriptor_base = str(self.descriptor.get("baseUrl") or "").rstrip("/")
+        if self.base_url_override or not options or self.base_url != descriptor_base:
+            return self.base_url
+        resolved = str(provider_resolve_descriptor(self.profile, options).get("baseUrl") or "").rstrip("/")
+        return resolved or self.base_url
+
+    def _restore_read_timeout(self, response, timeout_ms):
+        # A call's timeoutMs bounds only the wait for the response headers, as
+        # TS apiCall's timer does; the body reads under the client's timeout.
+        if timeout_ms is None:
+            return
+        sock = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+        if sock is not None:
+            try: sock.settimeout(self.timeout)
+            except OSError: pass
+
+    def _open_http_response(self, request, cancellation, timeout_ms=None):
+        timeout = self.timeout if timeout_ms is None else timeout_ms / 1000.0
+        if cancellation is None:
+            response = urllib.request.urlopen(request, timeout=timeout)
+            self._restore_read_timeout(response, timeout_ms)
+            return response, lambda: None
+        import socket
+        connections = []
+        def interrupt():
+            for connection in list(connections):
+                sock = connection.sock
+                if sock is not None:
+                    try: sock.shutdown(socket.SHUT_RDWR)
+                    except OSError: pass
+        def connection_factory(base):
+            class Connection(base):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    connections.append(self)
+                def connect(self):
+                    cancellation.throw_if_cancelled()
+                    super().connect()
+                    if cancellation.cancelled:
+                        self.close()
+                        cancellation.throw_if_cancelled()
+            return Connection
+        class HTTPHandler(urllib.request.HTTPHandler):
+            def http_open(self, req):
+                return self.do_open(connection_factory(http.client.HTTPConnection), req)
+        class HTTPSHandler(urllib.request.HTTPSHandler):
+            def https_open(self, req):
+                return self.do_open(connection_factory(http.client.HTTPSConnection), req, context=self._context)
+        unsubscribe = cancellation.subscribe(interrupt)
+        try:
+            cancellation.throw_if_cancelled()
+            response = urllib.request.build_opener(HTTPHandler(), HTTPSHandler()).open(request, timeout=timeout)
+            self._restore_read_timeout(response, timeout_ms)
+            return response, unsubscribe
+        except BaseException:
+            unsubscribe()
+            for connection in connections: connection.close()
+            raise
+
+    def _request_json_retried(self, endpoint: str, payload: dict[str, Any], *, retry_options: dict[str, Any] | None, **kwargs):
+        # TS apiCall's request-layer retry around one request: a listed status
+        # or a network failure goes out again after its jittered backoff (or its
+        # Retry-After), under the call's retry options, else the client's.
+        config = resolve_stream_retry(retry_options if retry_options is not None else self.options)
+        cancellation = kwargs.get("cancellation")
+        attempt = 0
+        while True:
+            try:
+                return self._request_json(endpoint, payload, **kwargs)
+            except AxAIServiceError as error:
+                if cancellation is not None and cancellation.cancelled:
+                    raise
+                if not _request_retry_wait(config, attempt, error, cancellation):
+                    raise
+                attempt += 1
+
+    def _request_json(self, endpoint: str, payload: dict[str, Any], *, stream: bool, body_key: str = "json", binary_response: bool = False, method: str = "POST", base_url: str | None = None, operation: str = "chat", accept: str | None = None, cancellation: AxCancellationToken | None = None, error_options: dict[str, Any] | None = None, timeout_ms: float | None = None):
+        if cancellation is not None: cancellation.throw_if_cancelled()
         method = str(method or "POST").upper()
         request_base_url = (base_url or self.base_url).rstrip("/")
-        request_url = request_base_url + endpoint
+        request_url = endpoint if endpoint.startswith(("http://", "https://")) else request_base_url + endpoint
         headers = self._headers()
+        if self.profile == "typesafe":
+            headers = provider_merge_headers(headers, typesafe_image_headers(payload))
+        if accept:
+            headers["Accept"] = accept
         if self.credential_provider:
             fresh = self.credential_provider({
                 "profile": self.profile,
@@ -1324,7 +1940,7 @@ class ProviderOperationClient(AxBaseAI):
                 raise AxAIServiceAuthenticationError(
                     "credential_provider must return a header dictionary"
                 )
-            headers.update({str(key): str(value) for key, value in fresh.items()})
+            headers = provider_merge_headers(headers, {str(key): str(value) for key, value in fresh.items()})
         call = {
             "method": method,
             "url": request_url,
@@ -1332,65 +1948,180 @@ class ProviderOperationClient(AxBaseAI):
             body_key: payload,
             "stream": stream,
         }
+        if method in ("GET", "HEAD"):
+            call.pop(body_key, None)
+        if timeout_ms is not None:
+            # The call's timeoutMs, for a custom transport to honor.
+            call["timeout_ms"] = timeout_ms
+        # The request this call's provider errors keep (Core owns the view).
+        error_request = _ai_error_request(call, self.options if error_options is None else error_options)
+        # As TS's apiCall, a verbose call (the call's verbose, else the
+        # client's) logs the request, then the JSON response or the stream's
+        # start.
+        verbose = bool((self.options if error_options is None else error_options).get("verbose"))
+        if verbose:
+            _verbose_log(ai_verbose_request_log(request_url, method, headers, payload))
         if self.transport:
             try:
-                return _transport_result(self.transport(call), call)
+                cancellable_name = "stream_with_cancellation" if stream else "call_with_cancellation"
+                cancellable = getattr(self.transport, cancellable_name, None)
+                result = cancellable(call, cancellation) if callable(cancellable) else self.transport(call)
+                if cancellation is not None: cancellation.throw_if_cancelled()
+                if binary_response:
+                    return _binary_transport_result(result, error_request)
+                value = _transport_result(result, error_request)
+                if verbose:
+                    _verbose_log(ai_verbose_stream_log(_transport_status(result)) if stream else ai_verbose_response_log(_transport_status(result), value))
+                return value
+            except AxAIServiceAbortedError:
+                raise
             except AxAIServiceError:
                 raise
             except TimeoutError as exc:
-                raise AxAIServiceTimeoutError("OpenAI-compatible request timed out", request=call, retryable=True) from exc
+                if cancellation is not None and cancellation.cancelled: cancellation.throw_if_cancelled()
+                if timeout_ms is not None:
+                    raise _call_timeout_error(timeout_ms, error_request) from exc
+                raise AxAIServiceTimeoutError("OpenAI-compatible request timed out", request=error_request, retryable=True) from exc
             except OSError as exc:
-                raise AxAIServiceNetworkError(str(exc), request=call, retryable=True) from exc
-        if not self.api_key:
-            raise AxAIServiceAuthenticationError("OPENAI_API_KEY is required")
+                if cancellation is not None and cancellation.cancelled: cancellation.throw_if_cancelled()
+                raise _network_error(exc, error_request) from exc
+        if not self.api_key and not self.credential_provider:
+            raise AxAIServiceAuthenticationError("api_key or credential_provider is required")
         request_headers = call["headers"]
-        if body_key == "data":
+        if method in ("GET", "HEAD"):
+            request_body = None
+        elif body_key == "data":
             request_body, multipart_content_type = _encode_multipart(payload)
             request_headers = dict(request_headers)
             request_headers["Content-Type"] = multipart_content_type
         else:
-            request_body = json.dumps(payload).encode()
+            request_body = _wire_json_body(payload)
         req = urllib.request.Request(
             call["url"],
             data=request_body,
             headers=request_headers,
             method=method,
         )
+        opened = False
+        client_timeout = self.timeout
         try:
-            res = urllib.request.urlopen(req, timeout=self.timeout)
+            if cancellation is not None: cancellation.throw_if_cancelled()
+            res, stop_open = self._open_http_response(req, cancellation, timeout_ms)
+            opened = True
+            if stream and verbose:
+                _verbose_log(ai_verbose_stream_log(int(getattr(res, "status", 200) or 200)))
             if stream:
-                def body_chunks():
-                    try:
-                        read = getattr(res, "read1", res.read)
-                        while True:
-                            chunk = read(8192)
-                            if not chunk:
-                                return
-                            yield chunk
-                    except TimeoutError as exc:
-                        raise AxAIServiceTimeoutError("OpenAI-compatible request timed out", request=call, retryable=True) from exc
-                    except OSError as exc:
-                        raise AxAIServiceNetworkError(str(exc), request=call, retryable=True) from exc
-                    finally:
+                # A generator cannot be closed while another thread is reading it.
+                # Own the response explicitly so cancellation can interrupt that read.
+                import socket
+                import threading
+                class ResponseChunks:
+                    def __init__(self):
+                        self.closed = threading.Event()
+                        self.socket = getattr(getattr(getattr(res, "fp", None), "raw", None), "_sock", None)
+                    def __iter__(self):
+                        return self
+                    def __next__(self):
+                        if cancellation is not None: cancellation.throw_if_cancelled()
+                        if self.closed.is_set():
+                            raise StopIteration
+                        try:
+                            chunk = getattr(res, "read1", res.read)(8192)
+                            if cancellation is not None: cancellation.throw_if_cancelled()
+                        except TimeoutError as exc:
+                            self.close()
+                            if cancellation is not None and cancellation.cancelled: cancellation.throw_if_cancelled()
+                            raise _client_timeout_error(client_timeout, exc, error_request) from exc
+                        except http.client.IncompleteRead as exc:
+                            # A connection that drops mid-stream is a network error,
+                            # as TS reports a failed body read.
+                            self.close()
+                            if cancellation is not None and cancellation.cancelled: cancellation.throw_if_cancelled()
+                            raise _network_error(exc, error_request) from exc
+                        except OSError as exc:
+                            self.close()
+                            if cancellation is not None and cancellation.cancelled: cancellation.throw_if_cancelled()
+                            raise _network_error(exc, error_request) from exc
+                        if not chunk:
+                            self.close()
+                            raise StopIteration
+                        return chunk
+                    def close(self):
+                        if self.closed.is_set():
+                            return
+                        self.closed.set()
+                        stop_open()
+                        if self.socket is not None:
+                            try:
+                                self.socket.shutdown(socket.SHUT_RDWR)
+                            except OSError:
+                                pass
                         res.close()
-                return body_chunks()
-            with res:
-                if binary_response:
-                    # Binary operations (e.g. OpenAI /audio/speech returns raw mp3)
-                    # must not be UTF-8 decoded; return the bytes as base64.
-                    return base64.b64encode(res.read()).decode()
-                return json.loads(res.read().decode())
+                return ResponseChunks()
+            # Interrupt blocking response reads and always release the subscription.
+            def close_response():
+                import socket
+                sock = getattr(getattr(getattr(res, "fp", None), "raw", None), "_sock", None)
+                if sock is not None:
+                    try: sock.shutdown(socket.SHUT_RDWR)
+                    except OSError: pass
+            unsubscribe = cancellation.subscribe(close_response) if cancellation is not None else lambda: None
+            try:
+                with res:
+                    if binary_response:
+                        # Binary operations (e.g. OpenAI /audio/speech returns raw mp3)
+                        # must not be UTF-8 decoded: the bytes go on as base64 with
+                        # their Content-Type. A JSON body (as TS reads one by its
+                        # Content-Type) goes on parsed.
+                        content_type = res.headers.get("content-type") or ""
+                        body_bytes = res.read()
+                        if "application/json" in content_type:
+                            value = json.loads(body_bytes.decode())
+                        else:
+                            value = _BinaryBody(base64.b64encode(body_bytes).decode(), content_type)
+                    else:
+                        response_text = res.read().decode()
+                        try:
+                            value = json.loads(response_text)
+                        except json.JSONDecodeError:
+                            value = response_text
+                        if verbose:
+                            _verbose_log(ai_verbose_response_log(int(getattr(res, "status", 200) or 200), value))
+                    if cancellation is not None: cancellation.throw_if_cancelled()
+                    return value
+            finally:
+                unsubscribe()
+                stop_open()
+        except AxAIServiceAbortedError:
+            raise
+        except http.client.HTTPException as exc:
+            if cancellation is not None and cancellation.cancelled: cancellation.throw_if_cancelled()
+            raise _network_error(exc, error_request) from exc
         except TimeoutError as exc:
-            raise AxAIServiceTimeoutError("OpenAI-compatible request timed out", request=call, retryable=True) from exc
+            if cancellation is not None and cancellation.cancelled: cancellation.throw_if_cancelled()
+            if timeout_ms is not None and not opened:
+                raise _call_timeout_error(timeout_ms, error_request) from exc
+            raise _client_timeout_error(client_timeout, exc, error_request) from exc
         except urllib.error.HTTPError as exc:
-            body = exc.read().decode()
+            if cancellation is not None and cancellation.cancelled: cancellation.throw_if_cancelled()
+            try: body = exc.read().decode()
+            finally: exc.close()
             try:
                 parsed = json.loads(body)
             except json.JSONDecodeError:
                 parsed = body
-            raise openai_normalize_error(exc.code, parsed, call) from exc
+            error = openai_normalize_error(exc.code, parsed, error_request)
+            error.retry_after = _retry_after_header(exc.headers)
+            raise error from exc
         except OSError as exc:
-            raise AxAIServiceNetworkError(str(exc), request=call, retryable=True) from exc
+            if cancellation is not None and cancellation.cancelled: cancellation.throw_if_cancelled()
+            # urllib reports a connect that ran out of the call's timeoutMs, or
+            # the client's timeout, as a URLError around the timeout.
+            if isinstance(getattr(exc, "reason", None), TimeoutError):
+                if timeout_ms is not None and not opened:
+                    raise _call_timeout_error(timeout_ms, error_request) from exc
+                raise _client_timeout_error(client_timeout, exc, error_request) from exc
+            raise _network_error(exc, error_request) from exc
 
     def _headers(self):
         headers = {
@@ -1403,9 +2134,162 @@ class ProviderOperationClient(AxBaseAI):
         if self.descriptor.get("auth") == "api_key_header":
             key_name = self.descriptor.get("apiKeyHeader") or "api-key"
             headers[str(key_name)] = self.api_key or ""
-        for key, value in (self.descriptor.get("headers") or {}).items():
-            headers[str(key)] = str(value)
-        return headers
+        headers = provider_merge_headers(headers, {str(key): str(value) for key, value in (self.descriptor.get("headers") or {}).items()})
+        return provider_merge_headers(headers, {str(key): str(value) for key, value in (self.options.get("headers") or {}).items()})
+
+
+TypesafeEntry = str | dict[str, Any] | list[Any] | None
+
+class _TypesafeQuestionOptions(TypedDict, total=False):
+    instructions: TypesafeEntry
+    criteria: dict[str, TypesafeEntry] | list[TypesafeEntry] | None
+
+class TypesafeQuestion(_TypesafeQuestionOptions):
+    type: Literal["noul", "choice", "score", "box"]
+
+class AxBox(TypedDict):
+    top: float
+    bottom: float
+    left: float
+    right: float
+
+class _TypesafeImageAssetOptions(TypedDict, total=False):
+    type: Literal["image"]
+
+class TypesafeImageAsset(_TypesafeImageAssetOptions):
+    format: Literal["png", "jpg", "jpeg"]
+    data_base64: str
+
+class _TypesafeRequestOptions(TypedDict, total=False):
+    model: str
+    assets: dict[str, TypesafeImageAsset]
+
+class TypesafeRequest(_TypesafeRequestOptions):
+    state: TypesafeEntry
+    questions: dict[str, TypesafeQuestion]
+
+class TypesafeNoul(TypedDict):
+    type: Literal["noul"]
+    noul: float
+
+class TypesafeChoice(TypedDict):
+    type: Literal["choice"]
+    choice: str
+    probabilities: dict[str, float]
+    confidence: float
+
+class TypesafeScore(TypedDict):
+    type: Literal["score"]
+    score: float
+    probabilities: dict[str, float]
+    confidence: float
+    legend: dict[str, TypesafeEntry]
+
+class TypesafeBox(TypedDict):
+    type: Literal["box"]
+    box: AxBox
+    confidence: float
+
+TypesafeAnswer = TypesafeNoul | TypesafeChoice | TypesafeScore | TypesafeBox
+
+class TypesafeUsage(TypedDict):
+    input_tokens: int
+    output_tokens: int
+
+class TypesafeResponse(TypedDict):
+    model: str
+    answers: dict[str, TypesafeAnswer]
+    usage: TypesafeUsage
+
+class TypesafeModelCard(TypedDict):
+    name: str
+    description: str
+    release_date: str
+
+
+class AxAITypesafeClient:
+    """Native System One API. Probabilities and fractional rubric scores are unchanged."""
+
+    def __init__(self, *, model: str = "jev-latest", **options):
+        # A provider transport is private implementation detail, not a new AxAI method.
+        self._client = ai("typesafe", model=model, **options)
+
+    def system_one(self, request: TypesafeRequest, options: dict[str, Any] | None = None) -> TypesafeResponse:
+        # Serialize before any callback so a concurrent caller cannot change the decoding plan.
+        payload = json.loads(json.dumps(request, allow_nan=False))
+        payload.setdefault("model", self._client.model)
+        typesafe_validate_request(payload)
+        raw = self._request("POST", "/v1/systemone", payload, "chat", options)
+        return typesafe_decode_response(raw, payload["questions"])
+
+    def list_models(self, options: dict[str, Any] | None = None) -> list[TypesafeModelCard]:
+        return typesafe_decode_models(self._request("GET", "/v1/models", None, "models", options))
+
+    def _request(self, method, path, payload, operation, options):
+        opts = {**self._client.options, **provider_normalize_call_options(options)}
+        inherited = _check_cancelled(self._client.options)
+        per_call = _check_cancelled(options)
+        cancellation = inherited or per_call
+        subscriptions = []
+        try:
+            if inherited is not None and per_call is not None and inherited is not per_call:
+                cancellation = AxCancellationToken()
+                subscriptions.append(inherited.subscribe(lambda: cancellation.cancel(inherited.reason or "cancelled")))
+                subscriptions.append(per_call.subscribe(lambda: cancellation.cancel(per_call.reason or "cancelled")))
+            return self._request_with_cancellation(method, path, payload, operation, opts, cancellation)
+        finally:
+            for unsubscribe in subscriptions:
+                unsubscribe()
+
+    def _request_with_cancellation(self, method, path, payload, operation, opts, cancellation):
+        client = copy.copy(self._client)
+        return client._request_json_retried(path, payload, stream=False, method=method, operation=operation, cancellation=cancellation, error_options=opts, retry_options=opts, timeout_ms=provider_call_timeout_ms(opts))
+
+
+def typesafe(**options) -> AxAITypesafeClient:
+    """Create a native Typesafe client for Noul, Choice, Score, and model discovery."""
+    return AxAITypesafeClient(**options)
+
+
+class AxAIOpenAIDecisionsClient:
+    """Native ordered predicate/choice/score questions and complete raw answers."""
+    def __init__(self, **options):
+        model = options.pop("model", "gpt-6-luna")
+        self._client = ai("openai-decisions", model=model, **options)
+
+    def create(self, request: dict[str, Any], options: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = json.loads(json.dumps(request, allow_nan=False))
+        decisions_require_object(payload, "request")
+        if payload.get("model") is None:
+            payload["model"] = self._client.model
+        decisions_validate_request(payload)
+        raw = self._request("POST", "/decisions", payload, "chat", options)
+        return decisions_decode_response(raw, payload["questions"])
+
+    def _request(self, method, path, payload, operation, options):
+        opts = {**self._client.options, **provider_normalize_call_options(options)}
+        inherited = _check_cancelled(self._client.options)
+        per_call = _check_cancelled(options)
+        cancellation = inherited or per_call
+        subscriptions = []
+        try:
+            if inherited is not None and per_call is not None and inherited is not per_call:
+                cancellation = AxCancellationToken()
+                subscriptions.append(inherited.subscribe(lambda: cancellation.cancel(inherited.reason or "cancelled")))
+                subscriptions.append(per_call.subscribe(lambda: cancellation.cancel(per_call.reason or "cancelled")))
+            return self._request_with_cancellation(method, path, payload, operation, opts, cancellation)
+        finally:
+            for unsubscribe in subscriptions:
+                unsubscribe()
+
+    def _request_with_cancellation(self, method, path, payload, operation, opts, cancellation):
+        client = copy.copy(self._client)
+        return client._request_json_retried(path, payload, stream=False, method=method, operation=operation, cancellation=cancellation, error_options=opts, retry_options=opts, timeout_ms=provider_call_timeout_ms(opts))
+
+
+def openai_decisions(**options) -> AxAIOpenAIDecisionsClient:
+    """Create a native Decisions client; predicate policies belong to the caller."""
+    return AxAIOpenAIDecisionsClient(**options)
 
 
 class OpenAICompatibleClient(ProviderOperationClient):
@@ -1445,8 +2329,10 @@ class GoogleGeminiClient(ProviderOperationClient):
         if embed_model is None:
             embed_model = options.pop("embedModel", "gemini-embedding-2")
         is_vertex = bool((options.get("project_id") or options.get("projectId")) and options.get("region"))
-        api_key = options.pop("api_key", None) or options.pop("apiKey", None) or (os.environ.get("GOOGLE_VERTEX_ACCESS_TOKEN") if is_vertex else None) or os.environ.get("GOOGLE_APIKEY") or os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-        base_url = options.pop("base_url", None) or options.pop("baseUrl", None) or os.environ.get("GOOGLE_GEMINI_BASE_URL")
+        # The Google env vars belong to the google-gemini profile only.
+        own_env = _profile == "google-gemini"
+        api_key = options.pop("api_key", None) or options.pop("apiKey", None) or ((os.environ.get("GOOGLE_VERTEX_ACCESS_TOKEN") if is_vertex else None) or os.environ.get("GOOGLE_APIKEY") or os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY") if own_env else None)
+        base_url = options.pop("base_url", None) or options.pop("baseUrl", None) or (os.environ.get("GOOGLE_GEMINI_BASE_URL") if own_env else None)
         super().__init__(
             _profile,
             _profile,
@@ -1462,8 +2348,11 @@ class AnthropicClient(ProviderOperationClient):
     def __init__(self, _profile="anthropic", **options):
         descriptor = provider_descriptor(_profile)
         is_vertex = bool((options.get("project_id") or options.get("projectId")) and options.get("region"))
-        api_key = options.pop("api_key", None) or options.pop("apiKey", None) or (os.environ.get("GOOGLE_VERTEX_ACCESS_TOKEN") if is_vertex else None) or os.environ.get("ANTHROPIC_API_KEY")
-        base_url = options.pop("base_url", None) or options.pop("baseUrl", None) or os.environ.get("ANTHROPIC_BASE_URL")
+        # The Anthropic env vars belong to the anthropic profile only: an
+        # Anthropic key never goes to another anthropic-messages host.
+        own_env = _profile == "anthropic"
+        api_key = options.pop("api_key", None) or options.pop("apiKey", None) or ((os.environ.get("GOOGLE_VERTEX_ACCESS_TOKEN") if is_vertex else os.environ.get("ANTHROPIC_API_KEY")) if own_env else None)
+        base_url = options.pop("base_url", None) or options.pop("baseUrl", None) or (os.environ.get("ANTHROPIC_BASE_URL") if own_env else None)
         super().__init__(
             _profile,
             _profile,
@@ -1505,6 +2394,21 @@ def _router_default_features() -> dict[str, Any]:
 
 
 class MultiServiceRouter(AxAIService):
+    def owned_worker_factory(self):
+        factories = {}
+        for key, entry in self.services.items():
+            factory = getattr(entry['service'], 'owned_worker_factory', lambda: None)()
+            if factory is None: return None
+            factories[key] = factory
+        metadata = {key: copy.deepcopy({k:v for k,v in entry.items() if k != 'service'}) for key,entry in self.services.items()}
+        options = copy.deepcopy(self.options)
+        def create():
+            worker = object.__new__(MultiServiceRouter)
+            worker.services = {key: {**copy.deepcopy(metadata[key]), 'service': factory()} for key,factory in factories.items()}
+            worker.options = copy.deepcopy(options); worker.last_used_service = None
+            return worker
+        return create
+
     def __init__(self, services):
         if not services:
             raise ValueError("No AI services provided.")
@@ -1520,6 +2424,8 @@ class MultiServiceRouter(AxAIService):
                     "service": item["service"],
                     "description": item.get("description", ""),
                     "isInternal": item.get("isInternal", item.get("is_internal")),
+                    **({"model": item["model"], "explicit_model": True} if item.get("model") is not None else {}),
+                    **({"embedModel": item["embedModel"]} if item.get("embedModel") is not None else {}),
                 }
                 continue
             service = item
@@ -1567,8 +2473,16 @@ class MultiServiceRouter(AxAIService):
 
     def get_features(self, model: str | None = None) -> dict[str, Any]:
         if model is not None and model in self.services:
-            return copy.deepcopy(self.services[model]["service"].get_features(model))
+            return copy.deepcopy(self.services[model]["service"].get_features(self.services[model].get("model")))
         return _router_default_features()
+
+    def open_chat_session(self, request, options=None):
+        entry = self.services.get(request.get("model"))
+        if entry is None:
+            raise ValueError("No service found for model key: " + str(request.get("model")))
+        self.last_used_service = entry["service"]
+        resolved = provider_session_route(entry, request, options or {})
+        return entry["service"].open_chat_session(resolved["request"], resolved["options"])
 
     def chat(self, request: dict[str, Any], options: dict[str, Any] | None = None):
         model_key = request.get("model")
@@ -1581,9 +2495,9 @@ class MultiServiceRouter(AxAIService):
         req = copy.deepcopy(request)
         if "modelConfig" in req and "model_config" not in req:
             req["model_config"] = copy.deepcopy(req["modelConfig"])
-        if "model" not in entry:
-            req.pop("model", None)
-            return entry["service"].chat(req, options)
+        if entry.get("explicit_model") or "model" not in entry:
+            resolved = provider_session_route(entry, req, options or {})
+            return entry["service"].chat(resolved["request"], resolved["options"])
         return entry["service"].chat(req, options)
 
     def stream(self, request: dict[str, Any], options: dict[str, Any] | None = None):
@@ -1597,8 +2511,9 @@ class MultiServiceRouter(AxAIService):
         req = copy.deepcopy(request)
         if "modelConfig" in req and "model_config" not in req:
             req["model_config"] = copy.deepcopy(req["modelConfig"])
-        if "model" not in entry:
-            req.pop("model", None)
+        if entry.get("explicit_model") or "model" not in entry:
+            resolved = provider_session_route(entry, req, options or {})
+            return entry["service"].stream(resolved["request"], resolved["options"])
         return entry["service"].stream(req, options)
 
     def embed(self, request: dict[str, Any], options: dict[str, Any] | None = None):
@@ -1609,12 +2524,8 @@ class MultiServiceRouter(AxAIService):
         if entry is None:
             raise ValueError(f"No service found for embed model key: {embed_key}")
         self.last_used_service = entry["service"]
-        if "model" not in entry:
-            req = copy.deepcopy(request)
-            req.pop("embedModel", None)
-            req.pop("embed_model", None)
-            return entry["service"].embed(req, options)
-        return entry["service"].embed(copy.deepcopy(request), options)
+        req = router_embed_request(request, entry.get("model"), entry.get("embedModel"))
+        return entry["service"].embed(req, options)
 
     def transcribe(self, request: dict[str, Any], options: dict[str, Any] | None = None):
         model_key = request.get("model")
@@ -1709,7 +2620,7 @@ def _service_latency_score(service: AxAIService) -> float:
 
 
 def _is_retryable_ai_error(exc: AxAIServiceError) -> bool:
-    if isinstance(exc, AxAIServiceAuthenticationError):
+    if isinstance(exc, (AxAIServiceAuthenticationError, AxAIServiceAbortedError)):
         return False
     if isinstance(exc, AxAIServiceStatusError):
         return getattr(exc, "status", None) in {408, 429, 500, 502, 503, 504, 529}
@@ -1835,7 +2746,92 @@ class AxBalancerOptions:
         }
 
 
+def _service_accepts_request(service, request):
+    validator = getattr(service, "validate_chat_request", None)
+    if not callable(validator):
+        return True
+    try:
+        validator(request)
+        return True
+    except (ValueError, RuntimeError):
+        return False
+
+
+def _merge_service_features(services, model=None):
+    features = {
+        "functions": False,
+        "streaming": False,
+        "thinking": False,
+        "asyncTools": False, "nativeSteering": False, "reasoningUpdates": False,
+        "multiTurn": False,
+        "structuredOutputs": False,
+        "media": {
+            "images": {"supported": False, "formats": []},
+            "audio": {"supported": False, "formats": []},
+            "files": {"supported": False, "formats": [], "uploadMethod": "none"},
+            "urls": {"supported": False, "webSearch": False, "contextFetching": False},
+        },
+        "caching": {"supported": False, "types": []},
+    }
+    if services and all((service.get_features(model) or {}).get("requiresStructuredOutput", (service.get_features(model) or {}).get("requires_structured_output", False)) for service in services):
+        features["requiresStructuredOutput"] = True
+    structured_output_modes: list[Any] = []
+    all_modes_advertised = bool(services)
+    for service in services:
+        raw = service.get_features(model) or {}
+        features = provider_merge_audio_output(features, raw)
+        raw_modes = raw.get("structuredOutputModes", raw.get("structured_output_modes"))
+        if raw_modes is None:
+            all_modes_advertised = False
+        else:
+            _append_unique(structured_output_modes, list(raw_modes or []))
+        for key in ("functions", "streaming", "thinking", "asyncTools", "nativeSteering", "reasoningUpdates", "multiTurn", "structuredOutputs", "functionCot", "hasThinkingBudget", "hasShowThoughts"):
+            if _feature_bool(raw, key):
+                features[key] = True
+        media = raw.get("media") or {}
+        for kind in ("images", "audio", "files"):
+            src = media.get(kind) or {}
+            if src.get("supported"):
+                features["media"][kind]["supported"] = True
+            _append_unique(features["media"][kind]["formats"], list(src.get("formats") or []))
+        upload = (media.get("files") or {}).get("uploadMethod") or (media.get("files") or {}).get("upload_method")
+        if upload and upload != "none":
+            features["media"]["files"]["uploadMethod"] = upload
+        urls = media.get("urls") or {}
+        if urls.get("supported"):
+            features["media"]["urls"]["supported"] = True
+        if urls.get("webSearch") or urls.get("web_search"):
+            features["media"]["urls"]["webSearch"] = True
+        if urls.get("contextFetching") or urls.get("context_fetching"):
+            features["media"]["urls"]["contextFetching"] = True
+        caching = raw.get("caching") or {}
+        if caching.get("supported"):
+            features["caching"]["supported"] = True
+        _append_unique(features["caching"]["types"], list(caching.get("types") or []))
+    if all_modes_advertised:
+        features["structured_output_modes"] = structured_output_modes
+    return features
+
 class AxBalancer(AxAIService):
+    def owned_worker_factory(self):
+        factories = [getattr(service, 'owned_worker_factory', lambda: None)() for service in self.services]
+        if any(factory is None for factory in factories): return None
+        snapshot = copy.copy(self)
+        policy = copy.deepcopy(self.policy)
+        adaptive = self.adaptive
+        keys = [adaptive['route_keys'][id(service)] for service in self.services] if adaptive else []
+        indices = [adaptive['indices'][id(service)] for service in self.services] if adaptive else []
+        def create():
+            worker = copy.copy(snapshot)
+            worker.services = [factory() for factory in factories]
+            worker.current_service = worker.services[worker.current_service_index]
+            worker.policy = copy.deepcopy(policy)
+            if adaptive:
+                # All node workers observe the same adaptive accounting store.
+                worker.adaptive = {**adaptive, 'route_keys': {id(service): keys[i] for i,service in enumerate(worker.services)}, 'indices': {id(service): indices[i] for i,service in enumerate(worker.services)}}
+            return worker
+        return create
+
     input_order_comparator = "input_order"
 
     @staticmethod
@@ -1859,6 +2855,7 @@ class AxBalancer(AxAIService):
         self.initial_backoff_ms = int(self.policy.get("initialBackoffMs", 1000))
         self.max_backoff_ms = int(self.policy.get("maxBackoffMs", 32000))
         self.service_failures: dict[str, dict[str, Any]] = {}
+        self._failures_lock = threading.Lock()
         self.services = list(services)
         self._validate_models()
         if self.policy.get("strategy") != "input_order":
@@ -1917,17 +2914,21 @@ class AxBalancer(AxAIService):
         self.current_service = self.services[0]
 
     def _can_retry_service(self, service: AxAIService) -> bool:
-        return service.get_id() not in self.service_failures
+        with self._failures_lock: return service.get_id() not in self.service_failures
 
     def _handle_failure(self, service: AxAIService, exc: AxAIServiceError):
-        failure = self.service_failures.get(service.get_id(), {"retries": 0})
-        self.service_failures[service.get_id()] = {"retries": int(failure.get("retries", 0)) + 1}
+        with self._failures_lock:
+            failure = self.service_failures.get(service.get_id(), {"retries": 0})
+            self.service_failures[service.get_id()] = {"retries": int(failure.get("retries", 0)) + 1}
 
     def _handle_success(self, service: AxAIService):
-        self.service_failures.pop(service.get_id(), None)
+        with self._failures_lock: self.service_failures.pop(service.get_id(), None)
+
+    def validate_chat_request(self, request: dict[str, Any]) -> None:
+        self._candidate_services(request)
 
     def _candidate_services(self, request: dict[str, Any]):
-        candidates = [service for service in self.services if provider_balancer_candidate_allowed(service.get_features(str(request.get("model"))) or {}, request)]
+        candidates = [service for service in self.services if _service_accepts_request(service, request) and provider_balancer_candidate_allowed(service.get_features(str(request.get("model"))) or {}, request)]
         if candidates:
             return candidates
         requirements = []
@@ -2095,55 +3096,7 @@ class AxBalancer(AxAIService):
         return None
 
     def get_features(self, model: str | None = None) -> dict[str, Any]:
-        features = {
-            "functions": False,
-            "streaming": False,
-            "thinking": False,
-            "multiTurn": False,
-            "structuredOutputs": False,
-            "media": {
-                "images": {"supported": False, "formats": []},
-                "audio": {"supported": False, "formats": []},
-                "files": {"supported": False, "formats": [], "uploadMethod": "none"},
-                "urls": {"supported": False, "webSearch": False, "contextFetching": False},
-            },
-            "caching": {"supported": False, "types": []},
-        }
-        structured_output_modes: list[Any] = []
-        all_modes_advertised = bool(self.services)
-        for service in self.services:
-            raw = service.get_features(model) or {}
-            raw_modes = raw.get("structuredOutputModes", raw.get("structured_output_modes"))
-            if raw_modes is None:
-                all_modes_advertised = False
-            else:
-                _append_unique(structured_output_modes, list(raw_modes or []))
-            for key in ("functions", "streaming", "thinking", "multiTurn", "structuredOutputs", "functionCot", "hasThinkingBudget", "hasShowThoughts"):
-                if _feature_bool(raw, key):
-                    features[key] = True
-            media = raw.get("media") or {}
-            for kind in ("images", "audio", "files"):
-                src = media.get(kind) or {}
-                if src.get("supported"):
-                    features["media"][kind]["supported"] = True
-                _append_unique(features["media"][kind]["formats"], list(src.get("formats") or []))
-            upload = (media.get("files") or {}).get("uploadMethod") or (media.get("files") or {}).get("upload_method")
-            if upload and upload != "none":
-                features["media"]["files"]["uploadMethod"] = upload
-            urls = media.get("urls") or {}
-            if urls.get("supported"):
-                features["media"]["urls"]["supported"] = True
-            if urls.get("webSearch") or urls.get("web_search"):
-                features["media"]["urls"]["webSearch"] = True
-            if urls.get("contextFetching") or urls.get("context_fetching"):
-                features["media"]["urls"]["contextFetching"] = True
-            caching = raw.get("caching") or {}
-            if caching.get("supported"):
-                features["caching"]["supported"] = True
-            _append_unique(features["caching"]["types"], list(caching.get("types") or []))
-        if all_modes_advertised:
-            features["structured_output_modes"] = structured_output_modes
-        return features
+        return _merge_service_features(self.services, model)
 
     def get_metrics(self) -> dict[str, Any]:
         out = default_metrics()
@@ -2179,6 +3132,25 @@ class AxBalancer(AxAIService):
         if embed_count:
             out["latency"]["embed"]["mean"] = embed_sum / embed_count
         return out
+
+    def open_chat_session(self, request, options=None):
+        selected = self._pin_chat_run(request, options or {})
+        opener = getattr(selected, "open_chat_session", None)
+        if not callable(opener):
+            raise AxUnsupportedCapabilityError("Selected service does not support chat sessions")
+        return opener(request, options or {})
+
+    def _pin_chat_run(self, request, options):
+        if self.adaptive is not None:
+            ranked = self._rank_adaptive(request, options)
+            selected = ranked[0]["service"] if ranked else None
+        else:
+            selected = next((service for service in self._candidate_services(request)
+                             if self._can_retry_service(service)), None)
+        if selected is None:
+            raise AxUnsupportedCapabilityError("No eligible service for this run")
+        self.current_service = selected
+        return selected
 
     def chat(self, request: dict[str, Any], options: dict[str, Any] | None = None):
         if self.adaptive is not None:
@@ -2349,7 +3321,52 @@ class AxBalancer(AxAIService):
         return chat_response_to_completion(self.chat(_coerce_chat_request(request)))
 
 
+def _preprocess_provider_files(features, request, processing=None):
+    options = dict(processing or {})
+    options.pop("file_texts", None)
+    extractor = options.get("fileToText") or options.get("file_to_text")
+    if extractor is not None:
+        texts = {}
+        for task in provider_route_file_extractions(features, request):
+            try:
+                texts[task["slot"]] = extractor(task["data"], task["mime_type"])
+            except Exception as error:
+                raise AxAIServiceResponseError("File content processing failed: " + str(error)) from error
+        options["file_texts"] = texts
+    return provider_route_preprocess_request(features, request, options)
+
+
+class _PinnedProviderClient:
+    def __init__(self, provider, processing):
+        self.provider=provider
+        self.processing=processing
+    def __getattr__(self,name):
+        if name=="_pin_chat_run":raise AttributeError(name)
+        return getattr(self.provider,name)
+    def get_features(self,model=None):
+        return self.provider.get_features(model)
+    def _request(self,request):
+        return _preprocess_provider_files(self.get_features(request.get("model")),request,self.processing)
+    def chat(self,request,options=None):
+        return self.provider.chat(self._request(request),options)
+    def open_chat_session(self,request,options=None):
+        opener=getattr(self.provider,"open_chat_session",None)
+        if not callable(opener):raise AxUnsupportedCapabilityError("Selected provider does not support chat sessions")
+        return opener(self._request(request),options or {})
+
+
 class ProviderRouter:
+    def owned_worker_factory(self):
+        factories = [getattr(service, 'owned_worker_factory', lambda: None)() for service in self.providers]
+        if any(factory is None for factory in factories): return None
+        processing, routing = copy.deepcopy(self.processing), copy.deepcopy(self.routing)
+        def create():
+            worker = object.__new__(ProviderRouter)
+            worker.providers = [factory() for factory in factories]
+            worker.processing, worker.routing = copy.deepcopy(processing), copy.deepcopy(routing)
+            return worker
+        return create
+
     def __init__(self, config: dict[str, Any]):
         providers_config = config.get("providers") or {}
         self.providers = [providers_config.get("primary"), *(providers_config.get("alternatives") or [])]
@@ -2358,9 +3375,26 @@ class ProviderRouter:
         routing = config.get("routing") or {}
         self.routing = routing.get("capability") or {}
 
-    def _provider_records(self):
+    def get_features(self, model=None):
+        return _merge_service_features(self.providers, model)
+
+    def _pin_chat_run(self, request, options):
+        _, provider=self._selected_provider(request)
+        visited=set()
+        while callable(getattr(provider,"_pin_chat_run",None)):
+            if id(provider) in visited:raise RuntimeError("Cyclic run routing")
+            visited.add(id(provider));provider=provider._pin_chat_run(request,options)
+        return _PinnedProviderClient(provider,self.processing)
+
+    def open_chat_session(self,request,options=None):
+        return self._pin_chat_run(request,options or {}).open_chat_session(request,options or {})
+
+    def complete(self,request):
+        return chat_response_to_completion(self.chat(request)["response"])
+
+    def _provider_records(self, model=None, request=None):
         return [
-            {"name": provider.get_name(), "id": provider.get_id(), "features": copy.deepcopy(provider.get_features())}
+            {"name": provider.get_name(), "id": provider.get_id(), "features": copy.deepcopy(provider.get_features(model)), "requestCompatible": request is None or _service_accepts_request(provider, request)}
             for provider in self.providers
         ]
 
@@ -2371,13 +3405,16 @@ class ProviderRouter:
         return self.providers[0] if self.providers else None
 
     def get_routing_recommendation(self, request: dict[str, Any]):
-        rec = provider_route_recommendation(self._provider_records(), _coerce_chat_request(request), self.routing)
+        rec = provider_route_recommendation(self._provider_records(request.get("model"), request), _coerce_chat_request(request), self.routing)
         out = copy.deepcopy(rec)
         out["provider"] = self._service_for_name(out.get("providerName"))
         return out
 
     def validate_request(self, request: dict[str, Any]):
-        return provider_route_validation(self._provider_records(), _coerce_chat_request(request), self.processing, self.routing)
+        return provider_route_validation(self._provider_records(request.get("model"), request), _coerce_chat_request(request), self.processing, self.routing)
+
+    def get_compatibility_report(self, request):
+        return provider_compatibility_report(self._provider_records(request.get("model"), request), _coerce_chat_request(request))
 
     def get_routing_stats(self):
         return provider_routing_stats(self._provider_records())
@@ -2391,13 +3428,13 @@ class ProviderRouter:
 
     def chat(self, request: dict[str, Any], options: dict[str, Any] | None = None):
         rec, provider = self._selected_provider(request)
-        processed_request = provider_route_preprocess_request(provider.get_features(), request)
+        processed_request = _preprocess_provider_files(provider.get_features(request.get("model")), request, self.processing)
         response = provider.chat(processed_request, options)
         return {"response": response, "routing": rec}
 
     def stream(self, request: dict[str, Any], options: dict[str, Any] | None = None):
         _rec, provider = self._selected_provider(request)
-        processed_request = provider_route_preprocess_request(provider.get_features(), request)
+        processed_request = _preprocess_provider_files(provider.get_features(request.get("model")), request, self.processing)
         return provider.stream(processed_request, options)
 
     def embed(self, request: dict[str, Any], options: dict[str, Any] | None = None):
@@ -2420,6 +3457,7 @@ def _core_add(left, right): return left + right
 def _core_mul(left, right): return left * right
 def _core_div(left, right): return float(left or 0) / float(right or 1)
 def _core_math_abs(value): return abs(float(value or 0))
+def _core_math_floor(value): return math.floor(value)
 def _core_math_log(value): return math.log(float(value))
 def _core_math_exp(value): return math.exp(float(value))
 def _core_math_sqrt(value): return math.sqrt(float(value))
@@ -2519,12 +3557,20 @@ def _core_list_get(values, index, default=None):
     return values[index] if values is not None and 0 <= index < len(values) else default
 
 
+def _wire_json_body(payload):
+    """The JSON bytes the HTTP transport sends for a request payload, as TS
+    JSON.stringify writes them: compact, RFC 8259 escapes for control
+    characters, other text as UTF-8, and JavaScript's number text."""
+    return _js_json_dumps(payload).encode("utf-8")
+
+
 def _core_json_parse(value):
     return json.loads(value)
 
 
 def _core_json_stringify(value):
-    return json.dumps(value or {}, sort_keys=True, separators=(",", ":"))
+    # TS JSON.stringify(value): keys in insertion order, null as null.
+    return _js_json_dumps(value)
 
 
 def _core_string_starts_with(value, prefix):
@@ -2543,16 +3589,32 @@ def _core_string_lower(value):
     return str(value).lower()
 
 
+def _core_string_slice(value, start, end=None):
+    if end is None:
+        return str(value)[int(start):]
+    return str(value)[int(start):int(end)]
+
+
 def _core_string_format(template, *args):
-    return str(template).format(*args)
+    return _js_format(template, args)
 
 
 def _core_string_replace(value, old, new):
     return str(value).replace(str(old), str(new))
 
 
+def _core_url_encode_component(value):
+    # JavaScript's encodeURIComponent: every UTF-8 byte except A-Z a-z 0-9 and
+    # - _ . ! ~ * ' ( ) becomes %XX.
+    return urllib.parse.quote("" if value is None else str(value), safe="!~*'()")
+
+
 def _core_string_str(value):
-    return str(value)
+    return _js_text(value)
+
+
+def _core_json_pretty(value):
+    return _js_json_dumps(value, indent=2)
 
 
 def _core_ai_error_response(message, response_body=None):
@@ -2572,15 +3634,44 @@ def _core_ai_error_unsupported(message):
 
 
 def _core_ai_error_auth(message, status=None, code=None, response_body=None, request=None):
-    return AxAIServiceAuthenticationError(str(message), status=status, code=code, response_body=response_body, request=request)
+    return AxAIServiceAuthenticationError(str(message), status=status, code=code, response_body=response_body, request=_ai_error_request(request))
 
 
 def _core_ai_error_timeout(message, status=None, code=None, response_body=None, request=None, retryable=True):
-    return AxAIServiceTimeoutError(str(message), status=status, code=code, response_body=response_body, request=request, retryable=bool(retryable))
+    return AxAIServiceTimeoutError(str(message), status=status, code=code, response_body=response_body, request=_ai_error_request(request), retryable=bool(retryable))
 
 
 def _core_ai_error_status(message, status=None, code=None, response_body=None, request=None, retryable=False):
-    return AxAIServiceStatusError(str(message), status=status, code=code, response_body=response_body, request=request, retryable=bool(retryable))
+    return AxAIServiceStatusError(str(message), status=status, code=code, response_body=response_body, request=_ai_error_request(request), retryable=bool(retryable))
+
+
+_CORE_AI_WARNINGS_SHOWN: set[str] = set()
+_CORE_AI_WARNINGS_LOCK = threading.Lock()
+_core_ai_warning_sink: Callable[[str], None] | None = None
+
+
+def _core_ai_warn_once(key, message):
+    # TS console.warn, once per key per process: a setting Ax could not send,
+    # such as a sampling parameter the selected model rejects.
+    with _CORE_AI_WARNINGS_LOCK:
+        if key in _CORE_AI_WARNINGS_SHOWN:
+            return None
+        _CORE_AI_WARNINGS_SHOWN.add(key)
+        sink = _core_ai_warning_sink
+    if sink is not None:
+        sink(str(message))
+    else:
+        warnings.warn(str(message), UserWarning, stacklevel=2)
+    return None
+
+
+def _core_ai_capture_warnings(sink):
+    # Conformance hook: forgets the one-time warnings already shown and sends
+    # new ones to ``sink`` (None shows them as warnings again).
+    global _core_ai_warning_sink
+    with _CORE_AI_WARNINGS_LOCK:
+        _CORE_AI_WARNINGS_SHOWN.clear()
+        _core_ai_warning_sink = sink
 
 
 # AXIR_CORE_AI_FUNCTIONS
@@ -2655,6 +3746,54 @@ def _tools_to_functions(tools):
     return out
 
 
+class _BinaryBody:
+    """A binary response body as base64 text, with its Content-Type."""
+
+    __slots__ = ("data", "content_type")
+
+    def __init__(self, data: str, content_type: str):
+        self.data = data
+        self.content_type = content_type
+
+
+def _binary_transport_result(result: Any, request: dict[str, Any]):
+    # A transport's binary answer: `body` (base64 text or bytes) with its
+    # headers' Content-Type, or parsed `json`. A JSON Content-Type makes a text
+    # body JSON, as TS reads it.
+    headers = result.get("headers") if isinstance(result, dict) else None
+    content_type = ""
+    if isinstance(headers, dict):
+        for key, value in headers.items():
+            if str(key).lower() == "content-type":
+                content_type = str(value or "")
+    body = _transport_result(result, request)
+    if isinstance(body, (bytes, bytearray)):
+        body = base64.b64encode(bytes(body)).decode()
+    if isinstance(body, str):
+        if "application/json" in content_type:
+            return json.loads(body)
+        return _BinaryBody(body, content_type)
+    return body
+
+
+# Where verbose blocks go: print, as TS's apiCall uses console.log (the
+# conformance runner collects them instead).
+_verbose_sink = None
+
+
+def _verbose_log(text: str) -> None:
+    (_verbose_sink or print)(text)
+
+
+def _transport_status(result: Any) -> int:
+    # A transport result's HTTP status.
+    if isinstance(result, tuple):
+        return int(result[0])
+    if isinstance(result, dict) and "status" in result:
+        return int(result.get("status") or 200)
+    return 200
+
+
 def _transport_result(result: Any, request: dict[str, Any]):
     if isinstance(result, tuple):
         status, body = result[0], result[1]
@@ -2663,7 +3802,9 @@ def _transport_result(result: Any, request: dict[str, Any]):
         status = int(result.get("status") or 200)
         body = result.get("json", result.get("body", result.get("data")))
         if status >= 400:
-            raise openai_normalize_error(status, body, request)
+            error = openai_normalize_error(status, body, request)
+            error.retry_after = _retry_after_header(result.get("headers"))
+            raise error
         return body
     return result
 

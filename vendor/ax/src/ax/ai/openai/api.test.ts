@@ -1,4 +1,6 @@
+// cspell:ignore JVBE (the base64 of a PDF's %PDF- header)
 import { describe, expect, it, vi } from 'vitest';
+import { AxGen } from '../../dsp/generate.js';
 import {
   AxAIOpenAI,
   axAIOpenAIAudioDefaultConfig,
@@ -59,7 +61,12 @@ function createMockStreamFetch(
 class FakeOpenAIRealtimeWebSocket {
   static serverMessages: unknown[] = [];
   static instances: FakeOpenAIRealtimeWebSocket[] = [];
+  // OpenAI uses text frames. 'binary' mimics a compatible server that does
+  // not: a WebSocket delivers those as a Blob unless binaryType is
+  // 'arraybuffer'.
+  static frames: 'text' | 'binary' = 'text';
 
+  binaryType = 'blob';
   readonly sent: string[] = [];
   readonly url: string;
   readonly options: any;
@@ -87,7 +94,7 @@ class FakeOpenAIRealtimeWebSocket {
     if (message.type === 'session.update') {
       queueMicrotask(() =>
         this.emit('message', {
-          data: JSON.stringify({ type: 'session.updated' }),
+          data: this.frame({ type: 'session.updated' }),
         })
       );
       return;
@@ -96,7 +103,7 @@ class FakeOpenAIRealtimeWebSocket {
     if (message.type === 'transcription_session.update') {
       queueMicrotask(() =>
         this.emit('message', {
-          data: JSON.stringify({ type: 'transcription_session.updated' }),
+          data: this.frame({ type: 'transcription_session.updated' }),
         })
       );
       return;
@@ -108,7 +115,7 @@ class FakeOpenAIRealtimeWebSocket {
     ) {
       queueMicrotask(() => {
         for (const serverMessage of FakeOpenAIRealtimeWebSocket.serverMessages) {
-          this.emit('message', { data: JSON.stringify(serverMessage) });
+          this.emit('message', { data: this.frame(serverMessage) });
         }
       });
     }
@@ -116,6 +123,15 @@ class FakeOpenAIRealtimeWebSocket {
 
   close() {
     this.emit('close', {});
+  }
+
+  private frame(message: unknown): unknown {
+    const json = JSON.stringify(message);
+    if (FakeOpenAIRealtimeWebSocket.frames === 'text') {
+      return json;
+    }
+    const bytes = new TextEncoder().encode(json);
+    return this.binaryType === 'arraybuffer' ? bytes.buffer : new Blob([bytes]);
   }
 
   private emit(type: string, event: any) {
@@ -129,9 +145,13 @@ class FakeOpenAIRealtimeWebSocket {
   }
 }
 
-function openAIRealtimeWebSocket(messages: unknown[]) {
+function openAIRealtimeWebSocket(
+  messages: unknown[],
+  frames: 'text' | 'binary' = 'text'
+) {
   FakeOpenAIRealtimeWebSocket.serverMessages = messages;
   FakeOpenAIRealtimeWebSocket.instances = [];
+  FakeOpenAIRealtimeWebSocket.frames = frames;
   return FakeOpenAIRealtimeWebSocket as any;
 }
 
@@ -182,7 +202,7 @@ describe('AxAIOpenAI model key preset merging', () => {
     expect(mc?.maxTokens).toBe(256);
     // Temperature may be omitted by model; ensure no crash and allow undefined
     expect(
-      Array.isArray(mc?.stopSequences) ? mc?.stopSequences!.length : 0
+      Array.isArray(mc?.stopSequences) ? mc!.stopSequences!.length : 0
     ).toBeGreaterThan(0);
   });
 
@@ -225,6 +245,103 @@ describe('AxAIOpenAI model key preset merging', () => {
 });
 
 describe('AxAIOpenAI', () => {
+  // Chat Completions reads an image's `detail`; OpenAI accepts and ignores a
+  // `details` key (a low-detail image cost as much as a high-detail one).
+  // Chat Completions rejects inline file data without a filename (HTTP 400,
+  // "Missing required parameter: 'messages[0].content[1].file.file_id'"), so
+  // an AxGen file input's filename must reach the wire.
+  it("sends an AxGen file input's filename to OpenAI", async () => {
+    const ai = new AxAIOpenAI({
+      apiKey: 'key',
+      config: { model: AxAIOpenAIModel.GPT41, stream: false },
+    });
+    const capture: { lastBody?: any } = {};
+    ai.setOptions({
+      fetch: createMockFetch(
+        {
+          choices: [
+            {
+              index: 0,
+              message: { role: 'assistant', content: 'Summary: A report' },
+              finish_reason: 'stop',
+            },
+          ],
+        },
+        capture
+      ),
+    });
+
+    await new AxGen('doc:file -> summary:string').forward(ai, {
+      doc: {
+        mimeType: 'application/pdf',
+        data: 'JVBERi0=',
+        filename: 'report.pdf',
+      },
+    });
+
+    const user = capture.lastBody?.messages.at(-1);
+    expect(user.content).toContainEqual({
+      type: 'file',
+      file: {
+        file_data: 'data:application/pdf;base64,JVBERi0=',
+        filename: 'report.pdf',
+      },
+    });
+  });
+
+  it("sends an image part's details as OpenAI's detail", async () => {
+    const ai = new AxAIOpenAI({
+      apiKey: 'key',
+      config: { model: AxAIOpenAIModel.GPT41 },
+    });
+    const capture: { lastBody?: any } = {};
+    ai.setOptions({
+      fetch: createMockFetch(
+        {
+          choices: [
+            {
+              index: 0,
+              message: { role: 'assistant', content: 'a square' },
+              finish_reason: 'stop',
+            },
+          ],
+        },
+        capture
+      ),
+    });
+
+    await ai.chat(
+      {
+        chatPrompt: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: 'Describe' },
+              {
+                type: 'image',
+                mimeType: 'image/png',
+                image: 'aW1hZ2U=',
+                details: 'low',
+              },
+              { type: 'image', mimeType: 'image/png', image: 'aW1hZ2U=' },
+            ],
+          },
+        ],
+      },
+      { stream: false }
+    );
+
+    const parts = capture.lastBody?.messages[0].content;
+    expect(parts[1]).toEqual({
+      type: 'image_url',
+      image_url: { url: 'data:image/png;base64,aW1hZ2U=', detail: 'low' },
+    });
+    expect(parts[2]).toEqual({
+      type: 'image_url',
+      image_url: { url: 'data:image/png;base64,aW1hZ2U=', detail: 'auto' },
+    });
+  });
+
   it('passes strict nullable structured-output schemas unchanged', async () => {
     const ai = new AxAIOpenAI({
       apiKey: 'key',
@@ -457,6 +574,82 @@ describe('AxAIOpenAI audio chat', () => {
     });
   });
 
+  // Chat Completions takes only data and format in input_audio: it answers
+  // HTTP 400 to any other key ("Unknown parameter:
+  // 'messages[0].content[1].input_audio.mimeType'"). A part without a format
+  // takes it from its mime type.
+  it('sends input_audio as data and format, the format from the mime type', async () => {
+    const ai = new AxAIOpenAI({
+      apiKey: 'key',
+      config: axAIOpenAIAudioDefaultConfig(),
+    });
+    const capture: { lastBody?: any } = {};
+    ai.setOptions({
+      fetch: createMockFetch(
+        {
+          choices: [
+            {
+              index: 0,
+              message: { role: 'assistant', content: 'heard' },
+              finish_reason: 'stop',
+            },
+          ],
+        },
+        capture
+      ),
+    });
+
+    await ai.chat(
+      {
+        chatPrompt: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: 'Answer this recording.' },
+              {
+                type: 'audio',
+                data: 'UklGRg==',
+                mimeType: 'audio/wav',
+                sampleRate: 24000,
+                channels: 1,
+              },
+            ],
+          },
+        ],
+      },
+      { stream: false }
+    );
+
+    expect(capture.lastBody?.messages[0]?.content[1]).toEqual({
+      type: 'input_audio',
+      input_audio: { data: 'UklGRg==', format: 'wav' },
+    });
+  });
+
+  it('rejects input audio whose format it cannot tell', async () => {
+    const ai = new AxAIOpenAI({
+      apiKey: 'key',
+      config: axAIOpenAIAudioDefaultConfig(),
+    });
+    ai.setOptions({ fetch: createMockFetch({ choices: [] }, {}) });
+
+    await expect(
+      ai.chat(
+        {
+          chatPrompt: [
+            {
+              role: 'user',
+              content: [{ type: 'audio', data: 'UklGRg==' }],
+            },
+          ],
+        },
+        { stream: false }
+      )
+    ).rejects.toThrow(
+      'OpenAI audio chat input supports only wav and mp3 audio, received unknown format'
+    );
+  });
+
   it('maps batch transcription requests', async () => {
     const ai = new AxAIOpenAI({ apiKey: 'key' });
     const capture: { url?: string; body?: BodyInit | null } = {};
@@ -528,6 +721,36 @@ describe('AxAIOpenAI audio chat', () => {
       transcript: 'hello world',
     });
   });
+
+  // OpenAI's speech endpoint returns 16-bit PCM for `pcm` and answers HTTP 400
+  // to `pcm16` ("Supported values are: 'mp3', 'aac', 'opus', 'flac', 'pcm',
+  // and 'wav'").
+  it.each(['pcm', 'pcm16'] as const)(
+    'requests %s speech as the pcm response format',
+    async (format) => {
+      const ai = new AxAIOpenAI({ apiKey: 'key' });
+      const capture: { body?: any } = {};
+      ai.setOptions({
+        fetch: vi
+          .fn()
+          .mockImplementation(
+            async (_url: RequestInfo | URL, init?: RequestInit) => {
+              capture.body = JSON.parse(String(init?.body));
+              return new Response(new Uint8Array([0, 0]), {
+                status: 200,
+                headers: { 'Content-Type': 'audio/pcm' },
+              });
+            }
+          ),
+      });
+
+      const res = await ai.speak({ text: 'hello world', format });
+
+      expect(capture.body.response_format).toBe('pcm');
+      expect(res.format).toBe(format);
+      expect(res.mimeType).toBe('audio/pcm');
+    }
+  );
 
   it('keeps assistant audio history as an audio reference', async () => {
     const ai = new AxAIOpenAI({
@@ -842,6 +1065,47 @@ describe('AxAIOpenAI realtime audio chat', () => {
       totalTokens: 36,
       cacheReadTokens: 12,
     });
+  });
+
+  it('reads realtime events sent in binary frames', async () => {
+    const ai = new AxAIOpenAI({
+      apiKey: 'key',
+      config: axAIOpenAIRealtimeDefaultConfig(),
+    });
+    const webSocket = openAIRealtimeWebSocket(
+      [
+        {
+          type: 'response.output_audio_transcript.delta',
+          response_id: 'resp_binary',
+          delta: 'hello',
+        },
+        {
+          type: 'response.output_audio.delta',
+          response_id: 'resp_binary',
+          delta: 'AQI=',
+        },
+        {
+          type: 'response.done',
+          response_id: 'resp_binary',
+          response: {
+            id: 'resp_binary',
+            usage: { input_tokens: 5, output_tokens: 2, total_tokens: 7 },
+          },
+        },
+      ],
+      'binary'
+    );
+
+    const res = (await ai.chat(
+      { chatPrompt: [{ role: 'user', content: 'say hello' }] },
+      { stream: false, webSocket }
+    )) as any;
+
+    expect(FakeOpenAIRealtimeWebSocket.instances[0]?.binaryType).toBe(
+      'arraybuffer'
+    );
+    expect(res.results[0]?.content).toBe('hello');
+    expect(res.results[0]?.audio?.data).toBe('AQI=');
   });
 
   it('uses gpt-realtime-whisper for realtime transcript deltas', async () => {

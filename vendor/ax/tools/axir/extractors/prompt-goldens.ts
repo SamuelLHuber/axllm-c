@@ -7,27 +7,42 @@ import {
 } from '../../../src/ax/agent/templateEngine.js';
 import { AxPromptTemplate } from '../../../src/ax/dsp/prompt.js';
 import { AxSignature, f, fn } from '../../../src/ax/dsp/sig.js';
+import {
+  goldenValue,
+  NumberLiteral,
+  restoreNumberLiterals,
+} from './number-literals.js';
 
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 
 type Fixture = Record<string, Json>;
 
-const outDir = join(process.cwd(), 'ir/conformance/prompt');
+const outDir = join(
+  process.env.AXIR_CONFORMANCE_OUT_ROOT ?? process.cwd(),
+  'ir/conformance/prompt'
+);
 
-function stable(value: unknown, parentKey = ''): unknown {
+// Input values keep their key order: prompts render object values in insertion
+// order, so sorting them would no longer match the golden.
+function stable(value: unknown, parentKey = '', keepOrder = false): unknown {
+  if (value instanceof NumberLiteral) return value;
   if (Array.isArray(value)) {
-    return value.map((item) => stable(item, parentKey));
+    return value.map((item) => stable(item, parentKey, keepOrder));
   }
   if (value && typeof value === 'object') {
     const entries = Object.entries(value as Record<string, unknown>);
     const ordered =
+      keepOrder ||
       parentKey === 'inputs' ||
       parentKey === 'outputs' ||
       parentKey === 'fields'
         ? entries
         : entries.sort(([a], [b]) => a.localeCompare(b));
     return Object.fromEntries(
-      ordered.map(([key, item]) => [key, stable(item, key)])
+      ordered.map(([key, item]) => [
+        key,
+        stable(item, key, keepOrder || key === 'input'),
+      ])
     );
   }
   return value;
@@ -36,7 +51,7 @@ function stable(value: unknown, parentKey = ''): unknown {
 function writeFixture(name: string, fixture: Fixture): void {
   writeFileSync(
     join(outDir, `${name}.json`),
-    `${JSON.stringify(stable({ name, ...fixture }), null, 2)}\n`
+    `${restoreNumberLiterals(JSON.stringify(stable({ name, ...fixture }), null, 2))}\n`
   );
 }
 
@@ -46,6 +61,26 @@ function promptMessages(
   options: ConstructorParameters<typeof AxPromptTemplate>[1] = {}
 ): Json {
   return new AxPromptTemplate(sig, options).render(input as any, {}) as Json;
+}
+
+// A port-side golden: the ports also take the snake_case aliases their
+// provider mappings read (mime_type, file_uri, extracted_text, sample_rate,
+// cached_content, and an audio part's `audio` data) and turn them into the
+// declared camelCase keys. TS takes only the camelCase keys, so the expected
+// messages are TS's render of the camelCase input.
+function aliasPrompt(
+  name: string,
+  signature: string,
+  portInput: Record<string, unknown>,
+  tsInput: Record<string, unknown>
+): void {
+  const sig = AxSignature.create(signature);
+  writeFixture(name, {
+    kind: 'prompt',
+    signature,
+    input: portInput as Json,
+    expected_messages: promptMessages(sig, goldenValue(tsInput)),
+  });
 }
 
 function stringPrompt(
@@ -67,7 +102,7 @@ function stringPrompt(
       ? { options: fixtureOptions as Json }
       : {}),
     ...extra,
-    expected_messages: promptMessages(sig, input, options),
+    expected_messages: promptMessages(sig, goldenValue(input), options),
   });
 }
 
@@ -333,6 +368,22 @@ const customTemplate = `<task_definition>
 Return \`field name: value\` pairs.
 </formatting_rules>`;
 
+// includeOptionalInputFieldsInSystemPrompt lists every input field in the
+// system prompt, provided or not; the user message still leaves out an unset
+// optional field. Off (the default), the unset field is left out of both.
+stringPrompt(
+  'optional-input-listed-when-option-on',
+  'question:string, context?:string "Background notes" -> answer:string',
+  { question: 'How long do refunds take?' },
+  { includeOptionalInputFieldsInSystemPrompt: true }
+);
+
+stringPrompt(
+  'optional-input-omitted-by-default',
+  'question:string, context?:string "Background notes" -> answer:string',
+  { question: 'How long do refunds take?' }
+);
+
 stringPrompt(
   'custom-template-reordered',
   '"Analyze the user query carefully" userQuery:string -> aiResponse:string "the result"',
@@ -394,3 +445,459 @@ templateValidateFixture(
   '{{ identityText }} {{ inputFieldsSection }}',
   ['identityText', 'inputFieldsSection']
 );
+
+stringPrompt(
+  'value-descriptions',
+  'ticket:string -> urgent:boolean(true "Core task blocked", false "Routine") "Urgent?", team:class "support, billing"(support "Help", billing "Invoices")',
+  { ticket: 'Checkout is down' }
+);
+stringPrompt(
+  'nested-value-descriptions',
+  'ticket:string -> analysis:object{ urgent:boolean(true "Core task blocked"), teams:class[] "support, billing"(billing "Invoices") }',
+  { ticket: 'Checkout is down' }
+);
+
+// Field titles follow TS's toTitle (src/ax/dsp/sig.ts): a snake_case name keeps
+// its later words lowercase ("Generator answer"), a camelCase name starts a
+// word at each capital ("Key Insight") but keeps a run of capitals together
+// ("User ID", "Parse HTTP Response"), a digit run starts a word ("Item 123"),
+// and words are separated by one space ("Field 2").
+stringPrompt(
+  'field-titles-snake-and-camel-case',
+  'generator_answer:string, question_context:string, snake_case_name:string, keyInsight:string, item1:string, item123:string, field_2:string, step2Result:string, x2Y:string, value99Count:string, userID:string, apiURL:string, orderID:string, parseHTTPResponse:string -> root_cause:string, errorIdentification:string',
+  {
+    generator_answer: 'Paris',
+    question_context: 'European capitals',
+    snake_case_name: 'snake',
+    keyInsight: 'Cite the source',
+    item1: 'first',
+    item123: 'third',
+    field_2: 'second field',
+    step2Result: 'done',
+    x2Y: 'axis',
+    value99Count: '99',
+    userID: 'u-1',
+    apiURL: 'https://example.com',
+    orderID: 'o-7',
+    parseHTTPResponse: 'ok',
+  }
+);
+
+// JSON and array outputs keep the `field name: value` text contract: TS asks
+// for one JSON object (and prints its shape) only when an output is an object
+// or an array of objects.
+stringPrompt(
+  'json-and-array-outputs-text-contract',
+  'question:string -> tags:string[], details:json',
+  { question: 'What is Ax?' }
+);
+
+// Object input values render as JSON.stringify(value, null, 2): two-space
+// indentation, keys in insertion order, {} and [] for empty containers, and
+// non-ASCII text (including non-BMP emoji) as UTF-8 rather than \u escapes.
+stringPrompt('json-input-pretty-json', 'plan:json -> answer:string', {
+  plan: {
+    zeta: 'Café ☕ naïve',
+    alpha: { steps: [1, 2.5, { deep: 'ok' }], empty: {}, none: [] },
+    emoji: 'Launch 🚀',
+    flags: [true, false, null],
+    count: 3,
+  },
+});
+
+// Audio inputs: a plain string, and an audio object with a transcript (what an
+// AxGen audio output renders to), reach the model as text; audio without a
+// transcript is an audio part with only its format (wav when it has none) and
+// its data.
+stringPrompt(
+  'audio-input-transcript-as-text',
+  'speech:audio -> summary:string',
+  {
+    speech: {
+      data: 'SUQzBAA=',
+      format: 'mp3',
+      mimeType: 'audio/mpeg',
+      transcript: 'Hello there',
+    },
+  }
+);
+stringPrompt(
+  'audio-input-plain-string-as-text',
+  'speech:audio -> summary:string',
+  { speech: 'Hello there' }
+);
+stringPrompt(
+  'audio-input-object-as-audio-part',
+  'question:string, speech:audio -> summary:string',
+  {
+    question: 'What is said?',
+    speech: { data: 'SUQzBAA=', format: 'mp3', mimeType: 'audio/mpeg' },
+  }
+);
+stringPrompt(
+  'audio-input-format-defaults-to-wav',
+  'speech:audio -> summary:string',
+  { speech: { data: 'UklGRg==' } }
+);
+stringPrompt(
+  'audio-input-array-as-audio-parts',
+  'clips:audio[] -> summary:string',
+  { clips: [{ data: 'SUQzBAA=', format: 'mp3' }, { data: 'UklGRg==' }] }
+);
+
+// Image, file and url inputs: TS joins every run of consecutive text parts in
+// a multimodal message with a newline, and builds each media part from only
+// the keys its type takes (an image's data goes out as `image`, and its
+// details, which the provider reads, stay on the part).
+stringPrompt(
+  'image-input-after-text-joins-text',
+  'question:string, photo:image -> answer:string',
+  {
+    question: 'What is it?',
+    photo: { mimeType: 'image/png', data: 'aW1hZ2U=' },
+  }
+);
+stringPrompt(
+  'image-input-between-text-fields',
+  'question:string, photo:image, note:string -> answer:string',
+  {
+    question: 'What is it?',
+    photo: { mimeType: 'image/png', data: 'aW1hZ2U=' },
+    note: 'Be brief',
+  }
+);
+stringPrompt(
+  'image-input-array-as-image-parts',
+  'question:string, photos:image[] -> answer:string',
+  {
+    question: 'Which is newer?',
+    photos: [
+      { mimeType: 'image/png', data: 'aW1hZ2U=' },
+      { mimeType: 'image/jpeg', data: 'anBlZw==' },
+    ],
+  }
+);
+// Each media part carries the optional keys its part type declares
+// (AxChatRequest) when the input sets them; other keys stay behind.
+stringPrompt(
+  'image-input-declared-keys-carried',
+  'photo:image -> answer:string',
+  {
+    photo: {
+      mimeType: 'image/png',
+      data: 'aW1hZ2U=',
+      details: 'low',
+      cache: true,
+      optimize: 'size',
+      altText: 'A red square',
+      caption: 'A square',
+    },
+  }
+);
+stringPrompt('file-input-declared-keys-carried', 'doc:file -> answer:string', {
+  doc: {
+    mimeType: 'application/pdf',
+    data: 'JVBERi0=',
+    filename: 'report.pdf',
+    cache: true,
+    extractedText: 'Revenue grew',
+    pages: 3,
+  },
+});
+stringPrompt('url-input-declared-keys-carried', 'link:url -> answer:string', {
+  link: {
+    url: 'https://example.com/',
+    title: 'Example',
+    description: 'A sample page',
+    cachedContent: 'Example page text',
+    cache: true,
+    rank: 1,
+  },
+});
+aliasPrompt(
+  'image-input-snake-case-aliases',
+  'photo:image -> answer:string',
+  { photo: { mime_type: 'image/png', data: 'aW1hZ2U=', details: 'low' } },
+  { photo: { mimeType: 'image/png', data: 'aW1hZ2U=', details: 'low' } }
+);
+aliasPrompt(
+  'file-input-snake-case-aliases',
+  'doc:file -> answer:string',
+  {
+    doc: {
+      mime_type: 'application/pdf',
+      file_uri: 'gs://bucket/report.pdf',
+      extracted_text: 'Revenue grew',
+    },
+  },
+  {
+    doc: {
+      mimeType: 'application/pdf',
+      fileUri: 'gs://bucket/report.pdf',
+      extractedText: 'Revenue grew',
+    },
+  }
+);
+aliasPrompt(
+  'url-input-snake-case-aliases',
+  'link:url -> answer:string',
+  {
+    link: { url: 'https://example.com/', cached_content: 'Example page text' },
+  },
+  { link: { url: 'https://example.com/', cachedContent: 'Example page text' } }
+);
+aliasPrompt(
+  'audio-input-snake-case-aliases',
+  'speech:audio -> summary:string',
+  { speech: { audio: 'UklGRg==', mime_type: 'audio/wav', sample_rate: 24000 } },
+  { speech: { data: 'UklGRg==', mimeType: 'audio/wav', sampleRate: 24000 } }
+);
+stringPrompt(
+  'audio-input-declared-keys-carried',
+  'speech:audio -> summary:string',
+  {
+    speech: {
+      data: 'UklGRg==',
+      format: 'wav',
+      mimeType: 'audio/wav',
+      sampleRate: 24000,
+      channels: 1,
+      cache: true,
+      transcription: 'Hello there',
+      duration: 1.5,
+      filename: 'hello.wav',
+    },
+  }
+);
+stringPrompt(
+  'file-input-after-text-joins-text',
+  'question:string, doc:file -> answer:string',
+  {
+    question: 'Summarize it',
+    doc: { mimeType: 'application/pdf', data: 'JVBERi0=' },
+  }
+);
+stringPrompt(
+  'file-input-file-uri',
+  'question:string, doc:file -> answer:string',
+  {
+    question: 'Summarize it',
+    doc: { mimeType: 'application/pdf', fileUri: 'gs://bucket/doc.pdf' },
+  }
+);
+stringPrompt('file-input-array-as-file-parts', 'docs:file[] -> answer:string', {
+  docs: [
+    { mimeType: 'application/pdf', data: 'JVBERi0=' },
+    { mimeType: 'text/plain', fileUri: 'gs://bucket/notes.txt' },
+  ],
+});
+stringPrompt(
+  'url-input-after-text-joins-text',
+  'question:string, link:url -> answer:string',
+  {
+    question: 'What is on the page?',
+    link: { url: 'https://example.com/', title: 'Example' },
+  }
+);
+stringPrompt(
+  'url-input-plain-string',
+  'question:string, link:url -> answer:string',
+  { question: 'What is on the page?', link: 'https://example.com/' }
+);
+
+// Numbers in prompt JSON render as JSON.stringify writes them (Number's
+// toString): shortest round-trip digits, integral values without ".0",
+// exponent form only below 1e-6 and from 1e21 up (1e-7, 1e+21), and -0 as 0.
+// Top-level number fields render the same way. The literals keep 2.0, -0.0,
+// 1e16 and 1.152921504606847e18 as floats in the runners' JSON parsers.
+stringPrompt(
+  'json-input-number-format',
+  'plan:json, budget:number -> answer:string',
+  {
+    plan: {
+      values: [
+        0,
+        new NumberLiteral('-0.0'),
+        new NumberLiteral('2.0'),
+        2.5,
+        -1234.56789,
+        1234.56789,
+        12345678.9,
+        0.30000000000000004,
+        0.0001,
+        0.00001,
+        0.000001,
+        1e-7,
+        1.5e-7,
+        5e-324,
+        new NumberLiteral('1e16'),
+        9007199254740994,
+        new NumberLiteral('1.152921504606847e18'),
+        123456789012345680000,
+        1e21,
+        1.7976931348623157e308,
+      ],
+    },
+    budget: 12345678.9,
+  }
+);
+
+// String(x) and JSON.stringify(x) for numbers each runner parses from `input`
+// with its own float parser. That reaches values a JSON fixture cannot hold:
+// NaN and the infinities (JSON null, String "NaN" / "Infinity") and -0 ("0").
+// Runners check `string` against their string.str intrinsic and `json`
+// against every JSON encoder they use (compact, key-sorted, pretty, wire).
+const numberFormatInputs = [
+  '0',
+  '-0',
+  '2',
+  '2.0',
+  '-2',
+  '2.5',
+  '0.1',
+  '0.30000000000000004',
+  '4.35',
+  '100',
+  '1234.56789',
+  '-1234.56789',
+  '12345678.9',
+  '0.0001',
+  '0.00001',
+  '0.000001',
+  '0.0000015',
+  '1e-7',
+  '1.5e-7',
+  '-1e-7',
+  '1.2345678901234567e-7',
+  '123e-20',
+  '1e16',
+  '1e20',
+  '9.999999999999999e20',
+  '1e21',
+  '-1e21',
+  '1.5e21',
+  '123456789012345680000',
+  '9007199254740993',
+  '9007199254740994',
+  '1152921504606846976',
+  '5e-324',
+  '2.2250738585072014e-308',
+  '1.7976931348623157e308',
+  '1e300',
+  'NaN',
+  'Infinity',
+  '-Infinity',
+];
+writeFixture('number-format-cases', {
+  kind: 'number_format',
+  cases: numberFormatInputs.map((input) => {
+    const value = Number(input);
+    return { input, string: String(value), json: JSON.stringify(value) };
+  }),
+});
+
+// JSON.stringify: keys in the object's own-key order (array-index keys, "0"
+// to "4294967294" in canonical form, first in ascending numeric order, then
+// the other keys in insertion order), null as null, empty arrays and objects
+// as themselves. Each case's input is JSON text, parsed in key order by the
+// runners (the fixture's own keys would lose it to the canonical sort), and
+// `json` is what JSON.stringify(JSON.parse(input)) writes; every port's
+// json.stringify intrinsic must write it. json.stable_stringify stays
+// key-sorted.
+const jsonStringifyInputs: string[] = [
+  '{"b":1,"a":[2]}',
+  '{"zeta":{"y":1,"x":[{"d":1,"c":2}]},"alpha":null,"mid":"text"}',
+  '[]',
+  'null',
+  '{}',
+  '[null,{},[],{"b":false,"a":true}]',
+  '{"k":[],"e":{},"c":""}',
+  JSON.stringify('quote " backslash \\ newline \n tab \t'),
+  '0',
+  'false',
+  '""',
+  '{"b":1,"10":2,"2":3}',
+  '{"01":1,"1":2,"-1":3,"4294967295":4,"4294967294":5,"1.5":6,"0":7}',
+  '{"z":{"9":"nine","x":"ex","3":"three"},"list":[{"20":0,"b":1,"1":2}]}',
+];
+writeFixture('json-stringify-cases', {
+  kind: 'json_stringify',
+  cases: jsonStringifyInputs.map((input) => ({
+    input,
+    json: JSON.stringify(JSON.parse(input)),
+  })),
+});
+
+// string.format fills each {} from left to right with the next argument's
+// text and string.str writes one value's text, in every port as JavaScript
+// writes it: String(x) for a string, number, boolean or null, JSON.stringify(x)
+// for a list or object (keys in insertion order). {{ and }} write one brace,
+// any other brace is kept, an argument goes in as is, and a {} past the last
+// argument stays {}. Each case's `input` keeps its key order in the file.
+const jsValueText = (value: unknown): string =>
+  value !== null && typeof value === 'object'
+    ? JSON.stringify(value)
+    : String(value);
+function jsTemplateText(template: string, args: readonly unknown[]): string {
+  let out = '';
+  let next = 0;
+  for (let index = 0; index < template.length; ) {
+    const pair = template.slice(index, index + 2);
+    if (pair === '{{') {
+      out += '{';
+      index += 2;
+    } else if (pair === '}}') {
+      out += '}';
+      index += 2;
+    } else if (pair === '{}') {
+      out += next < args.length ? jsValueText(args[next++]) : '{}';
+      index += 2;
+    } else {
+      out += template[index];
+      index += 1;
+    }
+  }
+  return out;
+}
+const stringFormatCases: { template: string; input: unknown[] }[] = [
+  { template: 'Function not found: {}.', input: [null] },
+  { template: '{} and {}', input: [true, false] },
+  { template: '{} {} {} {}', input: [0, 2, 1.5, -12.25] },
+  { template: 'list {}', input: [[1, 'x', null, true]] },
+  { template: 'object {}', input: [{ query: 'scope-probe', limit: 2 }] },
+  { template: 'nested {}', input: [{ z: [1, { a: null }], a: 'b' }] },
+  {
+    template: 'Field "{}": unbalanced "{" in object type',
+    input: ['profile'],
+  },
+  {
+    template: "type 'object ({{ mimeType: string; data: string }})' for {}",
+    input: ['sourceFile'],
+  },
+  { template: '{{}} is literal, {} fills', input: ['x'] },
+  { template: 'as is: {} then {}', input: ['a{}b', 'c'] },
+  { template: 'one {} and {}', input: ['arg'] },
+  { template: 'text {} ✓', input: ['é "quoted"\n'] },
+];
+const stringStrInputs: unknown[] = [
+  null,
+  true,
+  false,
+  0,
+  1.5,
+  'text',
+  [1, 'a', null],
+  { b: 1, a: [null, false] },
+];
+writeFixture('string-format-cases', {
+  kind: 'string_format',
+  format_cases: stringFormatCases.map((item) => ({
+    template: item.template,
+    input: item.input,
+    expected: jsTemplateText(item.template, item.input),
+  })),
+  str_cases: stringStrInputs.map((input) => ({
+    input,
+    expected: jsValueText(input),
+  })),
+});

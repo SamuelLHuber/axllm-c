@@ -419,12 +419,12 @@ describe('MemoryImpl', () => {
     const last = memory.getLast();
     expect(last?.role).toBe('function');
     expect(last?.chat).toHaveLength(2);
-    expect(last?.chat[0]!.value).toEqual({
+    expect(last!.chat[0]!.value).toEqual({
       role: 'function',
       result: 'result1',
       functionId: 'func1',
     });
-    expect(last?.chat[1]!.value).toEqual({
+    expect(last!.chat[1]!.value).toEqual({
       role: 'function',
       result: 'result2',
       functionId: 'func2',
@@ -1043,4 +1043,72 @@ describe('MemoryImpl Debug Logging', () => {
       })
     ).not.toThrow();
   });
+});
+
+describe('MemoryImpl thinking replay and display', () => {
+  it('accumulates display thoughts without displaying redacted replay data', () => {
+    const memory = new MemoryImpl();
+    memory.updateResult({
+      index: 0,
+      thought: 'Checking ',
+      thoughtBlocks: [{ data: 'Checking ', encrypted: false }],
+    });
+    memory.updateResult({
+      index: 0,
+      thought: 'Paris.',
+      thoughtBlocks: [{ data: 'Paris.', encrypted: false }],
+    });
+    memory.updateResult({
+      index: 0,
+      thoughtBlocks: [
+        { data: '', encrypted: false, signature: 'signed-update' },
+      ],
+    });
+    memory.updateResult({
+      index: 0,
+      thoughtBlocks: [{ data: 'opaque-note', encrypted: true }],
+    });
+    expect(memory.history(0)[0]).toMatchObject({
+      thought: 'Checking Paris.',
+      thoughtBlocks: [
+        {
+          data: 'Checking Paris.',
+          encrypted: false,
+          signature: 'signed-update',
+        },
+        { data: 'opaque-note', encrypted: true },
+      ],
+    });
+  });
+});
+
+it('keeps consecutive redacted replay blocks separate from later signed thinking', () => {
+  const memory = new MemoryImpl();
+  memory.updateResult({
+    index: 0,
+    thoughtBlocks: [{ data: 'opaque-one', encrypted: true }],
+  });
+  memory.updateResult({
+    index: 0,
+    thoughtBlocks: [{ data: 'opaque-two', encrypted: true }],
+  });
+  memory.updateResult({
+    index: 0,
+    thoughtBlocks: [{ data: 'Later update.', encrypted: false }],
+  });
+  memory.updateResult({
+    index: 0,
+    thoughtBlocks: [{ data: '', encrypted: false, signature: 'signed-later' }],
+  });
+  expect(memory.history(0)[0]).toMatchObject({
+    thoughtBlocks: [
+      { data: 'opaque-one', encrypted: true },
+      { data: 'opaque-two', encrypted: true },
+      { data: 'Later update.', encrypted: false, signature: 'signed-later' },
+    ],
+  });
+  expect(memory.history(0)[0]).not.toHaveProperty(
+    'thought',
+    expect.any(String)
+  );
 });

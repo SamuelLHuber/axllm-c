@@ -32,9 +32,13 @@ auto schema = axllm::to_json_schema(axllm::Core::get(sig, "outputs"));
 - AxGen: run structured generation with retries, tool calls, field processors, assertions, traces, usage, and provider-backed output parsing.
 - AxAI: select named deployment profiles independently from model IDs, resolve model-aware structured-output modes, and attach renewable request credentials through one provider boundary.
 - Audio and realtime: `.chat()` accepts `input_audio` content parts, `transcribe()`/`speak()` do batch speech-to-text and text-to-speech, and realtime-capable models stream audio over a WebSocket — transparently through `chat()` or via the productized `realtime_chat()` driver (Go: `RealtimeChat`).
+- Meta Muse: `meta` (Responses), `meta-chat` (Chat Completions), and `meta-messages` (Messages) default to `muse-spark-1.3` with `MODEL_API_KEY`. Muse Image uses chat and `results[].images`; Muse Voice uses batch transcription or realtime streaming chat. Contributor models expose provider-training data-use metadata and are never defaults. Glimmer uses the existing self-hosted profiles; Ax does not manage weights.
+- Jev and OpenAI Decisions: use required boolean/class/rubric score signatures with (evidence) to retain probabilities, native values, optional confidence, and trusted provenance through AxGen. Generative models use the same contract with elicited evidence. Rerank query/document pairs by the continuous rubric score while preserving candidate IDs.
+- Native decision clients: use explicit provider request shapes for advanced criteria, structured state, ordered questions, and provider-specific media. Normal evidence-bearing signatures support scores and answered/refused outcomes without calling these clients directly.
 - AxAgent and RLM: let an agent plan and execute actor-code steps while Ax keeps envelopes, state, logs, traces, context, discovery, recall, and final typed responses aligned.
 - AxFlow: compose AxGen, AxAgent, and nested flows into a portable program graph.
 - Optimizers: save, load, apply, and evaluate optimizer artifacts, including the generated GEPA engine.
+- Evaluation: axllm::novel_f1_score scores multiset word overlap after excluding history and stopwords, with matching Unicode normalization and finite empty-input scores.
 
 ## Package Shape
 
@@ -51,11 +55,14 @@ Shared Ax behavior is Core-owned. The generated target code stays focused on idi
 `no-key` examples are deterministic local smokes. They are the fastest way to see the package work without any provider account:
 
 - `examples/signature_schema.cpp`: signature parsing and JSON schema generation
+- `examples/model_catalog.cpp`: model catalog, named profiles, thinking levels, and service tiers
 - `examples/axgen_scripted_client_tool.cpp`: AxGen with a scripted client and tool
+- `examples/axgen_streaming_no_key.cpp`: `streaming_forward` field deltas with a streaming assertion, feedback, streaming and transform field processors, stopping, cancellation, and run control through a scripted SSE transport, and `AxCachingFunction` hits from the generator, a per-call `caching_function` handle and `set_caching_function`
 - `examples/provider_mapping_no_key.cpp`: provider mapping through a scripted transport
 - `examples/runtime_hooks_no_key.cpp`: runtime-hook globals and typed program surfaces through a scripted transport
 - `examples/adaptive_balancer_no_key.cpp`: adaptive balancer state, scoring, and stable route keys without a provider key
 - `examples/provider_stream_no_key.cpp`: provider streaming through a scripted SSE transport
+- `examples/cancellation_no_key.cpp`: one-shot provider cancellation with no transport attempt
 - `examples/axflow_program_graph.cpp`: AxFlow program graph
 - `examples/flow_mermaid.cpp`: portable Mermaid flow parsing and canonical round-trip
 - `examples/audio_responses_mapping.cpp`: OpenAI Responses speak/transcribe mapping through a scripted transport

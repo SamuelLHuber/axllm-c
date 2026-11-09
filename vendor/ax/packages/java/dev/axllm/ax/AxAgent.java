@@ -15,8 +15,19 @@ public final class AxAgent implements AxProgram {
   AxGen responder;
   AxGen llmQuery;
   AxPlaybook playbookHandle;
+  // The stage the playbook targets and whether it writes into that stage's
+  // prompt, kept to rebind the playbook when a stage changes.
+  private String playbookTarget = "actor";
+  private boolean playbookApply = true;
   Object playbookConfig;
   volatile AxRuntimeHooks runtimeHooks;
+  // Each run uses the stage set of its mode (see useStageMode): "runtime", the
+  // RLM stages, or "plain", the runtime-less stages. The other mode's set is
+  // built on first use and kept; optimizedComponents apply to a set when a run
+  // switches to it.
+  private String stageMode = "plain";
+  private final Map<String, AxGen[]> stageSets = new LinkedHashMap<>();
+  private final Map<String, Object> optimizedComponents = new LinkedHashMap<>();
 
   public AxAgent(String signature, Map<String, Object> options) {
     this((Object) signature, options, AxRuntimeHooks.empty());
@@ -33,9 +44,8 @@ public final class AxAgent implements AxProgram {
     this.options = AxRuntimeHooks.strip(options);
     this.executionContext = AxExecutionContext.resolve(this.options, null);
     if (executionContext != null) {
-      List<Object> functions = new ArrayList<>(Core.asList(this.options.getOrDefault("functions", List.of())));
-      functions.addAll(executionContext.runtimeModules());
-      this.options.put("functions", functions);
+      executionContext.initialize();
+      this.options.putAll(Core.asMap(Core._agent_append_runtime_modules(this.options, executionContext.runtimeModules())));
       this.options.put("executionContext", executionContext);
     }
     this.playbookConfig = this.options.get("playbook");
@@ -54,10 +64,63 @@ public final class AxAgent implements AxProgram {
     this.state = Core.asMap(Core._agent_factory(signature, this.options));
     this.signature = Core.get(state, "signature", signature);
     Object actorValidationRetries = this.options.getOrDefault("validation_retries", this.options.getOrDefault("validationRetries", 1));
-    this.distiller = new AxGen(AxSignature.create(String.valueOf(Core.get(state, "distiller_signature", "input:json -> completion:json"))), childOptions(actorValidationRetries, "ctx.root.actor", Core.get(state, "distiller_description", "")));
-    this.executor = new AxGen(AxSignature.create(String.valueOf(Core.get(state, "executor_signature", "input:json -> completion:json"))), childOptions(actorValidationRetries, "task.root.actor", Core.get(state, "executor_description", "")));
-    this.responder = new AxGen(AxSignature.create(String.valueOf(Core.get(state, "responder_signature", "input:json -> completion:json"))), childOptions(this.options.getOrDefault("validation_retries", 2), "task.root.responder", Core.get(state, "responder_description", "")));
+    this.distiller = new AxGen(AxSignature.create(String.valueOf(Core.get(state, "distiller_signature", "input:json -> completion:json"))), actorOptions(actorValidationRetries, "ctx.root.actor", Core.get(state, "distiller_description", "")));
+    this.executor = new AxGen(AxSignature.create(String.valueOf(Core.get(state, "executor_signature", "input:json -> completion:json"))), actorOptions(actorValidationRetries, "task.root.actor", Core.get(state, "executor_description", "")));
+    this.responder = newResponder();
     this.llmQuery = new AxGen(AxSignature.create(String.valueOf(Core.get(state, "llm_query_signature", "task:string, context:json -> answer:string"))), childOptions(1, "rlm.llmquery", Core.get(state, "llm_query_description", "")));
+    this.stageMode = Core.truthy(Core.get(state, "runtime_enabled", false)) ? "runtime" : "plain";
+    stageSets.clear();
+    stageSets.put(stageMode, new AxGen[] {distiller, executor, responder});
+    optimizedComponents.clear();
+    rebindPlaybook();
+  }
+
+  // A run's stages follow its runtime: the constructor's, else the forward
+  // call's; without one, the runtime-less stages run. A set coming back into
+  // use takes the instructions from the agent's state (a standing instruction
+  // set since) and the optimized components again.
+  private void useStageMode(Map<String, Object> callOptions) {
+    Map<String, Object> record = Core.asMap(Core._agent_use_stage_mode(state, callOptions));
+    String mode = String.valueOf(record.getOrDefault("mode", "plain"));
+    if (mode.equals(stageMode)) return;
+    AxGen[] set = stageSets.get(mode);
+    if (set == null) {
+      Object retries = this.options.getOrDefault("validation_retries", this.options.getOrDefault("validationRetries", 1));
+      set = new AxGen[] {
+        new AxGen(AxSignature.create(String.valueOf(record.get("distiller_signature"))), actorOptions(retries, "ctx.root.actor", record.getOrDefault("distiller_description", ""))),
+        new AxGen(AxSignature.create(String.valueOf(record.get("executor_signature"))), actorOptions(retries, "task.root.actor", record.getOrDefault("executor_description", ""))),
+        newResponder(),
+      };
+      stageSets.put(mode, set);
+    } else {
+      set[0].setInstruction(String.valueOf(record.getOrDefault("distiller_description", "")));
+      set[1].setInstruction(String.valueOf(record.getOrDefault("executor_description", "")));
+      set[2].setInstruction(String.valueOf(record.getOrDefault("responder_description", "")));
+    }
+    if (!optimizedComponents.isEmpty()) {
+      for (AxGen stage : set) stage.applyOptimizedComponents(optimizedComponents);
+    }
+    distiller = set[0];
+    executor = set[1];
+    responder = set[2];
+    stageMode = mode;
+    rebindPlaybook();
+  }
+
+  // As in TypeScript, the responder's validation budget is maxRetries unless
+  // validation_retries is set, and with citations on it asserts that the
+  // cited ids exist in the run's evidence.
+  private AxGen newResponder() {
+    Map<String, Object> responderOptions = new LinkedHashMap<>();
+    if (this.options.containsKey("validation_retries")) responderOptions.put("validation_retries", this.options.get("validation_retries"));
+    responderOptions.put("id", "task.root.responder");
+    responderOptions.put("instruction", Core.get(state, "responder_description", ""));
+    AxGen built = new AxGen(AxSignature.create(String.valueOf(Core.get(state, "responder_signature", "input:json -> completion:json"))), responderOptions);
+    if (Core.truthy(Core.get(Core.get(state, "citations", Map.of()), "enabled", false))) {
+      Map<String, Object> runState = this.state;
+      built.addAssert((AxGen.AssertionCallback) output -> Core._agent_citation_assert(runState, output));
+    }
+    return built;
   }
 
   private Map<String, Object> childOptions(Object retries, String id, Object instruction) {
@@ -66,6 +129,22 @@ public final class AxAgent implements AxProgram {
     out.put("id", id);
     out.put("instruction", instruction);
     return out;
+  }
+
+  // The actor stages list every input field in their system prompt, as TS's
+  // actor AxGen does (includeOptionalInputFieldsInSystemPrompt).
+  private Map<String, Object> actorOptions(Object retries, String id, Object instruction) {
+    Map<String, Object> out = childOptions(retries, id, instruction);
+    out.put("includeOptionalInputFieldsInSystemPrompt", true);
+    return out;
+  }
+
+  public AxAgent addChildAgent(String namespace, String name, AxAgent child) {
+    Map<String, Object> updated = Core.asMap(Core._agent_register_child(options, namespace, name, child, child.signature));
+    options.clear();
+    options.putAll(updated);
+    rebuildFromSignature(signature);
+    return this;
   }
 
   public AxAgent setSignature(String signature) {
@@ -84,14 +163,14 @@ public final class AxAgent implements AxProgram {
   public AxAgent setInstruction(String instruction) {
     Object composed = Core._agent_set_instruction(state, instruction == null ? "" : instruction);
     options.put("instruction", Core.get(state, "stage_instruction", ""));
-    executor.setInstruction(String.valueOf(composed));
+    setStageInstruction(executor, String.valueOf(composed));
     return this;
   }
 
   public AxAgent addActorInstruction(String addendum) {
     Object composed = Core._agent_add_actor_instruction(state, addendum == null ? "" : addendum);
     options.put("instructionAddenda", new ArrayList<>(Core.asList(Core.get(state, "instruction_addenda", List.of()))));
-    executor.setInstruction(String.valueOf(composed));
+    setStageInstruction(executor, String.valueOf(composed));
     return this;
   }
 
@@ -103,15 +182,57 @@ public final class AxAgent implements AxProgram {
     return forward(client, values, forwardOptions, AxRuntimeHooks.fromOptions(forwardOptions));
   }
 
+  public Map<String,Object> forwardWithCancellation(AiClient client,Map<String,Object> values,AxCancellationToken cancellation){return forwardWithCancellation(client,values,Map.of(),cancellation);}
+  public Map<String,Object> forwardWithCancellation(AiClient client,Map<String,Object> values,Map<String,Object> options,AxCancellationToken cancellation){Map<String,Object> resolved=new LinkedHashMap<>(options==null?Map.of():options);resolved.put("cancellation",cancellation);return forward(client,values,resolved);}
+
   public Map<String, Object> forward(AiClient client, Map<String, Object> values, Map<String, Object> forwardOptions, AxRuntimeHooks hooks) {
-    AxGlobals.Scope scope = AxGlobals.openScope(
-        hooks,
-        runtimeHooks,
-        "ax_gen_agent_forward",
-        "ax_gen_agent",
-        Map.of("ax.program.id", "root.agent", "ax.program.type", "AxAgent"));
+    return run(client, values, forwardOptions, hooks, null);
+  }
+
+  /** Streams a run with no options; see {@link #streamingForward(AiClient, Map, Map, AxCancellationToken)}. */
+  public AxGenDeltaStream streamingForward(AiClient client, Map<String, Object> values) {
+    return streamingForward(client, values, Map.of(), null);
+  }
+
+  /** Streams a run; see {@link #streamingForward(AiClient, Map, Map, AxCancellationToken)}. */
+  public AxGenDeltaStream streamingForward(AiClient client, Map<String, Object> values, Map<String, Object> options) {
+    return streamingForward(client, values, options, null);
+  }
+
+  /**
+   * Runs the agent and returns the responder's output as it streams, as TypeScript's
+   * streamingForward does. The distiller and the executor (or the direct-respond skip) run first
+   * without streaming; then the stream yields the responder's {@link AxGenDelta} updates (see
+   * {@link AxGen#streamingForward}). With citations {@code surface: "hidden"} the updates leave
+   * out the citation field, and {@code onCitations} gets the streamed citations after the stream.
+   * The run works on a worker thread that starts when iteration starts and waits while the caller
+   * handles each update; closing the stream stops the run, and with a run {@code control} the run
+   * then ends with an aborted event. On a client that opens native chat sessions, each stage
+   * request opens its own session, and the responder streams its session's output as AxGen deltas
+   * do.
+   */
+  public AxGenDeltaStream streamingForward(AiClient client, Map<String, Object> values, Map<String, Object> options, AxCancellationToken cancellation) {
+    Map<String, Object> runOptions = new LinkedHashMap<>(options == null ? Map.of() : options);
+    AxCancellationToken parent = cancellation;
+    for (String key : List.of("cancellation", "cancellationToken", "cancellation_token")) {
+      Object token = runOptions.remove(key);
+      if (parent == null && token instanceof AxCancellationToken given) parent = given;
+    }
+    AxGenDeltaStream.StopToken stop = new AxGenDeltaStream.StopToken();
+    runOptions.put("cancellation", stop);
+    Map<String, Object> input = values == null ? new LinkedHashMap<>() : new LinkedHashMap<>(values);
+    return new AxGenDeltaStream(sink -> run(client, input, runOptions, AxRuntimeHooks.fromOptions(runOptions), sink), stop, parent);
+  }
+
+  // forward, and with a sink the streaming forward.
+  private Map<String, Object> run(AiClient client, Map<String, Object> values, Map<String, Object> forwardOptions, AxRuntimeHooks hooks, java.util.function.Consumer<Map<String, Object>> sink) {
+    Map<String, Object> attributes = new LinkedHashMap<>();
+    attributes.put("ax.program.id", "root.agent");
+    attributes.put("ax.program.type", "AxAgent");
+    if (sink != null) attributes.put("ax.streaming", true);
+    AxGlobals.Scope scope = AxGlobals.openScope(hooks, runtimeHooks, "ax_gen_agent_forward", "ax_gen_agent", attributes);
     try {
-      return forwardUnscoped(client, values, AxRuntimeHooks.strip(forwardOptions));
+      return forwardUnscoped(client, values, AxRuntimeHooks.strip(forwardOptions), sink);
     } catch (RuntimeException | Error error) {
       scope.fail(error);
       throw error;
@@ -120,14 +241,21 @@ public final class AxAgent implements AxProgram {
     }
   }
 
-  private Map<String, Object> forwardUnscoped(AiClient client, Map<String, Object> values, Map<String, Object> forwardOptions) {
+  private Map<String, Object> forwardUnscoped(AiClient client, Map<String, Object> values, Map<String, Object> forwardOptions, java.util.function.Consumer<Map<String, Object>> sink) {
     Map<String, Object> callOptions = new LinkedHashMap<>(forwardOptions == null ? Map.of() : forwardOptions);
+    if (callOptions.get("cancellation") instanceof AxCancellationToken cancellation) cancellation.throwIfCancelled();
+    useStageMode(callOptions);
     AxExecutionContext callContext = AxExecutionContext.resolve(callOptions, executionContext);
-    if (callContext != null) {
+    if (callContext != null || Core.truthy(state.get("mcp_run_context_active"))) {
+      List<Map<String,Object>> modules = List.of();
+      if (callContext != null) { callContext.initialize(); modules = callContext.runtimeModules(); }
       callOptions.put("executionContext", callContext);
-      List<Object> functions = new ArrayList<>(Core.asList(callOptions.getOrDefault("functions", List.of())));
-      functions.addAll(callContext.runtimeModules());
-      callOptions.put("functions", functions);
+      Core._agent_apply_run_context(state, options, callOptions, modules);
+      if (Core.truthy(state.get("runtime_enabled"))) {
+        setStageInstruction(distiller, String.valueOf(state.get("distiller_description")));
+        setStageInstruction(executor, String.valueOf(state.get("executor_description")));
+        setStageInstruction(responder, String.valueOf(state.get("responder_description")));
+      }
     }
     // Wire the built-in llmQuery primitive onto the runtime carried in agent
     // options (the same runtime the actor loop will create sessions on),
@@ -135,18 +263,68 @@ public final class AxAgent implements AxProgram {
     // AxIR-generated helper; this only registers the host callable.
     Object runtimeObj = callOptions.get("runtime");
     if (runtimeObj == null) runtimeObj = options.get("runtime");
+    var bindingActive = new java.util.concurrent.atomic.AtomicBoolean(true);
     if (runtimeObj instanceof AxCodeRuntime runtime) {
-      runtime.registerHostCallable("llmQuery", params -> Core._agent_run_llm_query(llmQuery, client, params));
+      java.lang.ref.WeakReference<AxAgent> parent = new java.lang.ref.WeakReference<>(this);
+      Thread owner = Thread.currentThread();
+      for (Object rawName : Core.asList(Core._agent_runtime_callable_names(state))) {
+        String qualified = String.valueOf(rawName);
+        runtime.registerHostCallable(qualified, arguments -> {
+          if (!bindingActive.get()) throw new IllegalStateException("Agent invocation belongs to a closed run");
+          AxAgent active = parent.get();
+          if (active == null) throw new IllegalStateException("Agent invocation belongs to a closed run");
+          if (Thread.currentThread() != owner) throw new IllegalStateException("Agent runtime callbacks must execute on the owning run thread");
+          return Core._agent_runtime_invoke_callable(active.state, qualified, arguments);
+        });
+      }
+      runtime.registerHostCallable("llmQuery", params -> {
+        if (!bindingActive.get()) throw new IllegalStateException("Agent invocation belongs to a closed run");
+        if (Thread.currentThread() != owner) throw new IllegalStateException("Agent runtime callbacks must execute on the owning run thread");
+        return Core._agent_run_llm_query(llmQuery, client, params, callOptions);
+      });
     }
-    Map<String, Object> output = Core.asMap(Core._agent_forward(
-      state,
-      distiller,
-      executor,
-      responder,
-      client,
-      values == null ? Map.of() : values,
-      callOptions
-    ));
+    // As TypeScript's forward and streamingForward do, a run control hears
+    // the run's own lifecycle at its path; each stage reports at
+    // <path>/<stage>.
+    AxRunControl control = callOptions.get("control") instanceof AxRunControl given ? given : null;
+    String runPath = String.valueOf(callOptions.getOrDefault("execution_path", callOptions.getOrDefault("executionPath", "root")));
+    if (control != null) control.emit(Map.of("type", "started", "path", runPath));
+    Map<String, Object> output;
+    try {
+      if (sink == null) {
+        output = Core.asMap(Core._agent_forward(
+          state,
+          distiller,
+          executor,
+          responder,
+          client,
+          values == null ? Map.of() : values,
+          callOptions
+        ));
+      } else {
+        output = Core.asMap(Core._agent_streaming_forward(
+          state,
+          distiller,
+          executor,
+          responder,
+          client,
+          values == null ? Map.of() : values,
+          callOptions,
+          sink
+        ));
+      }
+    } catch (RuntimeException | Error error) {
+      if (control != null) {
+        if (sink != null && callOptions.get("cancellation") instanceof AxGenDeltaStream.StopToken stop && stop.consumerStopped()) {
+          // The consumer stopped the stream early: the run ended on purpose,
+          // as with control.abort().
+          control.emit(Map.of("type", "aborted", "path", runPath));
+        } else {
+          control.emit(Map.of("type", "failed", "path", runPath, "error", String.valueOf(error)));
+        }
+      }
+      throw error;
+    } finally { bindingActive.set(false); }
     Object citationConfig = this.options.get("citations");
     if (citationConfig instanceof Map<?, ?> rawCitationConfig) {
       Map<String, Object> config = Core.asMap(rawCitationConfig);
@@ -161,7 +339,10 @@ public final class AxAgent implements AxProgram {
         }
       }
     }
-    learnPlaybookFailures(output);
+    // TS learns from the responder's answer after forward; a stream has no
+    // single answer to hand the playbook.
+    learnPlaybookFailures(sink == null ? output : new LinkedHashMap<>());
+    if (control != null) control.emit(Map.of("type", "completed", "path", runPath));
     return output;
   }
 
@@ -334,12 +515,14 @@ public final class AxAgent implements AxProgram {
   public AxAgent applyOptimizedComponents(Map<String, Object> componentMap) {
     Map<String, Object> updates = componentMap == null ? Map.of() : componentMap;
     Core._validate_optimization_component_map(getOptimizableComponents(), updates);
+    // Kept for the other stage set, which gets them when a run switches to it.
+    optimizedComponents.putAll(updates);
     distiller.applyOptimizedComponents(updates);
     executor.applyOptimizedComponents(updates);
     responder.applyOptimizedComponents(updates);
     Object composed = Core._agent_apply_optimized_components(state, updates);
     options.putAll(Core.asMap(Core.get(state, "options", Map.of())));
-    executor.setInstruction(String.valueOf(composed));
+    setStageInstruction(executor, String.valueOf(composed));
     return this;
   }
 
@@ -353,32 +536,31 @@ public final class AxAgent implements AxProgram {
 
   public Map<String, Object> evaluateOptimizationTask(AiClient client, Map<String, Object> task, Map<String, Object> options) {
     Map<String, Object> opts = options == null ? Map.of() : options;
+    // A runtime on the evolve or optimize call runs each task, as it runs a
+    // forward call (the agent may hold only a runtime descriptor), unless
+    // forward_options names one.
+    Map<String, Object> forwardOptions = new LinkedHashMap<>(Core.asMap(opts.getOrDefault("forward_options", Map.of())));
+    if (opts.get("runtime") != null && forwardOptions.get("runtime") == null) forwardOptions.put("runtime", opts.get("runtime"));
+    // As TS evaluates each task from a fresh state, the prediction carries
+    // only this run's share of the agent's logs.
+    Object marks = Core._agent_eval_marks(state);
+    Map<String, Object> completion = new LinkedHashMap<>();
+    // TS's evaluation path runs no playbook run-end learning.
+    state.put("playbook_learning_paused", true);
     try {
-      Map<String, Object> output = forward(client, Core.asMap(task.getOrDefault("input", task)), Core.asMap(opts.getOrDefault("forward_options", Map.of())));
-      return Core.asMap(Core._build_agent_eval_prediction(output, getActionLog(), getUsage(), exportTrace()));
+      Map<String, Object> output = forward(client, Core.asMap(task.getOrDefault("input", task)), forwardOptions);
+      completion.put("type", "final");
+      completion.put("output", output);
     } catch (AxAgentClarificationException e) {
-      Map<String, Object> out = new LinkedHashMap<>();
-      out.put("completionType", "askClarification");
-      out.put("clarification", e.clarification());
-      out.put("actionLog", getActionLog());
-      out.put("functionCalls", Core.asList(state.getOrDefault("function_call_traces", List.of())));
-      out.put("toolErrors", List.of());
-      out.put("turnCount", 0);
-      out.put("usage", getUsage());
-      out.put("trace", exportTrace());
-      return out;
+      completion.put("type", "askClarification");
+      completion.put("clarification", e.clarification());
     } catch (RuntimeException e) {
-      Map<String, Object> out = new LinkedHashMap<>();
-      out.put("completionType", "error");
-      out.put("error", Map.of("message", String.valueOf(e.getMessage())));
-      out.put("actionLog", getActionLog());
-      out.put("functionCalls", Core.asList(state.getOrDefault("function_call_traces", List.of())));
-      out.put("toolErrors", List.of(String.valueOf(e.getMessage())));
-      out.put("turnCount", 0);
-      out.put("usage", getUsage());
-      out.put("trace", exportTrace());
-      return out;
+      completion.put("type", "error");
+      completion.put("message", String.valueOf(e.getMessage()));
+    } finally {
+      state.remove("playbook_learning_paused");
     }
+    return Core.asMap(Core._build_agent_run_prediction(state, marks, completion, getUsage(), exportTrace()));
   }
 
   public Map<String, Object> evaluateOptimization(AiClient client, Object dataset, Map<String, Object> candidateMap, Map<String, Object> options) {
@@ -452,17 +634,49 @@ public final class AxAgent implements AxProgram {
     if (!(student instanceof AiClient)) {
       throw new IllegalArgumentException("AxAgent.playbook(): studentAI is required when the agent has no default ai.");
     }
-    AxGen stage = "responder".equals(target) ? this.responder : this.executor;
+    this.playbookTarget = target;
+    this.playbookApply = !Boolean.FALSE.equals(opts.get("apply"));
+    AxGen stage = playbookStage();
     opts.put("studentAI", student);
     AxPlaybook handle = new AxPlaybook(stage, opts);
-    if (Boolean.FALSE.equals(opts.get("apply"))) {
-      handle.setApplyHook(rendered -> {});
-    } else {
-      String base = stage.getInstruction();
-      handle.setApplyHook(rendered -> stage.setInstruction(AxPlaybook.composeInstruction(base, rendered)));
-    }
+    bindPlaybookStage(handle, stage);
     this.playbookHandle = handle.bindAgent(this);
     return this.playbookHandle;
+  }
+
+  // The stage the playbook targets: the actor, or the responder.
+  private AxGen playbookStage() {
+    return "responder".equals(playbookTarget) ? responder : executor;
+  }
+
+  // Point the playbook at an agent stage: the program it runs and the hook
+  // that writes the rendered playbook into the stage prompt.
+  private void bindPlaybookStage(AxPlaybook handle, AxGen stage) {
+    handle.rebindProgram(stage);
+    if (!playbookApply) {
+      handle.setApplyHook(rendered -> {});
+      return;
+    }
+    String base = stage.getInstruction();
+    handle.setApplyHook(rendered -> stage.setInstruction(AxPlaybook.composeInstruction(base, rendered)));
+  }
+
+  // Point the playbook at its stage again and write it into that stage's
+  // prompt: setSignature and addChildAgent rebuild the stages, and
+  // setStageInstruction rewrites a stage's instruction.
+  private void rebindPlaybook() {
+    if (playbookHandle == null) return;
+    bindPlaybookStage(playbookHandle, playbookStage());
+    playbookHandle.applyTo(null);
+  }
+
+  // Write an agent stage's instruction. The stage the playbook targets gets
+  // the rendered playbook composed on top, as TS keeps it in the stage prompt,
+  // so a stage instruction, an actor addendum, optimized components or the
+  // run-context refresh never drop it.
+  private void setStageInstruction(AxGen stage, String instruction) {
+    stage.setInstruction(instruction);
+    if (playbookHandle != null && playbookStage() == stage) rebindPlaybook();
   }
 
   public AxPlaybook getPlaybook() { return this.playbookHandle; }
@@ -470,19 +684,17 @@ public final class AxAgent implements AxProgram {
   private void attachConfiguredPlaybook() {
     Map<String, Object> config = this.playbookConfig instanceof Map<?, ?> ? new LinkedHashMap<>(Core.asMap(this.playbookConfig)) : new LinkedHashMap<>();
     config.putIfAbsent("maxReflectorRounds", 1);
-    Object seed = config.get("seed");
-    if (seed == null && (config.containsKey("playbook") || config.containsKey("artifact"))) seed = config;
+    // TS's `playbook` seed (a snapshot or a bare playbook). Numeric `seed` is reserved for the optimizer.
+    Object seed = Core._agent_playbook_config_seed(config);
     playbook(config);
-    if (seed instanceof Map<?, ?> seedMap) {
-      Map<String, Object> snapshot = Core.asMap(seedMap);
-      if (snapshot.containsKey("playbook")) playbookHandle.load(snapshot);
-      else playbookHandle.load(new LinkedHashMap<>(Map.of("playbook", snapshot)));
-    }
+    if (seed instanceof Map<?, ?> seedMap) playbookHandle.load(Core.asMap(seedMap));
   }
 
   @SuppressWarnings("unchecked")
   private void learnPlaybookFailures(Map<String, Object> output) {
     if (playbookHandle == null || playbookConfig == null || Boolean.FALSE.equals(playbookConfig)) return;
+    // An evaluated run learns nothing, as TS's evaluation path.
+    if (Core.truthy(Core.get(state, "playbook_learning_paused", false))) return;
     Map<String, Object> config = playbookConfig instanceof Map<?, ?> ? Core.asMap(playbookConfig) : Map.of();
     Object learn = config.getOrDefault("learn", Boolean.TRUE);
     if (Boolean.FALSE.equals(learn)) return;

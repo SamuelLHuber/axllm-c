@@ -6,6 +6,24 @@ import java.util.List;
 import java.util.Map;
 
 public final class AxFlow implements AxProgram {
+  public java.util.function.Supplier<AxProgram> ownedWorkerFactory() {
+    if(executionContext!=null)return null;
+    Map<String,Object> snapshot=Core.asMap(Core.ownedCopy(state));
+    Map<Integer,java.util.function.Supplier<AxProgram>> factories=new LinkedHashMap<>();
+    List<Object> steps=Core.asList(snapshot.get("steps"));
+    for(int index=0;index<steps.size();index++){
+      Object value=Core.get(steps.get(index),"program",null);if(value==null)continue;
+      if(!(value instanceof AxProgram program))return null;
+      var factory=program.ownedWorkerFactory();if(factory==null)return null;factories.put(index,factory);
+    }
+    var ownedOptions=Core.asMap(Core.ownedCopy(options));AxRuntimeHooks hooks=runtimeHooks;
+    return ()->{
+      AxFlow owned=new AxFlow(Core.asMap(Core.ownedCopy(ownedOptions)),hooks);owned.state.clear();owned.state.putAll(Core.asMap(Core.ownedCopy(snapshot)));
+      List<Object> ownedSteps=Core.asList(owned.state.get("steps"));
+      for(var entry:factories.entrySet())Core.set(ownedSteps.get(entry.getKey()),"program",entry.getValue().get());
+      return owned;
+    };
+  }
   public interface Mapper {
     Object apply(Map<String, Object> state);
   }
@@ -213,6 +231,7 @@ public final class AxFlow implements AxProgram {
   }
 
   public Map<String, Object> evaluateOptimization(AiClient client, Object dataset, Map<String, Object> candidateMap, Map<String, Object> options) {
+    if (options != null && options.get("demos") instanceof List<?> demos && !demos.isEmpty()) setDemos(demos);
     return Core.asMap(Core._flow_evaluate_optimization(state, client, dataset == null ? List.of() : dataset, candidateMap == null ? Map.of() : candidateMap, options == null ? Map.of() : options));
   }
 
@@ -248,22 +267,56 @@ public final class AxFlow implements AxProgram {
     return forward(client, values, options, AxRuntimeHooks.fromOptions(options));
   }
 
+  public Map<String,Object> forwardWithCancellation(AiClient client,Map<String,Object> values,AxCancellationToken cancellation){return forwardWithCancellation(client,values,Map.of(),cancellation);}
+  public Map<String,Object> forwardWithCancellation(AiClient client,Map<String,Object> values,Map<String,Object> options,AxCancellationToken cancellation){Map<String,Object> resolved=new LinkedHashMap<>(options==null?Map.of():options);resolved.put("cancellation",cancellation);return forward(client,values,resolved);}
+
   public Map<String, Object> forward(AiClient client, Map<String, Object> values, Map<String, Object> options, AxRuntimeHooks hooks) {
+    // As in TypeScript, the flow reads its cache before its span and metrics,
+    // so a stored output runs no node and records neither.
+    Map<String, Object> callOptions = AxRuntimeHooks.strip(options);
+    Map<String, Object> cached = readCacheFirst(values == null ? Map.of() : values, callOptions);
+    if (cached != null) return cached;
+    // As TypeScript's AxFlow.forward does, a run control hears the flow's own
+    // lifecycle at its path; each node reports at <path>/<node>.
+    AxRunControl control = callOptions.get("control") instanceof AxRunControl given ? given : null;
+    String runPath = String.valueOf(callOptions.getOrDefault("execution_path", callOptions.getOrDefault("executionPath", "root")));
+    if (control != null) control.emit(Map.of("type", "started", "path", runPath));
     AxGlobals.Scope scope = AxGlobals.openScope(
         hooks,
         runtimeHooks,
         "ax_gen_flow_forward",
         "ax_gen_flow",
         Map.of("ax.program.id", String.valueOf(state.getOrDefault("program_id", "root.flow")), "ax.program.type", "AxFlow"));
+    Map<String, Object> output;
     try {
-      return forwardUnscoped(client, values, AxRuntimeHooks.strip(options));
+      output = forwardUnscoped(client, values, callOptions);
     } catch (RuntimeException | Error error) {
       scope.fail(error);
+      if (control != null) control.emit(Map.of("type", "failed", "path", runPath, "error", String.valueOf(error.getMessage())));
       throw error;
     } finally {
       scope.close();
     }
+    if (control != null) control.emit(Map.of("type", "completed", "path", runPath));
+    return output;
   }
+
+  // The flow's cache read (Core._flow_cache_lookup_impl), made before the run
+  // opens its span and metrics. It returns the stored output on a hit; after
+  // a miss it adds the lookup to callOptions as _ax_flow_cache_lookup, so the
+  // forward only stores, and returns null. Options that already carry a
+  // lookup are left as they are, and without a caching function (or under a
+  // run control) the options stay unchanged.
+  private Map<String, Object> readCacheFirst(Map<String, Object> values, Map<String, Object> callOptions) {
+    if (callOptions.containsKey(CACHE_LOOKUP)) return null;
+    Map<String, Object> lookup = Core.asMap(Core._flow_cache_lookup_impl(state, values, callOptions));
+    if (lookup.get("fn") == null) return null;
+    if (Core.truthy(lookup.get("hit"))) return Core.asMap(lookup.get("value"));
+    callOptions.put(CACHE_LOOKUP, lookup);
+    return null;
+  }
+
+  private static final String CACHE_LOOKUP = "_ax_flow_cache_lookup";
 
   private Map<String, Object> forwardUnscoped(AiClient client, Map<String, Object> values, Map<String, Object> options) {
     Map<String, Object> callOptions = new LinkedHashMap<>(options == null ? Map.of() : options);

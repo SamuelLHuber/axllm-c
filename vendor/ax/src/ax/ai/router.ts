@@ -136,6 +136,23 @@ export class AxProviderRouter {
     this.config = config.routing;
   }
 
+  /** Select and pin a provider for one session without failover. */
+  async openChatSession(
+    request: AxChatRequest,
+    options: AxAIServiceOptions = {}
+  ) {
+    const routing = await this.selectProviderWithDegradation(
+      request,
+      {},
+      options.serviceTier,
+      options
+    );
+    if (!routing.provider.openChatSession)
+      throw new Error('Selected provider does not support chat sessions');
+    const processed = await this.preprocessRequest(request, routing.provider);
+    return await routing.provider.openChatSession(processed, options);
+  }
+
   /**
    * Routes a chat request to the most appropriate provider with automatic content processing.
    *
@@ -185,7 +202,8 @@ export class AxProviderRouter {
     const routingResult = await this.selectProviderWithDegradation(
       request,
       options.routingOptions || {},
-      options.serviceTier
+      options.serviceTier,
+      options
     );
 
     const processedRequest = await this.preprocessRequest(
@@ -195,6 +213,7 @@ export class AxProviderRouter {
     );
 
     try {
+      routingResult.provider.validateChatRequest?.(processedRequest, options);
       const response = await routingResult.provider.chat(
         processedRequest,
         options
@@ -263,9 +282,9 @@ export class AxProviderRouter {
           processedChatPrompt.push({
             ...message,
             content: processedContent.map((item) =>
-              item.type === 'image'
-                ? item
-                : { type: 'text' as const, text: item.text }
+              item.type === 'text'
+                ? { type: 'text' as const, text: item.text }
+                : item
             ),
           });
         }
@@ -290,7 +309,8 @@ export class AxProviderRouter {
       allowDegradation?: boolean;
       maxRetries?: number;
     },
-    serviceTier?: AxAIServiceOptions['serviceTier']
+    serviceTier?: AxAIServiceOptions['serviceTier'],
+    serviceOptions?: Readonly<AxAIServiceOptions>
   ): Promise<AxRoutingResult> {
     const requirements = axAnalyzeRequestRequirements(request);
     const processingApplied: string[] = [];
@@ -309,12 +329,18 @@ export class AxProviderRouter {
       if (eligibleProviders.length === 0) {
         throw new Error(`No provider supports service tier ${serviceTier}`);
       }
-      const provider = axSelectOptimalProvider(request, eligibleProviders, {
-        requireExactMatch:
-          options.requireExactMatch ?? this.config.capability.requireExactMatch,
-        allowDegradation:
-          options.allowDegradation ?? this.config.capability.allowDegradation,
-      });
+      const provider = axSelectOptimalProvider(
+        request,
+        eligibleProviders,
+        {
+          requireExactMatch:
+            options.requireExactMatch ??
+            this.config.capability.requireExactMatch,
+          allowDegradation:
+            options.allowDegradation ?? this.config.capability.allowDegradation,
+        },
+        serviceOptions
+      );
 
       const features = provider.getFeatures();
 
@@ -382,6 +408,7 @@ export class AxProviderRouter {
         continue;
       }
       try {
+        fallbackProvider.validateChatRequest?.(request, options);
         const routingResult: AxRoutingResult = {
           provider: fallbackProvider,
           processingApplied: ['Fallback provider selection'],
@@ -397,6 +424,7 @@ export class AxProviderRouter {
           { fallbackBehavior: 'degrade' }
         );
 
+        fallbackProvider.validateChatRequest?.(processedRequest, options);
         const response = await fallbackProvider.chat(processedRequest, options);
 
         return {

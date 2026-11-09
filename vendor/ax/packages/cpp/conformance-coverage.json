@@ -32,6 +32,12 @@
       },
       {
         "suite": "axagent",
+        "kind": "agent_streaming_forward",
+        "runner": "cpp:axagent",
+        "category": "semantic"
+      },
+      {
+        "suite": "axagent",
         "kind": "agent_runtime_adapter",
         "runner": "cpp:axagent",
         "category": "semantic"
@@ -82,6 +88,36 @@
         "kind": "ai_chat",
         "runner": "cpp:axai",
         "category": "transport-boundary"
+      },
+      {
+        "suite": "axai",
+        "kind": "ai_responses_validation",
+        "runner": "cpp:axai",
+        "category": "semantic"
+      },
+      {
+        "suite": "axai",
+        "kind": "ai_typesafe_native",
+        "runner": "cpp:axai",
+        "category": "transport-boundary"
+      },
+      {
+        "suite": "axai",
+        "kind": "ai_decisions_native",
+        "runner": "cpp:axai",
+        "category": "transport-boundary"
+      },
+      {
+        "suite": "axai",
+        "kind": "ai_session_events",
+        "runner": "cpp:axai",
+        "category": "semantic"
+      },
+      {
+        "suite": "axai",
+        "kind": "ai_session_state",
+        "runner": "cpp:axai",
+        "category": "semantic"
       },
       {
         "suite": "axai",
@@ -282,7 +318,25 @@
       },
       {
         "suite": "axgen",
+        "kind": "date_field_value",
+        "runner": "cpp:axgen",
+        "category": "semantic"
+      },
+      {
+        "suite": "axgen",
+        "kind": "date_input",
+        "runner": "cpp:axgen",
+        "category": "semantic"
+      },
+      {
+        "suite": "axgen",
         "kind": "stream",
+        "runner": "cpp:axgen",
+        "category": "semantic"
+      },
+      {
+        "suite": "axgen",
+        "kind": "eval_novel_f1",
         "runner": "cpp:axgen",
         "category": "semantic"
       }
@@ -424,6 +478,20 @@
       {
         "suite": "axmcp",
         "kind": "mcp",
+        "operation": "tool_authorization",
+        "runner": "cpp:axmcp.tool_authorization",
+        "category": "transport-boundary"
+      },
+      {
+        "suite": "axmcp",
+        "kind": "mcp",
+        "operation": "tool_task_handling",
+        "runner": "cpp:axmcp.tool_task_handling",
+        "category": "transport-boundary"
+      },
+      {
+        "suite": "axmcp",
+        "kind": "mcp",
         "operation": "mrtr_violations",
         "runner": "cpp:axmcp.mrtr_violations",
         "category": "semantic"
@@ -433,6 +501,13 @@
         "kind": "mcp",
         "operation": "subscriptions_listen",
         "runner": "cpp:axmcp.subscriptions_listen",
+        "category": "transport-boundary"
+      },
+      {
+        "suite": "axmcp",
+        "kind": "mcp",
+        "operation": "task_listen_restart",
+        "runner": "cpp:axmcp.task_listen_restart",
         "category": "transport-boundary"
       },
       {
@@ -643,6 +718,12 @@
       {
         "suite": "prompt",
         "kind": "template_validate",
+        "runner": "cpp:prompt",
+        "category": "semantic"
+      },
+      {
+        "suite": "prompt",
+        "kind": "number_format",
         "runner": "cpp:prompt",
         "category": "semantic"
       }

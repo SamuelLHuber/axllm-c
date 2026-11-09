@@ -43,7 +43,7 @@ export class MemoryImpl {
 
   addResponse(results: Readonly<AxChatResponseResult[]>): void {
     // Drop assistant turns with no usable content (empty/whitespace text, no
-    // tool calls, no thoughts, no audio). Storing one poisons a later outgoing
+    // tool calls, no thoughts, no audio/images). Storing one poisons a later outgoing
     // request, which fails assistant-message validation and hard-aborts the run.
     const meaningful = results.filter((result) => {
       const hasContent =
@@ -53,7 +53,15 @@ export class MemoryImpl {
       const hasThoughtBlocks =
         Array.isArray(result.thoughtBlocks) && result.thoughtBlocks.length > 0;
       const hasAudio = result.audio != null;
-      return hasContent || hasFunctionCalls || hasThoughtBlocks || hasAudio;
+      const hasImages =
+        Array.isArray(result.images) && result.images.length > 0;
+      return (
+        hasContent ||
+        hasFunctionCalls ||
+        hasThoughtBlocks ||
+        hasAudio ||
+        hasImages
+      );
     });
 
     if (meaningful.length === 0) {
@@ -74,6 +82,8 @@ export class MemoryImpl {
     functionCalls,
     thought,
     thoughtBlocks,
+    images,
+    phase,
     index,
   }: Readonly<AxChatResponseResult & { index: number }>): void {
     const lastItem = this.data.at(-1);
@@ -95,6 +105,8 @@ export class MemoryImpl {
               functionCalls,
               thought,
               thoughtBlocks,
+              images,
+              phase,
             }),
           },
         ],
@@ -113,6 +125,8 @@ export class MemoryImpl {
           functionCalls,
           thought,
           thoughtBlocks,
+          images,
+          phase,
         }),
       });
       return;
@@ -131,6 +145,25 @@ export class MemoryImpl {
         functionCalls;
     }
 
+    if (Array.isArray(images) && images.length > 0) {
+      const existing = ((chat.value as any).images ?? []) as typeof images;
+      for (const image of images) {
+        const imageIndex = image.id
+          ? existing.findIndex((candidate) => candidate.id === image.id)
+          : -1;
+        if (imageIndex >= 0) {
+          existing[imageIndex] = structuredClone(image);
+        } else {
+          existing.push(structuredClone(image));
+        }
+      }
+      (chat.value as any).images = existing;
+    }
+
+    if (phase !== undefined) {
+      (chat.value as any).phase = phase;
+    }
+
     if (typeof thought === 'string' && thought.trim() !== '') {
       const existing = (chat.value as any).thought;
       (chat.value as any).thought =
@@ -145,13 +178,44 @@ export class MemoryImpl {
       // For streaming, we may receive partial data for the same block
       // New blocks are appended, existing blocks have their data concatenated
       for (const newBlock of thoughtBlocks) {
+        // Responses identifies each reasoning/commentary item independently.
+        // A completed summary replaces its deltas and carries opaque replay state.
+        if (newBlock.id) {
+          const blockIndex = existing.findIndex(
+            (block) => block.id === newBlock.id
+          );
+          if (blockIndex < 0) {
+            existing.push(structuredClone(newBlock));
+          } else {
+            const previous = existing[blockIndex]!;
+            const complete =
+              newBlock.summary !== undefined ||
+              newBlock.encryptedContent !== undefined;
+            existing[blockIndex] = {
+              ...previous,
+              ...structuredClone(newBlock),
+              data: complete ? newBlock.data : previous.data + newBlock.data,
+            };
+          }
+          continue;
+        }
         const lastExisting =
           existing.length > 0 ? existing[existing.length - 1] : undefined;
+
+        // Opaque redacted blocks arrive whole; concatenating them corrupts replay.
+        if (newBlock.encrypted && !newBlock.signature) {
+          existing.push(structuredClone(newBlock));
+          continue;
+        }
 
         // If the new block has no signature yet (streaming partial)
         if (!newBlock.signature && newBlock.data) {
           // Merge with last block ONLY if it doesn't have a signature yet
-          if (lastExisting && !lastExisting.signature) {
+          if (
+            lastExisting &&
+            !lastExisting.signature &&
+            lastExisting.encrypted === newBlock.encrypted
+          ) {
             lastExisting.data = (lastExisting.data ?? '') + newBlock.data;
             if (newBlock.encrypted) {
               lastExisting.encrypted = true;
@@ -162,7 +226,11 @@ export class MemoryImpl {
           }
         } else if (newBlock.signature) {
           // Block has a signature, so it's complete - check if we need to update or append
-          if (lastExisting && !lastExisting.signature) {
+          if (
+            lastExisting &&
+            !lastExisting.signature &&
+            lastExisting.encrypted === newBlock.encrypted
+          ) {
             // Update existing open block with final signature
             lastExisting.data = (lastExisting.data ?? '') + newBlock.data;
             lastExisting.signature = newBlock.signature;
@@ -181,9 +249,13 @@ export class MemoryImpl {
 
       (chat.value as any).thoughtBlocks = existing;
 
-      // Update thought string for display
-      if (existing.length > 0) {
-        (chat.value as any).thought = existing.map((b) => b.data).join('');
+      // Replay blocks alone do not opt into displaying thoughts. Preserve the
+      // provider's display choice and exclude encrypted replay data.
+      if (typeof (chat.value as any).thought === 'string') {
+        (chat.value as any).thought = existing
+          .filter((block) => !block.encrypted)
+          .map((block) => block.data)
+          .join('');
       }
     }
   }

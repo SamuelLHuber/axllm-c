@@ -1,12 +1,14 @@
 {
   "expected_output": {
-    "audio": "base64-speech",
-    "format": "mp3"
+    "data": "base64-speech",
+    "format": "mp3",
+    "mimeType": "audio/mpeg",
+    "transcript": "hello"
   },
   "expected_transport_request": {
     "json": {
       "input": "hello",
-      "model": "tts-1",
+      "model": "gpt-4o-mini-tts",
       "response_format": "mp3",
       "voice": "alloy"
     },
@@ -23,7 +25,7 @@
   "transport_responses": [
     {
       "json": {
-        "audio": "base64-speech"
+        "data": "base64-speech"
       },
       "status": 200
     }

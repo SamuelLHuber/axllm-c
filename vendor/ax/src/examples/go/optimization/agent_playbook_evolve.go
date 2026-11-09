@@ -32,9 +32,9 @@ func main() {
 	}
 	model := os.Getenv("AX_OPENAI_MODEL")
 	if model == "" {
-		model = "gpt-5.4-mini"
+		model = "gpt-6-luna"
 	}
-	client := ax.NewOpenAICompatibleClient(map[string]ax.Value{"api_key": apiKey, "model": model})
+	client := ax.NewAI("openai", map[string]ax.Value{"api_key": apiKey, "model": model})
 
 	bullet := ax.Object(
 		"id", "failures-to-avoid-00001",
@@ -59,10 +59,12 @@ func main() {
 	assistant := ax.NewAgent(
 		"question:string -> answer:string",
 		ax.Object(
+			// The playbook learns with the agent's own client.
+			"ai", client,
 			"contextFields", ax.Array(),
 			"runtime", ax.Object("language", "JavaScript"),
 			"playbook", ax.Object(
-				"seed", seed,
+				"playbook", seed, "seed", 7,
 				"onUpdate", func(value ax.Value) { playbookUpdates = append(playbookUpdates, value) },
 			),
 			"citations", ax.Object(
@@ -101,8 +103,22 @@ func main() {
 		panic(err)
 	}
 
+	// Each train task replays on the runtime. A replay that fails scores 0 and
+	// would be mined as the weakness, so stop instead.
+	replays := []ax.Value{}
+	records, _ := evolution.(map[string]ax.Value)["records"].([]ax.Value)
+	for _, raw := range records {
+		record, _ := raw.(map[string]ax.Value)
+		prediction, _ := record["prediction"].(map[string]ax.Value)
+		if record["error"] != nil || prediction["completionType"] == "error" {
+			panic(fmt.Sprintf("evolve replay failed: %v %v", record["error"], prediction["error"]))
+		}
+		replays = append(replays, prediction["completionType"])
+	}
+
 	encoded, _ := json.MarshalIndent(answer, "", "  ")
 	fmt.Println(string(encoded))
+	fmt.Println("replays:", replays)
 	fmt.Println("citations:", observedCitations)
 	fmt.Println("run-end updates:", len(playbookUpdates))
 	fmt.Println("outcomes:", evolution.(map[string]ax.Value)["outcomes"])

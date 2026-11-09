@@ -5,6 +5,15 @@
   "fence": "go",
   "packageName": "github.com/ax-llm/ax/packages/go",
   "install": ["go get github.com/ax-llm/ax/packages/go"],
+  "quickStartRun": {
+    "file": "main.go",
+    "setup": [
+      "export OPENAI_API_KEY=\"sk-...\"",
+      "go mod init quickstart && go get github.com/ax-llm/ax/packages/go"
+    ],
+    "run": ["go run ."],
+    "output": ["sentiment: positive"]
+  },
   "exampleRoot": "packages/go/examples",
   "academy": {
     "unitExamples": {
@@ -84,6 +93,18 @@
           "return stream.Err()"
         ]
       },
+      "cancellation": {
+        "sourcePath": "src/examples/go/generation/cancellation.go",
+        "verified": true,
+        "requiresCredentials": false,
+        "code": [
+          "ctx, cancel := context.WithCancelCause(context.Background())",
+          "cancel(errors.New(\"user stopped\"))",
+          "_, err := client.Chat(ctx, request, nil)",
+          "var aborted ax.AxAIServiceAbortedError",
+          "if !errors.As(err, &aborted) || aborted.Retryable { panic(err) }"
+        ]
+      },
       "balancer": {
         "sourcePath": "src/examples/go/generation/adaptive_balancer.go",
         "verified": true,
@@ -99,18 +120,84 @@
         ]
       },
       "audio": [
-        "// Realtime audio over WebSocket — needs Go 1.23+",
+        "// Realtime audio over WebSocket \u2014 needs Go 1.23+",
         "client := ax.NewOpenAIResponsesClient(map[string]ax.Value{\"model\": \"gpt-realtime-2\", \"api_key\": os.Getenv(\"OPENAI_APIKEY\")})",
         "request := map[string]ax.Value{\"model\": \"gpt-realtime-2\", \"chat_prompt\": ax.Array(ax.Object(\"role\", \"user\", \"content\", \"Say hello.\")), \"audio\": ax.Object(\"output\", ax.Object(\"voice\", \"alloy\"))}",
         "final, _ := client.RealtimeChat(context.Background(), request, nil, nil)  // one merged turn: transcript + base64 PCM audio",
         "// Realtime models also route transparently through Chat(); Chat() accepts input_audio parts; Transcribe()/Speak() do batch STT/TTS."
-      ]
+      ],
+      "typesafe": {
+        "sourcePath": "src/examples/go/generation/typesafe.go",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "// ax-example:start",
+          "// title: Go Jev Signature Decisions",
+          "// group: generation",
+          "// description: Converts Jev probabilities into boolean and class outputs with a provider threshold.",
+          "// provider: typesafe",
+          "// env: TYPESAFE_APIKEY",
+          "// level: beginner",
+          "// order: 35",
+          "// ax-example:end",
+          "package main",
+          "",
+          "import (",
+          "\t\"context\"",
+          "\t\"encoding/json\"",
+          "\t\"fmt\"",
+          "\tax \"github.com/ax-llm/ax/packages/go\"",
+          "\t\"os\"",
+          "\t\"time\"",
+          ")",
+          "",
+          "func main() {",
+          "\tctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)",
+          "\tdefer cancel()",
+          "\tmodel := ax.NewAI(\"typesafe\", map[string]ax.Value{\"api_key\": os.Getenv(\"TYPESAFE_APIKEY\"), \"trueThreshold\": 0.9})",
+          "\ttriage := ax.NewAx(\"ticket:string -> urgent:boolean(true \\\"Customers cannot complete a core task\\\", false \\\"Routine request\\\") \\\"Needs immediate attention?\\\", team:class \\\"support, billing, engineering\\\"\", nil)",
+          "\tdecisionValue, err := triage.Forward(ctx, model, map[string]ax.Value{\"ticket\": \"Checkout is unavailable for all customers after the latest deployment.\"}, nil)",
+          "\tif err != nil {",
+          "\t\tpanic(err)",
+          "\t}",
+          "\tvalues := decisionValue.(map[string]ax.Value)",
+          "\tdecision := map[string]ax.Value{\"urgent\": values[\"urgent\"], \"team\": values[\"team\"]}",
+          "\tif _, ok := decision[\"urgent\"].(bool); !ok {",
+          "\t\tpanic(\"Invalid boolean\")",
+          "\t}",
+          "\toutput := decision",
+          "\tdata, err := json.MarshalIndent(output, \"\", \"  \")",
+          "\tif err != nil {",
+          "\t\tpanic(err)",
+          "\t}",
+          "\tfmt.Println(string(data))",
+          "}"
+        ]
+      }
     },
     "quickStart": [
-      "import axllm \"github.com/ax-llm/ax/packages/go\"",
+      "package main",
       "",
-      "client := axllm.NewAI(\"openai\", map[string]axllm.Value{\"apiKey\": os.Getenv(\"OPENAI_API_KEY\")})",
-      "classify := axllm.NewAx(\"review:string -> sentiment:class \\\"positive, negative, neutral\\\"\", nil)"
+      "import (",
+      "    \"context\"",
+      "    \"fmt\"",
+      "    \"os\"",
+      "",
+      "    axllm \"github.com/ax-llm/ax/packages/go\"",
+      ")",
+      "",
+      "func main() {",
+      "    client := axllm.NewAI(\"openai\", map[string]axllm.Value{\"apiKey\": os.Getenv(\"OPENAI_API_KEY\")})",
+      "    classify := axllm.NewAx(\"review:string -> sentiment:class \\\"positive, negative, neutral\\\"\", nil)",
+      "    result, err := classify.Forward(context.Background(), client, map[string]axllm.Value{",
+      "        \"review\": \"Useful and boring in the best way.\"",
+      "    }, nil)",
+      "    if err != nil {",
+      "        panic(err)",
+      "    }",
+      "",
+      "    fmt.Println(\"sentiment:\", result.(map[string]axllm.Value)[\"sentiment\"])",
+      "}"
     ],
     "dspy": [
       "qa := axllm.NewAx(\"question:string -> answer:string, confidence:number\", nil)"
@@ -155,10 +242,69 @@
       "pb.Evolve(ctx, examples, metric, nil)   // grow a playbook offline from examples",
       "pb.Update(ctx, map[string]axllm.Value{\"example\": ex, \"prediction\": pred, \"feedback\": \"...\"})",
       "pb.ApplyTo(program)"
-    ]
+    ],
+    "decisionEvidenceExample": {
+      "sourcePath": "src/examples/go/generation/decision-evidence.go",
+      "code": [
+        "package main",
+        "",
+        "import (",
+        "\t\"context\"",
+        "\t\"encoding/json\"",
+        "\t\"fmt\"",
+        "\tax \"github.com/ax-llm/ax/packages/go\"",
+        "\t\"os\"",
+        "\t\"sort\"",
+        "\t\"time\"",
+        ")",
+        "",
+        "func main() {",
+        "\tkey := os.Getenv(\"OPENAI_API_KEY\")",
+        "\tif key == \"\" {",
+        "\t\tkey = os.Getenv(\"OPENAI_APIKEY\")",
+        "\t}",
+        "\tctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)",
+        "\tdefer cancel()",
+        "\tmodel := ax.NewAI(\"openai-decisions\", map[string]ax.Value{\"api_key\": key})",
+        "\tjudge := ax.NewAx(\"query:string, document:string -> relevant:boolean(evidence, threshold 0.7), relevance:score \\\"Irrelevant, Related, Partial answer, Direct answer\\\"(evidence)\", nil)",
+        "\tcandidates := []struct{ id, text string }{{\"refund\", \"Request a refund within 30 days through your account billing page.\"}, {\"password\", \"Reset your password using the sign-in page.\"}}",
+        "\tranked := []map[string]ax.Value{}",
+        "\tfor _, item := range candidates {",
+        "\t\tresult, err := judge.Forward(ctx, model, map[string]ax.Value{\"query\": \"How do I request a refund?\", \"document\": item.text}, nil)",
+        "\t\tif err != nil {",
+        "\t\t\tpanic(err)",
+        "\t\t}",
+        "\t\tvalues := result.(map[string]ax.Value)",
+        "\t\tvalues[\"id\"] = item.id",
+        "\t\tranked = append(ranked, values)",
+        "\t}",
+        "\tscore := func(i int) float64 { return ranked[i][\"relevance\"].(map[string]ax.Value)[\"value\"].(float64) }",
+        "\tsort.SliceStable(ranked, func(i, j int) bool { return score(i) > score(j) })",
+        "\tdata, err := json.MarshalIndent(ranked, \"\", \"  \")",
+        "\tif err != nil {",
+        "\t\tpanic(err)",
+        "\t}",
+        "\tfmt.Println(string(data))",
+        "}"
+      ],
+      "fence": "go",
+      "requiresCredentials": true
+    }
   },
   "snippetGroups": {
     "ai": {
+      "catalog": {
+        "sourcePath": "src/examples/go/generation/model_catalog.go",
+        "verified": true,
+        "requiresCredentials": false,
+        "code": [
+          "catalog := ax.GetSupportedAIModels(map[string]ax.Value{})",
+          "azure := provider(catalog, \"azure-openai\")",
+          "capabilities := azure[\"capabilities\"].(map[string]ax.Value)",
+          "fmt.Println(capabilities[\"thinkingLevels\"])",
+          "fmt.Println(capabilities[\"serviceTiers\"])"
+        ]
+      },
       "serviceTier": {
         "sourcePath": "src/examples/go/generation/gemini_service_tier.go",
         "verified": true,
@@ -181,6 +327,42 @@
           "    \"model\": \"google/gemma-4-26b-a4b-it-maas\",",
           "    \"credential_provider\": vertexCredentialProvider(),",
           "})"
+        ]
+      }
+    },
+    "ax": {
+      "streaming": {
+        "sourcePath": "src/examples/go/generation/streaming_forward.go",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "story := ax.NewAx(`topic:string -> title:string, story:string \"Three short sentences\"`, nil)",
+          "for delta, err := range story.StreamingForward(ctx, client, values, nil) {",
+          "\tif err != nil {",
+          "\t\tpanic(err)",
+          "\t}",
+          "\t// delta.Version changes when a retry starts the output over.",
+          "\tif text, ok := delta.Delta[\"story\"].(string); ok {",
+          "\t\tfmt.Print(text)",
+          "\t}",
+          "}"
+        ]
+      },
+      "dates": {
+        "sourcePath": "src/examples/go/generation/date_fields.go",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "planner := ax.NewAx(`emailText:string, sentAt:datetime -> meetingStartsAt:datetime, travelWindow:dateRange`,",
+          "\tmap[string]ax.Value{\"parseDates\": true})",
+          "out, err := planner.Forward(ctx, client, map[string]ax.Value{",
+          "\t\"emailText\": emailText,",
+          "\t\"sentAt\":    time.Date(2024, 5, 2, 16, 30, 0, 0, time.UTC),",
+          "}, nil)",
+          "if err != nil {",
+          "\tpanic(err)",
+          "}",
+          "fmt.Println(out.(map[string]ax.Value)[\"meetingStartsAt\"]) // 2024-05-07T19:00:00.000Z"
         ]
       }
     },
@@ -282,6 +464,41 @@
           "    ctx, dataset,",
           "    map[string]ax.Value{\"verify\": true, \"maxProposals\": 1, \"runtime\": runtime},",
           ")"
+        ]
+      },
+      "streaming": {
+        "sourcePath": "src/examples/go/short-agents/streaming_agent.go",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "// The handbook stays in the agent's runtime, out of the prompt. With",
+          "// citations on, the answer cites the evidence it used, and ids the run never",
+          "// gathered are sent back to the model for a correction.",
+          "assistant := ax.NewAgent(\"question:string, handbook:string -> answer:string\", map[string]ax.Value{",
+          "\t\"contextFields\": ax.Array(\"handbook\"),",
+          "\t\"runtime\":       ax.Object(\"language\", \"JavaScript\"),",
+          "\t\"citations\":     ax.Object(\"onCitations\", func(ids []ax.Value) { fmt.Printf(\"\\ncited: %v\\n\", ids) }),",
+          "})",
+          "",
+          "// The distiller and the executor run first; then the responder's answer",
+          "// streams. Merge each delta and start over when the version changes (a retry).",
+          "version := 0",
+          "for delta, err := range assistant.StreamingForward(ctx, openAIClient(), map[string]ax.Value{",
+          "\t\"question\": \"I downgraded today. When does it take effect, and is my data safe if I delete the workspace?\",",
+          "\t\"handbook\": handbook,",
+          "}, map[string]ax.Value{\"runtime\": axgoja.NewRuntime(), \"max_actor_steps\": 12}) {",
+          "\tif err != nil {",
+          "\t\tpanic(err)",
+          "\t}",
+          "\tif delta.Version != version {",
+          "\t\tversion = delta.Version",
+          "\t\tfmt.Println(\"\\n[retry: starting over]\")",
+          "\t}",
+          "\tif text, ok := delta.Delta[\"answer\"].(string); ok {",
+          "\t\tfmt.Print(text)",
+          "\t}",
+          "}",
+          "fmt.Println()"
         ]
       }
     },

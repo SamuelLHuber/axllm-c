@@ -1,0 +1,104 @@
+{
+  "expected_output": {
+    "model_usage": {
+      "ai": "google-gemini",
+      "model": "gemini-3.8-flash",
+      "tokens": {
+        "completion_tokens": 1,
+        "prompt_tokens": 2,
+        "total_tokens": 3
+      }
+    },
+    "provider_metadata": {
+      "google": {
+        "modelVersion": "gemini-3.8-flash"
+      }
+    },
+    "remote_id": "gemini-38-flash-server-managed-sampling-response",
+    "results": [
+      {
+        "content": "Done.",
+        "finish_reason": "stop",
+        "function_calls": [],
+        "index": 0
+      }
+    ]
+  },
+  "expected_transport_json_absent": [
+    "generationConfig.temperature",
+    "generationConfig.topP",
+    "generationConfig.topK",
+    "generationConfig.candidateCount",
+    "generationConfig.frequencyPenalty"
+  ],
+  "expected_transport_request": {
+    "headers": {
+      "x-goog-api-key": "test-key"
+    },
+    "json": {
+      "contents": [
+        {
+          "parts": [
+            {
+              "text": "Answer briefly."
+            }
+          ],
+          "role": "user"
+        }
+      ],
+      "generationConfig": {
+        "maxOutputTokens": 64,
+        "responseMimeType": "text/plain"
+      }
+    },
+    "method": "POST",
+    "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
+  },
+  "kind": "ai_chat",
+  "model": "gemini-3.8-flash",
+  "name": "gemini-38-flash-server-managed-sampling",
+  "provider": "google-gemini",
+  "request": {
+    "chat_prompt": [
+      {
+        "content": "Answer briefly.",
+        "role": "user"
+      }
+    ],
+    "model_config": {
+      "frequencyPenalty": 0.4,
+      "maxTokens": 64,
+      "n": 2,
+      "stream": false,
+      "temperature": 0.2,
+      "topK": 20,
+      "topP": 0.8
+    }
+  },
+  "transport_responses": [
+    {
+      "json": {
+        "candidates": [
+          {
+            "content": {
+              "parts": [
+                {
+                  "text": "Done."
+                }
+              ]
+            },
+            "finishReason": "STOP"
+          }
+        ],
+        "modelVersion": "gemini-3.8-flash",
+        "responseId": "gemini-38-flash-server-managed-sampling-response",
+        "usageMetadata": {
+          "candidatesTokenCount": 1,
+          "promptTokenCount": 2,
+          "totalTokenCount": 3
+        }
+      },
+      "status": 200
+    }
+  ]
+}

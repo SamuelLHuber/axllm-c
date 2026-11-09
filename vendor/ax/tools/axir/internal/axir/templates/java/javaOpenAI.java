@@ -24,20 +24,48 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 
-public class OpenAICompatibleClient extends AxBaseAI {
+public class OpenAICompatibleClient extends AxBaseAI implements AxChatSession.Provider {
+  private boolean ownedWorker;
+  public java.util.function.Supplier<AiClient> ownedWorkerFactory() {
+    if(!ownedWorker && getClass()!=OpenAICompatibleClient.class && getClass()!=OpenAIResponsesClient.class && getClass()!=GoogleGeminiClient.class && getClass()!=AnthropicClient.class)return null;
+    var transportFactory=transport==null?null:transport.ownedWorkerFactory();
+    if(transport!=null&&transportFactory==null)return null;
+    Map<String,Object> snapshot=Core.asMap(Core.ownedCopy(options));
+    snapshot.put("api_key",apiKey);snapshot.put("base_url",baseUrl);snapshot.put("model",model);snapshot.put("embed_model",embedModel);snapshot.put("model_config",Core.ownedCopy(modelConfig));
+    if(credentialProvider!=null)snapshot.put("credentialProvider",credentialProvider);
+    AxRuntimeHooks hooks=runtimeHooks;String sourceId=getId();
+    var cache=Core.asMap(Core.ownedCopy(contextCacheEntries));
+    return ()->{
+      var ownedOptions=Core.asMap(Core.ownedCopy(snapshot));if(transportFactory!=null)ownedOptions.put("transport",transportFactory.get());
+      OpenAICompatibleClient owned=new OpenAICompatibleClient(profile,name,ownedOptions,model,embedModel){public String getId(){return sourceId;}};
+      owned.runtimeHooks=hooks;owned.ownedWorker=true;
+      for(var entry:cache.entrySet())owned.contextCacheEntries.put(entry.getKey(),Core.asMap(Core.ownedCopy(entry.getValue())));
+      return owned;
+    };
+  }
+  public AxChatSession openChatSession(Map<String,Object> request,Map<String,Object> options) throws Exception {
+    Map<String, Object> resolved = resolveModelKey(request, options, false);
+    return new ResponsesChatSession(this,Core.asMap(resolved.get("request")),Core.asMap(resolved.get("options")));
+  }
   public interface Transport {
+    default java.util.function.Supplier<Transport> ownedWorkerFactory() { return null; }
     Object call(Map<String, Object> request) throws Exception;
     default Object stream(Map<String, Object> request) throws Exception { return call(request); }
+    default Object call(Map<String,Object> request,AxCancellationToken cancellation)throws Exception{if(cancellation!=null)cancellation.throwIfCancelled();Object value=call(request);if(cancellation!=null)cancellation.throwIfCancelled();return value;}
+    default Object stream(Map<String,Object> request,AxCancellationToken cancellation)throws Exception{if(cancellation!=null)cancellation.throwIfCancelled();Object value=stream(request);if(cancellation!=null)cancellation.throwIfCancelled();return value;}
   }
 
-  private static final class RawSseStream implements AutoCloseable {
+  static final class RawSseStream implements AutoCloseable {
     private final BufferedReader reader;
     private final Iterator<?> events;
     private final AutoCloseable close;
     private final List<String> dataLines = new ArrayList<>();
     private boolean atStart = true;
-    private boolean closed;
+    private volatile boolean closed;
 
     private RawSseStream(BufferedReader reader, Iterator<?> events, AutoCloseable close) {
       this.reader = reader;
@@ -144,7 +172,18 @@ public class OpenAICompatibleClient extends AxBaseAI {
   }
 
   public OpenAICompatibleClient(Map<String, Object> options) {
-    this("openai-compatible", "openai", options == null ? Map.of() : options, "gpt-4.1-mini", "text-embedding-3-small");
+    this("openai-compatible", "openai", withDefaultBaseUrl(options == null ? Map.of() : options), "gpt-4.1-mini", "text-embedding-3-small");
+  }
+
+  private static final java.util.Set<String> OPENAI_ENV_PROFILES = java.util.Set.of("openai", "openai-responses", "openai-compatible");
+
+  // Built directly without a base_url (or OPENAI_BASE_URL), the generic client
+  // talks to OpenAI, as it does in the other languages.
+  private static Map<String, Object> withDefaultBaseUrl(Map<String, Object> options) {
+    if (options.get("base_url") != null || options.get("baseUrl") != null || Core.env("OPENAI_BASE_URL") != null) return options;
+    Map<String, Object> resolved = new LinkedHashMap<>(options);
+    resolved.put("base_url", "https://api.openai.com/v1");
+    return resolved;
   }
 
   public OpenAICompatibleClient(String profile, String name, Map<String, Object> options, String defaultModel, String defaultEmbedModel) {
@@ -156,11 +195,35 @@ public class OpenAICompatibleClient extends AxBaseAI {
       Core.asMap(Core.mapMerge(options, Core.asMap(options.get("options"))))
     );
     this.profile = profile == null || profile.isBlank() ? "openai-compatible" : profile;
+    // Only the caller's settings: provider_build_chat_request adds the
+    // provider's sampling defaults (as its TS class starts from) under them,
+    // after dropping the explicit ones the model rejects.
+    this.modelConfig = new LinkedHashMap<>(Core.asMap(options.get("model_config")));
+    if (this.profile.equals("openai-decisions")) {
+      Core.decisions_require_number(this.options.getOrDefault("trueThreshold", this.options.getOrDefault("true_threshold", 0.5)), "trueThreshold", 0, 1);
+    }
+    if (this.profile.equals("typesafe")) {
+      Core.typesafe_require_number(this.options.getOrDefault("trueThreshold", this.options.getOrDefault("true_threshold", 0.5)), "trueThreshold", 0, 1);
+    }
     Map<String, Object> resolvedOptions = Core.asMap(Core.mapMerge(options, Core.asMap(options.get("options"))));
     this.descriptor = Core.asMap(Core.provider_resolve_descriptor(this.profile, resolvedOptions));
-    String descriptorBaseUrl = String.valueOf(this.descriptor.getOrDefault("baseUrl", "https://api.openai.com/v1"));
-    this.baseUrl = String.valueOf(options.getOrDefault("base_url", options.getOrDefault("baseUrl", System.getenv().getOrDefault("OPENAI_BASE_URL", descriptorBaseUrl)))).replaceAll("/+$", "");
-    this.apiKey = String.valueOf(options.getOrDefault("api_key", options.getOrDefault("apiKey", System.getenv("OPENAI_API_KEY"))));
+    // OPENAI_BASE_URL and OPENAI_API_KEY belong to OpenAI's own profiles and the
+    // generic client: any other provider's key never goes to that host, and the
+    // OpenAI key never goes to another provider.
+    boolean readsOpenAIEnv = OPENAI_ENV_PROFILES.contains(this.profile);
+    Object explicitBaseUrl = options.get("base_url") != null ? options.get("base_url") : options.get("baseUrl");
+    String envBaseUrl = readsOpenAIEnv ? Core.env("OPENAI_BASE_URL") : null;
+    Object descriptorBaseUrl = this.descriptor.get("baseUrl");
+    String resolvedBaseUrl = explicitBaseUrl != null ? String.valueOf(explicitBaseUrl)
+        : envBaseUrl != null && !envBaseUrl.isBlank() ? envBaseUrl
+        : descriptorBaseUrl != null ? String.valueOf(descriptorBaseUrl)
+        : "https://api.openai.com/v1";
+    this.baseUrl = resolvedBaseUrl.replaceAll("/+$", "");
+    Object explicitApiKey = options.get("api_key") != null ? options.get("api_key") : options.get("apiKey");
+    String envApiKey = this.profile.equals("typesafe")
+        ? (Core.env("TYPESAFE_APIKEY") != null ? Core.env("TYPESAFE_APIKEY") : Core.env("TYPESAFE_API_KEY"))
+        : readsOpenAIEnv ? Core.env("OPENAI_API_KEY") : null;
+    this.apiKey = explicitApiKey != null ? String.valueOf(explicitApiKey) : envApiKey;
     this.apiVersion = String.valueOf(this.descriptor.getOrDefault("apiVersion", options.getOrDefault("api_version", options.getOrDefault("apiVersion", ""))));
     Object timeout = options.getOrDefault("timeout", 60.0);
     this.timeoutSeconds = timeout instanceof Number n ? n.doubleValue() : 60.0;
@@ -170,7 +233,7 @@ public class OpenAICompatibleClient extends AxBaseAI {
     if (Core.truthy(this.descriptor.get("authRequired")) &&
         (this.apiKey == null || this.apiKey.isBlank() || "null".equals(this.apiKey)) &&
         this.credentialProvider == null) {
-      throw new AxAIServiceAuthenticationError(profile + " requires api_key or credential_provider", null, null, null, null);
+      throw new AxAIServiceAuthenticationError(String.valueOf(Core.provider_missing_api_key_message(this.profile)), null, null, null, null);
     }
   }
 
@@ -179,6 +242,9 @@ public class OpenAICompatibleClient extends AxBaseAI {
     Object modelInfo = options.getOrDefault("modelInfo", options.get("model_info"));
     return Core.asDouble(Core.provider_estimate_cost(modelUsage == null ? Map.of() : modelUsage, modelInfo));
   }
+
+  @Override
+  protected String modelCatalogProvider() { return profile; }
 
   @Override
   public Map<String, Object> getFeatures(String model) {
@@ -198,18 +264,26 @@ public class OpenAICompatibleClient extends AxBaseAI {
     Object stream = payload.get("stream");
     if (Boolean.TRUE.equals(stream)) {
       Object modelName = request.getOrDefault("model", payload.getOrDefault("model", model));
-      return Map.of("results", streamEvents(payload, modelName));
+      return Map.of("results", streamEvents(payload, modelName, cancellation(options), options, Core.asMap(Core.provider_response_context(payload, request.getOrDefault("model_config", Map.of()), options))));
     }
     Object modelName = request.getOrDefault("model", payload.getOrDefault("model", model));
     Object raw = contextCacheChat(request, options, payload, modelName);
-    if (raw == null) raw = requestJson(operationPath("chat", modelName), payload, false, "json", false, operationMethod("chat"), "openai-responses".equals(descriptor.get("transport")) ? "responses" : "chat");
-    return Core.asMap(Core.provider_normalize_chat_response(profile, raw, name, modelName));
+    if (raw == null) raw = requestJsonRetried(operationPath("chat", modelName), payload, operationMethod("chat"), "openai-responses".equals(descriptor.get("transport")) ? "responses" : "chat", activeCancellation(), options);
+    return Core.asMap(Core.provider_normalize_chat_response(profile, raw, name, modelName, profile.equals("openai-decisions") ? Core.decisions_response_context(payload, options, request) : profile.equals("typesafe") ? Core.typesafe_response_context(payload, options, request) : Core.provider_response_context(payload, request.getOrDefault("model_config", Map.of()), options)));
+  }
+
+  @Override public void validateChatRequest(Map<String, Object> request) {
+    Map<String, Object> req = Core.asMap(resolveModelKey(Core.coerceChatRequest(request), null, false).get("request"));
+    req.put("model", req.get("model") == null ? model : req.get("model"));
+    req.put("model_config", Core.merge_model_config(modelConfig, req.get("model_config"), options));
+    Core.provider_validate_chat_request(profile, req, options);
   }
 
   protected Map<String, Object> doEmbed(Map<String, Object> request, Map<String, Object> options) throws Exception {
     Map<String, Object> payload = Core.asMap(Core.provider_build_embed_request(profile, request, options));
     Object modelName = request.getOrDefault("embed_model", request.getOrDefault("embedModel", payload.getOrDefault("model", embedModel)));
-    Object raw = requestJson(operationPath("embed", modelName), payload, false, "json", false, operationMethod("embed"), "embed");
+    String embedUrl = String.valueOf(Core.provider_embed_url(profile, String.valueOf(modelName), options));
+    Object raw = requestJsonRetried(embedUrl.isEmpty() ? operationPath("embed", modelName) : embedUrl, payload, operationMethod("embed"), "embed", activeCancellation(), options);
     return Core.asMap(Core.provider_normalize_embed_response(profile, raw, name, modelName));
   }
 
@@ -223,7 +297,7 @@ public class OpenAICompatibleClient extends AxBaseAI {
     if (!explicit.isBlank()) {
       Map<String,Object> cached = new LinkedHashMap<>(payload);
       cached.put("cachedContent", explicit);
-      return requestJson(operationPath("chat", modelName), cached, false, "json", false, operationMethod("chat"));
+      return requestJsonRetried(operationPath("chat", modelName), cached, operationMethod("chat"), "chat", activeCancellation(), options);
     }
     List<Object> prompts = Core.asList(request.getOrDefault("chat_prompt", request.getOrDefault("chatPrompt", request.getOrDefault("messages", List.of()))));
     int nonSystem = 0, cachedCount = 0;
@@ -269,7 +343,7 @@ public class OpenAICompatibleClient extends AxBaseAI {
       try {
         String endpoint = String.valueOf(op.get("path"));
         if (op.get("base_url") != null) endpoint = String.valueOf(op.get("base_url")).replaceAll("/+$", "") + endpoint;
-        return requestJson(endpoint, Core.asMap(op.get("request")), false, "json", false, String.valueOf(op.getOrDefault("method", "POST")));
+        return requestJsonRetried(endpoint, Core.asMap(op.get("request")), String.valueOf(op.getOrDefault("method", "POST")), "chat", activeCancellation(), options);
       }
       catch (Exception error) { if (error instanceof RuntimeException runtime) throw runtime; throw new RuntimeException(error); }
     };
@@ -293,10 +367,10 @@ public class OpenAICompatibleClient extends AxBaseAI {
         if (expiresAt == 0) throw new AxAIServiceResponseError("Gemini cache refresh omitted a future expireTime", refreshed);
         setEntry.accept(new LinkedHashMap<>(Map.of("cacheName", cacheName[0], "expiresAt", expiresAt)));
       } catch (AxAIServiceError error) {
-        if (!create.getAsBoolean()) return requestJson(operationPath("chat", modelName), payload, false, "json", false, operationMethod("chat"));
+        if (!create.getAsBoolean()) return requestJsonRetried(operationPath("chat", modelName), payload, operationMethod("chat"), "chat", activeCancellation(), options);
       }
     } else if ("create".equals(action)) {
-      if (!create.getAsBoolean()) return requestJson(operationPath("chat", modelName), payload, false, "json", false, operationMethod("chat"));
+      if (!create.getAsBoolean()) return requestJsonRetried(operationPath("chat", modelName), payload, operationMethod("chat"), "chat", activeCancellation(), options);
     } else if ("none".equals(action)) return null;
     if (cacheName[0].isBlank()) return null;
     Map<String,Object> cached = new LinkedHashMap<>(payload);
@@ -304,7 +378,7 @@ public class OpenAICompatibleClient extends AxBaseAI {
     cached.put("contents", new ArrayList<>(contents.subList(Math.min(cachedCount, contents.size()), contents.size())));
     cached.put("cachedContent", cacheName[0]);
     try {
-      return requestJson(operationPath("chat", modelName), cached, false, "json", false, operationMethod("chat"));
+      return requestJsonRetried(operationPath("chat", modelName), cached, operationMethod("chat"), "chat", activeCancellation(), options);
     } catch (AxAIServiceError error) {
       if (!Core.truthy(Core.ai_context_cache_rejection(error.status == null ? 0 : error.status, error.responseBody))) throw error;
       Map<String,Object> recovery = Core.asMap(Core.ai_context_cache_recovery(getEntry.get(), cacheName[0], registry != null));
@@ -312,74 +386,88 @@ public class OpenAICompatibleClient extends AxBaseAI {
         if (registry != null) registry.set(namespace, cacheKey, Core.asMap(recovery.get("externalEntry")));
         else if (Core.truthy(recovery.get("deleteInMemory"))) contextCacheEntries.remove(cacheKey);
       }
-      return requestJson(operationPath("chat", modelName), payload, false, "json", false, operationMethod("chat"));
+      return requestJsonRetried(operationPath("chat", modelName), payload, operationMethod("chat"), "chat", activeCancellation(), options);
     }
   }
 
-  protected List<Map<String, Object>> streamEvents(Map<String, Object> payload, Object modelName) throws Exception {
+  protected List<Map<String, Object>> streamEvents(Map<String, Object> payload, Object modelName, AxCancellationToken cancellation) throws Exception {
+    return streamEvents(payload, modelName, cancellation, options);
+  }
+
+  protected AxChatStream streamEventsIncremental(Map<String, Object> payload, Object modelName, AxCancellationToken cancellation) throws Exception {
+    return streamEventsIncremental(payload, modelName, cancellation, options);
+  }
+
+  // errorOptions are the call's merged options; their includeRequestBodyInErrors
+  // decides whether a provider error keeps the request body.
+  protected List<Map<String, Object>> streamEvents(Map<String, Object> payload, Object modelName, AxCancellationToken cancellation, Map<String, Object> errorOptions) throws Exception {
+    return streamEvents(payload, modelName, cancellation, errorOptions, Core.asMap(Core.provider_response_context(payload, Map.of(), errorOptions)));
+  }
+
+  protected List<Map<String, Object>> streamEvents(Map<String, Object> payload, Object modelName, AxCancellationToken cancellation, Map<String, Object> errorOptions, Map<String, Object> responseContext) throws Exception {
     List<Map<String, Object>> out = new ArrayList<>();
-    try (AxChatStream stream = streamEventsIncremental(payload, modelName)) {
+    try (AxChatStream stream = streamEventsIncremental(payload, modelName, cancellation, errorOptions, responseContext)) {
       for (Map<String, Object> event : stream) out.add(event);
     }
     return out;
   }
 
-  protected AxChatStream streamEventsIncremental(Map<String, Object> payload, Object modelName) throws Exception {
-    Map<String, Object> retryCfg = Core.asMap(Core.resolve_stream_retry(options));
+  protected AxChatStream streamEventsIncremental(Map<String, Object> payload, Object modelName, AxCancellationToken cancellation, Map<String, Object> errorOptions) throws Exception {
+    return streamEventsIncremental(payload, modelName, cancellation, errorOptions, Core.asMap(Core.provider_response_context(payload, Map.of(), errorOptions)));
+  }
+
+  protected AxChatStream streamEventsIncremental(Map<String, Object> payload, Object modelName, AxCancellationToken cancellation, Map<String, Object> errorOptions, Map<String, Object> responseContext) throws Exception {
+    if(cancellation!=null)cancellation.throwIfCancelled();
+    // The call's retry options, else the client's (TS: options.retry ?? this.retry).
+    Map<String, Object> retryCfg = Core.asMap(Core.resolve_stream_retry(errorOptions == null ? options : errorOptions));
     int maxRetries = Core.asInt(retryCfg.getOrDefault("max_retries", 3));
     double initialDelay = Core.asDouble(retryCfg.getOrDefault("initial_delay_ms", 1000));
     double maxDelay = Core.asDouble(retryCfg.getOrDefault("max_delay_ms", 60000));
     double backoff = Core.asDouble(retryCfg.getOrDefault("backoff_factor", 2));
-    int attempt = 0;
+    int startAttempt = 0;
     while (true) {
-      RawSseStream raw = null;
+      // The stream's request goes through apiCall's request-layer retry; its
+      // first event is read once, as TS reads it after apiCall returns, and a
+      // failure to read it surfaces.
+      RawSseStream raw = requestSseRetried(operationPath("stream_chat", modelName), payload, modelName, cancellation, errorOptions, retryCfg);
       Object first;
       try {
-        raw = requestSse(operationPath("stream_chat", modelName), payload, modelName);
         first = raw.nextEvent();
       } catch (Exception failure) {
-        if (raw != null) try { raw.close(); } catch (Exception ignored) {}
-        AxAIServiceError error = failure instanceof AxAIServiceError serviceError
-            ? serviceError
-            : new AxAIServiceNetworkError(failure.getMessage() == null ? failure.toString() : failure.getMessage());
-        boolean retryable = error instanceof AxAIServiceNetworkError
-            || error instanceof AxAIServiceResponseError
-            || error instanceof AxAIServiceStreamTerminatedError
-            || error instanceof AxAIServiceTimeoutError
-            || error instanceof AxAIServiceStatusError && error.status != null && Core.truthy(Core.is_retryable_status(error.status));
-        if (!retryable || attempt >= maxRetries) throw error;
-        attempt++;
-        double delay = Math.min(initialDelay * Math.pow(backoff, attempt - 1), maxDelay);
-        if (delay > 0) Thread.sleep((long) delay);
-        continue;
+        try { raw.close(); } catch (Exception ignored) {}
+        if (failure instanceof AxAIServiceError serviceError) throw serviceError;
+        throw networkError(failure, null);
       }
-      // Pre-content streaming retry: peek the first raw SSE event before any stateful normalize
-      // runs (so peeking has no side effects); if the provider classifies it as a retryable
-      // transient status (e.g. Anthropic's HTTP-200 overloaded_error event), re-issue with the
-      // same exponential backoff apiCall uses for a 529 before surfacing.
+      // TS retryTransientStreamStart: peek the first raw SSE event before any stateful
+      // normalize runs (so peeking has no side effects); if the provider classifies it as a
+      // listed transient status (e.g. Anthropic's HTTP-200 overloaded_error event), re-issue
+      // it with its own budget and backoff, without jitter.
       if (first != null) {
         Object status = Core.provider_classify_stream_error_status(profile, first);
-        if (status != null && Core.truthy(Core.is_retryable_status(status)) && attempt < maxRetries) {
+        if (status != null && Core.truthy(Core.retry_status_listed(retryCfg, status)) && startAttempt < maxRetries) {
           raw.close();
-          attempt++;
-          double delay = Math.min(initialDelay * Math.pow(backoff, attempt - 1), maxDelay);
-          if (delay > 0) Thread.sleep((long) delay);
+          startAttempt++;
+          double delay = Math.min(initialDelay * Math.pow(backoff, startAttempt - 1), maxDelay);
+          requestRetrySleep(delay, cancellation);
           continue;
         }
       }
       Map<String, Object> state = new LinkedHashMap<>();
-      Map<String, Object> firstNormalized = first == null ? null : Core.asMap(Core.provider_normalize_stream_delta(profile, first, state, name, modelName));
+      Map<String, Object> firstNormalized = first == null ? null : Core.asMap(Core.provider_normalize_stream_delta(profile, first, state, name, modelName, responseContext));
       boolean[] emitFirst = {firstNormalized != null};
       RawSseStream selectedRaw = raw;
       return new AxChatStream(
         () -> {
+          if(cancellation!=null)cancellation.throwIfCancelled();
           if (emitFirst[0]) { emitFirst[0] = false; return firstNormalized; }
           try {
             Object event = selectedRaw.nextEvent();
-            return event == null ? null : Core.asMap(Core.provider_normalize_stream_delta(profile, event, state, name, modelName));
+            if(cancellation!=null)cancellation.throwIfCancelled();
+            return event == null ? null : Core.asMap(Core.provider_normalize_stream_delta(profile, event, state, name, modelName, responseContext));
           } catch (AxAIServiceError error) {
             throw error;
           } catch (Exception error) {
+            if(cancellation!=null&&cancellation.cancelled())cancellation.throwIfCancelled();
             throw new AxAIServiceStreamTerminatedError(error.getMessage() == null ? error.toString() : error.getMessage(), null, true);
           }
         },
@@ -388,27 +476,74 @@ public class OpenAICompatibleClient extends AxBaseAI {
     }
   }
 
-  @Override public AxChatStream openStream(Map<String, Object> request) throws Exception {
+  @Override public AxChatStream openStream(Map<String, Object> request) throws Exception {return openStream(request,null);}
+
+  @Override public AxChatStream openStream(Map<String,Object> request,AxCancellationToken cancellation)throws Exception {return openStream(request,Map.of(),cancellation);}
+
+  @Override public Map<String, Object> chat(Map<String, Object> request, Map<String, Object> callOptions) throws Exception {
+    if (!"openai-decisions".equals(profile)) return super.chat(request, callOptions);
+    var inherited = cancellation(options);
+    var perCall = cancellation(callOptions);
+    boolean merge = inherited != null && perCall != null && inherited != perCall;
+    var token = merge ? new AxCancellationToken() : inherited != null ? inherited : perCall;
+    var subscriptions = new java.util.ArrayList<AxCancellationToken.Subscription>();
+    try {
+      if (merge) {
+        subscriptions.add(inherited.subscribe(() -> token.cancel(inherited.reason())));
+        subscriptions.add(perCall.subscribe(() -> token.cancel(perCall.reason())));
+      }
+      if (token != null) token.throwIfCancelled();
+      var resolved = new LinkedHashMap<String,Object>(callOptions == null ? Map.of() : callOptions);
+      if (token != null) resolved.put("cancellation", token);
+      return super.chat(request, resolved);
+    } finally {
+      for (var subscription : subscriptions) subscription.close();
+    }
+  }
+
+  @Override public Map<String, Object> embed(Map<String, Object> request, Map<String, Object> callOptions) throws Exception {
+    return super.embed(request, callOptions);
+  }
+
+  @Override public AxChatStream openStream(Map<String,Object> request,Map<String,Object> options,AxCancellationToken cancellation)throws Exception {
+    Map<String, Object> resolved = resolveModelKey(Core.coerceChatRequest(request), options, false);
+    request = Core.asMap(resolved.get("request"));
+    Map<String,Object> callOptions=new LinkedHashMap<>(Core.asMap(resolved.get("options")));
+    if(Boolean.FALSE.equals(getFeatures((String)request.get("model")).get("streaming"))) {
+      callOptions.put("stream",false);if(cancellation!=null)callOptions.put("cancellation",cancellation);
+      return AxChatStream.fromIterable(List.of(chat(request,callOptions)));
+    }
+    if(cancellation!=null)cancellation.throwIfCancelled();
     Map<String, Object> req = Core.coerceChatRequest(request);
     Core.validate_chat_request(req);
-    AxRuntimeHooks hooks = AxGlobals.effective(Map.of("stream", true), runtimeHooks);
+    callOptions.put("stream",true);if(cancellation!=null)callOptions.put("cancellation",cancellation);
+    AxRuntimeHooks hooks = AxGlobals.effective(callOptions, runtimeHooks);
     Map<String, Object> modelConfig = Core.asMap(Core.merge_model_config(modelConfig(), req.get("model_config"), Map.of("stream", true)));
     modelConfig.put("stream", true);
-    req.put("model", req.getOrDefault("model", model));
+    // A request without a model, or with a null one (AxGen sends one when the
+    // forward names no model), uses the client's model, as chat() does.
+    Object requestedModel = req.get("model");
+    req.put("model", requestedModel == null ? model : requestedModel);
     req.put("model_config", modelConfig);
-    Map<String, Object> streamOptions = mergedOptions(Map.of("stream", true));
+    // Streamed requests skip chat(), so gate them here the same way: only the
+    // stream call's options (or a model-key entry) confirm an expensive model.
+    Core.provider_require_expensive_model_confirmation(modelCatalogProvider(), String.valueOf(req.get("model") == null ? model : req.get("model")), this.options, AxRuntimeHooks.strip(callOptions));
+    Map<String, Object> streamOptions = mergedOptions(callOptions);
     Map<String, Object> payload = Core.asMap(Core.provider_build_chat_request(profile, req, streamOptions));
     Object modelName = req.getOrDefault("model", payload.getOrDefault("model", model));
     String selectedModel = String.valueOf(modelName);
     lastUsedChatModel = selectedModel;
     lastUsedModelConfig = new LinkedHashMap<>(modelConfig);
-    Map<String, Object> attributes = Map.of("ax.operation", "chat", "ax.ai", name, "ax.model", selectedModel, "ax.streaming", true);
-    AxSpan span = AxGlobals.startSpan(hooks, "ax_llm_chat", "client", attributes, AxGlobals.currentSpan());
-    AxGlobals.recordMetric(hooks.meter(), "counter", "ax_llm_requests_total", 1, attributes);
+    Map<String, Object> spanAttributes = Map.of("ax.operation", "chat", "ax.ai", name, "ax.model", selectedModel, "ax.streaming", true);
+    AxSpan span = AxGlobals.startSpan(hooks, "ax_llm_chat", "client", spanAttributes, AxGlobals.currentSpan());
+    AxGlobals.recordMetric(hooks.meter(), "counter", "ax_llm_requests_total", 1, AxGlobals.labeled(spanAttributes, this.options, callOptions, false));
+    // The duration and errors carry the custom labels cut to 100 characters.
+    Map<String, Object> attributes = AxGlobals.labeled(spanAttributes, this.options, callOptions, true);
     long started = System.nanoTime();
     Throwable failure = null;
     try {
-      AxRequestExecutor next = () -> streamEventsIncremental(payload, modelName);
+      AxRequestExecutor next = () -> Boolean.TRUE.equals(Core.provider_should_use_realtime(profile, selectedModel, req, streamOptions))
+          ? realtimeStream(req) : streamEventsIncremental(payload, modelName, cancellation, streamOptions, Core.asMap(Core.provider_response_context(payload, req.getOrDefault("model_config", Map.of()), streamOptions)));
       Object raw = hooks.rateLimiter() == null
           ? next.execute()
           : hooks.rateLimiter().run(next, new AxRateLimitInfo("chat", name, selectedModel, true, lastModelUsage == null ? null : new LinkedHashMap<>(lastModelUsage)));
@@ -417,6 +552,7 @@ public class OpenAICompatibleClient extends AxBaseAI {
       Map<String, Object>[] lastUsage = new Map[] {null};
       return new AxChatStream(
         () -> {
+          if(cancellation!=null)cancellation.throwIfCancelled();
           if (!iterator.hasNext()) return null;
           Map<String, Object> value = iterator.next();
           if (value.get("model_usage") instanceof Map<?, ?> || value.get("modelUsage") instanceof Map<?, ?>) lastUsage[0] = value;
@@ -447,25 +583,60 @@ public class OpenAICompatibleClient extends AxBaseAI {
   }
 
   @Override public AxChatStream stream(Map<String, Object> request) { return AxChatStream.lazy(() -> openStream(request)); }
+  @Override public Iterable<Map<String,Object>> stream(Map<String,Object> request,AxCancellationToken cancellation){return AxChatStream.lazy(()->openStream(request,cancellation));}
 
   public Map<String, Object> transcribe(Map<String, Object> request) throws Exception {
+    return transcribe(request,Map.of());
+  }
+
+  @Override public Map<String,Object> transcribe(Map<String,Object> request,Map<String,Object> options)throws Exception{
+    AxCancellationToken cancellation=cancellation(options);if(cancellation!=null)cancellation.throwIfCancelled();
     Map<String, Object> payload = Core.asMap(Core.provider_build_transcribe_request(profile, request));
-    Object modelName = request.getOrDefault("model", model);
     Map<String, Object> descriptor = Core.asMap(Core.provider_operation_descriptor(profile, "transcribe"));
+    Object modelName = request.getOrDefault("model", descriptor.getOrDefault("defaultModel", model));
     String bodyKey = "multipart".equals(String.valueOf(descriptor.getOrDefault("body", "json"))) ? "data" : "json";
-    Object raw = requestJson(operationPath("transcribe", modelName), payload, false, bodyKey, false, operationMethod("transcribe"), "transcribe");
-    return Core.asMap(Core.provider_normalize_transcribe_response(profile, raw));
+    Map<String, Object> query = Core.asMap(payload.remove("query"));
+    String endpoint = operationPath("transcribe", modelName);
+    if (!query.isEmpty()) {
+      List<String> parts = new ArrayList<>();
+      for (Map.Entry<String, Object> entry : query.entrySet()) {
+        parts.add(URLEncoder.encode(entry.getKey(), StandardCharsets.UTF_8) + "=" + URLEncoder.encode(String.valueOf(entry.getValue()), StandardCharsets.UTF_8));
+      }
+      endpoint += (endpoint.contains("?") ? "&" : "?") + String.join("&", parts);
+    }
+    Object raw = requestJson(endpoint, payload, false, bodyKey, false, operationMethod("transcribe"), "transcribe", cancellation, mergedOptions(options));
+    if ("meta".equals(profile) && raw instanceof String) {
+      List<Object> events = new ArrayList<>();
+      for (Object event : iterSseJson(raw)) events.add(event);
+      raw = Map.of("events", events);
+    }
+    return Core.asMap(Core.provider_normalize_transcribe_response(profile, raw, request));
   }
 
   public Map<String, Object> speak(Map<String, Object> request) throws Exception {
+    return speak(request,Map.of());
+  }
+
+  @Override public Map<String,Object> speak(Map<String,Object> request,Map<String,Object> options)throws Exception{
+    AxCancellationToken cancellation=cancellation(options);if(cancellation!=null)cancellation.throwIfCancelled();
     Map<String, Object> payload = Core.asMap(Core.provider_build_speak_request(profile, request));
-    Object modelName = request.getOrDefault("model", model);
     Map<String, Object> descriptor = Core.asMap(Core.provider_operation_descriptor(profile, "speak"));
+    Object modelName = request.getOrDefault("model", descriptor.getOrDefault("defaultModel", model));
     String bodyKey = "multipart".equals(String.valueOf(descriptor.getOrDefault("body", "json"))) ? "data" : "json";
     boolean binary = "binary".equals(String.valueOf(descriptor.get("response")));
-    Object raw = requestJson(operationPath("speak", modelName), payload, false, bodyKey, binary, operationMethod("speak"), "speak");
-    return Core.asMap(Core.provider_normalize_speak_response(profile, raw, request));
+    Object raw = requestJson(operationPath("speak", modelName), payload, false, bodyKey, binary, operationMethod("speak"), "speak",cancellation, mergedOptions(options));
+    // As TS's axFetchJsonSpeech: a JSON body arrives parsed, and a binary one
+    // as base64 with its Content-Type, which names its mime type.
+    Object contentType = null;
+    if (raw instanceof BinaryBody body) {
+      raw = body.data();
+      contentType = body.contentType().isEmpty() ? null : body.contentType();
+    }
+    return Core.asMap(Core.provider_normalize_speak_response(profile, raw, request, contentType));
   }
+
+  /** A binary response body as base64 text, with its Content-Type. */
+  record BinaryBody(String data, String contentType) {}
 
   public Iterable<Map<String, Object>> realtime(Iterable<?> events) {
     List<Map<String, Object>> out = new ArrayList<>();
@@ -484,6 +655,21 @@ public class OpenAICompatibleClient extends AxBaseAI {
 
   /** Transport seam for the realtime turn driver: a ScriptedRealtimeTransport for
    * deterministic offline turns, the JDK-WebSocket-backed transport for live ones. */
+  @FunctionalInterface public interface SessionWebSocketFactory {
+    RealtimeTransport connect(String url, Map<String,String> headers);
+  }
+  RealtimeTransport openSessionSocket(SessionWebSocketFactory factory, String modelName) throws Exception {
+    String endpoint=operationPath("stream_chat",modelName);
+    String target=endpoint.startsWith("http://") || endpoint.startsWith("https://")?endpoint:baseUrl+endpoint;
+    Map<String,Object> resolved=headers();
+    if(credentialProvider!=null) {
+      Map<String,String> fresh=credentialProvider.credentials(new CredentialRequest(profile,"stream_chat","GET",target));
+      if(fresh==null)throw new AxAIServiceAuthenticationError("credential_provider returned null headers",null,null,null,null);
+      resolved.putAll(fresh);
+    }
+    Map<String,String> headers=new LinkedHashMap<>();resolved.forEach((key,value)->headers.put(key,String.valueOf(value)));
+    return factory.connect(target.replaceFirst("^https:","wss:").replaceFirst("^http:","ws:"),headers);
+  }
   public interface RealtimeTransport {
     void send(Map<String, Object> event);
     Map<String, Object> recv();
@@ -493,47 +679,93 @@ public class OpenAICompatibleClient extends AxBaseAI {
   public static final class ScriptedRealtimeTransport implements RealtimeTransport {
     private final java.util.Deque<Map<String, Object>> inbound = new java.util.ArrayDeque<>();
     public final List<Map<String, Object>> sent = new ArrayList<>();
+    private final java.util.concurrent.CountDownLatch ended = new java.util.concurrent.CountDownLatch(1);
+    private boolean meta = false;
     public ScriptedRealtimeTransport(List<?> inbound) {
-      for (Object event : inbound) this.inbound.add(Core.asMap(event));
+      for (Object event : inbound) { Map<String, Object> frame = Core.asMap(event); this.inbound.add(frame); if (frame.containsKey("sessionId") && !frame.containsKey("type")) meta = true; }
     }
-    public void send(Map<String, Object> event) { sent.add(event); }
-    public Map<String, Object> recv() { return inbound.poll(); }
-    public void close() {}
+    public void send(Map<String, Object> event) { sent.add(event); if ("endStream".equals(event.get("type"))) ended.countDown(); }
+    public Map<String, Object> recv() {
+      if (!inbound.isEmpty()) return inbound.poll();
+      try { if (meta && !ended.await(30, java.util.concurrent.TimeUnit.SECONDS)) throw new AxAIServiceError("scripted realtime input did not finish"); }
+      catch (InterruptedException error) { Thread.currentThread().interrupt(); throw new AxAIServiceError("scripted realtime interrupted"); }
+      return null;
+    }
+    public void close() { ended.countDown(); }
   }
 
   // Bridges the JDK WebSocket's async, fragment-delivering listener to a blocking
-  // recv(): onText reassembles fragments and enqueues whole messages; recv() polls
-  // the queue. request(1) drives the one-at-a-time backpressure the JDK API needs.
+  // recv(): onText/onBinary reassemble fragments and enqueue whole messages; recv()
+  // polls the queue. request(1) drives the one-at-a-time backpressure the JDK API needs.
   static final class WebSocketRealtimeTransport implements RealtimeTransport {
     private static final Object CLOSED = new Object();
     private final java.net.http.WebSocket ws;
     private final java.util.concurrent.BlockingQueue<Object> queue = new java.util.concurrent.LinkedBlockingQueue<>();
     private final StringBuilder buffer = new StringBuilder();
+    private final java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+
+    // A failed handshake keeps its HTTP response, whose request URI holds the
+    // Gemini Live ?key= credential, so the failure is rethrown without it.
+    private static java.net.http.WebSocket connected(java.util.concurrent.CompletableFuture<java.net.http.WebSocket> connecting) {
+      try { return connecting.join(); }
+      catch (java.util.concurrent.CompletionException failure) {
+        if (!(failure.getCause() instanceof java.net.http.WebSocketHandshakeException handshake)) throw failure;
+        int status = handshake.getResponse() == null ? 0 : handshake.getResponse().statusCode();
+        throw new java.util.concurrent.CompletionException(new IOException("realtime WebSocket handshake returned HTTP " + status));
+      }
+    }
 
     WebSocketRealtimeTransport(String url, Map<String, String> headers) {
       java.net.http.WebSocket.Builder builder = HttpClient.newHttpClient().newWebSocketBuilder();
       for (Map.Entry<String, String> header : headers.entrySet()) builder.header(header.getKey(), header.getValue());
-      this.ws = builder.buildAsync(URI.create(url), new java.net.http.WebSocket.Listener() {
+      URI uri;
+      try { uri = URI.create(url); }
+      catch (IllegalArgumentException invalid) { throw new IllegalArgumentException("realtime WebSocket URL is invalid"); }
+      this.ws = connected(builder.buildAsync(uri, new java.net.http.WebSocket.Listener() {
         @Override public java.util.concurrent.CompletionStage<?> onText(java.net.http.WebSocket socket, CharSequence data, boolean last) {
           buffer.append(data);
           if (last) { queue.offer(buffer.toString()); buffer.setLength(0); }
           socket.request(1);
           return null;
         }
-        @Override public void onError(java.net.http.WebSocket socket, Throwable error) { queue.offer(CLOSED); }
-        @Override public java.util.concurrent.CompletionStage<?> onClose(java.net.http.WebSocket socket, int statusCode, String reason) { queue.offer(CLOSED); return null; }
-      }).join();
+        // Gemini Live sends its JSON messages as binary frames. The JDK's default
+        // onBinary discards them. Copy each fragment now (the buffer is reused
+        // once this returns) and decode the whole message, since a UTF-8
+        // character can span fragments.
+        @Override public java.util.concurrent.CompletionStage<?> onBinary(java.net.http.WebSocket socket, java.nio.ByteBuffer data, boolean last) {
+          byte[] fragment = new byte[data.remaining()];
+          data.get(fragment);
+          bytes.writeBytes(fragment);
+          if (last) { queue.offer(bytes.toString(java.nio.charset.StandardCharsets.UTF_8)); bytes.reset(); }
+          socket.request(1);
+          return null;
+        }
+        @Override public void onError(java.net.http.WebSocket socket, Throwable error) { queue.offer(new AxAIServiceError(error.toString())); }
+        @Override public java.util.concurrent.CompletionStage<?> onClose(java.net.http.WebSocket socket, int statusCode, String reason) {
+          queue.offer(statusCode == 1000 ? CLOSED : new AxAIServiceError("realtime WebSocket closed abnormally (code " + statusCode + ")" + (reason == null || reason.isEmpty() ? "" : ": " + reason)));
+          return null;
+        }
+      }));
       this.ws.request(1);
     }
-    public void send(Map<String, Object> event) { ws.sendText(Json.stringify(event), true).join(); }
+    public void send(Map<String, Object> event) {
+      if ("binary".equals(String.valueOf(event.get("type")))) {
+        byte[] bytes = Base64.getDecoder().decode(String.valueOf(event.getOrDefault("data", "")));
+        ws.sendBinary(java.nio.ByteBuffer.wrap(bytes), true).join();
+      } else {
+        ws.sendText(Json.stringify(event), true).join();
+      }
+    }
     public Map<String, Object> recv() {
       try {
         Object item = queue.poll(30, java.util.concurrent.TimeUnit.SECONDS);
-        if (item == null || item == CLOSED) return null;
+        if (item == null) throw new AxAIServiceError("realtime WebSocket timed out");
+        if (item instanceof RuntimeException error) throw error;
+        if (item == CLOSED) return null;
         return Core.asMap(Json.parse((String) item));
-      } catch (InterruptedException e) { Thread.currentThread().interrupt(); return null; }
+      } catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new AxAIServiceError("realtime WebSocket interrupted"); }
     }
-    public void close() { try { ws.sendClose(java.net.http.WebSocket.NORMAL_CLOSURE, ""); } catch (Exception ignored) {} }
+    public void close() { ws.abort(); queue.offer(CLOSED); }
   }
 
   /** Drive a realtime audio turn over a WebSocket transport: send the Core-built
@@ -542,9 +774,45 @@ public class OpenAICompatibleClient extends AxBaseAI {
    * concatenated, audio chunks base64-joined). Pass a ScriptedRealtimeTransport
    * to exercise the loop offline without a socket. */
   public Map<String, Object> realtimeChat(Map<String, Object> request, RealtimeTransport transport) {
+    return realtimeChat(request, transport, null);
+  }
+
+  private AxChatStream realtimeStream(Map<String, Object> request) {
+    java.util.concurrent.BlockingQueue<Object> queue = new java.util.concurrent.ArrayBlockingQueue<>(1);
+    Object done = new Object();
+    Thread worker = new Thread(() -> {
+      try {
+        Map<String, Object> finalResponse = realtimeChat(request, null, event -> {
+          try { queue.put(event); } catch (InterruptedException error) { Thread.currentThread().interrupt(); throw new AxAIServiceError("realtime stream cancelled"); }
+        });
+        queue.put(Core.provider_realtime_terminal_response(finalResponse));
+        queue.put(done);
+      } catch (Throwable error) {
+        if (!Thread.currentThread().isInterrupted()) {
+          try { queue.put(error); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+        }
+      }
+    }, "ax-realtime-stream");
+    worker.setDaemon(true);
+    worker.start();
+    return new AxChatStream(() -> {
+      Object value = queue.take();
+      if (value == done) return null;
+      if (value instanceof Throwable error) throw Core.asRuntime(error);
+      return Core.asMap(value);
+    }, worker::interrupt);
+  }
+
+  private Map<String, Object> realtimeChat(Map<String, Object> request, RealtimeTransport transport, java.util.function.Consumer<Map<String, Object>> emit) {
     Object model = request.getOrDefault("model", this.model);
     Map<String, Object> setup = realtimeAudioSetup(request);
     List<Object> inputs = realtimeAudioInput(request);
+    if ("meta".equals(profile) && credentialProvider != null) {
+      try {
+        Map<String, String> fresh = credentialProvider.credentials(new CredentialRequest(profile, "realtime", "WS", (String) realtimeWsTarget(String.valueOf(model))[0]));
+        setup = Core.asMap(Core.provider_apply_realtime_credentials(setup, fresh));
+      } catch (Exception error) { throw Core.asRuntime(error); }
+    }
     boolean ownTransport = transport == null;
     if (ownTransport) {
       Object[] target = realtimeWsTarget(String.valueOf(model));
@@ -552,26 +820,72 @@ public class OpenAICompatibleClient extends AxBaseAI {
       Map<String, String> wsHeaders = (Map<String, String>) target[1];
       transport = new WebSocketRealtimeTransport((String) target[0], wsHeaders);
     }
+    final RealtimeTransport sendingTransport = transport;
+    final Map<String, Object> sendingSetup = setup;
+    final java.util.concurrent.atomic.AtomicReference<RuntimeException> sendError = new java.util.concurrent.atomic.AtomicReference<>();
+    final java.util.concurrent.atomic.AtomicBoolean endStreamSent = new java.util.concurrent.atomic.AtomicBoolean();
+    Thread sender = null;
     try {
       transport.send(setup);
       boolean inputSent = false;
       List<Object> events = new ArrayList<>();
+      Map<String, Object> state = new LinkedHashMap<>();
+      state.put("partial_mode", setup.get("partialMode"));
       while (true) {
         Map<String, Object> event = transport.recv();
         if (event == null) break;
         if ("error".equals(String.valueOf(event.get("type")))) {
           Map<String, Object> err = Core.asMap(event.get("error"));
-          throw new AxAIServiceError(String.valueOf(err.getOrDefault("message", "realtime error")));
+          throw new AxAIServiceError(String.valueOf(event.getOrDefault("message", err.getOrDefault("message", "realtime error"))));
         }
         if (realtimeEventIsReady(event)) {
-          if (!inputSent) { inputSent = true; for (Object item : inputs) transport.send(Core.asMap(item)); }
+          if (event.get("sessionId") != null) state.put("session_id", event.get("sessionId"));
+          if (!inputSent) {
+            inputSent = true;
+            Runnable sendInputs = () -> {
+            try {
+            for (Object item : inputs) {
+              if (Thread.currentThread().isInterrupted()) return;
+              Map<String, Object> input = Core.asMap(item);
+              if (sendingSetup.containsKey("audioEncoding") && "binary".equals(String.valueOf(input.get("type")))) {
+                int rate = "PCM_16KHZ".equals(String.valueOf(sendingSetup.get("audioEncoding"))) ? 16000 : 24000;
+                byte[] bytes = Base64.getDecoder().decode(String.valueOf(input.getOrDefault("data", "")));
+                if (bytes.length % 2 != 0) throw new AxAIServiceError("PCM16 audio must contain complete 16-bit samples");
+                int chunkSize = rate * 2 * 80 / 1000;
+                for (int offset = 0; offset < bytes.length; offset += chunkSize) {
+                  if (Thread.currentThread().isInterrupted()) return;
+                  byte[] chunk = java.util.Arrays.copyOfRange(bytes, offset, Math.min(offset + chunkSize, bytes.length));
+                  sendingTransport.send(Map.of("type", "binary", "data", Base64.getEncoder().encodeToString(chunk)));
+                  long millis = Math.round(chunk.length * 1000.0 / (rate * 2.0));
+                  try { Thread.sleep(millis); } catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); return; }
+                }
+              } else {
+                if ("endStream".equals(input.get("type"))) endStreamSent.set(true);
+                sendingTransport.send(input);
+              }
+            }
+            } catch (RuntimeException error) {
+              sendError.set(error);
+              sendingTransport.close();
+            }
+            };
+            if (setup.containsKey("audioEncoding")) {
+              sender = new Thread(sendInputs, "ax-meta-audio");
+              sender.setDaemon(true);
+              sender.start();
+            } else sendInputs.run();
+          }
           continue;
         }
+        if (setup.containsKey("audioEncoding") && !inputSent) throw new AxAIServiceError("Meta Voice server did not acknowledge setup");
         boolean done = realtimeEventIsDone(event);
-        events.add(event);
+        Map<String, Object> normalized = Core.asMap(Core.provider_normalize_realtime_event(profile, event, state, name, model));
+        events.add(normalized);
+        if (emit != null) emit.accept(normalized);
         if (done) break;
       }
-      Map<String, Object> state = new LinkedHashMap<>();
+      if (setup.containsKey("audioEncoding") && !inputSent) throw new AxAIServiceError("Meta Voice closed before acknowledging setup");
+      if (setup.containsKey("audioEncoding") && !endStreamSent.get()) throw new AxAIServiceError("Meta Voice closed before audio upload completed");
       StringBuilder content = new StringBuilder();
       ByteArrayOutputStream audio = new ByteArrayOutputStream();
       boolean hasAudio = false;
@@ -580,7 +894,7 @@ public class OpenAICompatibleClient extends AxBaseAI {
       String finishReason = "";
       Object modelUsage = null;
       for (Object eventObj : events) {
-        Map<String, Object> out = Core.asMap(Core.provider_normalize_realtime_event(profile, eventObj, state, name, model));
+        Map<String, Object> out = Core.asMap(eventObj);
         List<Object> results = Core.asList(out.get("results"));
         if (results.isEmpty()) continue;
         Map<String, Object> result = Core.asMap(results.get(0));
@@ -619,15 +933,22 @@ public class OpenAICompatibleClient extends AxBaseAI {
       response.put("results", List.of(result));
       response.put("remote_id", responseId);
       response.put("model_usage", modelUsage);
-      return response;
+      return Core.asMap(Core.provider_finalize_realtime_response(profile, state, response));
     } finally {
+      if (sender != null) sender.interrupt();
       if (ownTransport) transport.close();
+      if (sender != null) {
+        try { sender.join(); }
+        catch (InterruptedException error) { Thread.currentThread().interrupt(); throw new AxAIServiceError("realtime audio interrupted"); }
+      }
+      if (sendError.get() != null) throw sendError.get();
     }
   }
 
   private static boolean realtimeEventIsReady(Map<String, Object> event) {
+    if (event.get("type") == null && event.get("sessionId") != null) return true;
     String type = String.valueOf(event.get("type"));
-    if (type.equals("session.created") || type.equals("session.updated") || type.equals("transcription_session.created") || type.equals("transcription_session.updated")) return true;
+    if (type.equals("session.created") || type.equals("session.updated") || type.equals("transcription_session.created") || type.equals("transcription_session.updated") || type.equals("ready") || type.equals("sessionStarted")) return true;
     return event.containsKey("setupComplete");
   }
 
@@ -635,14 +956,16 @@ public class OpenAICompatibleClient extends AxBaseAI {
     String type = String.valueOf(event.get("type"));
     if (type.equals("response.done") || type.equals("response.completed")) return true;
     Object sc = event.get("serverContent");
-    return sc instanceof Map && Boolean.TRUE.equals(((Map<?, ?>) sc).get("turnComplete"));
+    // Extended thinking ends an acknowledgement turn IN_PROGRESS and answers in the next turn.
+    return sc instanceof Map && Boolean.TRUE.equals(((Map<?, ?>) sc).get("turnComplete"))
+        && !"IN_PROGRESS".equals(((Map<?, ?>) sc).get("interactionStatus"));
   }
 
   private Object[] realtimeWsTarget(String model) {
     // Grammar-specific URL + auth construction lives in Core so the client stays
     // provider-agnostic.
     String key = apiKey == null || "null".equals(apiKey) ? "" : apiKey;
-    Map<String, Object> target = Core.asMap(Core.provider_realtime_ws_url(profile, model, key));
+    Map<String, Object> target = Core.asMap(Core.provider_realtime_ws_url(profile, model, key, options));
     Map<String, String> wsHeaders = new LinkedHashMap<>();
     for (Map.Entry<String, Object> header : Core.asMap(target.get("headers")).entrySet()) {
       wsHeaders.put(header.getKey(), String.valueOf(header.getValue()));
@@ -675,31 +998,56 @@ public class OpenAICompatibleClient extends AxBaseAI {
   }
 
   private Object requestJson(String endpoint, Map<String, Object> payload, boolean stream, String bodyKey, boolean binaryResponse, String method, String operation) throws Exception {
+    return requestJson(endpoint,payload,stream,bodyKey,binaryResponse,method,operation,activeCancellation());
+  }
+
+  Object requestJson(String endpoint, Map<String, Object> payload, boolean stream, String bodyKey, boolean binaryResponse, String method, String operation,AxCancellationToken cancellation) throws Exception {
+    return requestJson(endpoint,payload,stream,bodyKey,binaryResponse,method,operation,cancellation,options);
+  }
+
+  // errorOptions are the call's merged options; their includeRequestBodyInErrors
+  // decides whether a provider error keeps the request body.
+  Object requestJson(String endpoint, Map<String, Object> payload, boolean stream, String bodyKey, boolean binaryResponse, String method, String operation,AxCancellationToken cancellation,Map<String, Object> errorOptions) throws Exception {
+    if(cancellation!=null)cancellation.throwIfCancelled();
     Map<String, Object> call = new LinkedHashMap<>();
     method = method == null || method.isBlank() ? "POST" : method.toUpperCase(Locale.ROOT);
     call.put("method", method);
-    String requestUrl = endpoint.startsWith("http://") || endpoint.startsWith("https://") ? endpoint : baseUrl + endpoint;
+    String requestUrl = endpoint.startsWith("http://") || endpoint.startsWith("https://") ? endpoint : callBaseUrl(errorOptions) + endpoint;
+    // TS applies the call's timeout to chat, embed and cache requests, not to
+    // speech or transcription.
+    Object timeoutMs = "transcribe".equals(operation) || "speak".equals(operation) ? null : Core.provider_call_timeout_ms(errorOptions == null ? Map.of() : errorOptions);
     call.put("url", requestUrl);
     Map<String, Object> resolvedHeaders = headers();
+    if ("typesafe".equals(profile)) resolvedHeaders = Core.asMap(Core.provider_merge_headers(resolvedHeaders, Core.typesafe_image_headers(payload)));
+    if ("meta".equals(profile) && "transcribe".equals(operation)) resolvedHeaders.put("Accept", "text/event-stream");
     if (credentialProvider != null) {
       Map<String, String> fresh = credentialProvider.credentials(
         new CredentialRequest(profile, operation, method, requestUrl)
       );
       if (fresh == null) throw new AxAIServiceAuthenticationError("credential_provider returned null headers", null, null, null, null);
-      resolvedHeaders.putAll(fresh);
+      resolvedHeaders = Core.asMap(Core.provider_merge_headers(resolvedHeaders, fresh));
     }
     call.put("headers", resolvedHeaders);
     String resolvedBodyKey = bodyKey == null || bodyKey.isBlank() ? "json" : bodyKey;
-    call.put(resolvedBodyKey, payload);
+    if (!method.equals("GET") && !method.equals("HEAD")) call.put(resolvedBodyKey, payload);
     call.put("stream", stream);
-    if (transport != null) return transportResult(transport.call(call), call);
-    if (apiKey == null || apiKey.isBlank() || "null".equals(apiKey)) throw new AxAIServiceAuthenticationError("OPENAI_API_KEY is required", null, null, null, call);
+    // The call's timeoutMs, for a custom transport to honor.
+    if (timeoutMs != null) call.put("timeout_ms", timeoutMs);
+    Map<String, Object> errorRequest = errorRequest(call, errorOptions);
+    // As TS's apiCall, a verbose call (the call's verbose, else the client's)
+    // logs the request, then its JSON response or the stream's start.
+    boolean verbose = Core.truthy((errorOptions == null ? options : errorOptions).get("verbose"));
+    if (verbose) AxGlobals.verboseLog(String.valueOf(Core.ai_verbose_request_log(requestUrl, method, resolvedHeaders, payload)));
+    if (transport != null){Object value=transport.call(call,cancellation);if(cancellation!=null)cancellation.throwIfCancelled();if(binaryResponse)return binaryTransportResult(value,errorRequest);Object result=transportResult(value,errorRequest);if(verbose)AxGlobals.verboseLog(String.valueOf(stream?Core.ai_verbose_stream_log(AxGlobals.transportStatus(value)):Core.ai_verbose_response_log(AxGlobals.transportStatus(value),result)));return result;}
+    if (credentialProvider == null && (apiKey == null || apiKey.isBlank() || "null".equals(apiKey))) throw new AxAIServiceAuthenticationError("api_key or credential_provider is required", null, null, null, errorRequest);
     HttpRequest.Builder builder = HttpRequest.newBuilder()
       .uri(URI.create(requestUrl))
-      .timeout(Duration.ofMillis((long) (timeoutSeconds * 1000)));
+      .timeout(requestTimeout(timeoutMs));
     Map<String, Object> requestHeaders = new LinkedHashMap<>(resolvedHeaders);
     HttpRequest.BodyPublisher bodyPublisher;
-    if ("data".equals(resolvedBodyKey)) {
+    if (method.equals("GET") || method.equals("HEAD")) {
+      bodyPublisher = HttpRequest.BodyPublishers.noBody();
+    } else if ("data".equals(resolvedBodyKey)) {
       byte[] multipartBody = encodeMultipart(payload, MULTIPART_BOUNDARY);
       requestHeaders.put("Content-Type", "multipart/form-data; boundary=" + MULTIPART_BOUNDARY);
       bodyPublisher = HttpRequest.BodyPublishers.ofByteArray(multipartBody);
@@ -711,66 +1059,300 @@ public class OpenAICompatibleClient extends AxBaseAI {
     if (binaryResponse) {
       // Binary operations (e.g. OpenAI /audio/speech returns raw mp3) must not be UTF-8
       // decoded; read the response as bytes and return them as a base64 String.
-      HttpResponse<byte[]> res = http.send(req, HttpResponse.BodyHandlers.ofByteArray());
+      HttpResponse<byte[]> res = sendTimed(req, HttpResponse.BodyHandlers.ofByteArray(), cancellation, timeoutMs, errorRequest, typedTransportErrors(errorOptions));
       if (res.statusCode() >= 400) {
         String errorBody = new String(res.body(), StandardCharsets.UTF_8);
         Object parsed;
         try { parsed = Json.parse(errorBody); } catch (RuntimeException ex) { parsed = errorBody; }
-        throw Core.asRuntime(Core.openai_normalize_error(res.statusCode(), parsed, call));
+        throw statusError(res.statusCode(), parsed, errorRequest, res.headers().firstValue("Retry-After").orElse(null));
       }
-      return Base64.getEncoder().encodeToString(res.body());
+      // The bytes go on as base64 with their Content-Type; a JSON body (as TS
+      // reads one by its Content-Type) goes on parsed.
+      String contentType = res.headers().firstValue("content-type").orElse("");
+      if (contentType.contains("application/json")) return Json.parse(new String(res.body(), StandardCharsets.UTF_8));
+      return new BinaryBody(Base64.getEncoder().encodeToString(res.body()), contentType);
     }
-    HttpResponse<String> res = http.send(req, HttpResponse.BodyHandlers.ofString());
+    HttpResponse<String> res = sendTimed(req, HttpResponse.BodyHandlers.ofString(), cancellation, timeoutMs, errorRequest, typedTransportErrors(errorOptions));
     String responseBody = res.body();
     if (res.statusCode() >= 400) {
       Object parsed;
       try { parsed = Json.parse(responseBody); } catch (RuntimeException ex) { parsed = responseBody; }
-      throw Core.asRuntime(Core.openai_normalize_error(res.statusCode(), parsed, call));
+      throw statusError(res.statusCode(), parsed, errorRequest, res.headers().firstValue("Retry-After").orElse(null));
     }
     // Streaming responses are SSE text (text/event-stream): return the raw body
     // for iterSseJson to fold. This explicit branch matches the other ports
     // rather than relying on Json.parse throwing on the SSE body to fall back.
-    if (stream) return responseBody;
-    return Json.parse(responseBody);
+    if (stream) {
+      if (verbose) AxGlobals.verboseLog(String.valueOf(Core.ai_verbose_stream_log(res.statusCode())));
+      return responseBody;
+    }
+    Object parsedBody;
+    try { parsedBody = Json.parse(responseBody); } catch (RuntimeException ignored) { parsedBody = responseBody; }
+    if (verbose) AxGlobals.verboseLog(String.valueOf(Core.ai_verbose_response_log(res.statusCode(), parsedBody)));
+    return parsedBody;
   }
 
-  private RawSseStream requestSse(String endpoint, Map<String, Object> payload, Object modelName) throws Exception {
+  RawSseStream requestSse(String endpoint, Map<String, Object> payload, Object modelName) throws Exception {
+    return requestSse(endpoint,payload,modelName,null,options);
+  }
+  RawSseStream requestSse(String endpoint, Map<String, Object> payload, Object modelName,Map<String, Object> errorOptions) throws Exception {
+    return requestSse(endpoint,payload,modelName,null,errorOptions);
+  }
+  private RawSseStream requestSse(String endpoint, Map<String, Object> payload, Object modelName,AxCancellationToken cancellation,Map<String, Object> errorOptions) throws Exception {
+    if(cancellation!=null)cancellation.throwIfCancelled();
     Map<String, Object> call = new LinkedHashMap<>();
     String method = operationMethod("stream_chat").toUpperCase(Locale.ROOT);
-    String requestUrl = endpoint.startsWith("http://") || endpoint.startsWith("https://") ? endpoint : baseUrl + endpoint;
+    String requestUrl = endpoint.startsWith("http://") || endpoint.startsWith("https://") ? endpoint : callBaseUrl(errorOptions) + endpoint;
+    Object timeoutMs = Core.provider_call_timeout_ms(errorOptions == null ? Map.of() : errorOptions);
     Map<String, Object> resolvedHeaders = headers();
     if (credentialProvider != null) {
       Map<String, String> fresh = credentialProvider.credentials(new CredentialRequest(profile, "stream_chat", method, requestUrl));
       if (fresh == null) throw new AxAIServiceAuthenticationError("credential_provider returned null headers", null, null, null, null);
-      resolvedHeaders.putAll(fresh);
+      resolvedHeaders = Core.asMap(Core.provider_merge_headers(resolvedHeaders, fresh));
     }
     call.put("method", method);
     call.put("url", requestUrl);
     call.put("headers", resolvedHeaders);
     call.put("json", payload);
     call.put("stream", true);
-    if (transport != null) return RawSseStream.from(transportResult(transport.stream(call), call));
-    if (apiKey == null || apiKey.isBlank() || "null".equals(apiKey)) throw new AxAIServiceAuthenticationError("OPENAI_API_KEY is required", null, null, null, call);
+    // The call's timeoutMs, for a custom transport to honor.
+    if (timeoutMs != null) call.put("timeout_ms", timeoutMs);
+    Map<String, Object> errorRequest = errorRequest(call, errorOptions);
+    // As TS's apiCall, a verbose call logs the request and that its stream
+    // started.
+    boolean verbose = Core.truthy((errorOptions == null ? options : errorOptions).get("verbose"));
+    if (verbose) AxGlobals.verboseLog(String.valueOf(Core.ai_verbose_request_log(requestUrl, method, resolvedHeaders, payload)));
+    if (transport != null) {
+      Object streamed = transport.stream(call,cancellation);
+      Object result = transportResult(streamed, errorRequest);
+      if (verbose) AxGlobals.verboseLog(String.valueOf(Core.ai_verbose_stream_log(AxGlobals.transportStatus(streamed))));
+      return RawSseStream.from(result);
+    }
+    if (apiKey == null || apiKey.isBlank() || "null".equals(apiKey)) throw new AxAIServiceAuthenticationError("OPENAI_API_KEY is required", null, null, null, errorRequest);
     HttpRequest.Builder builder = HttpRequest.newBuilder()
       .uri(URI.create(requestUrl))
-      .timeout(Duration.ofMillis((long) (timeoutSeconds * 1000)));
+      .timeout(requestTimeout(timeoutMs));
     for (Map.Entry<String, Object> header : resolvedHeaders.entrySet()) builder.header(header.getKey(), String.valueOf(header.getValue()));
     HttpRequest req = builder.method(method, HttpRequest.BodyPublishers.ofString(Json.stringify(payload))).build();
-    HttpResponse<InputStream> res = http.send(req, HttpResponse.BodyHandlers.ofInputStream());
+    HttpResponse<InputStream> res = sendTimed(req, HttpResponse.BodyHandlers.ofInputStream(), cancellation, timeoutMs, errorRequest, true);
     if (res.statusCode() >= 400) {
       try (InputStream body = res.body()) {
         String errorBody = new String(body.readAllBytes(), StandardCharsets.UTF_8);
         Object parsed;
         try { parsed = Json.parse(errorBody); } catch (RuntimeException ex) { parsed = errorBody; }
-        throw Core.asRuntime(Core.openai_normalize_error(res.statusCode(), parsed, call));
+        throw statusError(res.statusCode(), parsed, errorRequest, res.headers().firstValue("Retry-After").orElse(null));
       }
     }
-    return RawSseStream.from(res.body());
+    if (verbose) AxGlobals.verboseLog(String.valueOf(Core.ai_verbose_stream_log(res.statusCode())));
+    InputStream body=res.body();
+    AxCancellationToken.Subscription subscription=cancellation==null?()->{}:cancellation.subscribe(()->{try{body.close();}catch(IOException ignored){}});
+    return new RawSseStream(new BufferedReader(new InputStreamReader(body,StandardCharsets.UTF_8)),null,()->{subscription.close();body.close();});
+  }
+
+  private static void waitBackoff(long milliseconds,AxCancellationToken cancellation)throws InterruptedException{
+    if(milliseconds<=0){if(cancellation!=null)cancellation.throwIfCancelled();return;}
+    if(cancellation==null){Thread.sleep(milliseconds);return;}
+    if(cancellation.await(milliseconds))cancellation.throwIfCancelled();
+  }
+
+  // The call's options can move the provider's base URL (a Vertex beta selects
+  // v1beta1), as TS resolves it for each call. An explicit base_url or
+  // OPENAI_BASE_URL still wins.
+  private String callBaseUrl(Map<String, Object> callOptions) {
+    Object descriptorBase = descriptor.get("baseUrl");
+    if (callOptions == null || callOptions.isEmpty() || descriptorBase == null) return baseUrl;
+    if (!baseUrl.equals(String.valueOf(descriptorBase).replaceAll("/+$", ""))) return baseUrl;
+    Object resolved = Core.asMap(Core.provider_resolve_descriptor(profile, callOptions)).get("baseUrl");
+    return resolved == null ? baseUrl : String.valueOf(resolved).replaceAll("/+$", "");
+  }
+
+  // Conformance hooks for the request-layer retry: a sleep that records the
+  // delay instead of waiting, and fixed random and clock sources.
+  static volatile java.util.function.DoubleConsumer requestRetrySleepHook;
+  static volatile java.util.function.DoubleSupplier requestRetryRandomHook;
+  static volatile java.util.function.DoubleSupplier requestRetryNowHook;
+
+  // TS apiCall's view of a failed request: its HTTP status (with its
+  // Retry-After) or a network failure. Anything else is null and not retried.
+  static Map<String, Object> requestRetryFailure(Throwable failure) {
+    if (failure instanceof AxAIServiceAuthenticationError || failure instanceof AxAIServiceAbortedError) return null;
+    if (failure instanceof AxAIServiceError service) {
+      if (service.status != null) {
+        Map<String, Object> described = new LinkedHashMap<>();
+        described.put("status", service.status);
+        if (service.retryAfter != null) described.put("retry_after", service.retryAfter);
+        return described;
+      }
+      return failure instanceof AxAIServiceNetworkError ? Map.of("network", true) : null;
+    }
+    // Legacy transport exceptions: failed connections are retried, timeouts are not.
+    if (failure instanceof java.net.http.HttpTimeoutException) return null;
+    if (failure instanceof IOException) return Map.of("network", true);
+    return null;
+  }
+
+  // Waits before the failed request goes out again, as TS apiCall does, and
+  // says whether it does.
+  static boolean requestRetryWait(Map<String, Object> config, int attempt, Throwable failure, AxCancellationToken cancellation) throws InterruptedException {
+    Map<String, Object> described = requestRetryFailure(failure);
+    if (described == null) return false;
+    java.util.function.DoubleSupplier now = requestRetryNowHook;
+    java.util.function.DoubleSupplier random = requestRetryRandomHook;
+    Object delay = Core.request_retry_delay(config, attempt, described,
+        now != null ? now.getAsDouble() : (double) System.currentTimeMillis(),
+        random != null ? random.getAsDouble() : Math.random());
+    if (delay == null) return false;
+    requestRetrySleep(Core.asDouble(delay), cancellation);
+    return true;
+  }
+
+  static void requestRetrySleep(double delay, AxCancellationToken cancellation) throws InterruptedException {
+    java.util.function.DoubleConsumer sleep = requestRetrySleepHook;
+    if (sleep != null) {
+      if (cancellation != null) cancellation.throwIfCancelled();
+      sleep.accept(delay);
+      return;
+    }
+    waitBackoff((long) delay, cancellation);
+  }
+
+  // TS apiCall's request-layer retry around one request: a listed status or a
+  // network failure goes out again after its jittered backoff (or its
+  // Retry-After), under the call's retry options, else the client's. Each
+  // retry builds the request again, as apiCall resolves its headers again.
+  Object requestJsonRetried(String endpoint, Map<String, Object> payload, String method, String operation, AxCancellationToken cancellation, Map<String, Object> errorOptions) throws Exception {
+    Map<String, Object> config = Core.asMap(Core.resolve_stream_retry(errorOptions == null ? options : errorOptions));
+    for (int attempt = 0; ; attempt++) {
+      try {
+        return requestJson(endpoint, payload, false, "json", false, method, operation, cancellation, errorOptions);
+      } catch (Exception failure) {
+        if (cancellation != null) cancellation.throwIfCancelled();
+        if (!requestRetryWait(config, attempt, failure, cancellation)) throw failure;
+      }
+    }
+  }
+
+  private RawSseStream requestSseRetried(String endpoint, Map<String, Object> payload, Object modelName, AxCancellationToken cancellation, Map<String, Object> errorOptions, Map<String, Object> config) throws Exception {
+    for (int attempt = 0; ; attempt++) {
+      try {
+        return requestSse(endpoint, payload, modelName, cancellation, errorOptions);
+      } catch (Exception failure) {
+        if (cancellation != null) cancellation.throwIfCancelled();
+        if (!requestRetryWait(config, attempt, failure, cancellation)) throw failure;
+      }
+    }
+  }
+
+  // A status response's error, with its Retry-After.
+  private static RuntimeException statusError(int status, Object body, Map<String, Object> request, String retryAfter) {
+    RuntimeException error = Core.asRuntime(Core.openai_normalize_error(status, body, request, null));
+    if (error instanceof AxAIServiceError service) service.retryAfter = retryAfter;
+    return error;
+  }
+
+  private static String retryAfterHeader(Object headers) {
+    if (!(headers instanceof Map<?, ?> map)) return null;
+    for (Map.Entry<?, ?> entry : map.entrySet()) {
+      if ("retry-after".equalsIgnoreCase(String.valueOf(entry.getKey()))) return entry.getValue() == null ? null : String.valueOf(entry.getValue());
+    }
+    return null;
+  }
+
+  // The client's timeout stays the request's timeout; a longer timeoutMs
+  // raises it.
+  private Duration requestTimeout(Object timeoutMs) {
+    long clientMillis = (long) (timeoutSeconds * 1000);
+    if (timeoutMs instanceof Number ms) return Duration.ofMillis(Math.max(clientMillis, (long) Math.ceil(ms.doubleValue())));
+    return Duration.ofMillis(clientMillis);
+  }
+
+  // A call's timeoutMs bounds the wait for the response headers, as TS
+  // apiCall's timer does: the body handler sees them arrive, and a request
+  // without them in time is cancelled with TS's AxAIServiceTimeoutError.
+  // (HttpRequest.timeout can't do it: newer JDKs apply it to the body too.)
+  private <T> HttpResponse<T> sendTimed(HttpRequest request, HttpResponse.BodyHandler<T> handler, AxCancellationToken cancellation, Object timeoutMs, Map<String, Object> errorRequest, boolean typed) throws Exception {
+    if (!(timeoutMs instanceof Number ms)) return sendCancellable(request, handler, cancellation, errorRequest, typed);
+    if (cancellation != null) cancellation.throwIfCancelled();
+    java.util.concurrent.CountDownLatch started = new java.util.concurrent.CountDownLatch(1);
+    HttpResponse.BodyHandler<T> timed = info -> {
+      started.countDown();
+      return handler.apply(info);
+    };
+    CompletableFuture<HttpResponse<T>> future = http.sendAsync(request, timed);
+    future.whenComplete((response, error) -> started.countDown());
+    AxCancellationToken.Subscription subscription = cancellation == null ? () -> {} : cancellation.subscribe(() -> future.cancel(true));
+    try {
+      if (!started.await(Math.max(1L, (long) Math.ceil(ms.doubleValue())), java.util.concurrent.TimeUnit.MILLISECONDS)) {
+        future.cancel(true);
+        if (cancellation != null) cancellation.throwIfCancelled();
+        throw new AxAIServiceTimeoutError(String.valueOf(Core.provider_call_timeout_message(timeoutMs)), null, null, null, errorRequest, true);
+      }
+      return future.get();
+    } catch (CancellationException error) {
+      if (cancellation != null) cancellation.throwIfCancelled();
+      throw error;
+    } catch (ExecutionException error) {
+      if (cancellation != null && cancellation.cancelled()) cancellation.throwIfCancelled();
+      Throwable cause = error.getCause();
+      if (cause instanceof Exception exception) throw typed ? transportFailure(exception, request, errorRequest) : untypedTransportFailure(exception);
+      if (cause instanceof Error fatal) throw fatal;
+      throw new RuntimeException(cause);
+    } catch (InterruptedException error) {
+      Thread.currentThread().interrupt();
+      if (cancellation != null && cancellation.cancelled()) cancellation.throwIfCancelled();
+      throw error;
+    } finally {
+      subscription.close();
+    }
+  }
+
+  private <T> HttpResponse<T> sendCancellable(HttpRequest request,HttpResponse.BodyHandler<T> handler,AxCancellationToken cancellation,Map<String, Object> errorRequest,boolean typed)throws Exception{
+    if(cancellation!=null)cancellation.throwIfCancelled();
+    CompletableFuture<HttpResponse<T>> future=http.sendAsync(request,handler);
+    AxCancellationToken.Subscription subscription=cancellation==null?()->{}:cancellation.subscribe(()->future.cancel(true));
+    try{return future.get();}
+    catch(CancellationException error){if(cancellation!=null)cancellation.throwIfCancelled();throw error;}
+    catch(ExecutionException error){if(cancellation!=null&&cancellation.cancelled())cancellation.throwIfCancelled();Throwable cause=error.getCause();if(cause instanceof Exception exception)throw typed?transportFailure(exception,request,errorRequest):untypedTransportFailure(exception);if(cause instanceof Error fatal)throw fatal;throw new RuntimeException(cause);}
+    catch(InterruptedException error){Thread.currentThread().interrupt();if(cancellation!=null&&cancellation.cancelled())cancellation.throwIfCancelled();throw error;}
+    finally{subscription.close();}
+  }
+
+  // How the HTTP client's failure surfaces, as TS apiCall reports fetch's: the
+  // request's own timeout is TS's AxAIServiceTimeoutError in its words (the
+  // client's timeout in milliseconds), any other I/O failure is a network
+  // error, and the JDK's exception stays the cause.
+  private static Exception transportFailure(Exception failure, HttpRequest request, Map<String, Object> errorRequest) {
+    if (failure instanceof java.net.http.HttpTimeoutException) {
+      long ms = request.timeout().map(Duration::toMillis).orElse(0L);
+      AxAIServiceTimeoutError timeout = new AxAIServiceTimeoutError(String.valueOf(Core.provider_call_timeout_message(ms)), null, null, null, errorRequest, true);
+      timeout.initCause(failure);
+      return timeout;
+    }
+    if (failure instanceof IOException) return networkError(failure, errorRequest);
+    return failure;
+  }
+
+  // Typed failures retain the JDK exception as their cause. Explicit false
+  // preserves the legacy exception contract for callers migrating from 24.x.
+  private boolean typedTransportErrors(Map<String, Object> callOptions) {
+    Map<String, Object> resolved = callOptions == null ? options : callOptions;
+    return Core.truthy(resolved.getOrDefault("typedTransportErrors", resolved.getOrDefault("typed_transport_errors", true)));
+  }
+
+  private static Exception untypedTransportFailure(Exception failure) {
+    return failure;
+  }
+
+  // TS's AxAIServiceNetworkError: "Network Error: " and the transport's message.
+  private static AxAIServiceNetworkError networkError(Throwable failure, Map<String, Object> errorRequest) {
+    AxAIServiceNetworkError error = new AxAIServiceNetworkError("Network Error: " + (failure.getMessage() == null ? failure.toString() : failure.getMessage()), errorRequest);
+    error.initCause(failure);
+    return error;
   }
 
   // Encode a request payload as multipart/form-data. Multipart operations (e.g. OpenAI
-  // /audio/transcriptions) carry the audio as a binary `file` part; every other field is a
-  // plain form field. The `file` value is a base64 String (optionally a data: URL) or a
+  // /audio/transcriptions) carry audio as a binary `file` or `audio` part; every other field is a
+  // plain form field. The binary value is a base64 String (optionally a data: URL) or a
   // Map {data, mimeType?, filename?}. The body is binary: text parts are UTF-8 bytes and the
   // file part is the raw decoded bytes.
   private static byte[] encodeMultipart(Map<String, Object> payload, String boundary) throws IOException {
@@ -781,7 +1363,7 @@ public class OpenAICompatibleClient extends AxBaseAI {
       String key = entry.getKey();
       Object value = entry.getValue();
       if (value == null) continue;
-      if ("file".equals(key)) {
+      if ("file".equals(key) || "audio".equals(key)) {
         String data;
         String filename;
         String contentType;
@@ -809,7 +1391,7 @@ public class OpenAICompatibleClient extends AxBaseAI {
         }
         out.write(dashes);
         out.write(crlf);
-        out.write(("Content-Disposition: form-data; name=\"file\"; filename=\"" + filename + "\"").getBytes(StandardCharsets.UTF_8));
+        out.write(("Content-Disposition: form-data; name=\"" + key + "\"; filename=\"" + filename + "\"").getBytes(StandardCharsets.UTF_8));
         out.write(crlf);
         out.write(("Content-Type: " + contentType).getBytes(StandardCharsets.UTF_8));
         out.write(crlf);
@@ -821,6 +1403,10 @@ public class OpenAICompatibleClient extends AxBaseAI {
         out.write(crlf);
         out.write(("Content-Disposition: form-data; name=\"" + key + "\"").getBytes(StandardCharsets.UTF_8));
         out.write(crlf);
+        if ("request".equals(key)) {
+          out.write("Content-Type: application/json".getBytes(StandardCharsets.UTF_8));
+          out.write(crlf);
+        }
         out.write(crlf);
         out.write(String.valueOf(value).getBytes(StandardCharsets.UTF_8));
         out.write(crlf);
@@ -836,15 +1422,11 @@ public class OpenAICompatibleClient extends AxBaseAI {
     return operationPath(operation, null);
   }
 
-  private String operationPath(String operation, Object modelName) {
+  String operationPath(String operation, Object modelName) {
     Map<String, Object> desc = Core.asMap(Core.asMap(descriptor.get("operations")).get(operation));
-    String path = String.valueOf(desc.getOrDefault("path", "/" + operation));
+    String path = String.valueOf(Core.provider_chat_operation_path(profile, String.valueOf(modelName), operation, String.valueOf(desc.getOrDefault("path", "/" + operation))));
     if (modelName != null) {
       path = path.replace("{model}", URLEncoder.encode(String.valueOf(modelName), StandardCharsets.UTF_8));
-    }
-    if ("api_key_query".equals(String.valueOf(descriptor.get("auth")))) {
-      String keyName = String.valueOf(descriptor.getOrDefault("apiKeyQuery", "key"));
-      path += (path.contains("?") ? "&" : "?") + URLEncoder.encode(keyName, StandardCharsets.UTF_8) + "=" + URLEncoder.encode(apiKey == null || "null".equals(apiKey) ? "" : apiKey, StandardCharsets.UTF_8);
     }
     if (apiVersion != null && !apiVersion.isBlank() && !"null".equals(apiVersion)) {
       path += (path.contains("?") ? "&" : "?") + "api-version=" + URLEncoder.encode(apiVersion, StandardCharsets.UTF_8);
@@ -864,11 +1446,35 @@ public class OpenAICompatibleClient extends AxBaseAI {
     if ("api_key_header".equals(String.valueOf(descriptor.get("auth")))) {
       headers.put(String.valueOf(descriptor.getOrDefault("apiKeyHeader", "api-key")), apiKey == null ? "" : apiKey);
     }
-    Object extraHeaders = descriptor.get("headers");
-    if (extraHeaders instanceof Map<?, ?> rawHeaders) {
-      for (Map.Entry<?, ?> entry : rawHeaders.entrySet()) headers.put(String.valueOf(entry.getKey()), String.valueOf(entry.getValue()));
-    }
+    headers = Core.asMap(Core.provider_merge_headers(headers, descriptor.getOrDefault("headers", Map.of())));
+    headers = Core.asMap(Core.provider_merge_headers(headers, options.getOrDefault("headers", Map.of())));
     return headers;
+  }
+
+  // A transport's binary answer: `body` (base64 text or bytes) with its
+  // headers' Content-Type, or parsed `json`. A JSON Content-Type makes a text
+  // body JSON, as TS reads it.
+  private Object binaryTransportResult(Object result, Map<String, Object> request) {
+    String contentType = "";
+    if (result instanceof Map<?, ?> raw && raw.get("headers") instanceof Map<?, ?> headers) {
+      for (Map.Entry<?, ?> header : headers.entrySet()) {
+        if ("content-type".equalsIgnoreCase(String.valueOf(header.getKey()))) contentType = String.valueOf(header.getValue());
+      }
+    }
+    Object body = transportResult(result, request);
+    if (body instanceof byte[] bytes) body = Base64.getEncoder().encodeToString(bytes);
+    if (body instanceof String text) {
+      if (contentType.contains("application/json")) return Json.parse(text);
+      return new BinaryBody(text, contentType);
+    }
+    return body;
+  }
+
+  // TypeScript's includeRequestBodyInErrors: on unless the call or client options set it false.
+  // The request this call's provider errors keep; Core owns the view (the URL,
+  // plus the body unless includeRequestBodyInErrors is false, never headers).
+  static Map<String, Object> errorRequest(Map<String, Object> call, Map<String, Object> options) {
+    return Core.asMap(Core._ai_error_request(call, options));
   }
 
   private Object transportResult(Object result, Map<String, Object> request) {
@@ -877,7 +1483,7 @@ public class OpenAICompatibleClient extends AxBaseAI {
       if (map.containsKey("status")) {
         int status = Core.asInt(map.getOrDefault("status", 200));
         Object body = map.containsKey("json") ? map.get("json") : map.containsKey("body") ? map.get("body") : map.get("data");
-        if (status >= 400) throw Core.asRuntime(Core.openai_normalize_error(status, body, request));
+        if (status >= 400) throw statusError(status, body, request, retryAfterHeader(map.get("headers")));
         return body;
       }
     }

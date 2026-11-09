@@ -3,6 +3,7 @@ import os
 
 import base64
 import hashlib
+import http.client
 import ipaddress
 import json
 import re
@@ -17,8 +18,9 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .signature import AxSignature
+from .signature import AxSignature, _js_json_dumps, _js_number_text, _js_format
 from .tool import Tool
+from .ai import AxCancellationToken, AxAIServiceAbortedError
 # AXIR_CORE_IMPORTS
 
 
@@ -32,6 +34,10 @@ def _core_coverage_mark(name):
     _CORE_COVERAGE_SEEN.add(name)
     with open(path, "a", encoding="utf-8") as handle:
         handle.write(name + "\n")
+
+
+def _core_runtime_error(message):
+    return RuntimeError(str(message))
 
 
 def _core_get(target, key, default=None):
@@ -74,9 +80,10 @@ def _core_len(value): return len(value or [])
 def _core_contains(container, item): return False if container is None else item in container
 def _core_truthy(value): return bool(value)
 def _core_none(): return None
-def _core_json_stringify(value): return json.dumps(value, separators=(",", ":"), sort_keys=True)
+def _core_json_stringify(value): return _js_json_dumps(value)  # TS JSON.stringify: insertion order
 def _core_json_parse(value): return json.loads(value)
 def _core_math_abs(value): return abs(value)
+def _core_sorted_strings(values): return sorted(str(value) for value in (values or []))
 
 
 def _core_map_merge(left, right):
@@ -115,10 +122,7 @@ def _core_validation_error(message): return AxMCPError(str(message))
 
 
 def _core_string_format(template, *args):
-    rendered = str(template)
-    for value in args:
-        rendered = rendered.replace("{}", str(value), 1)
-    return rendered
+    return _js_format(template, args)
 
 
 # AXIR_CORE_MCP_FUNCTIONS
@@ -345,9 +349,8 @@ class AxEventContinuation:
     expiresAt: float | None = None
 
 
-class AxEventCancellationToken:
-    def __init__(self): self.cancelled = False; self.reason = None
-    def cancel(self, reason="cancelled"): self.cancelled = True; self.reason = reason
+class AxEventCancellationToken(AxCancellationToken):
+    """Backward-compatible event cancellation token."""
 
 
 @dataclass
@@ -477,8 +480,9 @@ class AxSystemEventClock(AxEventClock):
     def now(self) -> float: return time.time() * 1000
     def sleep(self, seconds, cancellation=None):
         if cancellation is not None and cancellation.cancelled: return False
-        time.sleep(max(0.0, seconds))
-        return cancellation is None or not cancellation.cancelled
+        if cancellation is None:
+            time.sleep(max(0.0, seconds)); return True
+        return not cancellation.wait(max(0.0, seconds))
 
 
 class AxManualEventClock(AxEventClock):
@@ -493,6 +497,7 @@ class AxManualEventClock(AxEventClock):
             while self._sleepers < count: self._condition.wait()
     def sleep(self, seconds, cancellation=None):
         target = self.now() + max(0.0, seconds) * 1000
+        remove = cancellation.subscribe(self._wake) if cancellation is not None else lambda: None
         with self._condition:
             self._sleepers += 1; self._condition.notify_all()
             try:
@@ -501,7 +506,10 @@ class AxManualEventClock(AxEventClock):
                     self._condition.wait()
             finally:
                 self._sleepers -= 1
+                remove()
         return cancellation is None or not cancellation.cancelled
+    def _wake(self):
+        with self._condition: self._condition.notify_all()
 
 
 class AxEventStore:
@@ -840,6 +848,17 @@ class AxEventRuntime:
         return event_normalize_mcp(namespace, method, params)
 
 
+def _mcp_check_context(context):
+    if not context:
+        return
+    token = context.get("cancellation")
+    if token is not None:
+        token.throw_if_cancelled()
+    signal = context.get("signal")
+    if signal is not None and signal.is_set():
+        raise AxAIServiceAbortedError("MCP invocation cancelled")
+
+
 class AxMCPTransport:
     def send(self, message: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError
@@ -849,6 +868,13 @@ class AxMCPTransport:
 
     def send_with_headers(self, message: dict[str, Any], headers: dict[str, str] | None = None) -> dict[str, Any]:
         return self.send(message)
+
+    def send_with_context(self, message, headers=None, context=None):
+        """Optional cancellation boundary; existing transports remain valid."""
+        _mcp_check_context(context)
+        result = self.send_with_headers(message, headers)
+        _mcp_check_context(context)
+        return result
 
     def send_response(self, message: dict[str, Any]) -> None:
         self.send_notification(message)
@@ -991,8 +1017,11 @@ class AxMCPClient:
         self._subscription_ready = threading.Event()
         self._subscription_restart_lock = threading.Lock()
         self._next_id = 1
+        self._request_id_lock = threading.Lock()
         self._notification_listeners: list[Callable[[dict[str, Any]], None]] = []
         self._lifecycle_listeners: list[Callable[[str], None]] = []
+        # Latest snapshot of each task this client has seen, by task id.
+        self._tasks: dict[str, dict[str, Any]] = {}
         self._initialized = False
         self.transport.set_message_handler(self._handle_inbound_message)
         self.transport.set_request_handler(self._handle_server_request)
@@ -1158,14 +1187,14 @@ class AxMCPClient:
         if changed:
             self.catalog_revision += 1
 
-    def _collect_catalog(self, method: str, field: str) -> list[dict[str, Any]]:
+    def _collect_catalog(self, method: str, field: str, *, context=None) -> list[dict[str, Any]]:
         values: list[dict[str, Any]] = []
         pages: list[dict[str, Any]] = []
         cursor = None
         seen: set[str] = set()
         max_pages = int(self.options.get("maxPaginationPages", 1000))
         for _page in range(max_pages):
-            result = self._request(method, {"cursor": cursor} if cursor else {})
+            result = self._request(method, {"cursor": cursor} if cursor else {}, context=context)
             pages.append(result)
             values.extend(json.loads(json.dumps(result.get(field) or [])))
             cursor = result.get("nextCursor")
@@ -1200,8 +1229,36 @@ class AxMCPClient:
         params = {"cursor": cursor} if cursor else {}
         return self._request("tools/list", params)
 
-    def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    def call_tool(self, name: str, arguments: dict[str, Any] | None = None, *, context=None, task_handling: str = "await") -> dict[str, Any]:
+        """Calls a tool, as TypeScript's callTool. When a modern server answers with a
+        task, task_handling="await" (the default) waits for its result and
+        task_handling="expose" returns the flattened CreateTaskResult (with its
+        top-level taskId) instead."""
+        if task_handling not in ("await", "expose"):
+            raise ValueError(f"task_handling must be 'await' or 'expose', not {task_handling!r}")
+        outcome = self._request_tool_call_outcome(name, arguments, context=context)
+        if outcome["kind"] == "complete":
+            return outcome["result"]
+        task = outcome["task"]
+        if task_handling == "expose":
+            return task
+        return self._await_modern_task(str(task["taskId"]), context=context)
+
+    def call_tool_outcome(self, name: str, arguments: dict[str, Any] | None = None, *, context=None) -> dict[str, Any]:
+        """Calls a tool without waiting on a task, as TypeScript's callToolOutcome:
+        {"kind": "complete", "result": ...} or {"kind": "task", "task": ...}. A task
+        is a modern server's CreateTaskResult; a legacy server's task-shaped result
+        is a complete result."""
+        return self._request_tool_call_outcome(name, arguments, context=context)
+
+    def _request_tool_call_outcome(self, name: str, arguments: dict[str, Any] | None, *, context=None) -> dict[str, Any]:
+        _mcp_check_context(context)
         args = arguments or {}
+        authorize = self.options.get("authorizeToolCall", self.options.get("authorize_tool_call"))
+        if authorize is not None:
+            authorization_context = _mcp_tool_authorization_context(self.tools, self.namespace(), name, args)
+            authorization_context["client"] = self
+            _mcp_tool_authorization_result(name, authorize(authorization_context))
         headers: dict[str, str] = {}
         if self.era == "modern":
             tool = next((item for item in self.tools if item.get("name") == name), None)
@@ -1209,11 +1266,11 @@ class AxMCPClient:
                 bindings = mcp_param_header_bindings(tool.get("inputSchema") or {})
                 headers = {str(key): str(value) for key, value in mcp_param_header_values(bindings, args).items()}
         try:
-            result = self._request_with_input_rounds("tools/call", {"name": name, "arguments": args}, extra_headers=headers)
+            result = self._request_with_input_rounds("tools/call", {"name": name, "arguments": args}, extra_headers=headers, context=context)
         except AxMCPError as error:
             if self.era != "modern" or error.code != -32020:
                 raise
-            raw_tools = self._collect_catalog("tools/list", "tools")
+            raw_tools = self._collect_catalog("tools/list", "tools", context=context)
             self.tools = []
             for tool in raw_tools:
                 try:
@@ -1224,19 +1281,37 @@ class AxMCPClient:
             tool = next((item for item in self.tools if item.get("name") == name), None)
             bindings = mcp_param_header_bindings((tool or {}).get("inputSchema") or {})
             headers = {str(key): str(value) for key, value in mcp_param_header_values(bindings, args).items()}
-            result = self._request_with_input_rounds("tools/call", {"name": name, "arguments": args}, extra_headers=headers)
-        if result.get("resultType") != "task":
-            return result
-        if not self._has_tasks_capability():
-            raise AxMCPError("MCP protocol violation: server returned a task without negotiating io.modelcontextprotocol/tasks")
-        if not mcp_validate_modern_task(result):
-            raise AxMCPError("MCP protocol violation: invalid CreateTaskResult")
-        return self._await_modern_task(str(result["taskId"]))
+            result = self._request_with_input_rounds("tools/call", {"name": name, "arguments": args}, extra_headers=headers, context=context)
+        outcome = dict(mcp_tool_call_outcome(result, self._has_tasks_capability()))
+        if outcome.get("kind") == "violation":
+            raise AxMCPError(str(outcome.get("message")))
+        if outcome.get("kind") == "task":
+            self._record_task(outcome["task"])
+        return outcome
 
-    def _await_modern_task(self, task_id: str) -> dict[str, Any]:
+    def _record_task(self, task: Any) -> None:
+        # As TypeScript's recordTask: keep the task's latest snapshot, and ask a
+        # running modern listener for a new task's updates.
+        task_id = task.get("taskId") if isinstance(task, dict) else None
+        if not isinstance(task_id, str) or not task_id:
+            return
+        is_new = task_id not in self._tasks
+        self._tasks[task_id] = json.loads(json.dumps(task))
+        if is_new and self.era == "modern":
+            self._restart_modern_listener()
+
+    def _listen_task_ids(self) -> list[str]:
+        # TypeScript's modern listener asks for its recorded tasks' updates when
+        # something listens for them.
+        listening = bool(self._notification_listeners) or callable(self.options.get("onNotification"))
+        if not listening or not self._has_tasks_capability():
+            return []
+        return sorted(self._tasks)
+
+    def _await_modern_task(self, task_id: str, *, context=None) -> dict[str, Any]:
         max_polls = int(self.options.get("maxTaskPolls", 1000))
         for _ in range(max_polls):
-            task = self.get_task(task_id)
+            task = self.get_task(task_id, context=context)
             outcome = mcp_task_terminal_outcome(task)
             kind = outcome.get("kind")
             if kind == "result":
@@ -1263,7 +1338,7 @@ class AxMCPClient:
                         pending.get("params") or {},
                         {"client": self, "namespace": self.namespace()},
                     )
-                self.provide_task_input(task_id, responses)
+                self.provide_task_input(task_id, responses, context=context)
         raise AxMCPError(f"MCP task {task_id} exceeded {max_polls} polls")
 
     def list_prompts(self, cursor: str | None = None) -> dict[str, Any]:
@@ -1341,7 +1416,8 @@ class AxMCPClient:
         self._active_subscription_id = subscription_id
         self._subscription_ready.clear()
         notifications = mcp_listen_interests(
-            sorted(self._subscription_owners), self.options.get("subscriptionFilters") or {}
+            sorted(self._subscription_owners), self.options.get("subscriptionFilters") or {},
+            self._listen_task_ids(),
         )
         params = {"notifications": notifications}
         params["_meta"] = mcp_build_request_meta(
@@ -1375,12 +1451,13 @@ class AxMCPClient:
         if not isinstance(resources, dict) or not resources.get("subscribe"):
             raise AxMCPError("Resource subscriptions are not supported")
 
-    def get_task(self, task_id: str) -> dict[str, Any]:
+    def get_task(self, task_id: str, *, context=None) -> dict[str, Any]:
         if not self._has_tasks_capability():
             raise AxMCPError("Tasks are not supported")
-        result = self._request("tasks/get", {"taskId": task_id})
+        result = self._request("tasks/get", {"taskId": task_id}, context=context)
         if self.era == "modern" and not mcp_validate_modern_task(result):
             raise AxMCPError("MCP protocol violation: invalid tasks/get result")
+        self._record_task(result)
         return result
 
     def cancel_task(self, task_id: str) -> dict[str, Any]:
@@ -1403,10 +1480,10 @@ class AxMCPClient:
             raise AxMCPError("Tasks are not supported")
         return self._request("tasks/result", {"taskId": task_id})
 
-    def provide_task_input(self, task_id: str, input_responses: dict[str, Any]) -> None:
+    def provide_task_input(self, task_id: str, input_responses: dict[str, Any], *, context=None) -> None:
         if self.era != "modern" or not self._has_tasks_capability():
             raise AxMCPError("tasks/update is only available for modern MCP Tasks v2")
-        self._request("tasks/update", {"taskId": task_id, "inputResponses": input_responses})
+        self._request("tasks/update", {"taskId": task_id, "inputResponses": input_responses}, context=context)
 
     def list_resource_templates(self, cursor: str | None = None) -> dict[str, Any]:
         return self._request("resources/templates/list", {"cursor": cursor} if cursor else {})
@@ -1447,6 +1524,7 @@ class AxMCPClient:
                 _override_description(tool, self.options),
                 tool.get("inputSchema") or {"type": "object", "properties": {}},
                 lambda args, original=original: self.call_tool(original, args),
+                context_handler=lambda args, context, original=original: self.call_tool(original, args, context=context),
             ))
         return out
 
@@ -1479,12 +1557,12 @@ class AxMCPClient:
     def namespace(self) -> str:
         return str(self.options.get("namespace") or (self.server_info or {}).get("name") or "mcp")
 
-    def _request_with_input_rounds(self, method: str, base_params: dict[str, Any], *, extra_headers: dict[str, str] | None = None) -> dict[str, Any]:
+    def _request_with_input_rounds(self, method: str, base_params: dict[str, Any], *, extra_headers: dict[str, str] | None = None, context=None) -> dict[str, Any]:
         params = json.loads(json.dumps(base_params))
         max_rounds = self.options.get("maxInputRounds")
         round_index = 0
         while True:
-            result = self._request(method, params, extra_headers=extra_headers)
+            result = self._request(method, params, extra_headers=extra_headers, context=context)
             plan = mcp_mrtr_plan_round(result, self.era or "legacy", method, round_index, max_rounds)
             action = plan.get("action")
             if action == "complete":
@@ -1512,9 +1590,11 @@ class AxMCPClient:
             params = mcp_mrtr_next_params(base_params, input_responses, request_state)
             round_index += 1
 
-    def _request(self, method: str, params: dict[str, Any] | None = None, *, extra_headers: dict[str, str] | None = None, allow_version_retry: bool = True) -> dict[str, Any]:
-        request_id = str(self._next_id)
-        self._next_id += 1
+    def _request(self, method: str, params: dict[str, Any] | None = None, *, extra_headers: dict[str, str] | None = None, allow_version_retry: bool = True, context=None) -> dict[str, Any]:
+        _mcp_check_context(context)
+        with self._request_id_lock:
+            request_id = str(self._next_id)
+            self._next_id += 1
         message: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id, "method": method}
         request_params = dict(params or {})
         if self.era == "modern":
@@ -1530,7 +1610,9 @@ class AxMCPClient:
             )
         if params is not None:
             message["params"] = request_params
-        response = self.transport.send_with_headers(message, extra_headers or {})
+        send = getattr(self.transport, "send_with_context", None)
+        response = send(message, extra_headers or {}, context) if callable(send) else self.transport.send_with_headers(message, extra_headers or {})
+        _mcp_check_context(context)
         if "error" in response:
             error = response["error"] or {}
             protocol_error = AxMCPError(str(error.get("message", "MCP JSON-RPC error")), code=error.get("code"), data=error.get("data"))
@@ -1539,7 +1621,7 @@ class AxMCPClient:
                 if version:
                     self.negotiated_protocol_version = version
                     self.transport.set_protocol_version(version)
-                    return self._request(method, params, extra_headers=extra_headers, allow_version_retry=False)
+                    return self._request(method, params, extra_headers=extra_headers, allow_version_retry=False, context=context)
             raise protocol_error
         result = response.get("result") or {}
         if self.era == "modern" and isinstance(result, dict):
@@ -1589,6 +1671,9 @@ class AxMCPClient:
             uri = (message.get("params") or {}).get("uri")
             if uri:
                 self._resource_read_cache.pop(str(uri), None)
+        if method in {"notifications/tasks", "notifications/tasks/status"}:
+            params = message.get("params") or {}
+            self._record_task(params.get("task") if isinstance(params.get("task"), dict) else params)
         callback = self.options.get("onNotification")
         if callable(callback):
             callback(message)
@@ -1621,13 +1706,13 @@ class AxMCPClient:
         name = _override_name(tool.get("name", ""), self.options)
         description = _override_description(tool, self.options)
 
-        def handler(args: dict[str, Any]) -> Any:
-            result = self.call_tool(tool.get("name", name), args)
+        def handler(args: dict[str, Any], context=None) -> Any:
+            result = self.call_tool(tool.get("name", name), args, context=context)
             if "structuredContent" in result:
                 return result["structuredContent"]
             return _content_to_value(result.get("content", []))
 
-        return Tool(name, description, tool.get("inputSchema") or {"type": "object", "properties": {}}, handler)
+        return Tool(name, description, tool.get("inputSchema") or {"type": "object", "properties": {}}, handler, context_handler=handler)
 
     def _prompt_to_function(self, prompt: dict[str, Any]) -> Tool:
         name = _override_name("prompt_" + prompt.get("name", ""), self.options)
@@ -1860,16 +1945,12 @@ class AxExecutionContext:
         return modules
 
     def derive(self, inheritance: Any = "all"):
-        if inheritance == "none":
-            return AxExecutionContext()
-        if isinstance(inheritance, (list, tuple, set)):
-            allowed = set(map(str, inheritance))
-            return AxExecutionContext(
-                [client for client in self.mcp if client.namespace() in allowed],
-                [client for client in self.ucp if client.namespace() in allowed],
-                self.options,
-            )
-        return self
+        by_mcp = {client.namespace(): client for client in self.mcp}
+        by_ucp = {client.namespace(): client for client in self.ucp}
+        plan = _mcp_inheritance_plan(list(by_mcp), list(by_ucp), inheritance)
+        child = AxExecutionContext([by_mcp[name] for name in plan["mcp"]], [by_ucp[name] for name in plan["ucp"]], self.options)
+        child._initialized = self._initialized
+        return child
 
     def continuation_state(self) -> dict[str, Any]:
         namespaces = [client.namespace() for client in [*self.mcp, *self.ucp]]
@@ -1881,12 +1962,12 @@ def resolve_execution_context(options: dict[str, Any] | None, parent: AxExecutio
     opts = options or {}
     explicit = opts.get("executionContext") or opts.get("mcpExecutionContext")
     if isinstance(explicit, AxExecutionContext):
-        return explicit.derive(opts.get("mcpInheritance", "all"))
+        return explicit
     mcp = opts.get("mcp")
     ucp = opts.get("ucp")
     if mcp is not None or ucp is not None:
         return AxExecutionContext(mcp if isinstance(mcp, (list, tuple)) else [mcp] if mcp else [], ucp if isinstance(ucp, (list, tuple)) else [ucp] if ucp else [], opts)
-    return parent.derive(opts.get("mcpInheritance", "all")) if parent else None
+    return parent if parent is not None else opts.get("inheritedExecutionContext")
 
 
 def _ax_mcp_encode_header_value(value: str) -> str:
@@ -1958,7 +2039,7 @@ class AxMCPStreamableHTTPTransport(AxMCPTransport):
 
     def _request_stream_once(self, message: dict[str, Any]) -> None:
         try:
-            body = json.dumps(message).encode("utf-8")
+            body = _js_json_dumps(message).encode("utf-8")
             headers = self.build_headers(
                 {"Content-Type": "application/json", "Accept": "text/event-stream"},
                 True, str(message.get("method") or ""),
@@ -2053,8 +2134,12 @@ class AxMCPStreamableHTTPTransport(AxMCPTransport):
     def send(self, message: dict[str, Any]) -> dict[str, Any]:
         return self.send_with_headers(message)
 
-    def send_with_headers(self, message: dict[str, Any], extra_headers: dict[str, str] | None = None) -> dict[str, Any]:
-        body = json.dumps(message).encode("utf-8")
+    def send_with_headers(self, message, extra_headers=None):
+        return self.send_with_context(message, extra_headers)
+
+    def send_with_context(self, message, extra_headers=None, context=None):
+        _mcp_check_context(context)
+        body = _js_json_dumps(message).encode("utf-8")
         headers = self.build_headers(
             {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
             message.get("method") != "initialize",
@@ -2063,11 +2148,53 @@ class AxMCPStreamableHTTPTransport(AxMCPTransport):
             extra_headers,
         )
         request = urllib.request.Request(self.endpoint, data=body, headers=headers, method="POST")
+        done = threading.Event()
+        sockets = []
+        socket_lock = threading.Lock()
+        def capture_socket(connection):
+            with socket_lock:
+                sockets.append(connection.sock)
+            try:
+                _mcp_check_context(context)
+            except AxAIServiceAbortedError:
+                connection.close()
+                raise
+        def watch_cancel():
+            while not done.wait(0.01):
+                try:
+                    _mcp_check_context(context)
+                except AxAIServiceAbortedError:
+                    with socket_lock:
+                        current = list(sockets)
+                    for connection in current:
+                        try: connection.shutdown(socket.SHUT_RDWR)
+                        except OSError: pass
+                    return
+        opener = urllib.request.urlopen
+        watcher = None
+        if context:
+            class HTTPConnection(http.client.HTTPConnection):
+                def connect(self):
+                    super().connect()
+                    capture_socket(self)
+            class HTTPSConnection(http.client.HTTPSConnection):
+                def connect(self):
+                    super().connect()
+                    capture_socket(self)
+            class HTTPHandler(urllib.request.HTTPHandler):
+                def http_open(self, req): return self.do_open(HTTPConnection, req)
+            class HTTPSHandler(urllib.request.HTTPSHandler):
+                def https_open(self, req): return self.do_open(HTTPSConnection, req, context=self._context)
+            opener = urllib.request.build_opener(HTTPHandler(), HTTPSHandler()).open
+            watcher = threading.Thread(target=watch_cancel, daemon=True)
+            watcher.start()
         try:
-            with urllib.request.urlopen(request, timeout=float(self.options.get("timeout", 30))) as response:
+            with opener(request, timeout=float(self.options.get("timeout", 30))) as response:
+                _mcp_check_context(context)
                 self._capture_session(response.headers)
                 content_type = response.headers.get("Content-Type", "") if hasattr(response.headers, "get") else ""
                 text = response.read().decode("utf-8")
+                _mcp_check_context(context)
                 if not text:
                     return {"jsonrpc": "2.0", "id": message.get("id"), "result": {}}
                 # A spec-compliant MCP server may answer a JSON-RPC POST with an SSE
@@ -2081,9 +2208,18 @@ class AxMCPStreamableHTTPTransport(AxMCPTransport):
                     return self._select_sse_response(_ax_mcp_parse_sse(text), message.get("id"))
                 return json.loads(text)
         except urllib.error.HTTPError as error:
+            _mcp_check_context(context)
             if error.code == 401 and self._apply_oauth(error.headers.get("WWW-Authenticate") if error.headers else None):
-                return self.send_with_headers(message, extra_headers)
+                return self.send_with_context(message, extra_headers, context)
             raise AxMCPError(f"HTTP error {error.code}: {error.reason}")
+
+        except (OSError, http.client.HTTPException) as error:
+            _mcp_check_context(context)
+            raise
+        finally:
+            done.set()
+            if watcher is not None:
+                watcher.join()
 
     def _select_sse_response(self, messages: list[dict[str, Any]], request_id: Any) -> dict[str, Any]:
         # Return the JSON-RPC response whose id matches this request; route any
@@ -2268,6 +2404,130 @@ class AxMCPStreamableHTTPTransport(AxMCPTransport):
         return True
 
 
+class AxMCPWebSocketTransport(AxMCPTransport):
+    """Legacy MCP over WebSocket. Install axllm[realtime] or supply a socket factory.
+
+    The factory receives (url, protocols) and returns a socket with send/recv/close.
+    Each pending request owns its cleanup, so an old cancellation cannot remove a
+    later request that reuses its ID. Concurrent active IDs must be unique.
+    """
+    def __init__(self, url: str, *, protocols=None, web_socket_factory=None):
+        self.url, self.protocols, self._factory = url, ([protocols] if isinstance(protocols, str) else protocols), web_socket_factory
+        self.protocol_version = ""
+        self._lock = threading.RLock()
+        self._pending = {}
+        self._socket = None
+        self._reader = None
+
+    @property
+    def era_hint(self): return "legacy"
+
+    def connect(self):
+        with self._lock:
+            if self._socket is not None: return
+            factory = self._factory
+            if factory is None:
+                try: import websocket
+                except ImportError as exc:
+                    raise AxMCPError("MCP WebSocket requires axllm[realtime] or a web_socket_factory") from exc
+                def factory(url, protocols):
+                    sock = websocket.create_connection(url, subprotocols=protocols, timeout=30)
+                    # Connection timeout must not impose an idle-session deadline.
+                    sock.settimeout(None)
+                    return sock
+            sock = factory(self.url, self.protocols)
+            self._socket = sock
+            self._reader = threading.Thread(target=self._receive, args=(sock,), daemon=True)
+            self._reader.start()
+
+    def start_listening(self): self.connect()
+
+    def _receive(self, sock):
+        try:
+            while True:
+                raw = sock.recv()
+                if raw is None or raw == "": raise AxMCPError("MCP WebSocket closed")
+                parsed = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
+                messages = parsed if isinstance(parsed, list) else [parsed]
+                if isinstance(parsed, list) and self.protocol_version != "2025-03-26":
+                    raise AxMCPError("JSON-RPC batching is only allowed for MCP 2025-03-26")
+                for message in messages:
+                    with self._lock:
+                        if self._socket is not sock: return
+                        slot = self._pending.pop(json.dumps(message.get("id")), None) if "id" in message and "method" not in message else None
+                        if slot is not None:
+                            slot["response"] = message
+                            slot["done"].set()
+                    if slot is None:
+                        threading.Thread(target=self._dispatch_socket_message, args=(sock, message), daemon=True).start()
+        except Exception as error:
+            self._terminate(sock, error)
+
+    def _dispatch_socket_message(self, sock, message):
+        with self._lock:
+            if self._socket is not sock: return
+        request_handler = getattr(self, "_request_handler", None)
+        if callable(request_handler) and "id" in message and "method" in message:
+            response = request_handler(message)
+            with self._lock:
+                if self._socket is not sock: return
+            # A late reply belongs to its original connection and must never reconnect.
+            sock.send(_js_json_dumps(response))
+            return
+        handler = getattr(self, "_message_handler", None)
+        if callable(handler): handler(message)
+
+    def _terminate(self, sock, error):
+        with self._lock:
+            if self._socket is not sock: return
+            self._socket = None
+            pending, self._pending = list(self._pending.values()), {}
+            for slot in pending:
+                slot["error"] = error
+                slot["done"].set()
+        try: sock.close()
+        finally:
+            handler = getattr(self, "_lifecycle_handler", None)
+            if callable(handler): handler("disconnected")
+
+    def _send_requests(self, messages, context, batch):
+        ids = mcp_websocket_request_ids(messages, self.protocol_version, batch)
+        _mcp_check_context(context)
+        # Serialize before registering anything: serialization failures leave no pending work.
+        payload = _js_json_dumps(messages if batch else messages[0])
+        self.connect()
+        slots = [{"done": threading.Event()} for _ in ids]
+        with self._lock:
+            if any(key in self._pending for key in ids): raise AxMCPError("MCP request ID is already pending")
+            sock = self._socket
+            if sock is None: raise AxMCPError("MCP WebSocket closed")
+            for key, slot in zip(ids, slots): self._pending[key] = slot
+        try:
+            _mcp_check_context(context)
+            sock.send(payload)
+            for slot in slots:
+                while not slot["done"].wait(0.01): _mcp_check_context(context)
+                _mcp_check_context(context)
+                if "error" in slot: raise slot["error"]
+            return [slot["response"] for slot in slots]
+        finally:
+            with self._lock:
+                for key, slot in zip(ids, slots):
+                    if self._pending.get(key) is slot: self._pending.pop(key)
+
+    def send(self, message): return self._send_requests([message], None, False)[0]
+    def send_with_context(self, message, headers=None, context=None): return self._send_requests([message], context, False)[0]
+    def send_batch(self, messages, context=None): return self._send_requests(messages, context, True)
+    def send_notification(self, message):
+        self.connect()
+        with self._lock: sock = self._socket
+        if sock is None: raise AxMCPError("MCP WebSocket closed")
+        sock.send(_js_json_dumps(message))
+    def close(self):
+        with self._lock: sock = self._socket
+        if sock is not None: self._terminate(sock, AxMCPError("MCP WebSocket closed"))
+
+
 class AxMCPStdioTransport(AxMCPTransport):
     def __init__(self, command: str, args: list[str] | None = None, options: dict[str, Any] | None = None):
         env = None
@@ -2305,7 +2565,7 @@ class AxMCPStdioTransport(AxMCPTransport):
 
 
 def ax_mcp_stdio_encode(message: dict[str, Any]) -> str:
-    return json.dumps(message, separators=(",", ":")) + "\n"
+    return _js_json_dumps(message) + "\n"
 
 
 def ax_mcp_stdio_decode(line: str) -> dict[str, Any]:
@@ -2459,6 +2719,103 @@ def run_mcp_conformance_fixture(fixture: dict[str, Any]) -> None:
     operation = fixture.get("operation", "initialize")
     expected_error = fixture.get("expected_error_contains")
     try:
+        if operation in ("inheritance_context", "inheritance_agent_context"):
+            for case in fixture["cases"]:
+                clients, transports = [], {}
+                for spec in fixture["clients"]:
+                    transport = AxMCPScriptedTransport(spec["responses"])
+                    transports[spec["namespace"]] = transport
+                    clients.append(AxMCPClient(transport, {"namespace":spec["namespace"], "era":"modern"}))
+                context = AxExecutionContext(clients)
+                results, selected, error = [], [], None
+                try:
+                    child = context.derive(case["inheritance"])
+                    selected = [client.namespace() for client in child.mcp]
+                    if operation == "inheritance_agent_context":
+                        from .agent import AxAgent
+                        program = AxAgent("question:string -> answer:string", {**fixture["agent_options"], "executionContext": child})
+                        assert program.invoke_callable("tools.local_echo", {}) == fixture["expected_local_result"]
+                        for client in child.mcp:
+                            for tool in client.native_tools():
+                                result = program.invoke_callable(f"mcp.{client.namespace()}.tools.{tool.name}", {"query":"scope-probe"})
+                                assert result["status"] == "ok", result
+                                results.append(result["value"])
+                    else:
+                        results = [tool.call({"query":"scope-probe"}) for tool in child.native_tools()]
+                except Exception as caught:
+                    error = str(caught)
+                assert error == case.get("expected_error"), (error, case)
+                if error is None: assert selected == case["expected_namespaces"], (selected, case)
+                assert results == case["expected_results"], (results, case)
+                for namespace, transport in transports.items():
+                    assert [request["method"] for request in transport.requests] == case["expected_methods"][namespace]
+                    for request in transport.requests:
+                        if request["method"] == "tools/call": assert request["params"]["arguments"] == {"query":"scope-probe"}
+                parent_results = [tool.call({"query":"parent-probe"}) for tool in context.native_tools()]
+                assert parent_results == case["expected_parent_results"], (parent_results, case)
+                for namespace, transport in transports.items():
+                    assert [request["method"] for request in transport.requests] == case["expected_parent_methods"][namespace]
+                    calls = [{key:request["params"][key] for key in ("name","arguments")} for request in transport.requests if request["method"] == "tools/call"]
+                    assert calls == case["expected_calls"][namespace], calls
+            return
+        if operation == "inheritance_plan":
+            for case in fixture["cases"]:
+                try:
+                    result = _mcp_inheritance_plan(fixture["mcp"], fixture["ucp"], case["inheritance"])
+                except Exception as error:
+                    assert str(error) == case.get("expected_error"), (error, case)
+                else:
+                    assert "expected_error" not in case and result == case["expected"], (result, case)
+            return
+        if operation == "tool_authorization":
+            for case in fixture["cases"]:
+                transport = AxMCPScriptedTransport(fixture["responses"])
+                observed = []
+                def authorize(call):
+                    assert call["client"] is client
+                    observed.append({key: value for key, value in call.items() if key != "client"})
+                    return case["decision"]
+                client = AxMCPClient(transport, {**fixture["client_options"], "authorizeToolCall": authorize})
+                client.init()
+                error = None
+                try:
+                    result = client.call_tool(case["name"], {"query": "REF-42"})
+                except Exception as caught:
+                    error = str(caught)
+                assert error == case.get("expected_error"), (error, case)
+                if error is None: assert result == case["expected_result"]
+                assert len(observed) == case["expected_authorization_calls"]
+                if observed: assert observed[0] == case["expected_context"]
+                sent = [request for request in transport.requests if request["method"] == "tools/call"]
+                assert len(sent) == case["expected_tool_requests"]
+                for request in sent:
+                    assert request["params"]["name"] == case["name"] and request["params"]["arguments"] == {"query": "REF-42"}
+            return
+        if operation == "tool_task_handling":
+            for case in fixture["cases"]:
+                transport = AxMCPScriptedTransport(case["responses"])
+                client = AxMCPClient(transport, {**fixture["client_options"], "era": case["era"]})
+                client.init()
+                before = len(transport.requests)
+                error = None
+                result = None
+                try:
+                    if case["api"] == "call_tool":
+                        result = client.call_tool(fixture["tool"], fixture["arguments"])
+                    elif case["api"] == "call_tool_expose":
+                        result = client.call_tool(fixture["tool"], fixture["arguments"], task_handling="expose")
+                    elif case["api"] == "call_tool_outcome":
+                        result = client.call_tool_outcome(fixture["tool"], fixture["arguments"])
+                    else:
+                        raise AssertionError(f"unknown task-handling api {case['api']}")
+                except AxMCPError as caught:
+                    error = str(caught)
+                assert error == case.get("expected_error"), (case["name"], error)
+                if error is None:
+                    assert result == case["expected"], (case["name"], result)
+                methods = [request["method"] for request in transport.requests[before:]]
+                assert methods == case["expected_methods"], (case["name"], methods)
+            return
         if operation == "ssrf":
             ax_mcp_validate_endpoint(fixture.get("endpoint", "https://127.0.0.1/mcp"), fixture.get("ssrfProtection"))
             if expected_error:
@@ -2891,7 +3248,7 @@ def run_mcp_conformance_fixture(fixture: dict[str, Any]) -> None:
             return
         if operation == "subscriptions_listen":
             for case in fixture.get("semantic_cases") or []:
-                actual = mcp_listen_interests(case.get("subscribed_uris") or [], case.get("filters") or {})
+                actual = mcp_listen_interests(case.get("subscribed_uris") or [], case.get("filters") or {}, case.get("task_ids"))
                 if actual != (case.get("expected") or {}):
                     raise AssertionError(f"listen interests mismatch: {actual!r}")
             delivered: list[dict[str, Any]] = []
@@ -2924,6 +3281,29 @@ def run_mcp_conformance_fixture(fixture: dict[str, Any]) -> None:
                 if forbidden in methods:
                     raise AssertionError(f"modern subscription emitted legacy method {forbidden}")
             return
+        if operation == "task_listen_restart":
+            delivered: list[dict[str, Any]] = []
+            client.add_notification_listener(delivered.append)
+            client.start_listening()
+            if len(transport.request_streams) != 1:
+                raise AssertionError("initial subscriptions/listen stream missing")
+            if "taskIds" in ((transport.request_streams[0].get("params") or {}).get("notifications") or {}):
+                raise AssertionError("listener asked for tasks before any were recorded")
+            outcome = client.call_tool_outcome(fixture["tool"], fixture.get("arguments") or {})
+            if outcome.get("kind") != "task":
+                raise AssertionError(f"expected a task outcome, got {outcome!r}")
+            if len(transport.request_streams) != 2:
+                raise AssertionError("a recorded task did not restart the listener")
+            second = transport.request_streams[-1]
+            _assert_subset((second.get("params") or {}).get("notifications") or {}, fixture["expected_second_notifications"], "task listen interests")
+            notification = json.loads(json.dumps(fixture["task_notification"]))
+            notification.setdefault("params", {})["_meta"] = {"io.modelcontextprotocol/subscriptionId": second.get("id")}
+            transport.emit(notification)
+            if len([item for item in delivered if item.get("method") == "notifications/tasks"]) != 1:
+                raise AssertionError("task notification was not delivered")
+            if len(transport.request_streams) != 2:
+                raise AssertionError("a known task restarted the listener")
+            return
         if operation == "initialize":
             _assert_requests(transport.requests, fixture)
             return
@@ -2933,6 +3313,10 @@ def run_mcp_conformance_fixture(fixture: dict[str, Any]) -> None:
             return
         if operation == "tools":
             functions = client.native_tools()
+            for function in functions:
+                if function.name in (fixture.get("expected_schemas") or {}):
+                    if function.parameters != fixture["expected_schemas"][function.name]:
+                        raise AssertionError("Native tool schema was altered")
             names = [fn.name for fn in functions]
             if fixture.get("expected_function_names") and names != fixture["expected_function_names"]:
                 raise AssertionError(f"function names mismatch: {names!r}")

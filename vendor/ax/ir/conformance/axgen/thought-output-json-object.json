@@ -1,0 +1,40 @@
+{
+  "expected_output": {
+    "user": {
+      "name": "Ada"
+    },
+    "thought": "JSON thought"
+  },
+  "expected_request": {
+    "provider_metadata": {
+      "ax": {
+        "structured_output_rung": "json_object"
+      }
+    }
+  },
+  "features": {
+    "functions": true,
+    "structured_output_modes": [
+      "json_object"
+    ],
+    "structured_outputs": false
+  },
+  "input": {
+    "question": "Who?"
+  },
+  "kind": "forward",
+  "name": "thought-output-json-object",
+  "responses": [
+    {
+      "results": [
+        {
+          "content": "{\"user\":{\"name\":\"Ada\"}}",
+          "finish_reason": "stop",
+          "index": 0,
+          "thought": "JSON thought"
+        }
+      ]
+    }
+  ],
+  "signature": "question:string -> user:object{name:string}"
+}

@@ -14,9 +14,21 @@ Create provider clients near the application boundary, keep keys in environment 
 
 {{aiProviderExamples}}
 
+### Jev and OpenAI Decisions
+
+Use the `typesafe` or `openai-decisions` provider profile for required boolean,
+class, and rubric score signatures. Add `(evidence)` to retain probabilities and
+native confidence through your Ax program. See [decision evidence](/{{languageId}}/concepts/signatures/).
+Use the separate native clients for advanced structured criteria and request
+features. Typesafe/Jev defaults to `jev-latest`; OpenAI Decisions defaults to
+`gpt-6-luna`. Prose and tools need a generative step. See the [Typesafe/Jev skill](/typescript/skills/ax-typesafe/)
+for conversion settings and question design. TypeScript, Python, Java, C++, Go,
+and Rust all support both interfaces, with signature, native, and hybrid examples
+in each language’s [generation gallery](/{{languageId}}/examples/generation/).
+
 ## Model Catalog
 
-Use the model catalog before runtime when a UI or router needs model choices, costs, and capabilities. It can filter for text, code, embedding, and audio models.
+Use the model catalog before runtime when a UI or router needs model choices, costs, and capabilities. It can filter for text, code, embedding, and audio models, and reports provider/model portable thinking levels plus verified explicit service tiers. Provider capabilities describe the default deployment profile; static model entries carry their resolved capability arrays.
 
 {{aiCatalogExample}}
 
@@ -62,7 +74,9 @@ Thinking controls expose provider-specific reasoning budgets through one Ax opti
 
 For OpenAI GPT-5.6 Chat, Ax emits explicit stable message breakpoints only when
 caching is requested and forwards `promptCacheKey` from AxGen. Older models,
-Azure, Responses, and uncached calls keep their existing request shape. For
+Azure, Responses, and uncached calls keep their existing request shape, except
+that every OpenAI Responses request sends `prompt_cache_key`, from
+`promptCacheKey`, else `sessionId`. For
 Vertex Gemini and Anthropic, project and region select global, US/EU
 multi-region, or regional routes; bearer-token lifecycle remains host-owned.
 

@@ -3,6 +3,240 @@ import type { AxModelInfo } from '../types.js';
 import { AxAIAnthropicModel, AxAIAnthropicVertexModel } from './types.js';
 
 export const axModelInfoAnthropic: AxModelInfo[] = [
+  // Haiku 5.5 (2026-10). Long-context rates apply above 100K input tokens.
+  // https://platform.claude.com/docs/en/models/haiku-5-5/overview
+  {
+    name: AxAIAnthropicModel.Claude55Haiku,
+    currency: 'usd',
+    promptTokenCostPer1M: 0.1,
+    completionTokenCostPer1M: 0.5,
+    cacheReadTokenCostPer1M: 0.01,
+    cacheWriteTokenCostPer1M: 0.125,
+    longContextThreshold: 100_000,
+    longContextPromptTokenCostPer1M: 0.5,
+    longContextCompletionTokenCostPer1M: 2.5,
+    longContextCacheReadTokenCostPer1M: 0.05,
+    longContextCacheWriteTokenCostPer1M: 0.625,
+    maxTokens: 128000,
+    contextWindow: 1_000_000,
+    notSupported: { temperature: true, topP: true, topK: true },
+    supported: {
+      temperatureOne: true,
+      thinkingBudget: true,
+      showThoughts: true,
+      structuredOutputs: true,
+      structuredOutputModes: ['native', 'function'],
+    },
+  },
+  {
+    name: AxAIAnthropicVertexModel.Claude55Haiku,
+    currency: 'usd',
+    promptTokenCostPer1M: 0.1,
+    completionTokenCostPer1M: 0.5,
+    cacheReadTokenCostPer1M: 0.01,
+    cacheWriteTokenCostPer1M: 0.125,
+    longContextThreshold: 100_000,
+    longContextPromptTokenCostPer1M: 0.5,
+    longContextCompletionTokenCostPer1M: 2.5,
+    longContextCacheReadTokenCostPer1M: 0.05,
+    longContextCacheWriteTokenCostPer1M: 0.625,
+    maxTokens: 128000,
+    contextWindow: 1_000_000,
+    notSupported: { temperature: true, topP: true, topK: true },
+    supported: {
+      thinkingBudget: true,
+      showThoughts: true,
+      structuredOutputs: true,
+      structuredOutputModes: ['native', 'function'],
+    },
+  },
+  // 5.5 Opus (2026-09). Cache hits bill at 0.05x input. Forced tool choice
+  // is refused, so structured output must stay native.
+  {
+    name: AxAIAnthropicModel.Claude55Opus,
+    currency: 'usd',
+    promptTokenCostPer1M: 4.0,
+    completionTokenCostPer1M: 20.0,
+    cacheReadTokenCostPer1M: 0.2,
+    cacheWriteTokenCostPer1M: 5.0,
+    fastPromptTokenCostPer1M: 8.0,
+    fastCompletionTokenCostPer1M: 40.0,
+    fastCacheReadTokenCostPer1M: 0.4,
+    fastCacheWriteTokenCostPer1M: 10.0,
+    maxTokens: 128000,
+    contextWindow: 1_000_000,
+    notSupported: { temperature: true, topP: true, topK: true },
+    supported: {
+      temperatureOne: true,
+      thinkingBudget: true,
+      showThoughts: true,
+      structuredOutputs: true,
+      structuredOutputModes: ['native'],
+    },
+  },
+  {
+    name: AxAIAnthropicVertexModel.Claude55Opus,
+    currency: 'usd',
+    promptTokenCostPer1M: 4.0,
+    completionTokenCostPer1M: 20.0,
+    cacheReadTokenCostPer1M: 0.2,
+    cacheWriteTokenCostPer1M: 5.0,
+    maxTokens: 128000,
+    contextWindow: 1_000_000,
+    notSupported: { temperature: true, topP: true, topK: true },
+    supported: {
+      thinkingBudget: true,
+      showThoughts: true,
+      structuredOutputs: true,
+      structuredOutputModes: ['native'],
+    },
+  },
+  // 5.5 Sonnet (2026-09). Same rates as Sonnet 5; no fast mode. Forced tool
+  // choice is refused, so structured output must stay native.
+  {
+    name: AxAIAnthropicModel.Claude55Sonnet,
+    currency: 'usd',
+    promptTokenCostPer1M: 2.0,
+    completionTokenCostPer1M: 10.0,
+    cacheReadTokenCostPer1M: 0.2,
+    cacheWriteTokenCostPer1M: 2.5,
+    maxTokens: 128000,
+    contextWindow: 1_000_000,
+    notSupported: { temperature: true, topP: true, topK: true },
+    supported: {
+      temperatureOne: true,
+      thinkingBudget: true,
+      showThoughts: true,
+      structuredOutputs: true,
+      structuredOutputModes: ['native'],
+    },
+  },
+  {
+    name: AxAIAnthropicVertexModel.Claude55Sonnet,
+    currency: 'usd',
+    promptTokenCostPer1M: 2.0,
+    completionTokenCostPer1M: 10.0,
+    cacheReadTokenCostPer1M: 0.2,
+    cacheWriteTokenCostPer1M: 2.5,
+    maxTokens: 128000,
+    contextWindow: 1_000_000,
+    notSupported: { temperature: true, topP: true, topK: true },
+    supported: {
+      thinkingBudget: true,
+      showThoughts: true,
+      structuredOutputs: true,
+      structuredOutputModes: ['native'],
+    },
+  },
+  // 5.1 Fable (2026-08). Cache hits bill at 0.025x input. Forced tool
+  // choice is refused, so structured output must stay native.
+  {
+    name: AxAIAnthropicModel.Claude51Fable,
+    currency: 'usd',
+    promptTokenCostPer1M: 10.0,
+    completionTokenCostPer1M: 50.0,
+    cacheReadTokenCostPer1M: 0.25,
+    cacheWriteTokenCostPer1M: 12.5,
+    maxTokens: 128000,
+    contextWindow: 1_000_000,
+    notSupported: { temperature: true, topP: true, topK: true },
+    supported: {
+      temperatureOne: true,
+      thinkingBudget: true,
+      showThoughts: true,
+      structuredOutputs: true,
+      structuredOutputModes: ['native'],
+    },
+  },
+  {
+    name: AxAIAnthropicVertexModel.Claude51Fable,
+    currency: 'usd',
+    promptTokenCostPer1M: 10.0,
+    completionTokenCostPer1M: 50.0,
+    cacheReadTokenCostPer1M: 0.25,
+    cacheWriteTokenCostPer1M: 12.5,
+    maxTokens: 128000,
+    contextWindow: 1_000_000,
+    notSupported: { temperature: true, topP: true, topK: true },
+    supported: {
+      thinkingBudget: true,
+      showThoughts: true,
+      structuredOutputs: true,
+      structuredOutputModes: ['native'],
+    },
+  },
+  // 5 Opus (2026-07)
+  {
+    name: AxAIAnthropicModel.Claude5Opus,
+    currency: 'usd',
+    promptTokenCostPer1M: 5.0,
+    completionTokenCostPer1M: 25.0,
+    cacheReadTokenCostPer1M: 0.5,
+    cacheWriteTokenCostPer1M: 6.25,
+    fastPromptTokenCostPer1M: 10.0,
+    fastCompletionTokenCostPer1M: 50.0,
+    fastCacheReadTokenCostPer1M: 1.0,
+    fastCacheWriteTokenCostPer1M: 12.5,
+    maxTokens: 128000,
+    contextWindow: 1_000_000,
+    notSupported: { temperature: true, topP: true, topK: true },
+    supported: {
+      temperatureOne: true,
+      thinkingBudget: true,
+      showThoughts: true,
+      structuredOutputs: true,
+    },
+  },
+  {
+    name: AxAIAnthropicVertexModel.Claude5Opus,
+    currency: 'usd',
+    promptTokenCostPer1M: 5.0,
+    completionTokenCostPer1M: 25.0,
+    cacheReadTokenCostPer1M: 0.5,
+    cacheWriteTokenCostPer1M: 6.25,
+    maxTokens: 128000,
+    contextWindow: 1_000_000,
+    notSupported: { temperature: true, topP: true, topK: true },
+    supported: {
+      thinkingBudget: true,
+      showThoughts: true,
+      structuredOutputs: true,
+    },
+  },
+  // 5 Fable (2026-06)
+  {
+    name: AxAIAnthropicModel.Claude5Fable,
+    currency: 'usd',
+    promptTokenCostPer1M: 10.0,
+    completionTokenCostPer1M: 50.0,
+    cacheReadTokenCostPer1M: 1.0,
+    cacheWriteTokenCostPer1M: 12.5,
+    maxTokens: 128000,
+    contextWindow: 1_000_000,
+    notSupported: { temperature: true, topP: true, topK: true },
+    supported: {
+      temperatureOne: true,
+      thinkingBudget: true,
+      showThoughts: true,
+      structuredOutputs: true,
+    },
+  },
+  {
+    name: AxAIAnthropicVertexModel.Claude5Fable,
+    currency: 'usd',
+    promptTokenCostPer1M: 10.0,
+    completionTokenCostPer1M: 50.0,
+    cacheReadTokenCostPer1M: 1.0,
+    cacheWriteTokenCostPer1M: 12.5,
+    maxTokens: 128000,
+    contextWindow: 1_000_000,
+    notSupported: { temperature: true, topP: true, topK: true },
+    supported: {
+      thinkingBudget: true,
+      showThoughts: true,
+      structuredOutputs: true,
+    },
+  },
   // 5 Sonnet (2026-06)
   {
     name: AxAIAnthropicModel.Claude5Sonnet,
@@ -13,7 +247,9 @@ export const axModelInfoAnthropic: AxModelInfo[] = [
     cacheWriteTokenCostPer1M: 2.5,
     maxTokens: 128000,
     contextWindow: 1_000_000,
+    notSupported: { temperature: true, topP: true, topK: true },
     supported: {
+      temperatureOne: true,
       thinkingBudget: true,
       showThoughts: true,
       structuredOutputs: true,
@@ -28,6 +264,7 @@ export const axModelInfoAnthropic: AxModelInfo[] = [
     cacheWriteTokenCostPer1M: 2.5,
     maxTokens: 128000,
     contextWindow: 1_000_000,
+    notSupported: { temperature: true, topP: true, topK: true },
     supported: {
       thinkingBudget: true,
       showThoughts: true,
@@ -48,7 +285,9 @@ export const axModelInfoAnthropic: AxModelInfo[] = [
     fastCacheWriteTokenCostPer1M: 12.5,
     maxTokens: 128000,
     contextWindow: 1_000_000,
+    notSupported: { temperature: true, topP: true, topK: true },
     supported: {
+      temperatureOne: true,
       thinkingBudget: true,
       showThoughts: true,
       structuredOutputs: true,
@@ -63,6 +302,7 @@ export const axModelInfoAnthropic: AxModelInfo[] = [
     cacheWriteTokenCostPer1M: 6.25,
     maxTokens: 128000,
     contextWindow: 1_000_000,
+    notSupported: { temperature: true, topP: true, topK: true },
     supported: {
       thinkingBudget: true,
       showThoughts: true,
@@ -83,7 +323,9 @@ export const axModelInfoAnthropic: AxModelInfo[] = [
     fastCacheWriteTokenCostPer1M: 37.5,
     maxTokens: 128000,
     contextWindow: 1_000_000,
+    notSupported: { temperature: true, topP: true, topK: true },
     supported: {
+      temperatureOne: true,
       thinkingBudget: true,
       showThoughts: true,
       structuredOutputs: true,
@@ -98,6 +340,7 @@ export const axModelInfoAnthropic: AxModelInfo[] = [
     cacheWriteTokenCostPer1M: 6.25,
     maxTokens: 128000,
     contextWindow: 1_000_000,
+    notSupported: { temperature: true, topP: true, topK: true },
     supported: {
       thinkingBudget: true,
       showThoughts: true,
@@ -118,6 +361,8 @@ export const axModelInfoAnthropic: AxModelInfo[] = [
     fastCacheWriteTokenCostPer1M: 37.5,
     maxTokens: 128000,
     contextWindow: 1_000_000,
+    // Takes temperature or top_p, not both (400 for the pair).
+    notSupported: { temperatureWithTopP: true },
     supported: {
       thinkingBudget: true,
       showThoughts: true,
@@ -148,6 +393,8 @@ export const axModelInfoAnthropic: AxModelInfo[] = [
     cacheReadTokenCostPer1M: 0.3,
     cacheWriteTokenCostPer1M: 3.75,
     maxTokens: 64000,
+    // Takes temperature or top_p, not both (400 for the pair).
+    notSupported: { temperatureWithTopP: true },
     supported: {
       thinkingBudget: true,
       showThoughts: true,
@@ -177,6 +424,8 @@ export const axModelInfoAnthropic: AxModelInfo[] = [
     cacheReadTokenCostPer1M: 0.5,
     cacheWriteTokenCostPer1M: 6.25,
     maxTokens: 64000,
+    // Takes temperature or top_p, not both (400 for the pair).
+    notSupported: { temperatureWithTopP: true },
     supported: {
       thinkingBudget: true,
       showThoughts: true,
@@ -207,6 +456,8 @@ export const axModelInfoAnthropic: AxModelInfo[] = [
     cacheReadTokenCostPer1M: 0.3,
     cacheWriteTokenCostPer1M: 3.75,
     maxTokens: 200000,
+    // Takes temperature or top_p, not both (400 for the pair).
+    notSupported: { temperatureWithTopP: true },
     supported: {
       thinkingBudget: true,
       showThoughts: true,
@@ -237,6 +488,8 @@ export const axModelInfoAnthropic: AxModelInfo[] = [
     cacheReadTokenCostPer1M: 0.1,
     cacheWriteTokenCostPer1M: 1.25,
     maxTokens: 200000, // match modern context window similar to Sonnet 4.5 era
+    // Takes temperature or top_p, not both (400 for the pair).
+    notSupported: { temperatureWithTopP: true },
     supported: { thinkingBudget: true, showThoughts: true },
   },
   {
@@ -263,6 +516,8 @@ export const axModelInfoAnthropic: AxModelInfo[] = [
       showThoughts: true,
       structuredOutputs: true,
     },
+    isDeprecated: true,
+    deprecatedOn: '2026-08-05',
   },
   {
     name: AxAIAnthropicVertexModel.Claude41Opus,
@@ -291,6 +546,8 @@ export const axModelInfoAnthropic: AxModelInfo[] = [
       showThoughts: true,
       structuredOutputs: true,
     },
+    isDeprecated: true,
+    deprecatedOn: '2026-06-15',
   },
   {
     name: AxAIAnthropicVertexModel.Claude4Opus,
@@ -319,6 +576,8 @@ export const axModelInfoAnthropic: AxModelInfo[] = [
       showThoughts: true,
       structuredOutputs: true,
     },
+    isDeprecated: true,
+    deprecatedOn: '2026-06-15',
   },
   {
     name: AxAIAnthropicVertexModel.Claude4Sonnet,
@@ -348,6 +607,8 @@ export const axModelInfoAnthropic: AxModelInfo[] = [
       showThoughts: true,
       structuredOutputs: true,
     },
+    isDeprecated: true,
+    deprecatedOn: '2026-02-19',
   },
   {
     name: AxAIAnthropicVertexModel.Claude37Sonnet,
@@ -373,6 +634,8 @@ export const axModelInfoAnthropic: AxModelInfo[] = [
     cacheWriteTokenCostPer1M: 3.75,
     maxTokens: 8192,
     supported: { structuredOutputs: true },
+    isDeprecated: true,
+    deprecatedOn: '2025-10-28',
   },
   {
     name: AxAIAnthropicVertexModel.Claude35Sonnet,
@@ -406,6 +669,8 @@ export const axModelInfoAnthropic: AxModelInfo[] = [
     cacheReadTokenCostPer1M: 0.08,
     cacheWriteTokenCostPer1M: 1.0,
     maxTokens: 8192,
+    isDeprecated: true,
+    deprecatedOn: '2026-02-19',
   },
   {
     name: AxAIAnthropicVertexModel.Claude35Haiku,
@@ -426,6 +691,8 @@ export const axModelInfoAnthropic: AxModelInfo[] = [
     cacheWriteTokenCostPer1M: 18.75,
     maxTokens: 4096,
     supported: { structuredOutputs: true },
+    isDeprecated: true,
+    deprecatedOn: '2026-01-05',
   },
   {
     name: AxAIAnthropicVertexModel.Claude3Opus,
@@ -446,6 +713,8 @@ export const axModelInfoAnthropic: AxModelInfo[] = [
     cacheWriteTokenCostPer1M: 3.75,
     maxTokens: 4096,
     supported: { structuredOutputs: true },
+    isDeprecated: true,
+    deprecatedOn: '2025-07-21',
   },
   {
     name: AxAIAnthropicModel.Claude3Haiku,
@@ -455,6 +724,8 @@ export const axModelInfoAnthropic: AxModelInfo[] = [
     cacheReadTokenCostPer1M: 0.03,
     cacheWriteTokenCostPer1M: 0.3,
     maxTokens: 4096,
+    isDeprecated: true,
+    deprecatedOn: '2026-04-20',
   },
   {
     name: AxAIAnthropicVertexModel.Claude3Haiku,
@@ -472,6 +743,8 @@ export const axModelInfoAnthropic: AxModelInfo[] = [
     promptTokenCostPer1M: 8.0,
     completionTokenCostPer1M: 25,
     maxTokens: 4096,
+    isDeprecated: true,
+    deprecatedOn: '2025-07-21',
   },
   {
     name: AxAIAnthropicModel.ClaudeInstant12,
@@ -479,5 +752,7 @@ export const axModelInfoAnthropic: AxModelInfo[] = [
     promptTokenCostPer1M: 0.8,
     completionTokenCostPer1M: 2.24,
     maxTokens: 4096,
+    isDeprecated: true,
+    deprecatedOn: '2024-11-06',
   },
 ];

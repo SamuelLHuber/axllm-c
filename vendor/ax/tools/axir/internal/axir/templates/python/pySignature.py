@@ -8,9 +8,221 @@ import re
 from typing import Any
 # AXIR_CORE_IMPORTS
 
+def _core_string_utf8_length(value):
+    return len(str(value).encode("utf-8", "surrogatepass"))
+
+def _core_validation_error(message):
+    return ValueError(str(message))
+
+
 
 class AxSignatureError(ValueError):
     pass
+
+
+# JSON text as JavaScript's JSON.stringify writes it, shared by prompts, wire
+# bodies and the json.* intrinsics. json.dumps differs in its numbers: it writes
+# 2.0 for a float two, switches to exponents at 1e16 and 1e-5 (as 1e+16 and
+# 1e-05), and writes NaN and Infinity, which are not JSON.
+
+# JSON string escaping as json.dumps(ensure_ascii=False) does it (C-accelerated).
+_json_encode_string = json.encoder.encode_basestring
+
+
+def _js_number_text(value) -> str:
+    """A float as JavaScript's String(x) writes it (Number.prototype.toString):
+    repr's shortest round-trip digits, plain decimals from 1e-6 up to 1e21,
+    exponent form outside that range (1e-7, 1.5e+21), 0 for -0.0, and NaN,
+    Infinity or -Infinity."""
+    value = float(value)
+    if value != value:
+        return "NaN"
+    if value in (float("inf"), float("-inf")):
+        return "Infinity" if value > 0 else "-Infinity"
+    if value == 0:
+        return "0"
+    text = repr(value)
+    if "e" not in text:
+        # repr writes plain decimals from 1e-4 up to 1e16, where JavaScript
+        # does too; only an integral value's ".0" differs.
+        return text[:-2] if text.endswith(".0") else text
+    mantissa, _, exponent = repr(abs(value)).partition("e")
+    whole, _, fraction = mantissa.partition(".")
+    digits = (whole + fraction).lstrip("0")
+    # digits read as 0.ddd x 10^point
+    point = len(whole) + int(exponent or 0) - (len(whole + fraction) - len(digits))
+    digits = digits.rstrip("0")
+    count = len(digits)
+    if count <= point <= 21:
+        text = digits + "0" * (point - count)
+    elif 0 < point <= 21:
+        text = digits[:point] + "." + digits[point:]
+    elif -6 < point <= 0:
+        text = "0." + "0" * -point + digits
+    else:
+        power = point - 1
+        text = digits[0] + ("." + digits[1:] if count > 1 else "") + ("e+" if power >= 0 else "e-") + str(abs(power))
+    return "-" + text if value < 0 else text
+
+
+def _js_json_number(value) -> str:
+    """JSON.stringify's number: _js_number_text, or null for NaN and the
+    infinities."""
+    text = _js_number_text(value)
+    return "null" if text in ("NaN", "Infinity", "-Infinity") else text
+
+
+def _js_json_key(key) -> str:
+    if isinstance(key, str):
+        return key
+    if key is True or key is False or key is None:
+        return {True: "true", False: "false", None: "null"}[key]
+    if isinstance(key, int):
+        return int.__repr__(key)
+    if isinstance(key, float):
+        return _js_number_text(key)
+    raise TypeError(f"keys must be str, int, float, bool or None, not {type(key).__name__}")
+
+
+def _js_array_index(key: str) -> int | None:
+    """The array index a JavaScript property key names: "0" to "4294967294"
+    in canonical form (no sign, no leading zero), else None."""
+    if not key or not key.isascii() or not key.isdigit() or (len(key) > 1 and key[0] == "0"):
+        return None
+    index = int(key)
+    return index if index <= 4294967294 else None
+
+
+def _js_own_key_entries(mapping) -> list:
+    """A dict's entries in JavaScript's own-property order, which
+    JSON.stringify follows: array-index keys first in ascending numeric
+    order, then the other keys in insertion order."""
+    indexed = []
+    named = []
+    for key, element in mapping.items():
+        index = _js_array_index(_js_json_key(key))
+        if index is None:
+            named.append((key, element))
+        else:
+            indexed.append((index, key, element))
+    if not indexed:
+        return named
+    indexed.sort(key=lambda entry: entry[0])
+    return [(key, element) for _, key, element in indexed] + named
+
+
+def _js_json_dumps(value, indent: int | None = None, sort_keys: bool = False, default=None, separators: tuple[str, str] | None = None) -> str:
+    """json.dumps(value, ensure_ascii=False) with JavaScript's output: compact
+    separators by default (JSON.stringify(value)), `indent`-space lines as
+    JSON.stringify(value, null, indent) writes them, floats as
+    _js_json_number, and NaN or Infinity as null. Ints keep their exact digits;
+    dict keys convert and come in JavaScript's own-key order (sort_keys sorts
+    them instead), and `default` and `separators` work, as in json.dumps."""
+    out: list[str] = []
+    active: set[int] = set()
+    item_separator, key_separator = separators or ((",", ":") if indent is None else (",", ": "))
+
+    def write(item, prefix: str) -> None:
+        if isinstance(item, str):
+            out.append(_json_encode_string(item))
+        elif item is None:
+            out.append("null")
+        elif item is True:
+            out.append("true")
+        elif item is False:
+            out.append("false")
+        elif isinstance(item, int):
+            out.append(int.__repr__(item))
+        elif isinstance(item, float):
+            out.append(_js_json_number(item))
+        elif isinstance(item, (dict, list, tuple)):
+            marker = id(item)
+            if marker in active:
+                raise ValueError("Circular reference detected")
+            active.add(marker)
+            inner = prefix + " " * indent if indent is not None else ""
+            if isinstance(item, dict):
+                entries = sorted(item.items(), key=lambda entry: entry[0]) if sort_keys else _js_own_key_entries(item)
+                opening, closing = "{", "}"
+            else:
+                entries = [(None, element) for element in item]
+                opening, closing = "[", "]"
+            if not entries:
+                out.append(opening + closing)
+            else:
+                out.append(opening)
+                for index, (key, element) in enumerate(entries):
+                    if index:
+                        out.append(item_separator)
+                    if indent is not None:
+                        out.append("\n" + inner)
+                    if opening == "{":
+                        out.append(_json_encode_string(_js_json_key(key)))
+                        out.append(key_separator)
+                    write(element, inner)
+                if indent is not None:
+                    out.append("\n" + prefix)
+                out.append(closing)
+            active.discard(marker)
+        elif default is not None:
+            write(default(item), prefix)
+        else:
+            raise TypeError(f"Object of type {type(item).__name__} is not JSON serializable")
+
+    write(value, "")
+    return "".join(out)
+
+
+def _js_date_millis(value):
+    """Epoch milliseconds of a native date or time value, read as TypeScript
+    reads a Date: an aware datetime is its instant, a naive one is local time
+    (as datetime.timestamp() reads it, and as new Date(2024, 4, 9) does), and
+    a date is its UTC midnight (as new Date("2024-05-09") parses it). None
+    for anything else."""
+    import datetime as _datetime
+
+    if isinstance(value, _datetime.datetime):
+        instant = value if value.utcoffset() is not None else value.astimezone()
+        delta = instant - _datetime.datetime(1970, 1, 1, tzinfo=_datetime.timezone.utc)
+        return delta.days * 86400000 + delta.seconds * 1000 + delta.microseconds // 1000
+    if isinstance(value, _datetime.date):
+        return (value.toordinal() - 719163) * 86400000
+    return None
+
+
+def _js_iso_string(millis) -> str:
+    """Date.prototype.toISOString of epoch milliseconds."""
+    import datetime as _datetime
+
+    moment = _datetime.datetime(1970, 1, 1) + _datetime.timedelta(milliseconds=millis)
+    return f"{moment.year:04d}-{moment.month:02d}-{moment.day:02d}T{moment.hour:02d}:{moment.minute:02d}:{moment.second:02d}.{moment.microsecond // 1000:03d}Z"
+
+
+def _js_date_prompt_text(type_name, value):
+    """The prompt text TypeScript writes for a native date in a date-typed
+    field (processValue in src/ax/dsp/prompt.ts), or None when TS would not
+    see a Date: a date field's UTC day, a datetime without milliseconds, and
+    for a range with two dates the {start, end} JSON of those; a range object
+    holding anything else is its JSON with each date as toISOString."""
+    if type_name in ("date", "datetime"):
+        millis = _js_date_millis(value)
+        if millis is None:
+            return None
+        iso = _js_iso_string(millis)
+        return iso[: iso.index("T")] if type_name == "date" else iso[:-5] + "Z"
+    if type_name in ("dateRange", "datetimeRange") and isinstance(value, dict) and "start" in value and "end" in value:
+        start = _js_date_millis(value["start"])
+        end = _js_date_millis(value["end"])
+        if start is not None and end is not None:
+            if type_name == "dateRange":
+                bounds = {"start": _js_iso_string(start)[:10], "end": _js_iso_string(end)[:10]}
+            else:
+                bounds = {"start": _js_iso_string(start)[:-5] + "Z", "end": _js_iso_string(end)[:-5] + "Z"}
+            return _js_json_dumps(bounds, indent=2)
+        if any(_js_date_millis(item) is not None for item in value.values()):
+            dated = {key: (_js_iso_string(_js_date_millis(item)) if _js_date_millis(item) is not None else item) for key, item in value.items()}
+            return _js_json_dumps(dated, indent=2)
+    return None
 
 
 VALID_FIELD_TYPES = {
@@ -44,6 +256,8 @@ class FieldType:
     maximum: float | None = None
     pattern: str | None = None
     pattern_description: str | None = None
+    value_descriptions: dict[str, str] | None = None
+    evidence: dict[str, Any] | None = None
     format: str | None = None
     language: str | None = None
     description: str | None = None
@@ -83,6 +297,19 @@ class FluentField:
         self.is_optional = False
         self.is_internal = False
         self.is_cached = False
+
+    def describe_values(self, descriptions: dict[str, str]):
+        clone = self._clone()
+        clone.type.value_descriptions = copy.deepcopy(descriptions)
+        _signature_validate_value_descriptions_impl(clone.type, clone.type.name)
+        return clone
+
+    def with_evidence(self, *, threshold: float | None = None, on_refusal: str = "throw"):
+        clone = self._clone()
+        clone.type.evidence = {"onRefusal": on_refusal}
+        if threshold is not None: clone.type.evidence["threshold"] = threshold
+        _evidence_validate_type_impl(clone.type)
+        return clone
 
     def optional(self):
         clone = self._clone()
@@ -208,6 +435,13 @@ class FluentFactory:
 
     def string(self, description: str | None = None): return FluentField("string", description)
     def number(self, description: str | None = None): return FluentField("number", description)
+    def box(self, description: str | None = None): return FluentField("box", description)
+    def score(self, levels: list[str], description: str | None = None):
+        item = FluentField("score", description)
+        item.type.options = list(levels)
+        _evidence_validate_type_impl(item.type)
+        return item
+
     def boolean(self, description: str | None = None): return FluentField("boolean", description)
     def json(self, description: str | None = None): return FluentField("json", description)
     def object(self, fields: dict[str, FluentField] | None = None, description: str | None = None): return FluentField("object", description, fields=fields)
@@ -253,12 +487,12 @@ class AxSignature:
     def get_description(self): return self.description
 
     def has_complex_fields(self) -> bool:
-        return self.force_structured or any(field.type.name == "object" or field.type.fields for field in self.output_fields)
+        return self.force_structured or _evidence_has_fields_impl(self.output_fields) or any(field.type.name == "object" or field.type.fields for field in self.output_fields)
 
     def to_json_schema(self, target: str = "outputs", options: dict[str, Any] | None = None):
         from .schema import to_json_schema
         fields = self.input_fields if target == "inputs" else self.output_fields
-        return to_json_schema(fields, options=options)
+        return to_json_schema(fields, options={"decisionMode":"result", **(options or {})})
 
     def toJSONSchema(self, target: str = "outputs", options: dict[str, Any] | None = None):
         return self.to_json_schema(target, options)
@@ -319,6 +553,28 @@ def _core_get(target, key, default=None):
     return getattr(target, key, default)
 
 
+def _core_type_is(value, type_name):
+    if type_name == "object":
+        return isinstance(value, dict)
+    if type_name == "list":
+        return isinstance(value, list)
+    if type_name == "string":
+        return isinstance(value, str)
+    if type_name == "number":
+        return (isinstance(value, (int, float)) and not isinstance(value, bool))
+    if type_name == "boolean":
+        return isinstance(value, bool)
+    if type_name == "null":
+        return value is None
+    if type_name == "json":
+        return value is None or isinstance(value, (dict, list, str, int, float, bool))
+    return False
+
+
+def _core_map_keys(values):
+    return list(values) if isinstance(values, dict) else []
+
+
 def _core_map_merge(left, right):
     merged = dict(left or {})
     merged.update(right or {})
@@ -337,8 +593,62 @@ def _core_regex_match(pattern, value):
     return isinstance(value, str) and re.search(pattern, value) is not None
 
 
+def _js_text(value) -> str:
+    """A value's text in string.format and string.str, as every port writes
+    it: a string as is, None as "null", a bool as "true" or "false", a number
+    as JavaScript's String(x) (an int keeps its exact digits), and a list or
+    dict as compact JSON (JSON.stringify(x), keys in insertion order)."""
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return int.__repr__(value)
+    if isinstance(value, float):
+        return _js_number_text(value)
+    if isinstance(value, (list, tuple, dict)):
+        try:
+            return _js_json_dumps(value)
+        except (TypeError, ValueError):
+            return str(value)
+    return str(value)
+
+
+def _js_format(template, args) -> str:
+    """string.format as every port runs it: each {} takes the next argument's
+    _js_text, from left to right and inserted as is (never read as a
+    template); {{ and }} write one brace, any other brace is kept, and a {}
+    past the last argument stays {}."""
+    text = str(template)
+    out: list[str] = []
+    index = 0
+    next_arg = 0
+    length = len(text)
+    while index < length:
+        pair = text[index:index + 2]
+        if pair == "{{":
+            out.append("{")
+            index += 2
+        elif pair == "}}":
+            out.append("}")
+            index += 2
+        elif pair == "{}":
+            if next_arg < len(args):
+                out.append(_js_text(args[next_arg]))
+                next_arg += 1
+            else:
+                out.append("{}")
+            index += 2
+        else:
+            out.append(text[index])
+            index += 1
+    return "".join(out)
+
+
 def _core_string_format(template, *args):
-    return str(template).format(*args)
+    return _js_format(template, args)
 
 
 def _core_string_join(sep, values):
@@ -593,6 +903,8 @@ def _core_record_new(name, values):
             maximum=values.get("maximum"),
             pattern=values.get("pattern"),
             pattern_description=values.get("pattern_description", values.get("patternDescription")),
+            value_descriptions=values.get("value_descriptions", values.get("valueDescriptions")),
+            evidence=values.get("evidence"),
             format=values.get("format"),
             language=values.get("language"),
             description=values.get("description"),
@@ -622,14 +934,25 @@ def _core_fields_from_map(fields):
     return [item if isinstance(item, Field) else Field(name=name, type=item) for name, item in fields.items()]
 
 
+# A field name's title as TS's toTitle writes it (src/ax/dsp/sig.ts):
+# underscores become spaces, and a word starts at a capital after a lowercase
+# letter or digit, at the last capital of a run that begins a word, and at each
+# run of digits; words are separated by one space. userID is "User ID",
+# parseHTTPResponse "Parse HTTP Response", item123 "Item 123", field_2 "Field 2".
 def _title(name: str) -> str:
-    out = []
-    for i, ch in enumerate(name.replace("_", " ")):
-        if i > 0 and (ch.isupper() or ch.isdigit()):
-            out.append(" ")
-        out.append(ch)
-    text = "".join(out).strip()
+    text = name.replace("_", " ")
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text)
+    text = re.sub(r"([A-Z])([A-Z][a-z])", r"\1 \2", text)
+    text = re.sub(r"([^0-9])([0-9])", r"\1 \2", text)
+    text = re.sub(r"\s+", " ", text).strip()
     return text[:1].upper() + text[1:]
 
 
 # AXIR_CORE_SIGNATURE_FUNCTIONS
+
+
+def _core_gte(a, b): return a >= b
+def _core_lte(a, b): return a <= b
+def _core_math_is_finite(value):
+    import math
+    return math.isfinite(value)

@@ -8,6 +8,11 @@ import (
 	"strings"
 )
 
+// pythonJSTrimChars is a Python literal of the characters JavaScript's
+// String.prototype.trim removes: white space and line terminators. Python's
+// own strip() also removes U+001C-U+001F and U+0085 and keeps U+FEFF.
+const pythonJSTrimChars = `"\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"`
+
 // pythonEmitState carries the registry context for one python module
 // emission: the global symbol->name map, each symbol's host module, the
 // module being emitted, and the cross-module names referenced so far (which
@@ -147,7 +152,75 @@ var (
 // module scope, or imports from a sibling. Because every helper body is part of
 // the scanned text, transitive references (a helper that calls another helper,
 // e.g. _core_fields_from_map -> _nested_field) are covered too.
+// Ignore literal source text (including embedded guest-language programs) when
+// auditing Python calls. Keep formatted strings visible: their expressions may
+// call Python helpers and must remain covered by the reference audit.
+func pythonMaskStringLiterals(text string) string {
+	out := []byte(text)
+	mask := func(start, end int) {
+		for k := start; k < end; k++ {
+			if out[k] != '\n' && out[k] != '\r' {
+				out[k] = ' '
+			}
+		}
+	}
+	for i := 0; i < len(text); {
+		if text[i] == '#' {
+			end := i
+			for end < len(text) && text[end] != '\n' {
+				end++
+			}
+			mask(i, end)
+			i = end
+			continue
+		}
+		quote := text[i]
+		if quote != '\'' && quote != '"' {
+			i++
+			continue
+		}
+		start := i
+		prefixStart := i
+		for prefixStart > 0 && ((text[prefixStart-1] >= 'a' && text[prefixStart-1] <= 'z') || (text[prefixStart-1] >= 'A' && text[prefixStart-1] <= 'Z')) {
+			prefixStart--
+		}
+		prefix := strings.ToLower(text[prefixStart:i])
+		formatted := prefix == "f" || prefix == "fr" || prefix == "rf"
+		width := 1
+		if i+2 < len(text) && text[i+1] == quote && text[i+2] == quote {
+			width = 3
+		}
+		i += width
+		for i < len(text) {
+			if text[i] == '\\' {
+				i += 2
+				if i > len(text) {
+					i = len(text)
+				}
+				continue
+			}
+			if formatted && width == 1 {
+				if text[i] == '\n' {
+					break
+				}
+				i++
+				continue
+			}
+			if text[i] == quote && (width == 1 || i+2 < len(text) && text[i+1] == quote && text[i+2] == quote) {
+				i += width
+				break
+			}
+			i++
+		}
+		if !formatted {
+			mask(start, i)
+		}
+	}
+	return string(out)
+}
+
 func pythonModuleMissingHelpers(text string) []string {
+	text = pythonMaskStringLiterals(text)
 	allowed := map[string]bool{}
 	for _, m := range pythonHelperDefRe.FindAllStringSubmatch(text, -1) {
 		allowed[m[1]] = true
@@ -315,7 +388,7 @@ func emitPythonCoreStmt(st *pythonEmitState, stmt CoreStmt) ([]string, error) {
 	case "string_join":
 		return emitPythonStringJoin(st, stmt)
 	case "string_trim":
-		return []string{fmt.Sprintf("%s = str(%s).strip()", pyName(stmt.Result), pythonLiteral(stmt.Value))}, nil
+		return []string{fmt.Sprintf("%s = str(%s).strip(%s)", pyName(stmt.Result), pythonLiteral(stmt.Value), pythonJSTrimChars)}, nil
 	case "type_is":
 		return []string{fmt.Sprintf("%s = _core_type_is(%s, %s)", pyName(stmt.Result), pythonLiteral(stmt.Value), pythonAttrValue(stmt.Op, "type"))}, nil
 	case "set":
@@ -547,6 +620,8 @@ func pythonLiteral(value interface{}) string {
 			return pyName(v)
 		}
 		return strconv.Quote(v)
+	case QuotedString:
+		return strconv.Quote(string(v))
 	case bool:
 		if v {
 			return "True"
@@ -590,6 +665,10 @@ func pythonType(typ Type) string {
 
 func pythonArgDefault(funcName, argName string) string {
 	switch funcName {
+	case "mcp_listen_interests":
+		if argName == "task_ids" {
+			return "None"
+		}
 	case "to_json_schema":
 		if argName == "schema_title" {
 			return strconv.Quote("Schema")
@@ -646,7 +725,11 @@ func pythonArgDefault(funcName, argName string) string {
 			return "None"
 		}
 	case "openai_normalize_error":
-		if argName == "request" {
+		if argName == "request" || argName == "options" {
+			return "None"
+		}
+	case "ai_error_request", "_ai_error_request":
+		if argName == "request" || argName == "options" {
 			return "None"
 		}
 	case "build_chat_request", "build_embed_request":

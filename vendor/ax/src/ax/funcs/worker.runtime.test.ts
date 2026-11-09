@@ -1,5 +1,6 @@
 import { runInNewContext } from 'node:vm';
 
+import * as ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 
 import { getWorkerSource } from './worker.js';
@@ -35,9 +36,35 @@ describe('axWorkerRuntime bootstrap', () => {
     // esbuild is smart enough to see through `globalThis['require']` and
     // still replaces it with a module-scope polyfill variable. The function
     // must use `new Function(...)` instead.
-    const globalThisRequire =
-      /globalThis\s*(\[\s*['"]require['"]\s*]|\.require)/;
-    expect(source).not.toMatch(globalThisRequire);
+    // Inspect executable accesses: newer transforms retain the comments above.
+    const sourceFile = ts.createSourceFile(
+      'worker.js',
+      source,
+      ts.ScriptTarget.Latest,
+      true,
+      ts.ScriptKind.JS
+    );
+    const directRequireReferences: string[] = [];
+    const visit = (node: ts.Node) => {
+      if (
+        (ts.isPropertyAccessExpression(node) ||
+          ts.isElementAccessExpression(node)) &&
+        ts.isIdentifier(node.expression) &&
+        node.expression.text === 'globalThis'
+      ) {
+        const property = ts.isPropertyAccessExpression(node)
+          ? node.name.text
+          : ts.isStringLiteral(node.argumentExpression)
+            ? node.argumentExpression.text
+            : undefined;
+        if (property === 'require') {
+          directRequireReferences.push(node.getText(sourceFile));
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sourceFile);
+    expect(directRequireReferences).toEqual([]);
   });
 
   it('detects Node runtime via globalThis.require in isolated sandbox', () => {
@@ -349,6 +376,7 @@ describe('axWorkerRuntime in browser-like sandbox', () => {
     expect(result).toBeDefined();
     expect(result!.id).toBe(2);
     expect(result!.value).toBe(42);
+    expect(result!.codeError).toBeUndefined();
   });
 
   it('returns code execution errors as string values (not rejections)', async () => {
@@ -378,9 +406,11 @@ describe('axWorkerRuntime in browser-like sandbox', () => {
     expect(result).toBeDefined();
     expect(result!.id).toBe(3);
     // Code execution errors (ReferenceError, SyntaxError, etc.) are
-    // returned as string values so the LLM can self-correct.
+    // returned as string values so the LLM can self-correct, flagged so the
+    // host can still classify the execution as a failure.
     expect(typeof result!.value).toBe('string');
     expect(result!.value).toMatch(/^ReferenceError:/);
+    expect(result!.codeError).toBe(true);
     expect(result!.error).toBeUndefined();
   });
 
@@ -415,6 +445,7 @@ describe('axWorkerRuntime in browser-like sandbox', () => {
     expect(result!.id).toBe(4);
     // Non-code-execution errors are serialized as structured error objects.
     expect(result!.error).toBeDefined();
+    expect(result!.codeError).toBeUndefined();
     const err = result!.error as Record<string, unknown>;
     expect(err.name).toBe('Error');
     expect(err.message).toBe('custom boom');

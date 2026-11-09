@@ -1,14 +1,25 @@
 import { axModelInfoAnthropic } from './anthropic/info.js';
 import { AxAIAnthropicModel } from './anthropic/types.js';
+// axir-nonportable:start chrome-ai
+import { axModelInfoChromeAI } from './chrome-ai/info.js';
+import { AxAIChromeAIModel } from './chrome-ai/types.js';
+// axir-nonportable:end chrome-ai
 import { axModelInfoCohere } from './cohere/info.js';
 import { AxAICohereModel } from './cohere/types.js';
 import { axModelInfoDeepSeek } from './deepseek/info.js';
 import { AxAIDeepSeekModel } from './deepseek/types.js';
 import { axModelInfoGoogleGemini } from './google-gemini/info.js';
+import { axIsGeminiLiveAudioModel } from './google-gemini/live_audio.js';
 import {
   AxAIGoogleGeminiEmbedModel,
   AxAIGoogleGeminiModel,
 } from './google-gemini/types.js';
+import {
+  axModelInfoMeta,
+  axModelInfoMetaMessages,
+  axModelInfoMetaSpark,
+} from './meta/info.js';
+import { AxAIMetaModel } from './meta/types.js';
 import { axModelInfoMistral } from './mistral/info.js';
 import { AxAIMistralModel } from './mistral/types.js';
 import { AxAIOpenAIEmbedModel, AxAIOpenAIModel } from './openai/chat_types.js';
@@ -16,29 +27,66 @@ import {
   axModelInfoOpenAI,
   axModelInfoOpenAIResponses,
 } from './openai/info.js';
+import { axIsOpenAIRealtimeModel } from './openai/realtime.js';
 import { AxAIOpenAIResponsesModel } from './openai/responses_types.js';
-import { axAIProfiles } from './provider_profiles.js';
+import { axModelInfoOpenAIDecisions } from './openai-decisions/info.js';
+import { AxAIOpenAIDecisionsModel } from './openai-decisions/types.js';
+import {
+  type AxAIProfileSummary,
+  axAIProfiles,
+  axGetAIProfile,
+  axResolveAIProfileFeatures,
+} from './provider_profiles.js';
 import { axModelInfoReka } from './reka/info.js';
 import { AxAIRekaModel } from './reka/types.js';
-import type { AxModelInfo } from './types.js';
+import type {
+  AxAIServiceOptions,
+  AxModelInfo,
+  AxServiceTier,
+} from './types.js';
 // axir-nonportable:start webllm
 import { axModelInfoWebLLM } from './webllm/info.js';
 import { AxAIWebLLMModel } from './webllm/types.js';
 import type { AxAIArgs } from './wrap.js';
 // axir-nonportable:end webllm
+import { axIsGrokVoiceModel } from './x-grok/api.js';
 import { axModelInfoGrok } from './x-grok/info.js';
 import { AxAIGrokModel } from './x-grok/types.js';
 
 export type AxAIModelCatalogProviderName = AxAIArgs<string>['name'];
 
+/** Portable thinking levels accepted by Ax for a catalog provider or model. */
+export type AxAIModelCatalogThinkingLevel = NonNullable<
+  AxAIServiceOptions['thinkingTokenBudget']
+>;
+
 export type AxAIModelCatalogModelCapabilities = {
   thinkingBudget: boolean;
+  /** Portable Ax thinking levels accepted for this model. Levels may collapse onto the same provider-native value. */
+  thinkingLevels: AxAIModelCatalogThinkingLevel[];
   showThoughts: boolean;
   structuredOutputs: boolean;
   temperature: boolean;
   topP: boolean;
   audioInput: boolean;
   audioOutput: boolean;
+  /** Omitted when the bundled model metadata does not declare exact modalities. */
+  textInput?: boolean;
+  imageInput?: boolean;
+  videoInput?: boolean;
+  pdfInput?: boolean;
+  textOutput?: boolean;
+  imageOutput: boolean;
+  /** Verified explicit request tiers. `auto` remains available as the provider-delegated policy. */
+  serviceTiers: AxServiceTier[];
+};
+
+export type AxAIModelCatalogProviderCapabilities = {
+  thinking: boolean;
+  /** Portable Ax thinking levels accepted by the provider's default model. */
+  thinkingLevels: AxAIModelCatalogThinkingLevel[];
+  /** Verified explicit request tiers for the provider's default deployment profile. */
+  serviceTiers: AxServiceTier[];
 };
 
 export type AxAIModelCatalogAudioSupport = {
@@ -50,7 +98,8 @@ export type AxAIModelCatalogModelType =
   | 'text'
   | 'embeddings'
   | 'code'
-  | 'audio';
+  | 'audio'
+  | 'image';
 
 export type AxAIModelCatalogFilter = 'all' | AxAIModelCatalogModelType;
 
@@ -68,6 +117,7 @@ export type AxAIModelCatalogProvider = {
   defaultModel?: string;
   defaultEmbedModel?: string;
   isDynamic: boolean;
+  capabilities: AxAIModelCatalogProviderCapabilities;
   models: AxAIModelCatalogModel[];
 };
 
@@ -95,6 +145,12 @@ const axKnownModelCatalogProviderDefinitions = {
     isDynamic: false,
     modelInfo: axModelInfoOpenAI,
   },
+  'openai-decisions': {
+    displayName: 'OpenAI Decisions',
+    defaultModel: AxAIOpenAIDecisionsModel.GPT6Luna,
+    isDynamic: false,
+    modelInfo: axModelInfoOpenAIDecisions,
+  },
   'openai-responses': {
     displayName: 'OpenAI Responses',
     defaultModel: AxAIOpenAIResponsesModel.GPT4O,
@@ -109,13 +165,13 @@ const axKnownModelCatalogProviderDefinitions = {
   },
   anthropic: {
     displayName: 'Anthropic',
-    defaultModel: AxAIAnthropicModel.Claude37Sonnet,
+    defaultModel: AxAIAnthropicModel.Claude5Sonnet,
     isDynamic: false,
     modelInfo: axModelInfoAnthropic,
   },
   'google-gemini': {
     displayName: 'Google Gemini',
-    defaultModel: AxAIGoogleGeminiModel.Gemini25Flash,
+    defaultModel: AxAIGoogleGeminiModel.Gemini36Flash,
     defaultEmbedModel: AxAIGoogleGeminiEmbedModel.GeminiEmbedding2,
     isDynamic: false,
     modelInfo: axModelInfoGoogleGemini,
@@ -137,6 +193,24 @@ const axKnownModelCatalogProviderDefinitions = {
     defaultModel: AxAIDeepSeekModel.DeepSeekV4Flash,
     isDynamic: false,
     modelInfo: axModelInfoDeepSeek,
+  },
+  meta: {
+    displayName: 'Meta Model API',
+    defaultModel: AxAIMetaModel.MuseSpark13,
+    isDynamic: false,
+    modelInfo: axModelInfoMeta,
+  },
+  'meta-chat': {
+    displayName: 'Meta Model API Chat Completions',
+    defaultModel: AxAIMetaModel.MuseSpark13,
+    isDynamic: false,
+    modelInfo: axModelInfoMetaSpark,
+  },
+  'meta-messages': {
+    displayName: 'Meta Model API Messages',
+    defaultModel: AxAIMetaModel.MuseSpark13,
+    isDynamic: false,
+    modelInfo: axModelInfoMetaMessages,
   },
   mistral: {
     displayName: 'Mistral AI',
@@ -164,6 +238,14 @@ const axKnownModelCatalogProviderDefinitions = {
     modelInfo: axModelInfoWebLLM,
   },
   // axir-nonportable:end webllm
+  // axir-nonportable:start chrome-ai
+  'chrome-ai': {
+    displayName: 'Chrome AI',
+    defaultModel: AxAIChromeAIModel.GeminiNano,
+    isDynamic: false,
+    modelInfo: axModelInfoChromeAI,
+  },
+  // axir-nonportable:end chrome-ai
 } as const;
 
 const axAIModelCatalogProviderDefinitions = {
@@ -183,6 +265,98 @@ const axAIModelCatalogProviderDefinitions = {
   AxAIModelCatalogProviderDefinition
 >;
 
+const axAIModelCatalogProfiles = new Map([
+  ...axAIProfiles().map((profile) => [profile.id, profile] as const),
+  // axir-nonportable:start chrome-ai
+  ['chrome-ai', axGetAIProfile('chrome-ai')] as const,
+  // axir-nonportable:end chrome-ai
+]);
+
+const axAIModelCatalogThinkingLevels = [
+  'none',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'highest',
+] as const satisfies readonly AxAIModelCatalogThinkingLevel[];
+
+const axProfileModelRule = (
+  profile: Readonly<AxAIProfileSummary>,
+  model: string
+) =>
+  profile.modelRules.find(
+    (rule) =>
+      (rule.match.exact?.includes(model) ?? false) ||
+      (rule.match.prefix?.some((prefix) => model.startsWith(prefix)) ??
+        false) ||
+      (rule.match.contains?.some((part) =>
+        model.toLowerCase().includes(part.toLowerCase())
+      ) ??
+        false)
+  );
+
+const axThinkingLevelsFor = (
+  profile: Readonly<AxAIProfileSummary>,
+  model: string,
+  supported: boolean
+): AxAIModelCatalogThinkingLevel[] => {
+  if (!supported) return [];
+
+  const unsupported = {
+    ...Object.fromEntries(
+      (profile.unsupportedThinkingLevels ?? []).map((level) => [level, true])
+    ),
+    ...(axProfileModelRule(profile, model)?.request
+      ?.unsupportedThinkingLevels ?? {}),
+  };
+  return axAIModelCatalogThinkingLevels.filter(
+    (level) => !Object.hasOwn(unsupported ?? {}, level)
+  );
+};
+
+const axServiceTiersFor = (
+  provider: AxAIModelCatalogProviderName,
+  model: Readonly<AxAIModelCatalogModelInfo>,
+  type: AxAIModelCatalogModelType
+): AxServiceTier[] => {
+  if (type === 'embeddings') return [];
+
+  if (
+    (provider === 'openai' && axIsOpenAIRealtimeModel(model.name)) ||
+    (provider === 'google-gemini' && axIsGeminiLiveAudioModel(model.name)) ||
+    (provider === 'grok' && axIsGrokVoiceModel(model.name))
+  ) {
+    return [];
+  }
+
+  if (model.supported?.serviceTiers !== undefined) {
+    return [...model.supported.serviceTiers];
+  }
+
+  return [
+    ...(axResolveAIProfileFeatures(provider, model.name).serviceTiers ?? []),
+  ];
+};
+
+const axProviderCapabilities = (
+  profile: Readonly<AxAIProfileSummary>,
+  defaultModel: string | undefined
+): AxAIModelCatalogProviderCapabilities => {
+  const model = defaultModel ?? profile.defaultModel ?? '';
+  const features = axResolveAIProfileFeatures(profile.id, model);
+
+  return {
+    thinking: features.thinking,
+    thinkingLevels: axThinkingLevelsFor(
+      profile,
+      model,
+      features.hasThinkingBudget ?? false
+    ),
+    serviceTiers: [...(features.serviceTiers ?? [])],
+  };
+};
+
 const axCloneModelInfo = (
   model: Readonly<AxAIModelCatalogModelInfo>
 ): AxAIModelCatalogModelInfo => {
@@ -192,7 +366,20 @@ const axCloneModelInfo = (
     clone.aliases = [...model.aliases];
   }
   if (model.supported) {
-    clone.supported = { ...model.supported };
+    clone.supported = {
+      ...model.supported,
+      ...(model.supported.structuredOutputModes
+        ? {
+            structuredOutputModes: [...model.supported.structuredOutputModes],
+          }
+        : undefined),
+      ...(model.supported.serviceTiers
+        ? { serviceTiers: [...model.supported.serviceTiers] }
+        : undefined),
+      ...(model.supported.operations
+        ? { operations: [...model.supported.operations] }
+        : undefined),
+    };
   }
   if (model.notSupported) {
     clone.notSupported = { ...model.notSupported };
@@ -200,18 +387,36 @@ const axCloneModelInfo = (
   if (model.audio) {
     clone.audio = { ...model.audio };
   }
+  if (model.modalities) {
+    clone.modalities = {
+      input: [...model.modalities.input],
+      output: [...model.modalities.output],
+    };
+  }
+  if (model.dataUse) {
+    clone.dataUse = {
+      ...model.dataUse,
+      ...(model.dataUse.appliesTo
+        ? { appliesTo: [...model.dataUse.appliesTo] }
+        : undefined),
+    };
+  }
 
   return clone;
 };
 
 const axModelCapabilities = (
+  provider: AxAIModelCatalogProviderName,
+  profile: Readonly<AxAIProfileSummary>,
   model: Readonly<AxAIModelCatalogModelInfo>
 ): AxAIModelCatalogModelCapabilities => {
   const type = axModelType(model);
   const name = model.name.toLowerCase();
+  const thinkingBudget = model.supported?.thinkingBudget ?? false;
 
   return {
-    thinkingBudget: model.supported?.thinkingBudget ?? false,
+    thinkingBudget,
+    thinkingLevels: axThinkingLevelsFor(profile, model.name, thinkingBudget),
     showThoughts: model.supported?.showThoughts ?? false,
     structuredOutputs: model.supported?.structuredOutputs ?? false,
     temperature: !(model.notSupported?.temperature ?? false),
@@ -221,7 +426,22 @@ const axModelCapabilities = (
       model.audio?.output ??
       (type === 'audio' &&
         !name.includes('whisper') &&
-        !name.includes('transcription')),
+        !name.includes('transcription') &&
+        !name.includes('transcribe')),
+    ...(model.modalities
+      ? {
+          textInput: model.modalities.input.includes('text'),
+          imageInput: model.modalities.input.includes('image'),
+          videoInput: model.modalities.input.includes('video'),
+          pdfInput: model.modalities.input.includes('pdf'),
+          textOutput: model.modalities.output.includes('text'),
+        }
+      : {}),
+    imageOutput:
+      model.modalities?.output.includes('image') ??
+      model.supported?.imageOutput ??
+      false,
+    serviceTiers: axServiceTiersFor(provider, model, type),
   };
 };
 
@@ -230,13 +450,17 @@ const axModelType = (
 ): AxAIModelCatalogModelType => {
   const name = model.name.toLowerCase();
 
+  if (model.supported?.imageOutput || name.includes('image')) {
+    return 'image';
+  }
+
   if (
-    model.audio?.input ||
     model.audio?.output ||
     name.includes('audio') ||
     name.includes('realtime') ||
     name.includes('voice') ||
     name.includes('whisper') ||
+    name.includes('transcribe') ||
     name.includes('native-audio')
   ) {
     return 'audio';
@@ -307,6 +531,7 @@ const axCompareModelCatalogModels = (
 
 const axModelCatalogModel = (
   provider: AxAIModelCatalogProviderName,
+  profile: Readonly<AxAIProfileSummary>,
   defaultModel: string | undefined,
   defaultEmbedModel: string | undefined,
   model: Readonly<AxAIModelCatalogModelInfo>
@@ -323,7 +548,7 @@ const axModelCatalogModel = (
     isDefault: defaultModels.some(
       (item) => model.name === item || (model.aliases?.includes(item) ?? false)
     ),
-    capabilities: axModelCapabilities(model),
+    capabilities: axModelCapabilities(provider, profile, model),
   };
 };
 
@@ -350,9 +575,21 @@ export const axGetSupportedAIModels = (
         name,
         { displayName, defaultModel, defaultEmbedModel, isDynamic, modelInfo },
       ]) => {
+        const profile = axAIModelCatalogProfiles.get(name);
+        if (!profile) {
+          throw new Error(
+            `Missing AI profile metadata for catalog provider ${name}`
+          );
+        }
         const models = modelInfo
           .map((model) =>
-            axModelCatalogModel(name, defaultModel, defaultEmbedModel, model)
+            axModelCatalogModel(
+              name,
+              profile,
+              defaultModel,
+              defaultEmbedModel,
+              model
+            )
           )
           .filter((model) => axMatchesModelCatalogFilter(model, filters))
           .sort(axCompareModelCatalogModels);
@@ -365,6 +602,7 @@ export const axGetSupportedAIModels = (
             ? { defaultEmbedModel }
             : undefined),
           isDynamic,
+          capabilities: axProviderCapabilities(profile, defaultModel),
           models,
         };
       }

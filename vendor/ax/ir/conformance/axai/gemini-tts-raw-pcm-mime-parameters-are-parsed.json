@@ -1,0 +1,42 @@
+{
+  "expected_output": {
+    "channels": 2,
+    "data": "AAAAAA==",
+    "format": "pcm16",
+    "mimeType": "audio/L16;codec=pcm;RATE=16000;Channels=2",
+    "sampleRate": 16000,
+    "transcript": "Hello from Ax."
+  },
+  "expected_transport_request": {
+    "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-tts-preview:generateContent"
+  },
+  "kind": "ai_speak",
+  "name": "gemini-tts-raw-pcm-mime-parameters-are-parsed",
+  "provider": "google-gemini",
+  "request": {
+    "model": "gemini-3.1-flash-tts-preview",
+    "text": "Hello from Ax."
+  },
+  "transport_responses": [
+    {
+      "json": {
+        "candidates": [
+          {
+            "content": {
+              "parts": [
+                {
+                  "inlineData": {
+                    "data": "AAAAAA==",
+                    "mimeType": "audio/L16;codec=pcm;RATE=16000;Channels=2"
+                  }
+                }
+              ],
+              "role": "model"
+            }
+          }
+        ]
+      },
+      "status": 200
+    }
+  ]
+}

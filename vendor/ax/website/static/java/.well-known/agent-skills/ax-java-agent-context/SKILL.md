@@ -1,7 +1,7 @@
 ---
 name: "ax-java-agent-context"
 description: "Use when writing Java code with `dev.axllm:ax` for deciding between context maps, trajectory context policy, offline optimization (ACE/GEPA), and memory recall for long-context agents."
-version: "24.0.14"
+version: "25.4.9"
 ---
 # AxAgent Context Selection For Java
 
@@ -33,7 +33,7 @@ var out = helper.forward(llm, java.util.Map.of("question", "How should I proceed
 
 ## Relevant API Surface
 
-- Agents And RLM: `Ax.agent`, `AxAgent`
+- Agents And RLM: `Ax.agent`, `AxAgent`, `AxAgent.addChildAgent`, `AxAgent.streamingForward`
 - Runtime Profiles: `ProcessCodeRuntime`, `RuntimeCapabilities`, `RuntimeEnvelope`, `javascript-quickjs`, `python-pyodide`
 - Optimizers: `Ax.optimize`, `Ax.playbook`, `AxPlaybook`, `AxBootstrapFewShot`, `AxGEPA`, `OptimizerEngine`, `OptimizerEvaluator`
 

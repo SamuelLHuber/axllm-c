@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-import { createHash } from 'node:crypto';
 import {
   copyFile,
   cp,
@@ -23,6 +22,13 @@ import {
   readPublicExampleCatalog,
 } from './example-catalog.mjs';
 import {
+  readSkillMirrorSources,
+  skillArtifact,
+  skillDiscoverySchema,
+  skillIndexEntry,
+  skillMirrorRoot,
+} from './skill-mirrors.mjs';
+import {
   buildAcademyPages,
   validateAcademyCourse,
   validateAcademyLanguages,
@@ -34,8 +40,6 @@ const siteRoot = path.join(repoRoot, 'website');
 const contentSrcRoot = path.join(siteRoot, 'content-src');
 const generatedContentRoot = path.join(siteRoot, '.generated', 'content');
 const githubBlob = 'https://github.com/ax-llm/ax/blob/main';
-const skillDiscoverySchema =
-  'https://schemas.agentskills.io/discovery/0.2.0/schema.json';
 const providerProfilesManifest = await readJson(
   path.join(repoRoot, 'ir/axcore/data/provider-profiles.json')
 );
@@ -177,6 +181,7 @@ const coreApiSymbols = {
 const skillNavLabels = new Map([
   ['llm', 'Quick Reference'],
   ['ai', 'AI'],
+  ['typesafe', 'Typesafe / Jev'],
   ['audio', 'Audio'],
   ['signature', 'Signatures'],
   ['gen', 'Generation'],
@@ -196,6 +201,7 @@ const skillNavLabels = new Map([
 const skillNavOrder = [
   'llm',
   'ai',
+  'typesafe',
   'audio',
   'signature',
   'gen',
@@ -378,7 +384,9 @@ async function writeExampleGroupPages(language, navPages) {
 
 function sectionNavForPage(page) {
   if (page.slug === 'quick-start') return 'quick-start';
+  if (page.slug === 'how-ax-fits-together') return 'quick-start';
   if (page.slug === 'advanced-start') return 'quick-start';
+  if (page.slug === 'faq') return 'quick-start';
   if (page.slug.startsWith('examples')) return 'examples';
   if (page.slug === 'skills') return 'skills';
   return page.group;
@@ -407,8 +415,30 @@ async function renderContext(language, page) {
     install: (language.install ?? []).join('\n'),
     skillInstallURL: skillInstallURL(language),
     skillInstallCommand: skillInstallCommand(language),
+    skillSetupNotes:
+      language.id === 'typescript'
+        ? [
+            'Installing `@ax-llm/ax` automatically sets up only `ax-llm` and its local guides in `.claude/skills` outside CI. Set `AX_SKIP_SKILL_INSTALL=1` during package installation to skip setup for that run.',
+            '',
+            'To disable future automatic setup for the project, run `npx @ax-llm/ax skills-auto-install off` from the project root. This saves `ax.skills.autoInstall: false` in `package.json`; commit the setting to share it with your team. Run `npx @ax-llm/ax skills-auto-install on` to restore automatic setup on future installs. CI and `AX_SKIP_SKILL_INSTALL` take precedence over the saved setting.',
+            '',
+            'To opt out before the first installation, merge this field into your existing `package.json`:',
+            '',
+            '```json',
+            '{ "ax": { "skills": { "autoInstall": false } } }',
+            '```',
+            '',
+            'For manual Claude Code setup, run `npx @ax-llm/ax setup-claude`. This works even when automatic setup is disabled. Add `--all` for separate specialist entries, or `--skill ax-ai` to install just one specialist. Changing the preference leaves installed skills in place; manual setup and removal preserve the saved preference.',
+            '',
+            'Existing specialist installs are preserved. To switch an older full installation to one entry point, run `npx @ax-llm/ax remove-claude`, then `npx @ax-llm/ax setup-claude`.',
+          ].join('\n')
+        : '',
     skillList: skillList(inventory.languageSkills[language.id] ?? [], language),
     skillSource: skillSource(language),
+    quickStartFile: language.quickStartRun.file,
+    quickStartSetup: language.quickStartRun.setup.join('\n'),
+    quickStartRunCommand: language.quickStartRun.run.join('\n'),
+    quickStartOutput: language.quickStartRun.output.join('\n'),
     quickStartCode: lines(snippets.quickStart),
     dspyCode: lines(snippets.dspy ?? snippets.quickStart),
     signatureCode: lines(snippets.signature),
@@ -417,10 +447,12 @@ async function renderContext(language, page) {
       'signatures.string',
       'signature'
     ),
+    decisionEvidenceExample: snippetBlock(language, 'decisionEvidenceExample'),
     signatureFluentExample: snippetBlock(language, 'signatures.fluent'),
     signatureValidationExample: snippetBlock(language, 'signatures.validation'),
     signatureHybridExample: snippetBlock(language, 'signatures.hybrid'),
     standardSchemaSection: standardSchemaSection(language),
+    audioFieldsSection: audioFieldsSection(language),
     toolsBasicExample: snippetBlock(language, 'tools.basic'),
     toolsStandardSchemaExample: snippetBlock(language, 'tools.standardSchema'),
     toolsNamespacesExample: snippetBlock(language, 'tools.namespaces'),
@@ -430,6 +462,7 @@ async function renderContext(language, page) {
     axCode: lines(snippets.ax),
     axToolsExample: snippetBlock(language, 'ax.tools', 'ax'),
     axStreamingExample: snippetBlock(language, 'ax.streaming'),
+    axDatesExample: snippetBlock(language, 'ax.dates'),
     axMCPExample: snippetBlock(language, 'mcp.axTools'),
     flowCode: lines(snippets.flow),
     flowBranchExample: snippetBlock(language, 'flow.branch', 'flow'),
@@ -437,6 +470,7 @@ async function renderContext(language, page) {
     flowRefineExample: snippetBlock(language, 'flow.refine', 'flow'),
     agentCode: lines(snippets.agent),
     agentMinimalExample: snippetBlock(language, 'agents.minimal', 'agent'),
+    agentStreamingExample: snippetBlock(language, 'agents.streaming'),
     agentToolsExample: snippetBlock(language, 'tools.agentFlat', 'agent'),
     agentDiscoveryExample: snippetBlock(language, 'agents.discovery', 'agent'),
     agentMemoryExample: snippetBlock(language, 'agents.memory', 'agent'),
@@ -485,6 +519,9 @@ async function renderContext(language, page) {
     aiCatalogExample: snippetBlock(language, 'ai.catalog'),
     aiServiceTierExample: snippetBlock(language, 'ai.serviceTier'),
     aiProviderStreamExample: snippetBlock(language, 'ai.providerStream'),
+    aiTypesafeExample: snippetBlock(language, 'ai.typesafe'),
+    typesafeSkillPath: `/${language.id}/skills/ax-${language.id === 'typescript' ? '' : `${language.id}-`}typesafe/`,
+    aiCancellationExample: snippetBlock(language, 'ai.cancellation'),
     aiBalancerExample:
       language.id === 'typescript' ? snippetBlock(language, 'ai.balancer') : '',
     aiProviderExamples: aiProviderExamples(language),
@@ -842,68 +879,17 @@ async function readSkillDocs() {
 }
 
 async function readLanguageSkillCatalogs(languages) {
-  const rootPackage = await readJson(path.join(repoRoot, 'package.json'));
-  const rootVersion = String(rootPackage.version ?? '0.1.0');
-  const out = {};
-  for (const language of languages) {
-    if (language.id === 'typescript') {
-      const skillsRoot = path.join(repoRoot, 'src/ax/skills');
-      const files = (await readdir(skillsRoot))
-        .filter((file) => file.endsWith('.md'))
-        .sort();
-      out[language.id] = files.map((file) => {
-        const rel = `src/ax/skills/${file}`;
-        const abs = path.join(repoRoot, rel);
-        return { abs, rel, typeScriptVersion: rootVersion };
-      });
-      continue;
-    }
-
-    const packageSkillsRoot = path.join(
-      repoRoot,
-      'packages',
-      language.id,
-      'skills'
-    );
-    const files = (await listFiles(packageSkillsRoot))
-      .filter((file) => path.basename(file) === 'SKILL.md')
-      .sort();
-    out[language.id] = files.map((abs) => ({
-      abs,
-      rel: path.relative(repoRoot, abs).replaceAll(path.sep, '/'),
-    }));
-  }
-
-  for (const [languageId, entries] of Object.entries(out)) {
-    const skills = [];
-    for (const entry of entries) {
-      let content = await readFile(entry.abs, 'utf8');
-      if (entry.typeScriptVersion) {
-        content = content.replace(
-          /^version:\s*["']?__VERSION__["']?/m,
-          `version: "${entry.typeScriptVersion}"`
-        );
-      }
-      const frontmatter = parseSkillFrontmatter(content);
-      if (!frontmatter.name || !frontmatter.description) {
-        throw new Error(`${entry.rel} is missing skill name or description`);
-      }
-      skills.push({
-        name: frontmatter.name,
-        description: frontmatter.description,
-        version: frontmatter.version,
-        content,
-        source: entry.rel,
-      });
-    }
+  const out = await readSkillMirrorSources(
+    repoRoot,
+    languages.map((language) => language.id)
+  );
+  for (const [languageId, skills] of Object.entries(out)) {
     skills.sort((left, right) =>
       skillSortName(languageId, left).localeCompare(
         skillSortName(languageId, right)
       )
     );
-    out[languageId] = skills;
   }
-
   return out;
 }
 
@@ -913,35 +899,26 @@ async function writeSkillInstallIndexes(languages, languageSkills) {
     if (skills.length === 0) {
       throw new Error(`No skills found for ${language.id}`);
     }
-    const root = path.join(
-      siteRoot,
-      'static',
-      language.id,
-      '.well-known',
-      'agent-skills'
-    );
+    const root = skillMirrorRoot(repoRoot, language.id);
     await rm(root, { recursive: true, force: true });
     await mkdir(root, { recursive: true });
 
-    const entries = [];
     for (const skill of skills) {
       const skillDir = path.join(root, skill.name);
       await mkdir(skillDir, { recursive: true });
-      const skillPath = path.join(skillDir, 'SKILL.md');
-      await writeFile(skillPath, ensureTrailingNewline(skill.content), 'utf8');
-      const digest = sha256Digest(await readFile(skillPath));
-      entries.push({
-        name: skill.name,
-        type: 'skill-md',
-        description: skill.description,
-        url: `${skill.name}/SKILL.md`,
-        digest,
-      });
+      for (const [file, content] of Object.entries(skill.files)) {
+        const dest = path.join(skillDir, file);
+        await mkdir(path.dirname(dest), { recursive: true });
+        await writeFile(dest, content, 'utf8');
+      }
+      const artifact = skillArtifact(skill);
+      if (artifact.type === 'archive')
+        await writeFile(path.join(root, artifact.url), artifact.bytes);
     }
 
     await writeFile(
       path.join(root, 'index.json'),
-      `${JSON.stringify({ $schema: skillDiscoverySchema, skills: entries }, null, 2)}\n`,
+      `${JSON.stringify({ $schema: skillDiscoverySchema, skills: skills.map(skillIndexEntry) }, null, 2)}\n`,
       'utf8'
     );
   }
@@ -1478,6 +1455,16 @@ function builtInSnippet(languageId, key) {
       '',
       "const answer = ax('question:string -> answer:string');",
       'await answer.forward(llm, { question: "How do refunds work?" }, { functions: [searchDocs] });',
+    ],
+    'ax.dates': [
+      "const planner = ax('emailText:string -> meetingStartsAt:datetime, travelWindow:dateRange');",
+      'const out = await planner.forward(llm, {',
+      "  emailText: 'Meet Tuesday May 7 at 3pm New York time? I am away May 8 to 12.',",
+      '});',
+      '',
+      '// Dates, parsed from the model text: 2024-05-07T19:00:00.000Z and',
+      '// { start: 2024-05-08T00:00:00.000Z, end: 2024-05-12T00:00:00.000Z }',
+      'console.log(out.meetingStartsAt.toISOString(), out.travelWindow);',
     ],
     'ax.streaming': [
       "const write = ax('topic:string -> article:string');",
@@ -2141,6 +2128,7 @@ function generatedPackageSnippets(languageId) {
     'flow.refine': base['flow.refine'] ?? base.default,
     'ax.tools': base.default,
     'ax.streaming': base.default,
+    'ax.dates': base.default,
     'agents.tools': base['agents.minimal'],
     'agents.discovery': base['agents.minimal'],
     'agents.memory': base['agents.minimal'],
@@ -2185,6 +2173,27 @@ function generatedPackageSnippets(languageId) {
     'optimize.agent': base['optimize.axgen'],
     'optimize.artifact': base['optimize.axgen'],
   };
+}
+
+function audioFieldsSection(language) {
+  const inputs =
+    'An audio input given as a string, or as an audio object with a string `transcript` (such as a rendered audio output passed to the next program), reaches the model as text. Audio without a transcript goes as an audio part.';
+  if (language.id === 'typescript') {
+    return [
+      "An `audio` output field asks the model for text to speak, and the generator turns that text into audio with the AI client's `speak()`: the field becomes the speech result (`data`, `format`, `mimeType`) with the text as its `transcript`. The `speech.speak` forward option sets the `speak()` defaults and `speech.fields` sets them per field. A streaming forward streams the text; with a result picker, the picked sample is spoken before it goes out.",
+      '',
+      inputs,
+    ].join('\n');
+  }
+  const option =
+    language.id === 'python'
+      ? '`render_audio` (or `renderAudio`)'
+      : '`renderAudio` (or `render_audio`)';
+  return [
+    `An \`audio\` output field asks the model for text to speak. With the ${option} forward or constructor option, the generator turns that text into audio with the AI client's \`speak()\`, as TypeScript does: the field becomes the speech result (\`data\`, \`format\`, \`mimeType\`) with the text as its \`transcript\`. Without the option the field keeps the text, and a one-time deprecation warning names the option; speaking becomes the default in the next major version.`,
+    '',
+    inputs,
+  ].join('\n');
 }
 
 function standardSchemaSection(language) {
@@ -2516,7 +2525,10 @@ function relevantExports(subsystem, exports) {
 
 function skillMatchesSubsystem(rel, subsystem) {
   const name = path.basename(rel);
-  if (subsystem === 'ai') return name.includes('ai') || name.includes('audio');
+  if (subsystem === 'ai')
+    return (
+      name.includes('ai') || name.includes('audio') || name === 'ax-typesafe.md'
+    );
   if (subsystem === 'ax') return name.includes('gen');
   if (subsystem === 's') return name.includes('signature');
   if (subsystem === 'agent') return name.includes('agent');
@@ -2539,7 +2551,9 @@ function skillInstallURL(language) {
 }
 
 function skillInstallCommand(language) {
-  return `npx skills add ${skillInstallURL(language)} --skill '*'`;
+  const name =
+    language.id === 'typescript' ? 'ax-llm' : `ax-${language.id}-llm`;
+  return `npx skills add ${skillInstallURL(language)} --skill '${name}'`;
 }
 
 function skillPageSlug(skill) {
@@ -2578,7 +2592,11 @@ function skillPageTitle(skill) {
 
 function renderSkillPage(language, skill) {
   const title = skillPageTitle(skill);
-  const body = stripFirstHeading(stripFrontmatter(skill.content));
+  const body = stripFirstHeading(stripFrontmatter(skill.content)).replace(
+    /\]\((references\/[^)]+)\)/g,
+    (_, reference) =>
+      `](/${language.id}/.well-known/agent-skills/${skill.name}/${reference})`
+  );
   const publishedURL = `/${language.id}/.well-known/agent-skills/${skill.name}/SKILL.md`;
   return [
     `# ${title}`,
@@ -2812,25 +2830,6 @@ function parseFrontmatterTitle(markdown) {
   return match?.[1];
 }
 
-function parseSkillFrontmatter(markdown) {
-  if (!markdown.startsWith('---\n')) return {};
-  const end = markdown.indexOf('\n---', 4);
-  if (end === -1) return {};
-  const fm = markdown.slice(4, end);
-  return {
-    name: frontmatterField(fm, 'name'),
-    description: frontmatterField(fm, 'description'),
-    version: frontmatterField(fm, 'version'),
-  };
-}
-
-function frontmatterField(frontmatterText, key) {
-  const match = frontmatterText.match(
-    new RegExp(`^${key}:\\s*["']?(.+?)["']?\\s*$`, 'm')
-  );
-  return match?.[1]?.trim();
-}
-
 function parseMarkdownHeading(markdown) {
   const match = markdown.match(/^#\s+(.+)$/m);
   return match?.[1];
@@ -2891,10 +2890,6 @@ function escapeHTML(value) {
 
 function lines(value) {
   return Array.isArray(value) ? value.join('\n') : String(value ?? '');
-}
-
-function sha256Digest(data) {
-  return `sha256:${createHash('sha256').update(data).digest('hex')}`;
 }
 
 async function listFiles(root) {

@@ -1,7 +1,9 @@
 import { assertAssertions, assertStreamingAssertions } from '../asserts.js';
+import { decodeDecisionValues, hasDecisionFields } from '../decision.js';
 import { ValidationError } from '../errors.js';
 import { streamingExtractFinalValue, streamValues } from '../extract.js';
 import {
+  addPendingFeedbackToMemory,
   processFieldProcessors,
   processStreamingFieldProcessors,
 } from '../fieldProcessor.js';
@@ -43,6 +45,8 @@ export async function* finalizeStreamingResponse<OUT extends AxGenOut>({
   onFunctionCall,
   mcpExecutionContext,
   eventContext,
+  control,
+  executionPath,
 }: FinalizeStreamingResponseArgs) {
   const funcs = !signatureToolCallingManager
     ? parseFunctionCalls(ai, state.functionCalls, state.values, model)
@@ -73,11 +77,15 @@ export async function* finalizeStreamingResponse<OUT extends AxGenOut>({
       onFunctionCall,
       mcpExecutionContext,
       eventContext,
+      control,
+      executionPath,
     });
     state.functionsExecuted = new Set([...state.functionsExecuted, ...fx]);
     state.functionCalls = [];
+    addPendingFeedbackToMemory(state.pendingFeedback, mem, sessionId);
   } else {
-    const hasComplexFields = signature.hasComplexFields();
+    const hasComplexFields =
+      signature.hasComplexFields() || strictStructuredJson;
 
     let jsonParsed = false;
     if (hasComplexFields) {
@@ -88,6 +96,14 @@ export async function* finalizeStreamingResponse<OUT extends AxGenOut>({
           parseJsonStringFields,
           strictStructuredJson
         );
+        if (hasDecisionFields(signature.getOutputFields()))
+          decodeDecisionValues(
+            signature.getOutputFields(),
+            finalJson,
+            state.decisionContext ?? {
+              provenance: { source: 'elicited', provider: ai.getName() },
+            }
+          );
         const { delta, fullValues } = createStructuredDelta<OUT>({
           signature,
           parsedValues: finalJson,
@@ -134,6 +150,14 @@ export async function* finalizeStreamingResponse<OUT extends AxGenOut>({
       );
     }
 
+    if (!jsonParsed && hasDecisionFields(signature.getOutputFields()))
+      decodeDecisionValues(
+        signature.getOutputFields(),
+        state.values,
+        state.decisionContext ?? {
+          provenance: { source: 'elicited', provider: ai.getName() },
+        }
+      );
     if (signatureToolCallingManager) {
       const promptFuncs = await signatureToolCallingManager.processResults(
         state.values
@@ -165,6 +189,8 @@ export async function* finalizeStreamingResponse<OUT extends AxGenOut>({
           onFunctionCall,
           mcpExecutionContext,
           eventContext,
+          control,
+          executionPath,
         });
         state.functionsExecuted = new Set([...state.functionsExecuted, ...fx]);
 
@@ -181,6 +207,7 @@ export async function* finalizeStreamingResponse<OUT extends AxGenOut>({
           },
           sessionId
         );
+        addPendingFeedbackToMemory(state.pendingFeedback, mem, sessionId);
         return;
       }
     }
@@ -191,6 +218,10 @@ export async function* finalizeStreamingResponse<OUT extends AxGenOut>({
       state.content,
       true
     );
+
+    // Feedback from mid-stream processors follows the full assistant
+    // message, before the processors that run on the finished value.
+    addPendingFeedbackToMemory(state.pendingFeedback, mem, sessionId);
 
     if (fieldProcessors.length) {
       await processFieldProcessors(
@@ -223,7 +254,8 @@ export async function* finalizeStreamingResponse<OUT extends AxGenOut>({
         state.content,
         state.values as Record<string, OUT>,
         state.xstate,
-        state.index
+        state.index,
+        true
       );
     }
   }

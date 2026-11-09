@@ -8,6 +8,8 @@ import {
   AxBaseAI,
   axBaseAIDefaultConfig,
   axBaseAIDefaultCreativeConfig,
+  warnDroppedSampling,
+  warnSamplingOnce,
 } from '../base.js';
 import { resolveVertexAIHost } from '../vertex.js';
 
@@ -17,13 +19,129 @@ import { resolveVertexAIHost } from '../vertex.js';
 const isGemini3Model = (model: string): boolean => model.includes('gemini-3');
 
 /**
- * Gemini 3.7 Flash, 3.6 Flash, and 3.5 Flash-Lite use server-managed
- * sampling and ignore temperature, topP, and topK.
+ * Gemini 3.8 Flash, 3.7 Flash, 3.6 Flash, and 3.5 Flash-Lite use
+ * server-managed sampling and ignore temperature, topP, and topK.
  */
 const usesServerManagedSampling = (model: string): boolean =>
+  model === 'gemini-3.8-flash' ||
   model === 'gemini-3.7-flash' ||
   model === 'gemini-3.6-flash' ||
   model === 'gemini-3.5-flash-lite';
+
+/**
+ * Current Gemini Flash models reject candidateCount and token penalties.
+ */
+const usesStrictFlashParameters = (model: string): boolean =>
+  model === 'gemini-3.8-flash' ||
+  model === 'gemini-3.7-flash' ||
+  model === 'gemini-3.6-flash';
+
+/**
+ * Models the Gemini API answers with "Penalty is not enabled for this model"
+ * for presencePenalty and frequencyPenalty (probed 2026-09-27 with an AI Studio
+ * key; Vertex was not probed).
+ */
+const geminiApiRejectsPenalties = (model: string): boolean =>
+  [
+    'gemini-3.8-flash',
+    'gemini-3.7-flash',
+    'gemini-3.6-flash',
+    'gemini-3.5-flash',
+    'gemini-3.5-flash-lite',
+    'gemini-3.1-pro-preview',
+    'gemini-3.1-flash-lite',
+    'gemini-2.5-flash',
+    'gemini-2.5-pro',
+  ].includes(model);
+
+/**
+ * The sampling fields of a generationConfig. Explicit values are sent as
+ * before, except that a value Gemini rejects or Ax changes is warned about once:
+ * - Server-managed models ignore temperature, topP and topK (their model info
+ *   marks them, so the base layer already warned about explicit ones).
+ * - Gemini 3 takes no temperature below 1: Ax raises it, as Google
+ *   recommends 1.0 (warned for an explicit value).
+ * - The Gemini API rejects the penalties on the probed models, and Gemini 3
+ *   returns one candidate; Vertex (not probed) keeps its historical wire.
+ */
+const geminiSamplingConfig = ({
+  model,
+  modelConfig,
+  config,
+  isVertex,
+  explicit,
+}: Readonly<{
+  model: string;
+  modelConfig: Readonly<AxModelConfig> | undefined;
+  config: Readonly<AxAIGoogleGeminiConfig>;
+  isVertex: boolean;
+  explicit: ReadonlySet<string>;
+}>): Pick<
+  AxAIGoogleGeminiGenerationConfig,
+  'temperature' | 'topP' | 'topK' | 'frequencyPenalty' | 'candidateCount'
+> => {
+  const serverManagedSampling = usesServerManagedSampling(model);
+  const strictFlashParameters = usesStrictFlashParameters(model);
+  const rejectsPenalties = !isVertex && geminiApiRejectsPenalties(model);
+  const out: Pick<
+    AxAIGoogleGeminiGenerationConfig,
+    'temperature' | 'topP' | 'topK' | 'frequencyPenalty' | 'candidateCount'
+  > = {};
+  if (!serverManagedSampling) {
+    let temperature = modelConfig?.temperature ?? config.temperature;
+    // Gemini 3+ models require a minimum temperature of 1.0
+    if (
+      isGemini3Model(model) &&
+      (temperature === undefined || temperature < 1)
+    ) {
+      if (temperature !== undefined && explicit.has('temperature')) {
+        warnSamplingOnce(
+          `${model}\u0000temperature-raised`,
+          `Ax raised temperature ${temperature} to 1 for ${model}: Google recommends 1.0 for Gemini 3 models.`
+        );
+      }
+      temperature = 1;
+    }
+    out.temperature = temperature;
+    if (modelConfig?.topP !== undefined) out.topP = modelConfig.topP;
+    out.topK = modelConfig?.topK;
+  }
+
+  const presencePenalty = modelConfig?.presencePenalty;
+  if (presencePenalty !== undefined) {
+    warnDroppedSampling(
+      model,
+      'presencePenalty',
+      rejectsPenalties
+        ? 'the model does not accept it'
+        : 'Ax does not send it to Gemini'
+    );
+  }
+  const frequencyPenalty =
+    modelConfig?.frequencyPenalty ?? config.frequencyPenalty;
+  if (frequencyPenalty !== undefined) {
+    if (strictFlashParameters || rejectsPenalties) {
+      warnDroppedSampling(
+        model,
+        'frequencyPenalty',
+        'the model does not accept it'
+      );
+    } else {
+      out.frequencyPenalty = frequencyPenalty;
+    }
+  }
+
+  const n = modelConfig?.n ?? config.n;
+  const oneCandidate =
+    strictFlashParameters || (!isVertex && isGemini3Model(model));
+  if (n !== undefined && n > 1 && oneCandidate) {
+    warnDroppedSampling(model, 'n', 'the model returns one candidate');
+  }
+  if (!strictFlashParameters) {
+    out.candidateCount = oneCandidate ? 1 : (n ?? 1);
+  }
+  return out;
+};
 
 import {
   axNormalizeRequestedServiceTier,
@@ -82,6 +200,8 @@ import {
   type AxAIGoogleGeminiToolGoogleMaps,
   type AxAIGoogleVertexBatchEmbedRequest,
   type AxAIGoogleVertexBatchEmbedResponse,
+  type AxAIGoogleVertexEmbedContentRequest,
+  type AxAIGoogleVertexEmbedContentResponse,
   GEMINI_CONTEXT_CACHE_SUPPORTED_MODELS,
 } from './types.js';
 
@@ -93,7 +213,12 @@ type AxGeminiLogicalThinkingLevel =
   | 'high'
   | 'highest';
 
-type AxGemini3ThinkingFamily = 'full' | 'no-minimal' | 'image' | 'legacy-pro';
+type AxGemini3ThinkingFamily =
+  | 'full'
+  | 'no-minimal'
+  | 'image'
+  | 'legacy-pro'
+  | 'unsupported';
 
 const axGeminiLogicalThinkingLevels = new Set<AxGeminiLogicalThinkingLevel>([
   'none',
@@ -109,11 +234,15 @@ const getGemini3ThinkingFamily = (
 ): AxGemini3ThinkingFamily | undefined => {
   const normalized = model.toLowerCase();
   if (!isGemini3Model(normalized)) return undefined;
+  // 3.8 Live rejects every thinking setting, including a thinking level.
+  if (normalized === 'gemini-3.8-live') return 'unsupported';
   if (normalized.includes('-image')) return 'image';
   if (normalized.includes('gemini-3-pro')) return 'legacy-pro';
   if (
+    normalized.includes('gemini-3.8-flash') ||
     normalized.includes('gemini-3.7-flash') ||
-    normalized.includes('gemini-3.1-pro')
+    normalized.includes('gemini-3.1-pro') ||
+    normalized.includes('gemini-3.8-live-extended-thinking')
   ) {
     return 'no-minimal';
   }
@@ -132,10 +261,18 @@ const clampGemini3ThinkingLevel = (
     case 'no-minimal':
       return level === 'minimal' ? 'low' : level;
     case 'full':
+    case 'unsupported':
     case undefined:
       return level;
   }
 };
+
+/**
+ * 3.8 Live Extended Thinking refuses a setup without a thinking level, so Ax
+ * supplies Gemini's usual default when the caller does not pick one.
+ */
+const requiresGeminiThinkingLevel = (model: string): boolean =>
+  model.toLowerCase() === 'gemini-3.8-live-extended-thinking';
 
 const resolveGeminiThinkingConfig = ({
   model,
@@ -156,6 +293,7 @@ const resolveGeminiThinkingConfig = ({
     AxAIGoogleGeminiGenerationConfig['thinkingConfig']
   > = {};
   const gemini3Family = getGemini3ThinkingFamily(model);
+  if (gemini3Family === 'unsupported') return thinkingConfig;
 
   if (direct?.thinkingTokenBudget !== undefined) {
     if (gemini3Family) {
@@ -236,6 +374,13 @@ const resolveGeminiThinkingConfig = ({
     thinkingConfig.includeThoughts = false;
   }
 
+  if (
+    thinkingConfig.thinkingLevel === undefined &&
+    requiresGeminiThinkingLevel(model)
+  ) {
+    thinkingConfig.thinkingLevel = 'medium';
+  }
+
   if (thinkingConfig.thinkingLevel !== undefined) {
     delete thinkingConfig.thinkingBudget;
   }
@@ -250,9 +395,29 @@ const getVertexGeminiAPIVersion = (
 ): 'v1' | 'v1beta1' => (beta ? 'v1beta1' : 'v1');
 
 /**
- * Clean function schema for Gemini API compatibility by removing unsupported fields.
- * Gemini structured outputs support `additionalProperties` and nullable type
- * unions such as `["string", "null"]`.
+ * Embedding models that Vertex serves only at `locations/global` through
+ * `:embedContent`, one text per request, with no task type.
+ */
+const VERTEX_EMBED_CONTENT_MODELS: ReadonlySet<string> = new Set([
+  AxAIGoogleGeminiEmbedModel.GeminiEmbedding2,
+]);
+
+const isVertexEmbedContentResponse = (
+  resp: Readonly<
+    | AxAIGoogleGeminiBatchEmbedResponse
+    | AxAIGoogleVertexBatchEmbedResponse
+    | AxAIGoogleVertexEmbedContentResponse
+  >
+): resp is Readonly<AxAIGoogleVertexEmbedContentResponse> =>
+  'embedding' in resp;
+
+/**
+ * Clean a JSON Schema for Gemini's JSON Schema request fields
+ * (`generationConfig.responseJsonSchema` and
+ * `function_declarations[].parametersJsonSchema`). Both support
+ * `additionalProperties` and nullable type unions such as `["string", "null"]`.
+ * The legacy `responseSchema`/`parameters` fields use Gemini's OpenAPI Schema
+ * subset, which rejects both, so never send this output there.
  */
 const cleanSchemaForGemini = (schema: any): any => {
   if (!schema || typeof schema !== 'object') {
@@ -338,6 +503,7 @@ const mapFunctionResultParts = (
   const parts: AxAIGoogleGeminiContentPart[] = [
     {
       functionResponse: {
+        id: msg.functionId,
         name: resolveFunctionResponseName(chatPrompt, index, msg.functionId),
         response: {
           result: msg.result,
@@ -403,7 +569,7 @@ const safetySettings: AxAIGoogleGeminiSafetySettings = [
  */
 export const axAIGoogleGeminiDefaultConfig = (): AxAIGoogleGeminiConfig =>
   structuredClone<AxAIGoogleGeminiConfig>({
-    model: AxAIGoogleGeminiModel.Gemini25Flash,
+    model: AxAIGoogleGeminiModel.Gemini36Flash,
     embedModel: AxAIGoogleGeminiEmbedModel.TextEmbedding005,
     safetySettings,
     thinkingTokenBudgetLevels: {
@@ -428,7 +594,7 @@ export const axAIGoogleGeminiDefaultConfig = (): AxAIGoogleGeminiConfig =>
 export const axAIGoogleGeminiDefaultCreativeConfig =
   (): AxAIGoogleGeminiConfig =>
     structuredClone<AxAIGoogleGeminiConfig>({
-      model: AxAIGoogleGeminiModel.Gemini20Flash,
+      model: AxAIGoogleGeminiModel.Gemini36Flash,
       embedModel: AxAIGoogleGeminiEmbedModel.TextEmbedding005,
       safetySettings,
       thinkingTokenBudgetLevels: {
@@ -485,10 +651,14 @@ class AxAIGoogleGeminiImpl
       AxAIGoogleGeminiModel,
       AxAIGoogleGeminiEmbedModel,
       AxAIGoogleGeminiChatRequest,
-      AxAIGoogleGeminiBatchEmbedRequest | AxAIGoogleVertexBatchEmbedRequest,
+      | AxAIGoogleGeminiBatchEmbedRequest
+      | AxAIGoogleVertexBatchEmbedRequest
+      | AxAIGoogleVertexEmbedContentRequest,
       AxAIGoogleGeminiChatResponse,
       AxAIGoogleGeminiChatResponseDelta,
-      AxAIGoogleGeminiBatchEmbedResponse | AxAIGoogleVertexBatchEmbedResponse
+      | AxAIGoogleGeminiBatchEmbedResponse
+      | AxAIGoogleVertexBatchEmbedResponse
+      | AxAIGoogleVertexEmbedContentResponse
     >
 {
   private tokensUsed: AxTokenUsage | undefined;
@@ -622,7 +792,7 @@ class AxAIGoogleGeminiImpl
     req: Readonly<AxTranscriptionRequest<AxAIGoogleGeminiModel>>,
     options?: Readonly<AxAIServiceOptions>
   ): Promise<AxTranscriptionResponse> {
-    const model = req.model ?? AxAIGoogleGeminiModel.Gemini25Flash;
+    const model = req.model ?? AxAIGoogleGeminiModel.Gemini35Transcribe;
     const keyValue =
       typeof this.apiKey === 'function' ? await this.apiKey() : this.apiKey;
     const url = this.isVertex
@@ -681,9 +851,17 @@ class AxAIGoogleGeminiImpl
       );
     }
     const json = (await response.json()) as AxAIGoogleGeminiChatResponse;
+    // Dedicated speech-to-text models answer with `audioTranscription` parts;
+    // general models answer with text, which may be preceded by thoughts.
     const text =
       json.candidates?.[0]?.content?.parts
-        ?.map((part) => ('text' in part ? part.text : ''))
+        ?.map((part) =>
+          'audioTranscription' in part
+            ? part.audioTranscription.text
+            : 'text' in part && !part.thought
+              ? part.text
+              : ''
+        )
         .join('')
         .trim() ?? '';
     return { text };
@@ -693,8 +871,7 @@ class AxAIGoogleGeminiImpl
     req: Readonly<AxSpeechRequest<AxAIGoogleGeminiModel>>,
     options?: Readonly<AxAIServiceOptions>
   ): Promise<AxSpeechResponse> {
-    const model =
-      req.model ?? ('gemini-2.5-flash-preview-tts' as AxAIGoogleGeminiModel);
+    const model = req.model ?? AxAIGoogleGeminiModel.Gemini38FlashTTS;
     const keyValue =
       typeof this.apiKey === 'function' ? await this.apiKey() : this.apiKey;
     const url = this.isVertex
@@ -732,7 +909,8 @@ class AxAIGoogleGeminiImpl
           },
         },
       },
-      format: req.format ?? 'wav',
+      // No `format`: Gemini takes no output format. 3.8 TTS returns WAV and
+      // earlier TTS models raw 24 kHz PCM, so the returned mime type decides.
       transcript: req.text,
       fetch: options?.fetch,
       abortSignal: options?.abortSignal,
@@ -857,11 +1035,14 @@ class AxAIGoogleGeminiImpl
         }
 
         // Only include supported fields for Gemini function declarations
-        // Exclude 'cache' and other unsupported fields
+        // Exclude 'cache' and other unsupported fields.
+        // Use parametersJsonSchema (full JSON Schema): the legacy `parameters`
+        // field only takes the OpenAPI Schema subset and 400s on the
+        // `additionalProperties` that fn() and MCP tool schemas carry.
         return {
           name: fn.name,
           description: fn.description,
-          parameters,
+          parametersJsonSchema: parameters,
         };
       });
       tools.push({ function_declarations: cleanedFunctions });
@@ -920,15 +1101,15 @@ class AxAIGoogleGeminiImpl
           function_calling_config: { mode: 'ANY' as const },
         };
       } else {
-        const allowedFunctionNames = req.functionCall.function?.name
-          ? {
-              allowedFunctionNames: [req.functionCall.function.name],
-            }
-          : {};
+        // allowed_function_names belongs inside function_calling_config;
+        // Gemini 400s on it at the toolConfig level.
+        const functionName = req.functionCall.function?.name;
         toolConfig = {
-          function_calling_config: { mode: 'ANY' as const },
-          ...allowedFunctionNames,
-        } as AxAIGoogleGeminiChatRequest['toolConfig'];
+          function_calling_config: {
+            mode: 'ANY' as const,
+            ...(functionName ? { allowed_function_names: [functionName] } : {}),
+          },
+        };
       }
     } else if (hasFunctionDeclarations) {
       // Only set default function_calling_config when we actually provide function_declarations
@@ -1131,6 +1312,7 @@ class AxAIGoogleGeminiImpl
 
               const part: AxAIGoogleGeminiContentPart = {
                 functionCall: {
+                  ...(f.id ? { id: f.id } : {}),
                   name: f.function.name,
                   args: args,
                 },
@@ -1230,40 +1412,21 @@ class AxAIGoogleGeminiImpl
       );
     }
 
-    const serverManagedSampling = usesServerManagedSampling(model as string);
     const generationConfig: AxAIGoogleGeminiGenerationConfig = {
       maxOutputTokens: req.modelConfig?.maxTokens ?? this.config.maxTokens,
-      ...(!serverManagedSampling
-        ? {
-            temperature:
-              req.modelConfig?.temperature ?? this.config.temperature,
-          }
-        : {}),
-      ...(!serverManagedSampling && req.modelConfig?.topP !== undefined
-        ? { topP: req.modelConfig.topP }
-        : {}),
-      ...(!serverManagedSampling
-        ? { topK: req.modelConfig?.topK ?? this.config.topK }
-        : {}),
-      frequencyPenalty:
-        req.modelConfig?.frequencyPenalty ?? this.config.frequencyPenalty,
-      candidateCount: req.modelConfig?.n ?? this.config.n ?? 1,
+      ...geminiSamplingConfig({
+        model: model as string,
+        modelConfig: req.modelConfig,
+        config: this.config,
+        isVertex: this.isVertex,
+        explicit: new Set(req.explicitSamplingKeys ?? []),
+      }),
       stopSequences:
         req.modelConfig?.stopSequences ?? this.config.stopSequences,
       responseMimeType: 'text/plain',
 
       ...(Object.keys(thinkingConfig).length > 0 ? { thinkingConfig } : {}),
     };
-
-    // Gemini 3+ models require a minimum temperature of 1.0
-    if (
-      !serverManagedSampling &&
-      isGemini3Model(model as string) &&
-      (generationConfig.temperature === undefined ||
-        generationConfig.temperature < 1)
-    ) {
-      generationConfig.temperature = 1;
-    }
 
     if (useLiveAudio && (req.responseFormat || this.config.responseFormat)) {
       throw new Error(
@@ -1328,7 +1491,11 @@ class AxAIGoogleGeminiImpl
   ): Promise<
     [
       AxAPI,
-      AxAIGoogleGeminiBatchEmbedRequest | AxAIGoogleVertexBatchEmbedRequest,
+      (
+        | AxAIGoogleGeminiBatchEmbedRequest
+        | AxAIGoogleVertexBatchEmbedRequest
+        | AxAIGoogleVertexEmbedContentRequest
+      ),
     ]
   > => {
     const model = req.embedModel;
@@ -1344,9 +1511,37 @@ class AxAIGoogleGeminiImpl
     let apiConfig: AxAPI;
     let reqValue:
       | AxAIGoogleGeminiBatchEmbedRequest
-      | AxAIGoogleVertexBatchEmbedRequest;
+      | AxAIGoogleVertexBatchEmbedRequest
+      | AxAIGoogleVertexEmbedContentRequest;
 
-    if (this.isVertex) {
+    if (
+      this.vertexConfig &&
+      !this.endpointId &&
+      VERTEX_EMBED_CONTENT_MODELS.has(model)
+    ) {
+      // Vertex fuses every part of one request into a single vector and has no
+      // batch endpoint for these models.
+      if (req.texts.length !== 1) {
+        throw new Error(
+          `${model} on Vertex embeds one text per request; call embed() once per text`
+        );
+      }
+
+      // Served only at the global location, whatever region the client uses.
+      const host = resolveVertexAIHost('global');
+      const version = getVertexGeminiAPIVersion(model, config?.beta);
+      apiConfig = {
+        name: `/models/${model}:embedContent`,
+        url: `https://${host}/${version}/projects/${this.vertexConfig.projectId}/locations/global/publishers/google`,
+      };
+
+      // No task type: Vertex accepts one for these models but ignores it; callers put the task in the text.
+      reqValue = {
+        content: { parts: [{ text: req.texts[0] }] },
+        autoTruncate: this.config.autoTruncate,
+        outputDimensionality: this.config.dimensions,
+      };
+    } else if (this.isVertex) {
       if (this.endpointId) {
         apiConfig = {
           name: `/${this.endpointId}:predict`,
@@ -1362,7 +1557,7 @@ class AxAIGoogleGeminiImpl
       reqValue = {
         instances: req.texts.map((text) => ({
           content: text,
-          ...(this.config.embedType && { taskType: this.config.embedType }),
+          ...(this.config.embedType && { task_type: this.config.embedType }),
         })),
         parameters: {
           autoTruncate: this.config.autoTruncate,
@@ -1514,7 +1709,7 @@ class AxAIGoogleGeminiImpl
             result.functionCalls = [
               ...(result.functionCalls ?? []),
               {
-                id: randomUUID(),
+                id: part.functionCall.id ?? randomUUID(),
                 type: 'function',
                 function: {
                   name: part.functionCall.name,
@@ -1638,9 +1833,26 @@ class AxAIGoogleGeminiImpl
 
   createEmbedResp = (
     resp: Readonly<
-      AxAIGoogleGeminiBatchEmbedResponse | AxAIGoogleVertexBatchEmbedResponse
+      | AxAIGoogleGeminiBatchEmbedResponse
+      | AxAIGoogleVertexBatchEmbedResponse
+      | AxAIGoogleVertexEmbedContentResponse
     >
   ): AxEmbedResponse => {
+    // Base falls back to getTokenUsage(), so a response without usage must not see the last call's.
+    this.tokensUsed = undefined;
+
+    if (isVertexEmbedContentResponse(resp)) {
+      if (resp.usageMetadata) {
+        const promptTokens = resp.usageMetadata.promptTokenCount ?? 0;
+        this.tokensUsed = {
+          promptTokens,
+          completionTokens: 0,
+          totalTokens: resp.usageMetadata.totalTokenCount ?? promptTokens,
+        };
+      }
+      return { embeddings: [resp.embedding.values] };
+    }
+
     let embeddings: number[][];
     if (this.isVertex) {
       embeddings = (resp as AxAIGoogleVertexBatchEmbedResponse).predictions.map(
@@ -1889,7 +2101,6 @@ class AxAIGoogleGeminiImpl
     }
 
     // Build the generation config using existing logic
-    const serverManagedSampling = usesServerManagedSampling(model as string);
     const effectiveMappings = this.getEffectiveMappings(model);
     const thinkingConfig = resolveGeminiThinkingConfig({
       model,
@@ -1900,36 +2111,18 @@ class AxAIGoogleGeminiImpl
     });
     const generationConfig: AxAIGoogleGeminiGenerationConfig = {
       maxOutputTokens: req.modelConfig?.maxTokens ?? this.config.maxTokens,
-      ...(!serverManagedSampling
-        ? {
-            temperature:
-              req.modelConfig?.temperature ?? this.config.temperature,
-          }
-        : {}),
-      ...(!serverManagedSampling && req.modelConfig?.topP !== undefined
-        ? { topP: req.modelConfig.topP }
-        : {}),
-      ...(!serverManagedSampling
-        ? { topK: req.modelConfig?.topK ?? this.config.topK }
-        : {}),
-      frequencyPenalty:
-        req.modelConfig?.frequencyPenalty ?? this.config.frequencyPenalty,
-      candidateCount: req.modelConfig?.n ?? this.config.n ?? 1,
+      ...geminiSamplingConfig({
+        model: model as string,
+        modelConfig: req.modelConfig,
+        config: this.config,
+        isVertex: this.isVertex,
+        explicit: new Set(req.explicitSamplingKeys ?? []),
+      }),
       stopSequences:
         req.modelConfig?.stopSequences ?? this.config.stopSequences,
       responseMimeType: 'text/plain',
       ...(Object.keys(thinkingConfig).length > 0 ? { thinkingConfig } : {}),
     };
-
-    // Gemini 3+ models require a minimum temperature of 1.0
-    if (
-      !serverManagedSampling &&
-      isGemini3Model(model as string) &&
-      (generationConfig.temperature === undefined ||
-        generationConfig.temperature < 1)
-    ) {
-      generationConfig.temperature = 1;
-    }
 
     const safetySettings = this.config.safetySettings;
 
@@ -1973,7 +2166,7 @@ class AxAIGoogleGeminiImpl
     systemInstruction?: AxAIGoogleGeminiContent;
     contents?: AxAIGoogleGeminiContent[];
   } {
-    let systemInstruction: AxAIGoogleGeminiContent | undefined;
+    const systemPrompts: string[] = [];
     const contents: AxAIGoogleGeminiContent[] = [];
 
     // Find the last message with cache: true (the breakpoint)
@@ -1992,10 +2185,7 @@ class AxAIGoogleGeminiImpl
 
       // Always cache system prompts
       if (msg.role === 'system') {
-        systemInstruction = {
-          role: 'user' as const,
-          parts: [{ text: msg.content }],
-        };
+        systemPrompts.push(msg.content);
         continue;
       }
 
@@ -2078,7 +2268,11 @@ class AxAIGoogleGeminiImpl
                 args = f.function.params ?? {};
               }
               const part: AxAIGoogleGeminiContentPart = {
-                functionCall: { name: f.function.name, args },
+                functionCall: {
+                  ...(f.id ? { id: f.id } : {}),
+                  name: f.function.name,
+                  args,
+                },
               };
               if (firstSignature && index === 0) {
                 part.thought_signature = firstSignature;
@@ -2105,6 +2299,14 @@ class AxAIGoogleGeminiImpl
         }
       }
     }
+
+    const systemInstruction =
+      systemPrompts.length > 0
+        ? {
+            role: 'user' as const,
+            parts: [{ text: systemPrompts.join(' ') }],
+          }
+        : undefined;
 
     return { systemInstruction, contents };
   }
@@ -2226,7 +2428,11 @@ class AxAIGoogleGeminiImpl
               args = f.function.params ?? {};
             }
             const part: AxAIGoogleGeminiContentPart = {
-              functionCall: { name: f.function.name, args },
+              functionCall: {
+                ...(f.id ? { id: f.id } : {}),
+                name: f.function.name,
+                args,
+              },
             };
             // Attach signature only to the first function call
             if (firstSignature && index === 0) {
@@ -2261,10 +2467,14 @@ export class AxAIGoogleGemini<TModelKey = string> extends AxBaseAI<
   AxAIGoogleGeminiModel,
   AxAIGoogleGeminiEmbedModel,
   AxAIGoogleGeminiChatRequest,
-  AxAIGoogleGeminiBatchEmbedRequest | AxAIGoogleVertexBatchEmbedRequest,
+  | AxAIGoogleGeminiBatchEmbedRequest
+  | AxAIGoogleVertexBatchEmbedRequest
+  | AxAIGoogleVertexEmbedContentRequest,
   AxAIGoogleGeminiChatResponse,
   AxAIGoogleGeminiChatResponseDelta,
-  AxAIGoogleGeminiBatchEmbedResponse | AxAIGoogleVertexBatchEmbedResponse,
+  | AxAIGoogleGeminiBatchEmbedResponse
+  | AxAIGoogleVertexBatchEmbedResponse
+  | AxAIGoogleVertexEmbedContentResponse,
   TModelKey
 > {
   // Static factory method for automatic type inference
@@ -2559,5 +2769,6 @@ export class AxAIGoogleGemini<TModelKey = string> extends AxBaseAI<
       supportFor,
       models: normalizedModels ?? models,
     });
+    this.setExplicitModelConfigKeys(config);
   }
 }

@@ -1,7 +1,36 @@
+import { getModelInfo } from '../../dsp/modelinfo.js';
 import type { AxModelInfo } from '../types.js';
 
 import { AxAIOpenAIEmbedModel, AxAIOpenAIModel } from './chat_types.js';
+import { isBedrockModel } from './model_family.js';
 import { AxAIOpenAIResponsesModel } from './responses_types.js';
+
+// https://developers.openai.com/api/docs/models/gpt-6.1-sol
+// Priority is 2x Standard and Flex is 0.5x, including cache and long-context rates.
+const gpt61SolServiceTierPricing: NonNullable<
+  AxModelInfo['serviceTierPricing']
+> = {
+  priority: {
+    promptTokenCostPer1M: 4,
+    completionTokenCostPer1M: 20,
+    cacheReadTokenCostPer1M: 0.2,
+    cacheWriteTokenCostPer1M: 5,
+    longContextPromptTokenCostPer1M: 8,
+    longContextCompletionTokenCostPer1M: 30,
+    longContextCacheReadTokenCostPer1M: 0.4,
+    longContextCacheWriteTokenCostPer1M: 10,
+  },
+  flex: {
+    promptTokenCostPer1M: 1,
+    completionTokenCostPer1M: 5,
+    cacheReadTokenCostPer1M: 0.05,
+    cacheWriteTokenCostPer1M: 1.25,
+    longContextPromptTokenCostPer1M: 2,
+    longContextCompletionTokenCostPer1M: 7.5,
+    longContextCacheReadTokenCostPer1M: 0.1,
+    longContextCacheWriteTokenCostPer1M: 2.5,
+  },
+};
 
 /**
  * OpenAI: Model information
@@ -71,12 +100,28 @@ export const axModelInfoOpenAI: AxModelInfo[] = [
     supported: { thinkingBudget: true },
   },
   {
+    name: AxAIOpenAIModel.GPTRealtime21,
+    audio: { input: true, output: true },
+    supported: { thinkingBudget: true },
+  },
+  {
+    name: AxAIOpenAIModel.GPTRealtime21Mini,
+    audio: { input: true, output: true },
+    supported: { thinkingBudget: true },
+  },
+  {
     name: AxAIOpenAIModel.GPTRealtimeWhisper,
     audio: { input: true, output: false },
   },
   {
     name: AxAIOpenAIModel.GPTRealtimeTranslate,
     audio: { input: true, output: true },
+  },
+  // Billed per minute of audio rather than per token, so no token prices.
+  {
+    name: AxAIOpenAIModel.GPTTranscribe,
+    audio: { input: true, output: false },
+    supported: { operations: ['transcribe'], serviceTiers: [] },
   },
   {
     name: AxAIOpenAIModel.GPT4ChatGPT4O,
@@ -104,24 +149,39 @@ export const axModelInfoOpenAI: AxModelInfo[] = [
     currency: 'usd',
     promptTokenCostPer1M: 0.05,
     completionTokenCostPer1M: 0.4,
-    notSupported: { temperature: true, topP: true },
-    supported: { structuredOutputs: true },
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
+    supported: { temperatureOne: true, structuredOutputs: true },
   },
   {
     name: AxAIOpenAIModel.GPT5Mini,
     currency: 'usd',
     promptTokenCostPer1M: 0.25,
     completionTokenCostPer1M: 2,
-    notSupported: { temperature: true, topP: true },
-    supported: { structuredOutputs: true },
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
+    supported: { temperatureOne: true, structuredOutputs: true },
   },
   {
     name: AxAIOpenAIModel.GPT5,
     currency: 'usd',
     promptTokenCostPer1M: 1.25,
     completionTokenCostPer1M: 10,
-    notSupported: { temperature: true, topP: true },
-    supported: { structuredOutputs: true },
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
+    supported: { temperatureOne: true, structuredOutputs: true },
   },
   {
     name: AxAIOpenAIModel.GPT5Chat,
@@ -160,8 +220,18 @@ export const axModelInfoOpenAI: AxModelInfo[] = [
     currency: 'usd',
     promptTokenCostPer1M: 1.25,
     completionTokenCostPer1M: 10,
-    notSupported: { temperature: true, topP: true },
-    supported: { structuredOutputs: true },
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
+    supported: {
+      temperatureOne: true,
+      structuredOutputs: true,
+      samplingWithoutReasoning: true,
+      reasoningOffByDefault: true,
+    },
   },
   {
     name: AxAIOpenAIModel.GPT51ChatLatest,
@@ -200,8 +270,18 @@ export const axModelInfoOpenAI: AxModelInfo[] = [
     currency: 'usd',
     promptTokenCostPer1M: 1.75,
     completionTokenCostPer1M: 14,
-    notSupported: { temperature: true, topP: true },
-    supported: { structuredOutputs: true },
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
+    supported: {
+      temperatureOne: true,
+      structuredOutputs: true,
+      samplingWithoutReasoning: true,
+      reasoningOffByDefault: true,
+    },
   },
   {
     name: AxAIOpenAIModel.GPT52ChatLatest,
@@ -233,24 +313,54 @@ export const axModelInfoOpenAI: AxModelInfo[] = [
     currency: 'usd',
     promptTokenCostPer1M: 2.5,
     completionTokenCostPer1M: 15,
-    notSupported: { temperature: true, topP: true },
-    supported: { structuredOutputs: true },
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
+    supported: {
+      temperatureOne: true,
+      structuredOutputs: true,
+      samplingWithoutReasoning: true,
+      reasoningOffByDefault: true,
+    },
   },
   {
     name: AxAIOpenAIModel.GPT54Mini,
     currency: 'usd',
     promptTokenCostPer1M: 0.75,
     completionTokenCostPer1M: 4.5,
-    notSupported: { temperature: true, topP: true },
-    supported: { structuredOutputs: true },
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
+    supported: {
+      temperatureOne: true,
+      structuredOutputs: true,
+      samplingWithoutReasoning: true,
+      reasoningOffByDefault: true,
+    },
   },
   {
     name: AxAIOpenAIModel.GPT54Nano,
     currency: 'usd',
     promptTokenCostPer1M: 0.2,
     completionTokenCostPer1M: 1.25,
-    notSupported: { temperature: true, topP: true },
-    supported: { structuredOutputs: true },
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
+    supported: {
+      temperatureOne: true,
+      structuredOutputs: true,
+      samplingWithoutReasoning: true,
+      reasoningOffByDefault: true,
+    },
   },
   // GPT-5.5 models
   {
@@ -264,8 +374,18 @@ export const axModelInfoOpenAI: AxModelInfo[] = [
     longContextCompletionTokenCostPer1M: 45,
     longContextCacheReadTokenCostPer1M: 1,
     contextWindow: 1_000_000,
-    notSupported: { temperature: true, topP: true },
-    supported: { structuredOutputs: true, thinkingBudget: true },
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
+    supported: {
+      temperatureOne: true,
+      structuredOutputs: true,
+      thinkingBudget: true,
+      samplingWithoutReasoning: true,
+    },
   },
   {
     name: AxAIOpenAIModel.GPT55Pro,
@@ -280,24 +400,121 @@ export const axModelInfoOpenAI: AxModelInfo[] = [
     notSupported: { temperature: true, topP: true },
     supported: { structuredOutputs: true, thinkingBudget: true },
   },
+  // GPT-6 models. Above 272K input tokens the whole request is billed at 2x
+  // input and cache / 1.5x output across the family.
+  {
+    name: AxAIOpenAIModel.GPT6Astra,
+    currency: 'usd',
+    promptTokenCostPer1M: 10,
+    completionTokenCostPer1M: 50,
+    cacheReadTokenCostPer1M: 1,
+    cacheWriteTokenCostPer1M: 12.5,
+    longContextThreshold: 272_000,
+    longContextPromptTokenCostPer1M: 20,
+    longContextCompletionTokenCostPer1M: 75,
+    longContextCacheReadTokenCostPer1M: 2,
+    longContextCacheWriteTokenCostPer1M: 25,
+    contextWindow: 1_050_000,
+    maxTokens: 128_000,
+    notSupported: { temperature: true, topP: true },
+    supported: {
+      structuredOutputs: true,
+      thinkingBudget: true,
+      structuredOutputModes: ['native', 'json_object'],
+    },
+  },
+  {
+    name: AxAIOpenAIModel.GPT6Sol,
+    currency: 'usd',
+    promptTokenCostPer1M: 2,
+    completionTokenCostPer1M: 10,
+    cacheReadTokenCostPer1M: 0.2,
+    cacheWriteTokenCostPer1M: 2.5,
+    longContextThreshold: 272_000,
+    longContextPromptTokenCostPer1M: 4,
+    longContextCompletionTokenCostPer1M: 15,
+    longContextCacheReadTokenCostPer1M: 0.4,
+    longContextCacheWriteTokenCostPer1M: 5,
+    contextWindow: 1_050_000,
+    maxTokens: 128_000,
+    notSupported: { temperature: true, topP: true },
+    supported: {
+      structuredOutputs: true,
+      thinkingBudget: true,
+      structuredOutputModes: ['native', 'json_object'],
+    },
+  },
+  {
+    name: AxAIOpenAIModel.GPT6Luna,
+    currency: 'usd',
+    promptTokenCostPer1M: 0.1,
+    completionTokenCostPer1M: 0.5,
+    cacheReadTokenCostPer1M: 0.01,
+    cacheWriteTokenCostPer1M: 0.125,
+    longContextThreshold: 272_000,
+    longContextPromptTokenCostPer1M: 0.2,
+    longContextCompletionTokenCostPer1M: 0.75,
+    longContextCacheReadTokenCostPer1M: 0.02,
+    longContextCacheWriteTokenCostPer1M: 0.25,
+    contextWindow: 1_050_000,
+    maxTokens: 128_000,
+    notSupported: { temperature: true, topP: true },
+    supported: {
+      structuredOutputs: true,
+      thinkingBudget: true,
+      structuredOutputModes: ['native', 'json_object'],
+    },
+  },
+  {
+    name: AxAIOpenAIModel.GPT61Sol,
+    currency: 'usd',
+    serviceTierPricing: gpt61SolServiceTierPricing,
+    promptTokenCostPer1M: 2,
+    completionTokenCostPer1M: 10,
+    cacheReadTokenCostPer1M: 0.1,
+    cacheWriteTokenCostPer1M: 2.5,
+    longContextThreshold: 272_000,
+    longContextPromptTokenCostPer1M: 4,
+    longContextCompletionTokenCostPer1M: 15,
+    longContextCacheReadTokenCostPer1M: 0.2,
+    longContextCacheWriteTokenCostPer1M: 5,
+    contextWindow: 1_050_000,
+    maxTokens: 128_000,
+    notSupported: { temperature: true, topP: true },
+    supported: {
+      structuredOutputs: true,
+      thinkingBudget: true,
+      structuredOutputModes: ['native', 'json_object'],
+    },
+  },
   // GPT-5.6 models. Above 272K input tokens the whole request is billed at 2x
   // input / 1.5x output across the family.
   {
     name: AxAIOpenAIModel.GPT56Sol,
     aliases: [AxAIOpenAIModel.GPT56],
     currency: 'usd',
-    promptTokenCostPer1M: 5,
-    completionTokenCostPer1M: 30,
-    cacheReadTokenCostPer1M: 0.5,
-    cacheWriteTokenCostPer1M: 6.25,
+    promptTokenCostPer1M: 4,
+    completionTokenCostPer1M: 20,
+    cacheReadTokenCostPer1M: 0.4,
+    cacheWriteTokenCostPer1M: 5,
     longContextThreshold: 272_000,
-    longContextPromptTokenCostPer1M: 10,
-    longContextCompletionTokenCostPer1M: 45,
-    longContextCacheReadTokenCostPer1M: 1,
+    longContextPromptTokenCostPer1M: 8,
+    longContextCompletionTokenCostPer1M: 30,
+    longContextCacheReadTokenCostPer1M: 0.8,
     contextWindow: 1_050_000,
     maxTokens: 128_000,
-    notSupported: { temperature: true, topP: true },
-    supported: { structuredOutputs: true, thinkingBudget: true },
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
+    supported: {
+      temperatureOne: true,
+      structuredOutputs: true,
+      thinkingBudget: true,
+      samplingWithoutReasoning: true,
+    },
   },
   {
     name: AxAIOpenAIModel.GPT56Terra,
@@ -312,8 +529,18 @@ export const axModelInfoOpenAI: AxModelInfo[] = [
     longContextCacheReadTokenCostPer1M: 0.4,
     contextWindow: 1_050_000,
     maxTokens: 128_000,
-    notSupported: { temperature: true, topP: true },
-    supported: { structuredOutputs: true, thinkingBudget: true },
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
+    supported: {
+      temperatureOne: true,
+      structuredOutputs: true,
+      thinkingBudget: true,
+      samplingWithoutReasoning: true,
+    },
   },
   {
     name: AxAIOpenAIModel.GPT56Luna,
@@ -328,8 +555,18 @@ export const axModelInfoOpenAI: AxModelInfo[] = [
     longContextCacheReadTokenCostPer1M: 0.04,
     contextWindow: 1_050_000,
     maxTokens: 128_000,
-    notSupported: { temperature: true, topP: true },
-    supported: { structuredOutputs: true, thinkingBudget: true },
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
+    supported: {
+      temperatureOne: true,
+      structuredOutputs: true,
+      thinkingBudget: true,
+      samplingWithoutReasoning: true,
+    },
   },
   // Reasoning models
   {
@@ -337,13 +574,25 @@ export const axModelInfoOpenAI: AxModelInfo[] = [
     currency: 'usd',
     promptTokenCostPer1M: 15,
     completionTokenCostPer1M: 60,
-    supported: { structuredOutputs: true },
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
+    supported: { temperatureOne: true, structuredOutputs: true },
   },
   {
     name: AxAIOpenAIModel.O1Mini,
     currency: 'usd',
     promptTokenCostPer1M: 1.1,
     completionTokenCostPer1M: 4.4,
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
     supported: { structuredOutputs: true },
   },
   {
@@ -351,14 +600,39 @@ export const axModelInfoOpenAI: AxModelInfo[] = [
     currency: 'usd',
     promptTokenCostPer1M: 2,
     completionTokenCostPer1M: 8,
-    supported: { structuredOutputs: true },
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
+    supported: { temperatureOne: true, structuredOutputs: true },
+  },
+  {
+    name: AxAIOpenAIModel.O3Mini,
+    currency: 'usd',
+    promptTokenCostPer1M: 1.1,
+    completionTokenCostPer1M: 4.4,
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
+    supported: { temperatureOne: true, structuredOutputs: true },
   },
   {
     name: AxAIOpenAIModel.O4Mini,
     currency: 'usd',
     promptTokenCostPer1M: 1.1,
     completionTokenCostPer1M: 4.4,
-    supported: { structuredOutputs: true },
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
+    supported: { temperatureOne: true, structuredOutputs: true },
   },
   // Embedding models
   {
@@ -453,8 +727,14 @@ export const axModelInfoOpenAIResponses: AxModelInfo[] = [
     currency: 'usd',
     promptTokenCostPer1M: 0.05,
     completionTokenCostPer1M: 0.4,
-    notSupported: { temperature: true, topP: true },
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
     supported: {
+      temperatureOne: true,
       thinkingBudget: true,
       showThoughts: true,
       structuredOutputs: true,
@@ -465,8 +745,14 @@ export const axModelInfoOpenAIResponses: AxModelInfo[] = [
     currency: 'usd',
     promptTokenCostPer1M: 0.25,
     completionTokenCostPer1M: 2,
-    notSupported: { temperature: true, topP: true },
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
     supported: {
+      temperatureOne: true,
       thinkingBudget: true,
       showThoughts: true,
       structuredOutputs: true,
@@ -477,8 +763,14 @@ export const axModelInfoOpenAIResponses: AxModelInfo[] = [
     currency: 'usd',
     promptTokenCostPer1M: 1.25,
     completionTokenCostPer1M: 10,
-    notSupported: { temperature: true, topP: true },
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
     supported: {
+      temperatureOne: true,
       thinkingBudget: true,
       showThoughts: true,
       structuredOutputs: true,
@@ -537,11 +829,19 @@ export const axModelInfoOpenAIResponses: AxModelInfo[] = [
     currency: 'usd',
     promptTokenCostPer1M: 1.25,
     completionTokenCostPer1M: 10,
-    notSupported: { temperature: true, topP: true },
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
     supported: {
+      temperatureOne: true,
       thinkingBudget: true,
       showThoughts: true,
       structuredOutputs: true,
+      samplingWithoutReasoning: true,
+      reasoningOffByDefault: true,
     },
   },
   {
@@ -597,11 +897,19 @@ export const axModelInfoOpenAIResponses: AxModelInfo[] = [
     currency: 'usd',
     promptTokenCostPer1M: 1.75,
     completionTokenCostPer1M: 14,
-    notSupported: { temperature: true, topP: true },
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
     supported: {
+      temperatureOne: true,
       thinkingBudget: true,
       showThoughts: true,
       structuredOutputs: true,
+      samplingWithoutReasoning: true,
+      reasoningOffByDefault: true,
     },
   },
   {
@@ -646,11 +954,19 @@ export const axModelInfoOpenAIResponses: AxModelInfo[] = [
     currency: 'usd',
     promptTokenCostPer1M: 2.5,
     completionTokenCostPer1M: 15,
-    notSupported: { temperature: true, topP: true },
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
     supported: {
+      temperatureOne: true,
       thinkingBudget: true,
       showThoughts: true,
       structuredOutputs: true,
+      samplingWithoutReasoning: true,
+      reasoningOffByDefault: true,
     },
   },
   {
@@ -658,11 +974,19 @@ export const axModelInfoOpenAIResponses: AxModelInfo[] = [
     currency: 'usd',
     promptTokenCostPer1M: 0.75,
     completionTokenCostPer1M: 4.5,
-    notSupported: { temperature: true, topP: true },
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
     supported: {
+      temperatureOne: true,
       thinkingBudget: true,
       showThoughts: true,
       structuredOutputs: true,
+      samplingWithoutReasoning: true,
+      reasoningOffByDefault: true,
     },
   },
   {
@@ -670,11 +994,19 @@ export const axModelInfoOpenAIResponses: AxModelInfo[] = [
     currency: 'usd',
     promptTokenCostPer1M: 0.2,
     completionTokenCostPer1M: 1.25,
-    notSupported: { temperature: true, topP: true },
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
     supported: {
+      temperatureOne: true,
       thinkingBudget: true,
       showThoughts: true,
       structuredOutputs: true,
+      samplingWithoutReasoning: true,
+      reasoningOffByDefault: true,
     },
   },
   // GPT-5.5 models
@@ -689,11 +1021,18 @@ export const axModelInfoOpenAIResponses: AxModelInfo[] = [
     longContextCompletionTokenCostPer1M: 45,
     longContextCacheReadTokenCostPer1M: 1,
     contextWindow: 1_000_000,
-    notSupported: { temperature: true, topP: true },
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
     supported: {
+      temperatureOne: true,
       thinkingBudget: true,
       showThoughts: true,
       structuredOutputs: true,
+      samplingWithoutReasoning: true,
     },
   },
   {
@@ -713,27 +1052,121 @@ export const axModelInfoOpenAIResponses: AxModelInfo[] = [
       structuredOutputs: true,
     },
   },
+  // GPT-6 models. Above 272K input tokens the whole request is billed at 2x
+  // input and cache / 1.5x output across the family.
+  {
+    name: AxAIOpenAIResponsesModel.GPT6Astra,
+    currency: 'usd',
+    promptTokenCostPer1M: 10,
+    completionTokenCostPer1M: 50,
+    cacheReadTokenCostPer1M: 1,
+    cacheWriteTokenCostPer1M: 12.5,
+    longContextThreshold: 272_000,
+    longContextPromptTokenCostPer1M: 20,
+    longContextCompletionTokenCostPer1M: 75,
+    longContextCacheReadTokenCostPer1M: 2,
+    longContextCacheWriteTokenCostPer1M: 25,
+    contextWindow: 1_050_000,
+    maxTokens: 128_000,
+    notSupported: { temperature: true, topP: true },
+    supported: {
+      structuredOutputs: true,
+      thinkingBudget: true,
+      showThoughts: true,
+    },
+  },
+  {
+    name: AxAIOpenAIResponsesModel.GPT6Sol,
+    currency: 'usd',
+    promptTokenCostPer1M: 2,
+    completionTokenCostPer1M: 10,
+    cacheReadTokenCostPer1M: 0.2,
+    cacheWriteTokenCostPer1M: 2.5,
+    longContextThreshold: 272_000,
+    longContextPromptTokenCostPer1M: 4,
+    longContextCompletionTokenCostPer1M: 15,
+    longContextCacheReadTokenCostPer1M: 0.4,
+    longContextCacheWriteTokenCostPer1M: 5,
+    contextWindow: 1_050_000,
+    maxTokens: 128_000,
+    notSupported: { temperature: true, topP: true },
+    supported: {
+      structuredOutputs: true,
+      thinkingBudget: true,
+      showThoughts: true,
+    },
+  },
+  {
+    name: AxAIOpenAIResponsesModel.GPT6Luna,
+    currency: 'usd',
+    promptTokenCostPer1M: 0.1,
+    completionTokenCostPer1M: 0.5,
+    cacheReadTokenCostPer1M: 0.01,
+    cacheWriteTokenCostPer1M: 0.125,
+    longContextThreshold: 272_000,
+    longContextPromptTokenCostPer1M: 0.2,
+    longContextCompletionTokenCostPer1M: 0.75,
+    longContextCacheReadTokenCostPer1M: 0.02,
+    longContextCacheWriteTokenCostPer1M: 0.25,
+    contextWindow: 1_050_000,
+    maxTokens: 128_000,
+    notSupported: { temperature: true, topP: true },
+    supported: {
+      structuredOutputs: true,
+      thinkingBudget: true,
+      showThoughts: true,
+    },
+  },
+  {
+    name: AxAIOpenAIResponsesModel.GPT61Sol,
+    currency: 'usd',
+    serviceTierPricing: gpt61SolServiceTierPricing,
+    promptTokenCostPer1M: 2,
+    completionTokenCostPer1M: 10,
+    cacheReadTokenCostPer1M: 0.1,
+    cacheWriteTokenCostPer1M: 2.5,
+    longContextThreshold: 272_000,
+    longContextPromptTokenCostPer1M: 4,
+    longContextCompletionTokenCostPer1M: 15,
+    longContextCacheReadTokenCostPer1M: 0.2,
+    longContextCacheWriteTokenCostPer1M: 5,
+    contextWindow: 1_050_000,
+    maxTokens: 128_000,
+    notSupported: { temperature: true, topP: true },
+    supported: {
+      structuredOutputs: true,
+      thinkingBudget: true,
+      showThoughts: true,
+    },
+  },
   // GPT-5.6 models. Above 272K input tokens the whole request is billed at 2x
   // input / 1.5x output across the family.
   {
     name: AxAIOpenAIResponsesModel.GPT56Sol,
     aliases: [AxAIOpenAIResponsesModel.GPT56],
     currency: 'usd',
-    promptTokenCostPer1M: 5,
-    completionTokenCostPer1M: 30,
-    cacheReadTokenCostPer1M: 0.5,
-    cacheWriteTokenCostPer1M: 6.25,
+    promptTokenCostPer1M: 4,
+    completionTokenCostPer1M: 20,
+    cacheReadTokenCostPer1M: 0.4,
+    cacheWriteTokenCostPer1M: 5,
     longContextThreshold: 272_000,
-    longContextPromptTokenCostPer1M: 10,
-    longContextCompletionTokenCostPer1M: 45,
-    longContextCacheReadTokenCostPer1M: 1,
+    longContextPromptTokenCostPer1M: 8,
+    longContextCompletionTokenCostPer1M: 30,
+    longContextCacheReadTokenCostPer1M: 0.8,
     contextWindow: 1_050_000,
     maxTokens: 128_000,
-    notSupported: { temperature: true, topP: true },
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
     supported: {
+      temperatureOne: true,
       thinkingBudget: true,
       showThoughts: true,
       structuredOutputs: true,
+      samplingWithoutReasoning: true,
     },
   },
   {
@@ -749,11 +1182,18 @@ export const axModelInfoOpenAIResponses: AxModelInfo[] = [
     longContextCacheReadTokenCostPer1M: 0.4,
     contextWindow: 1_050_000,
     maxTokens: 128_000,
-    notSupported: { temperature: true, topP: true },
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
     supported: {
+      temperatureOne: true,
       thinkingBudget: true,
       showThoughts: true,
       structuredOutputs: true,
+      samplingWithoutReasoning: true,
     },
   },
   {
@@ -769,11 +1209,18 @@ export const axModelInfoOpenAIResponses: AxModelInfo[] = [
     longContextCacheReadTokenCostPer1M: 0.04,
     contextWindow: 1_050_000,
     maxTokens: 128_000,
-    notSupported: { temperature: true, topP: true },
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
     supported: {
+      temperatureOne: true,
       thinkingBudget: true,
       showThoughts: true,
       structuredOutputs: true,
+      samplingWithoutReasoning: true,
     },
   },
   // Reasoning models
@@ -782,6 +1229,12 @@ export const axModelInfoOpenAIResponses: AxModelInfo[] = [
     currency: 'usd',
     promptTokenCostPer1M: 150,
     completionTokenCostPer1M: 600,
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
     supported: {
       thinkingBudget: true,
       showThoughts: true,
@@ -794,7 +1247,14 @@ export const axModelInfoOpenAIResponses: AxModelInfo[] = [
     currency: 'usd',
     promptTokenCostPer1M: 15,
     completionTokenCostPer1M: 60,
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
     supported: {
+      temperatureOne: true,
       thinkingBudget: true,
       showThoughts: true,
       structuredOutputs: true,
@@ -805,6 +1265,12 @@ export const axModelInfoOpenAIResponses: AxModelInfo[] = [
     currency: 'usd',
     promptTokenCostPer1M: 20,
     completionTokenCostPer1M: 80,
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
     supported: {
       thinkingBudget: true,
       showThoughts: true,
@@ -817,7 +1283,14 @@ export const axModelInfoOpenAIResponses: AxModelInfo[] = [
     currency: 'usd',
     promptTokenCostPer1M: 2,
     completionTokenCostPer1M: 8,
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
     supported: {
+      temperatureOne: true,
       thinkingBudget: true,
       showThoughts: true,
       structuredOutputs: true,
@@ -828,6 +1301,12 @@ export const axModelInfoOpenAIResponses: AxModelInfo[] = [
     currency: 'usd',
     promptTokenCostPer1M: 1.1,
     completionTokenCostPer1M: 4.4,
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
     supported: {
       thinkingBudget: true,
       showThoughts: true,
@@ -839,10 +1318,47 @@ export const axModelInfoOpenAIResponses: AxModelInfo[] = [
     currency: 'usd',
     promptTokenCostPer1M: 1.1,
     completionTokenCostPer1M: 4.4,
+    notSupported: {
+      temperature: true,
+      topP: true,
+      presencePenalty: true,
+      frequencyPenalty: true,
+    },
     supported: {
+      temperatureOne: true,
       thinkingBudget: true,
       showThoughts: true,
       structuredOutputs: true,
     },
   },
 ];
+
+const openAIOSeriesNames = new Set<string>([
+  AxAIOpenAIModel.O1,
+  AxAIOpenAIModel.O1Mini,
+  AxAIOpenAIResponsesModel.O1Pro,
+  AxAIOpenAIModel.O3,
+  AxAIOpenAIModel.O3Mini,
+  AxAIOpenAIResponsesModel.O3Pro,
+  AxAIOpenAIModel.O4Mini,
+]);
+
+/**
+ * OpenAI's own info for a model named exactly like an o-series reasoning
+ * model. A profile without model info (azure-openai, openai-compatible, the
+ * other OpenAI Chat and Responses profiles) still keeps sampling parameters
+ * these models reject off the wire.
+ *
+ * An Amazon Bedrock ID such as `us.openai.gpt-6-sol` gets the info of the
+ * OpenAI model it names, so amazon-bedrock keeps them off too. Unlike a
+ * deployment name, the ID is fixed by AWS rather than chosen by the user.
+ */
+export const openAIOSeriesSamplingModelInfo = (
+  model: string
+): AxModelInfo | undefined =>
+  openAIOSeriesNames.has(model)
+    ? (axModelInfoOpenAI.find((info) => info.name === model) ??
+      axModelInfoOpenAIResponses.find((info) => info.name === model))
+    : isBedrockModel(model)
+      ? (getModelInfo({ model, modelInfo: axModelInfoOpenAI }) ?? undefined)
+      : undefined;

@@ -1,11 +1,19 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { MemoryImpl } from '../../mem/memory.js';
+
 import type { AxAIRefusalError } from '../../util/apicall.js';
 import {
   AxAIServiceAuthenticationError,
   AxAIServiceStatusError,
 } from '../../util/apicall.js';
-import { AxAIAnthropic } from './api.js';
+import type { AxChatResponse, AxChatResponseResult } from '../types.js';
+import { mergeFunctionCalls } from '../util.js';
+import {
+  AxAIAnthropic,
+  axAIAnthropicDefaultConfig,
+  axAIAnthropicVertexDefaultConfig,
+} from './api.js';
 import { AxAIAnthropicModel, AxAIAnthropicVertexModel } from './types.js';
 
 function createMockFetch(body: unknown) {
@@ -855,7 +863,10 @@ describe('AxAIAnthropic thinking configuration', () => {
     expect(body.top_k).toBeUndefined();
   });
 
-  it('Opus 4.6 omits sampling params', async () => {
+  // Opus 4.6 is adaptive but did not deprecate sampling: with thinking off the
+  // live API takes every value (probed 2026-09-27), so explicit ones are sent.
+  // Its default temperature keeps the historical rule and is not sent.
+  it('Opus 4.6 sends explicit sampling params with thinking off, temperature over top_p', async () => {
     const ai = new AxAIAnthropic({
       apiKey: 'key',
       config: { model: AxAIAnthropicModel.Claude46Opus },
@@ -874,14 +885,21 @@ describe('AxAIAnthropic thinking configuration', () => {
 
     expect(fetch).toHaveBeenCalled();
     const body = capture.lastBody;
-    expect(body.temperature).toBeUndefined();
+    // The Messages API rejects temperature and top_p together on Opus 4.6.
+    expect(body.temperature).toBe(0.2);
     expect(body.top_p).toBeUndefined();
-    expect(body.top_k).toBeUndefined();
+    expect(body.top_k).toBe(40);
+
+    await ai.chat(
+      { chatPrompt: [{ role: 'user', content: 'hi' }] },
+      { stream: false }
+    );
+    expect(capture.lastBody.temperature).toBeUndefined();
   });
 
   // Non-adaptive models still accept sampling params — the guard must not
   // suppress them everywhere.
-  it('Sonnet 4.6 still sends sampling params', async () => {
+  it('Sonnet 4.6 still sends sampling params, temperature or top_p', async () => {
     const ai = new AxAIAnthropic({
       apiKey: 'key',
       config: { model: AxAIAnthropicModel.Claude46Sonnet },
@@ -901,7 +919,17 @@ describe('AxAIAnthropic thinking configuration', () => {
     expect(fetch).toHaveBeenCalled();
     const body = capture.lastBody;
     expect(body.temperature).toBe(0.2);
-    expect(body.top_p).toBe(0.9);
+    expect(body.top_p).toBeUndefined();
+
+    await ai.chat(
+      {
+        chatPrompt: [{ role: 'user', content: 'hi' }],
+        modelConfig: { topP: 0.9 },
+      },
+      { stream: false }
+    );
+    expect(capture.lastBody.top_p).toBe(0.9);
+    expect(capture.lastBody.temperature).toBeUndefined();
   });
 
   it('Opus 4.8 accepts provider config xhigh effort', async () => {
@@ -985,7 +1013,7 @@ describe('AxAIAnthropic thinking configuration', () => {
     expect(body.output_config).toBeUndefined();
   });
 
-  it('none disables thinking and effort for all models', async () => {
+  it('none omits thinking and effort on models that do not think by default', async () => {
     const ai = new AxAIAnthropic({
       apiKey: 'key',
       config: { model: AxAIAnthropicModel.Claude46Opus },
@@ -1689,4 +1717,579 @@ describe('AxAIAnthropic function (tool_result) caching', () => {
     // Regression guard for the previous typo: must not be a `cache` field.
     expect(block.cache).toBeUndefined();
   });
+});
+
+describe('AxAIAnthropic Claude 5.x models', () => {
+  const weather = {
+    name: 'getWeather',
+    description: 'Get the weather for a city',
+    parameters: {
+      type: 'object' as const,
+      properties: { city: { type: 'string' as const } },
+      required: ['city'],
+    },
+  };
+
+  const chatBody = async (
+    model: string,
+    options: Record<string, unknown>,
+    request: Record<string, unknown> = {},
+    config: Record<string, unknown> = {}
+  ) => {
+    const ai = new AxAIAnthropic({
+      apiKey: 'key',
+      config: { model: model as AxAIAnthropicModel, ...config },
+    });
+    const { capture, fetch } = createCaptureFetch(model);
+    ai.setOptions({ fetch });
+    await ai.chat(
+      { chatPrompt: [{ role: 'user', content: 'hi' }], ...request },
+      { stream: false, ...options }
+    );
+    return capture.lastBody;
+  };
+
+  it('uses Sonnet 5 as the default model', () => {
+    expect(axAIAnthropicDefaultConfig().model).toBe(
+      AxAIAnthropicModel.Claude5Sonnet
+    );
+    expect(axAIAnthropicVertexDefaultConfig().model).toBe(
+      AxAIAnthropicVertexModel.Claude5Sonnet
+    );
+  });
+
+  it.each([
+    AxAIAnthropicModel.Claude55Opus,
+    AxAIAnthropicModel.Claude55Sonnet,
+    AxAIAnthropicModel.Claude51Fable,
+    AxAIAnthropicModel.Claude5Opus,
+    AxAIAnthropicModel.Claude5Fable,
+  ])(
+    '%s uses adaptive thinking + effort and drops sampling params',
+    async (model) => {
+      const body = await chatBody(
+        model,
+        { thinkingTokenBudget: 'high' },
+        { modelConfig: { temperature: 0.7, topP: 0.9 } }
+      );
+      expect(body.model).toBe(model);
+      expect(body.thinking).toEqual({
+        type: 'adaptive',
+        display: 'summarized',
+      });
+      expect(body.output_config).toEqual({ effort: 'high' });
+      expect(body.temperature).toBeUndefined();
+      expect(body.top_p).toBeUndefined();
+    }
+  );
+
+  it.each([
+    AxAIAnthropicModel.Claude55Opus,
+    AxAIAnthropicModel.Claude51Fable,
+    AxAIAnthropicModel.Claude5Fable,
+  ])(
+    'none clamps %s to low effort because its thinking is always on',
+    async (model) => {
+      const body = await chatBody(model, { thinkingTokenBudget: 'none' });
+      expect(body.thinking).toEqual({ type: 'adaptive', display: 'omitted' });
+      expect(body.output_config).toEqual({ effort: 'low' });
+    }
+  );
+
+  it.each([AxAIAnthropicModel.Claude5Opus, AxAIAnthropicModel.Claude5Sonnet])(
+    'none disables thinking explicitly on %s, which thinks by default',
+    async (model) => {
+      const body = await chatBody(model, { thinkingTokenBudget: 'none' });
+      expect(body.thinking).toEqual({ type: 'disabled' });
+      expect(body.output_config).toBeUndefined();
+    }
+  );
+
+  it('none turns Sonnet 5.5 thinking off with between_tools', async () => {
+    const body = await chatBody(
+      AxAIAnthropicModel.Claude55Sonnet,
+      { thinkingTokenBudget: 'none' },
+      { modelConfig: { temperature: 0, topP: 0.9 } }
+    );
+    expect(body.thinking).toEqual({ type: 'between_tools' });
+    expect(body.output_config).toBeUndefined();
+    expect(body.temperature).toBeUndefined();
+    expect(body.top_p).toBeUndefined();
+  });
+
+  it('keeps Sonnet 5.5 at effort high or below when thinking is off', async () => {
+    const high = await chatBody(
+      AxAIAnthropicModel.Claude55Sonnet,
+      { thinkingTokenBudget: 'none' },
+      {},
+      { effort: 'high' }
+    );
+    expect(high.thinking).toEqual({ type: 'between_tools' });
+    expect(high.output_config).toEqual({ effort: 'high' });
+
+    await expect(
+      chatBody(
+        AxAIAnthropicModel.Claude55Sonnet,
+        { thinkingTokenBudget: 'none' },
+        {},
+        { effort: 'max' }
+      )
+    ).rejects.toThrow(/cannot disable thinking at effort 'max'/);
+
+    await expect(
+      chatBody(
+        AxAIAnthropicModel.Claude55Sonnet,
+        { thinkingTokenBudget: 'none' },
+        { modelConfig: { effort: 'xhigh' } }
+      )
+    ).rejects.toThrow(/cannot disable thinking at effort 'xhigh'/);
+  });
+
+  it('hides Sonnet 5.5 between-tool updates under none', async () => {
+    const ai = new AxAIAnthropic({
+      apiKey: 'key',
+      config: { model: AxAIAnthropicModel.Claude55Sonnet },
+    });
+    const fetch = createMockFetch({
+      id: 'msg_between_tools',
+      type: 'message',
+      role: 'assistant',
+      model: 'claude-sonnet-5-5',
+      content: [
+        { type: 'thinking', thinking: 'Checking Paris first.' },
+        {
+          type: 'tool_use',
+          id: 'call_1',
+          name: 'getWeather',
+          input: { city: 'Paris' },
+        },
+      ],
+      stop_reason: 'tool_use',
+      usage: { input_tokens: 10, output_tokens: 5 },
+    });
+    ai.setOptions({ fetch });
+    const res = (await ai.chat(
+      {
+        chatPrompt: [{ role: 'user', content: 'Weather in Paris?' }],
+        functions: [weather],
+      },
+      { stream: false, thinkingTokenBudget: 'none' }
+    )) as AxChatResponse;
+    const body = JSON.parse(fetch.mock.calls[0]?.[1]?.body as string);
+    expect(body.thinking).toEqual({ type: 'between_tools' });
+    expect(res.results[0]?.thought).toBeUndefined();
+    expect(res.results[0]?.functionCalls?.[0]?.function.name).toBe(
+      'getWeather'
+    );
+  });
+
+  it('rejects disabling thinking at xhigh effort on Opus 5 locally', async () => {
+    await expect(
+      chatBody(
+        AxAIAnthropicModel.Claude5Opus,
+        { thinkingTokenBudget: 'none' },
+        {},
+        { effort: 'xhigh' }
+      )
+    ).rejects.toThrow(/cannot disable thinking at effort 'xhigh'/);
+  });
+
+  it('allows disabling thinking at xhigh effort on Sonnet 5', async () => {
+    const body = await chatBody(
+      AxAIAnthropicModel.Claude5Sonnet,
+      { thinkingTokenBudget: 'none' },
+      {},
+      { effort: 'xhigh' }
+    );
+    expect(body.thinking).toEqual({ type: 'disabled' });
+    expect(body.output_config).toEqual({ effort: 'xhigh' });
+  });
+
+  it('does not mistake Opus 5.5 or a dated Opus 5 snapshot for each other', async () => {
+    const opus55 = await chatBody('claude-opus-5-5', {
+      thinkingTokenBudget: 'none',
+    });
+    expect(opus55.thinking).toEqual({ type: 'adaptive', display: 'omitted' });
+
+    const qualified = await chatBody(
+      'publishers/anthropic/models/claude-opus-5-5',
+      { thinkingTokenBudget: 'none' }
+    );
+    expect(qualified.thinking).toEqual({
+      type: 'adaptive',
+      display: 'omitted',
+    });
+
+    const datedOpus5 = await chatBody('claude-opus-5@20260724', {
+      thinkingTokenBudget: 'none',
+    });
+    expect(datedOpus5.thinking).toEqual({ type: 'disabled' });
+  });
+
+  it('does not mistake Sonnet 5.5 or a dated Sonnet 5 snapshot for each other', async () => {
+    const qualified = await chatBody(
+      'publishers/anthropic/models/claude-sonnet-5-5',
+      { thinkingTokenBudget: 'none' }
+    );
+    expect(qualified.thinking).toEqual({ type: 'between_tools' });
+
+    const datedSonnet55 = await chatBody('claude-sonnet-5-5-20261001', {
+      thinkingTokenBudget: 'none',
+    });
+    expect(datedSonnet55.thinking).toEqual({ type: 'between_tools' });
+
+    const datedSonnet5 = await chatBody('claude-sonnet-5@20260601', {
+      thinkingTokenBudget: 'none',
+    });
+    expect(datedSonnet5.thinking).toEqual({ type: 'disabled' });
+
+    const sonnet550 = await chatBody('claude-sonnet-5-50', {
+      thinkingTokenBudget: 'none',
+    });
+    expect(sonnet550.thinking).toBeUndefined();
+  });
+
+  it.each([
+    [AxAIAnthropicModel.Claude55Opus, 'required'],
+    [AxAIAnthropicModel.Claude55Sonnet, 'required'],
+    [AxAIAnthropicModel.Claude51Fable, 'required'],
+    [
+      AxAIAnthropicModel.Claude55Opus,
+      { type: 'function', function: { name: 'getWeather' } },
+    ],
+    [
+      AxAIAnthropicModel.Claude55Sonnet,
+      { type: 'function', function: { name: 'getWeather' } },
+    ],
+  ] as const)(
+    '%s rejects a caller-forced tool choice (%o)',
+    async (model, functionCall) => {
+      await expect(
+        chatBody(
+          model,
+          {},
+          { functions: [weather], functionCall: functionCall as any }
+        )
+      ).rejects.toThrow(/does not support explicitly forced tool choices/);
+    }
+  );
+
+  it('drops the Ax-internal structured-output force on Opus 5.5', async () => {
+    const body = await chatBody(
+      AxAIAnthropicModel.Claude55Opus,
+      { functionCallSource: 'ax' },
+      {
+        functions: [{ ...weather, name: '__axOutput' }],
+        functionCall: { type: 'function', function: { name: '__axOutput' } },
+      }
+    );
+    expect(body.tool_choice).toBeUndefined();
+    expect(body.tools?.[0]?.name).toBe('__axOutput');
+  });
+
+  it.each([
+    AxAIAnthropicModel.Claude5Opus,
+    AxAIAnthropicModel.Claude5Fable,
+    AxAIAnthropicModel.Claude5Sonnet,
+  ])('%s still accepts a forced tool choice', async (model) => {
+    const body = await chatBody(
+      model,
+      {},
+      { functions: [weather], functionCall: 'required' }
+    );
+    expect(body.tool_choice).toEqual({ type: 'any' });
+  });
+
+  it('keeps thinking on when replaying a pre-supplied tool call to a model that thinks by default', async () => {
+    const body = await chatBody(
+      AxAIAnthropicModel.Claude5Opus,
+      { thinkingTokenBudget: 'medium' },
+      {
+        functions: [weather],
+        chatPrompt: [
+          { role: 'user', content: 'Weather in Paris?' },
+          {
+            role: 'assistant',
+            functionCalls: [
+              {
+                id: 'call_1',
+                type: 'function',
+                function: { name: 'getWeather', params: { city: 'Paris' } },
+              },
+            ],
+          },
+          {
+            role: 'function',
+            functionId: 'call_1',
+            result: 'Sunny',
+          },
+        ],
+      }
+    );
+    expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' });
+    expect(body.output_config).toEqual({ effort: 'medium' });
+  });
+
+  it('prices Opus 5.5 fast mode and cache reads at the published rates', () => {
+    const ai = new AxAIAnthropic({
+      apiKey: 'key',
+      config: { model: AxAIAnthropicModel.Claude55Opus },
+    });
+    const cost = (speed?: 'fast') =>
+      ai.getEstimatedCost({
+        ai: 'anthropic',
+        model: AxAIAnthropicModel.Claude55Opus,
+        tokens: {
+          promptTokens: 1_000_000,
+          completionTokens: 1_000_000,
+          cacheReadTokens: 1_000_000,
+          totalTokens: 3_000_000,
+          ...(speed ? { speed } : {}),
+        },
+      });
+    expect(cost()).toBeCloseTo(4 + 20 + 0.2);
+    expect(cost('fast')).toBeCloseTo(8 + 40 + 0.4);
+  });
+
+  it('prices Sonnet 5.5 at the published rates', () => {
+    const ai = new AxAIAnthropic({
+      apiKey: 'key',
+      config: { model: AxAIAnthropicModel.Claude55Sonnet },
+    });
+    const cost = ai.getEstimatedCost({
+      ai: 'anthropic',
+      model: AxAIAnthropicModel.Claude55Sonnet,
+      tokens: {
+        promptTokens: 1_000_000,
+        completionTokens: 1_000_000,
+        cacheReadTokens: 1_000_000,
+        cacheCreationTokens: 1_000_000,
+        totalTokens: 4_000_000,
+      },
+    });
+    expect(cost).toBeCloseTo(2 + 10 + 0.2 + 2.5);
+  });
+});
+
+describe('Sonnet 5.5 signed thinking replay', () => {
+  const model = AxAIAnthropicModel.Claude55Sonnet;
+  const content = [
+    {
+      type: 'thinking',
+      thinking: 'Checking Paris.',
+      signature: 'signed-update',
+    },
+    { type: 'redacted_thinking', data: 'opaque-note' },
+    {
+      type: 'tool_use',
+      id: 'call_1',
+      name: 'getWeather',
+      input: { city: 'Paris' },
+    },
+  ];
+  const functions = [
+    {
+      name: 'getWeather',
+      description: 'Get weather',
+      parameters: {
+        type: 'object',
+        properties: { city: { type: 'string' } },
+        required: ['city'],
+      },
+    },
+  ];
+  const hiddenOptions = [
+    { thinkingTokenBudget: 'none' as const },
+    { thinkingTokenBudget: 'high' as const, showThoughts: false },
+  ];
+
+  it.each(hiddenOptions)(
+    'preserves hidden blocks and replays the complete tool turn (%o)',
+    async (options) => {
+      const ai = new AxAIAnthropic({ apiKey: 'key', config: { model } });
+      const { fetch } = createCaptureFetch(model, {
+        id: 'msg_1',
+        type: 'message',
+        role: 'assistant',
+        model,
+        content,
+        stop_reason: 'tool_use',
+        usage: { input_tokens: 10, output_tokens: 5 },
+      });
+      ai.setOptions({ fetch });
+      const memory = new MemoryImpl();
+      memory.addRequest([{ role: 'user', content: 'Weather in Paris?' }], 0);
+      const response = (await ai.chat(
+        { chatPrompt: memory.history(0), functions },
+        { stream: false, ...options }
+      )) as AxChatResponse;
+      expect(response.results[0]?.thought).toBeUndefined();
+      memory.addResponse(response.results);
+      memory.addFunctionResults([
+        { index: 0, functionId: 'call_1', result: 'Sunny' },
+      ]);
+      await ai.chat(
+        { chatPrompt: memory.history(0), functions },
+        { stream: false, ...options }
+      );
+      const replay = JSON.parse(fetch.mock.calls[1]?.[1]?.body as string);
+      expect(replay.messages[1].content).toEqual(content);
+    }
+  );
+
+  it.each(hiddenOptions)(
+    'preserves streamed hidden text, signatures and redacted blocks without displaying them (%o)',
+    async (options) => {
+      const ai = new AxAIAnthropic({ apiKey: 'key', config: { model } });
+      ai.setOptions({
+        fetch: createMockStreamFetch([
+          {
+            type: 'message_start',
+            message: {
+              id: 'msg_1',
+              type: 'message',
+              role: 'assistant',
+              model,
+              content: [],
+              stop_reason: null,
+              usage: { input_tokens: 10, output_tokens: 0 },
+            },
+          },
+          {
+            type: 'content_block_start',
+            index: 0,
+            content_block: { type: 'thinking', thinking: 'Checking ' },
+          },
+          {
+            type: 'content_block_delta',
+            index: 0,
+            delta: { type: 'thinking_delta', thinking: 'Paris.' },
+          },
+          {
+            type: 'content_block_delta',
+            index: 0,
+            delta: { type: 'signature_delta', signature: 'signed-update' },
+          },
+          { type: 'content_block_stop', index: 0 },
+          {
+            type: 'content_block_start',
+            index: 1,
+            content_block: { type: 'redacted_thinking', data: 'opaque-note' },
+          },
+          { type: 'content_block_stop', index: 1 },
+          { type: 'content_block_start', index: 2, content_block: content[2] },
+          {
+            type: 'content_block_delta',
+            index: 2,
+            delta: {
+              type: 'input_json_delta',
+              partial_json: '{"city":"Paris"}',
+            },
+          },
+          { type: 'content_block_stop', index: 2 },
+          {
+            type: 'message_delta',
+            delta: { stop_reason: 'tool_use' },
+            usage: { output_tokens: 5 },
+          },
+          { type: 'message_stop' },
+        ]),
+      });
+      const memory = new MemoryImpl();
+      memory.addRequest([{ role: 'user', content: 'Weather in Paris?' }], 0);
+      const stream = (await ai.chat(
+        { chatPrompt: memory.history(0), functions },
+        { stream: true, ...options }
+      )) as ReadableStream<AxChatResponse>;
+      const functionCalls: NonNullable<AxChatResponseResult['functionCalls']> =
+        [];
+      for await (const delta of stream) {
+        for (const result of delta.results) {
+          expect(result.thought).toBeUndefined();
+          if (result.functionCalls)
+            mergeFunctionCalls(functionCalls, result.functionCalls);
+          memory.updateResult({ ...result, functionCalls });
+        }
+      }
+      const assistant = memory.history(0)[1];
+      expect(assistant).toMatchObject({
+        role: 'assistant',
+        thoughtBlocks: [
+          {
+            data: 'Checking Paris.',
+            encrypted: false,
+            signature: 'signed-update',
+          },
+          { data: 'opaque-note', encrypted: true },
+        ],
+      });
+      expect(
+        assistant && 'thought' in assistant ? assistant.thought : undefined
+      ).toBeUndefined();
+      memory.addFunctionResults([
+        { index: 0, functionId: 'call_1', result: 'Sunny' },
+      ]);
+      const { capture, fetch } = createCaptureFetch(model);
+      ai.setOptions({ fetch });
+      await ai.chat(
+        { chatPrompt: memory.history(0), functions },
+        { stream: false, ...options }
+      );
+      expect(capture.lastBody.messages[1].content).toEqual(content);
+    }
+  );
+
+  it.each([
+    [model, false],
+    ['publishers/anthropic/models/claude-sonnet-5-5', false],
+    ['claude-sonnet-5-5-20261001', false],
+    [AxAIAnthropicVertexModel.Claude55Sonnet, true],
+  ])(
+    'keeps later system instructions after signed thinking for %s',
+    async (resolvedModel, vertex) => {
+      const ai = new AxAIAnthropic({
+        apiKey: async () => 'key',
+        config: { model: resolvedModel as AxAIAnthropicModel },
+        ...(vertex ? { projectId: 'demo-project', region: 'us' } : {}),
+      });
+      const { capture, fetch } = createCaptureFetch(resolvedModel as string);
+      ai.setOptions({ fetch });
+      await ai.chat(
+        {
+          chatPrompt: [
+            { role: 'system', content: 'Initial instructions.' },
+            { role: 'user', content: 'Start.' },
+            {
+              role: 'assistant',
+              content: 'Started.',
+              thoughtBlocks: [
+                {
+                  data: 'Signed reasoning.',
+                  encrypted: false,
+                  signature: 'signed-prefix',
+                },
+              ],
+            },
+            { role: 'system', content: 'Later instructions.' },
+            { role: 'user', content: 'Continue.' },
+          ],
+        },
+        { stream: false }
+      );
+      expect(capture.lastBody.system).toEqual([
+        { type: 'text', text: 'Initial instructions.' },
+      ]);
+      expect(
+        capture.lastBody.messages.map(
+          (message: { role: string }) => message.role
+        )
+      ).toEqual(['user', 'assistant', 'system', 'user']);
+      expect(capture.lastBody.messages[2].content).toBe('Later instructions.');
+      expect(capture.lastBody.messages[1].content[0]).toEqual({
+        type: 'thinking',
+        thinking: 'Signed reasoning.',
+        signature: 'signed-prefix',
+      });
+    }
+  );
 });

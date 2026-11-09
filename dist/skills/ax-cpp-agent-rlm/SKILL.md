@@ -1,7 +1,7 @@
 ---
 name: "ax-cpp-agent-rlm"
 description: "Use when writing C++ code with `axllm` for RLM executor loops, AxCodeRuntime sessions, runtime envelopes, process runtimes, and optional runtime profiles."
-version: "24.0.15"
+version: "25.4.9"
 ---
 # AxAgent RLM Runtime For C++
 
@@ -33,7 +33,7 @@ auto out = helper.forward(llm, { {"question", "How should I proceed?"} });
 
 ## Relevant API Surface
 
-- Agents And RLM: `axllm::agent`, `axllm::AxAgent`
+- Agents And RLM: `axllm::agent`, `axllm::AxAgent`, `axllm::AxAgent::add_child_agent`, `axllm::AxAgent::streaming_forward`
 - Runtime Profiles: `axllm::ProcessCodeRuntime`, `axllm::RuntimeCapabilities`, `axllm::RuntimeEnvelope`, `javascript-quickjs`, `python-pyodide`
 
 ## Guardrails

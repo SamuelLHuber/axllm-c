@@ -27,9 +27,13 @@ func main() {
 - AxGen: run structured generation with retries, tool calls, field processors, assertions, traces, usage, and provider-backed output parsing.
 - AxAI: select named deployment profiles independently from model IDs, resolve model-aware structured-output modes, and attach renewable request credentials through one provider boundary.
 - Audio and realtime: `.chat()` accepts `input_audio` content parts, `transcribe()`/`speak()` do batch speech-to-text and text-to-speech, and realtime-capable models stream audio over a WebSocket — transparently through `chat()` or via the productized `realtime_chat()` driver (Go: `RealtimeChat`).
+- Meta Muse: `meta` (Responses), `meta-chat` (Chat Completions), and `meta-messages` (Messages) default to `muse-spark-1.3` with `MODEL_API_KEY`. Muse Image uses chat and `results[].images`; Muse Voice uses batch transcription or realtime streaming chat. Contributor models expose provider-training data-use metadata and are never defaults. Glimmer uses the existing self-hosted profiles; Ax does not manage weights.
+- Jev and OpenAI Decisions: use required boolean/class/rubric score signatures with (evidence) to retain probabilities, native values, optional confidence, and trusted provenance through AxGen. Generative models use the same contract with elicited evidence. Rerank query/document pairs by the continuous rubric score while preserving candidate IDs.
+- Native decision clients: use explicit provider request shapes for advanced criteria, structured state, ordered questions, and provider-specific media. Normal evidence-bearing signatures support scores and answered/refused outcomes without calling these clients directly.
 - AxAgent and RLM: let an agent plan and execute actor-code steps while Ax keeps envelopes, state, logs, traces, context, discovery, recall, and final typed responses aligned.
 - AxFlow: compose AxGen, AxAgent, and nested flows into a portable program graph.
 - Optimizers: save, load, apply, and evaluate optimizer artifacts, including the generated GEPA engine.
+- Evaluation: NovelF1Score scores multiset word overlap after excluding history and stopwords, with matching Unicode normalization and finite empty-input scores.
 
 ## Package Shape
 
@@ -48,12 +52,14 @@ Shared Ax behavior is Core-owned. The generated target code stays focused on idi
 `no-key` examples are deterministic local smokes. They are the fastest way to see the package work without any provider account:
 
 - `go run ./examples/signature_schema`: signature parsing and JSON schema generation
+- `go run ./examples/model_catalog`: model catalog, named profiles, thinking levels, and service tiers
 - `go run ./examples/axgen_scripted_client_tool`: AxGen with a scripted client and tool
 - `go run ./examples/provider_mapping_no_key`: provider mapping through a scripted transport
 - `go run ./examples/runtime_hooks_no_key`: runtime-hook globals and typed program surfaces through a scripted transport
 - `go run ./examples/vertex_gemma_maas_no_key`: Vertex Gemma MaaS JSON-object, thinking, reasoning replay, and renewable-header mapping through a scripted transport
 - `go run ./examples/adaptive_balancer_no_key`: adaptive balancer state, scoring, and stable route keys without a provider key
 - `go run ./examples/provider_stream_no_key`: provider streaming through a scripted SSE transport
+- `go run ./examples/cancellation_no_key`: context cancellation with no transport attempt
 - `go run ./examples/axflow_program_graph`: AxFlow program graph
 - `go run ./examples/flow_mermaid`: portable Mermaid flow parsing and canonical round-trip
 - `go run ./examples/audio_responses_mapping`: OpenAI Responses speak/transcribe mapping through a scripted transport

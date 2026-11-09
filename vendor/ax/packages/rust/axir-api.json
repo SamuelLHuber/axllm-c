@@ -71,10 +71,27 @@
             "modelConfig",
             "maxRetries",
             "streaming assertions",
-            "field processors"
+            "field processors",
+            "control",
+            "asyncMode"
           ],
           "returns": "AxResult\u003cAxGen\u003e",
           "example": "let qa = ax(\"question:string -\u003e answer:string\")?;"
+        },
+        {
+          "target_name": "rust",
+          "canonical_name": "novel_f1_score",
+          "public_name": "novel_f1_score",
+          "kind": "function",
+          "description": "Score novel multiset token overlap after Unicode normalization and history/stopword exclusion. Two empty filtered answers score one; a single empty answer scores zero.",
+          "form": "novel_f1_score",
+          "important_options": [
+            "history",
+            "prediction",
+            "ground truth",
+            "return recall"
+          ],
+          "returns": "score in [0, 1]"
         },
         {
           "target_name": "rust",
@@ -94,6 +111,62 @@
             "prompt template"
           ],
           "returns": "program object"
+        },
+        {
+          "target_name": "rust",
+          "canonical_name": "run_control",
+          "public_name": "run_control",
+          "kind": "function",
+          "description": "Create a controller for scoped steering, reasoning updates, cancellation, and queued/applied lifecycle events. Pass it through forward options.",
+          "form": "run_control()",
+          "returns": "AxRunControl",
+          "example": "let control = run_control();"
+        },
+        {
+          "target_name": "rust",
+          "canonical_name": "AxRunControl",
+          "public_name": "AxRunControl",
+          "kind": "type",
+          "description": "Run control shared by active and future descendant programs. Cancellation reports unresolved work and does not undo external effects.",
+          "form": "AxRunControl",
+          "important_options": [
+            "steer",
+            "thinking token budget",
+            "target path",
+            "abort",
+            "event listener"
+          ],
+          "returns": "run controller"
+        },
+        {
+          "target_name": "rust",
+          "canonical_name": "AxCachingFunction",
+          "public_name": "AxCachingFunction",
+          "kind": "type",
+          "description": "TypeScript's cachingFunction: read and store finished AxGen outputs by key. The forward call's function comes first, then the program's, then the process-wide one, and a run control skips the cache.",
+          "form": "Arc\u003cdyn Fn(\u0026str, Option\u003c\u0026Value\u003e) -\u003e AxResult\u003cOption\u003cValue\u003e\u003e + Send + Sync\u003e",
+          "important_options": [
+            "read",
+            "store",
+            "SHA-256 key",
+            "streamed hit as one delta"
+          ],
+          "returns": "stored output or miss",
+          "example": "let qa = ax(\"question:string -\u003e answer:string\")?.with_caching_function(cache);"
+        },
+        {
+          "target_name": "rust",
+          "canonical_name": "set_caching_function",
+          "public_name": "set_caching_function",
+          "kind": "function",
+          "description": "Register, replace, or clear the process-wide AxGen caching function.",
+          "form": "set_caching_function(Some(fn))",
+          "important_options": [
+            "caching function",
+            "clear"
+          ],
+          "returns": "void",
+          "example": "set_caching_function(Some(cache));"
         }
       ]
     },
@@ -118,6 +191,112 @@
           ],
           "returns": "AxResult\u003cOpenAICompatibleClient\u003e",
           "example": "let client = ai(\"openai\", json!({\"apiKey\": std::env::var(\"OPENAI_API_KEY\")?}))?;"
+        },
+        {
+          "target_name": "rust",
+          "canonical_name": "openai_decisions",
+          "public_name": "openai_decisions",
+          "kind": "function",
+          "description": "Create the native OpenAI Decisions client for ordered predicate, choice and score questions. Default model: gpt-6-luna.",
+          "form": "openai_decisions",
+          "important_options": [
+            "API key or credential provider",
+            "inline images",
+            "timeout",
+            "retry",
+            "cancellation"
+          ],
+          "returns": "AxAIOpenAIDecisionsClient"
+        },
+        {
+          "target_name": "rust",
+          "canonical_name": "AxAIOpenAIDecisionsClient",
+          "public_name": "AxAIOpenAIDecisionsClient",
+          "kind": "type",
+          "description": "Native create requests preserve ordered answers, refusals, distributions, fractional scores and full usage. Signature adapters accept required boolean/class fields.",
+          "form": "AxAIOpenAIDecisionsClient",
+          "important_options": [
+            "create / Create",
+            "question names",
+            "boolean or string choices",
+            "safety_identifier"
+          ],
+          "returns": "native Decisions response JSON"
+        },
+        {
+          "target_name": "rust",
+          "canonical_name": "typesafe",
+          "public_name": "typesafe",
+          "kind": "function",
+          "description": "Create the native Typesafe/Jev client separately from ordinary AI services. Default model: jev-latest.",
+          "form": "typesafe(options)",
+          "important_options": [
+            "api key or credential provider",
+            "endpoint",
+            "transport",
+            "timeout",
+            "retry"
+          ],
+          "returns": "AxAITypesafeClient"
+        },
+        {
+          "target_name": "rust",
+          "canonical_name": "AxAITypesafeClient",
+          "public_name": "AxAITypesafeClient",
+          "kind": "type",
+          "description": "Native System One questions and model discovery. Returns typed Noul probabilities, Choice labels, fractional Score positions, model, and usage.",
+          "form": "AxAITypesafeClient",
+          "important_options": [
+            "system_one / systemOne / SystemOne",
+            "list_models / listModels / ListModels",
+            "structured or null entries",
+            "cancellation"
+          ],
+          "returns": "native Typesafe responses"
+        },
+        {
+          "target_name": "rust",
+          "canonical_name": "AxCancellationToken",
+          "public_name": "AxCancellationToken",
+          "kind": "type",
+          "description": "Reusable one-shot cancellation for provider calls, streams, retries, and event-clock sleeps. Go uses context.Context.",
+          "form": "AxCancellationToken::default()",
+          "important_options": [
+            "first reason wins",
+            "removable wake subscriptions",
+            "non-retryable cancellation"
+          ],
+          "returns": "cancellation token or context"
+        },
+        {
+          "target_name": "rust",
+          "canonical_name": "AxAIServiceAbortedError",
+          "public_name": "AxAIServiceAbortedError",
+          "kind": "error",
+          "description": "Terminal provider error raised when caller cancellation is observed.",
+          "form": "AxError with error_type AxAIServiceAbortedError",
+          "important_options": [
+            "reason preservation",
+            "no retry",
+            "no provider failover"
+          ],
+          "returns": "non-retryable provider error"
+        },
+        {
+          "target_name": "rust",
+          "canonical_name": "get_supported_ai_models",
+          "public_name": "get_supported_ai_models",
+          "kind": "function",
+          "description": "Return the AxIR-backed provider and model catalog, including dynamic named profiles and portable capability metadata.",
+          "form": "get_supported_ai_models() / get_supported_ai_models_with_options(options)",
+          "important_options": [
+            "type filter",
+            "thinkingLevels",
+            "serviceTiers",
+            "isDynamic"
+          ],
+          "returns": "AxResult\u003cVec\u003cserde_json::Value\u003e\u003e",
+          "example": "let catalog = get_supported_ai_models()?;"
         },
         {
           "target_name": "rust",
@@ -150,6 +329,37 @@
             "retries"
           ],
           "returns": "header map or credential error"
+        },
+        {
+          "target_name": "rust",
+          "canonical_name": "owned_client_factory",
+          "public_name": "AxAIClient::owned_worker_factory",
+          "kind": "method",
+          "description": "Optional factory for an independent client worker with preserved configuration, authentication and routing. Built-in providers supply it; custom services may omit it without changing chat compatibility.",
+          "form": "AxAIClient::owned_worker_factory()",
+          "important_options": [
+            "owned configuration",
+            "shared balancer accounting",
+            "no borrowed client transfer"
+          ],
+          "returns": "worker factory or unavailable"
+        },
+        {
+          "target_name": "rust",
+          "canonical_name": "AxChatSession",
+          "public_name": "AxChatSession",
+          "kind": "interface",
+          "description": "Optional normalized session capability for custom provider adapters. High-level programs own tool execution and continuation; chat-only services remain supported.",
+          "form": "AxChatSession",
+          "important_options": [
+            "normalized events",
+            "completed calls",
+            "submit results",
+            "steering",
+            "reasoning updates",
+            "close"
+          ],
+          "returns": "run-owned chat session"
         },
         {
           "target_name": "rust",
@@ -524,6 +734,18 @@
         },
         {
           "target_name": "rust",
+          "canonical_name": "ProviderRouter::get_compatibility_report",
+          "public_name": "ProviderRouter::get_compatibility_report",
+          "kind": "method",
+          "description": "Rank request-compatible providers and summarize supported requirements, counting audio input and audio output independently.",
+          "form": "ProviderRouter::get_compatibility_report",
+          "important_options": [
+            "request"
+          ],
+          "returns": "provider names, scores and compatibility summary"
+        },
+        {
+          "target_name": "rust",
           "canonical_name": "ProviderRouter",
           "public_name": "ProviderRouter",
           "kind": "type",
@@ -595,6 +817,37 @@
             "playbook"
           ],
           "returns": "agent program"
+        },
+        {
+          "target_name": "rust",
+          "canonical_name": "add_child_agent",
+          "public_name": "AxAgent::with_child_agent",
+          "kind": "method",
+          "description": "Register an owned child agent for serialized delegation through the parent invocation boundary. Scoped controls use parent/namespace.name paths.",
+          "form": "AxAgent::with_child_agent(namespace, name, child)",
+          "important_options": [
+            "namespace",
+            "name",
+            "child",
+            "independent conversation",
+            "child usage"
+          ],
+          "returns": "parent agent"
+        },
+        {
+          "target_name": "rust",
+          "canonical_name": "agent_streaming_forward",
+          "public_name": "AxAgent::streaming_forward",
+          "kind": "method",
+          "description": "Run the agent and stream the responder's deltas, as TypeScript's streamingForward does, after the distiller and executor run without streaming.",
+          "form": "AxAgent::streaming_forward(\u0026mut client, input, options, on_delta)",
+          "important_options": [
+            "deltas",
+            "versions",
+            "hidden citations",
+            "run control"
+          ],
+          "returns": "responder deltas"
         }
       ]
     },
@@ -635,6 +888,21 @@
             "returns"
           ],
           "returns": "flow program"
+        },
+        {
+          "target_name": "rust",
+          "canonical_name": "owned_program_factory",
+          "public_name": "AxExecutableProgram::owned_worker_factory",
+          "kind": "method",
+          "description": "Optional factory for independent program state. Parallel groups require both client and program factories; otherwise the whole group runs serially with a fallback trace.",
+          "form": "AxExecutableProgram::owned_worker_factory()",
+          "important_options": [
+            "owned memory",
+            "per-node controls",
+            "deterministic result merge",
+            "cooperative cancellation"
+          ],
+          "returns": "worker factory or unavailable"
         }
       ]
     },
@@ -655,7 +923,9 @@
             "description",
             "args",
             "returns",
-            "handler"
+            "handler",
+            "execution: blocking or background",
+            "cancellation-aware handler"
           ],
           "returns": "ToolBuilder",
           "example": "let search = tool(\"search\").description(\"Search docs\").build();"
@@ -686,13 +956,16 @@
           "canonical_name": "AxMCPClient",
           "public_name": "AxMCPClient",
           "kind": "type",
-          "description": "MCP client that lists tools/prompts/resources and converts MCP tools to Ax functions.",
+          "description": "MCP client that lists tools/prompts/resources and converts MCP tools to Ax functions. `call_tool` waits for a modern server's task; `call_tool_with_task_handling(name, args, AxMCPTaskHandling::Expose)` returns it as its CreateTaskResult, and `call_tool_outcome` returns `AxMCPToolCallOutcome::Complete` or `AxMCPToolCallOutcome::Task`, as TypeScript's callTool taskHandling and callToolOutcome. A legacy server's task-shaped result is a complete result.",
           "form": "AxMCPClient::new(transport, options)",
           "important_options": [
             "transport",
             "client info",
             "roots",
-            "tool overrides"
+            "tool overrides",
+            "host tool authorization",
+            "task handling (await or expose)",
+            "tool call outcome"
           ],
           "returns": "MCP client",
           "example": "let client = AxMCPClient::new(transport, json!({}));"
@@ -709,6 +982,20 @@
             "headers",
             "OAuth",
             "SSRF protection"
+          ],
+          "returns": "MCP transport"
+        },
+        {
+          "target_name": "rust",
+          "canonical_name": "AxMCPWebSocketTransport",
+          "public_name": "AxMCPWebSocketTransport",
+          "kind": "type",
+          "description": "WebSocket transport with request-local pending ownership, send failure cleanup, cancellation, and close settlement. Batching requires MCP 2025-03-26.",
+          "form": "AxMCPWebSocketTransport::new(url)",
+          "important_options": [
+            "URL",
+            "socket factory",
+            "protocol version"
           ],
           "returns": "MCP transport"
         },
@@ -873,13 +1160,15 @@
           "canonical_name": "AxGEPA",
           "public_name": "AxGEPA",
           "kind": "type",
-          "description": "Generated GEPA optimizer engine with Core-owned reflection, Pareto, bootstrap, and selector-state behavior.",
-          "form": "AxGEPA::new(reflection, options)",
+          "description": "GEPA engine with Core-owned reflection, Pareto and bootstrap behavior. Artifacts report original-program baselineScore/baselineScores at the top level and in metadata, independently of the final frontier.",
+          "form": "AxGEPA::new().with_reflection_client(reflection)",
           "important_options": [
             "reflection client",
             "budget",
             "metric",
-            "candidate count"
+            "candidate count",
+            "baselineScore",
+            "baselineScores"
           ],
           "returns": "optimizer engine",
           "example": "let engine = AxGEPA::new(reflection_client, json!({}));"
@@ -910,6 +1199,23 @@
             "evidence"
           ],
           "returns": "score/evidence result"
+        },
+        {
+          "target_name": "rust",
+          "canonical_name": "optimize_with_client",
+          "public_name": "optimize_with_client",
+          "kind": "function",
+          "description": "Run BootstrapFewShot and GEPA against a live student client. Reports the original baseline before bootstrap. The client-free optimize helper requires pre-scored tasks.",
+          "form": "optimize_with_client(\u0026mut program, Rc\u003cRefCell\u003cClient\u003e\u003e, examples, options)",
+          "important_options": [
+            "Rc\u003cRefCell\u003cClient\u003e\u003e",
+            "examples",
+            "validationExamples",
+            "bootstrap",
+            "maxMetricCalls"
+          ],
+          "returns": "AxResult\u003cOptimizedArtifact\u003e",
+          "example": "let artifact = optimize_with_client(\u0026mut qa, student.clone(), train, json!({\"maxMetricCalls\": 100}))?;"
         }
       ]
     },
@@ -918,6 +1224,32 @@
       "title": "Errors And Values",
       "summary": "Handle target-native errors and dynamic values at Ax host boundaries.",
       "symbols": [
+        {
+          "target_name": "rust",
+          "canonical_name": "AxDecisionRefusalError",
+          "public_name": "AxError (error_type: AxDecisionRefusalError)",
+          "kind": "type",
+          "description": "Terminal decision-field refusal; retains field path and provider provenance.",
+          "form": "AxError (error_type: AxDecisionRefusalError)",
+          "important_options": [
+            "fieldPath",
+            "provenance"
+          ],
+          "returns": "error"
+        },
+        {
+          "target_name": "rust",
+          "canonical_name": "AxGenerateError",
+          "public_name": "AxGenerateError",
+          "kind": "type",
+          "description": "Generation boundary failure retaining the original cause; cancellation propagates unchanged.",
+          "form": "AxGenerateError",
+          "important_options": [
+            "message",
+            "cause"
+          ],
+          "returns": "error"
+        },
         {
           "target_name": "rust",
           "canonical_name": "AxError",

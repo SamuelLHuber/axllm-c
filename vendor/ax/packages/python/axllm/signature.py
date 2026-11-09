@@ -7,9 +7,221 @@ import json
 import re
 from typing import Any
 
+def _core_string_utf8_length(value):
+    return len(str(value).encode("utf-8", "surrogatepass"))
+
+def _core_validation_error(message):
+    return ValueError(str(message))
+
+
 
 class AxSignatureError(ValueError):
     pass
+
+
+# JSON text as JavaScript's JSON.stringify writes it, shared by prompts, wire
+# bodies and the json.* intrinsics. json.dumps differs in its numbers: it writes
+# 2.0 for a float two, switches to exponents at 1e16 and 1e-5 (as 1e+16 and
+# 1e-05), and writes NaN and Infinity, which are not JSON.
+
+# JSON string escaping as json.dumps(ensure_ascii=False) does it (C-accelerated).
+_json_encode_string = json.encoder.encode_basestring
+
+
+def _js_number_text(value) -> str:
+    """A float as JavaScript's String(x) writes it (Number.prototype.toString):
+    repr's shortest round-trip digits, plain decimals from 1e-6 up to 1e21,
+    exponent form outside that range (1e-7, 1.5e+21), 0 for -0.0, and NaN,
+    Infinity or -Infinity."""
+    value = float(value)
+    if value != value:
+        return "NaN"
+    if value in (float("inf"), float("-inf")):
+        return "Infinity" if value > 0 else "-Infinity"
+    if value == 0:
+        return "0"
+    text = repr(value)
+    if "e" not in text:
+        # repr writes plain decimals from 1e-4 up to 1e16, where JavaScript
+        # does too; only an integral value's ".0" differs.
+        return text[:-2] if text.endswith(".0") else text
+    mantissa, _, exponent = repr(abs(value)).partition("e")
+    whole, _, fraction = mantissa.partition(".")
+    digits = (whole + fraction).lstrip("0")
+    # digits read as 0.ddd x 10^point
+    point = len(whole) + int(exponent or 0) - (len(whole + fraction) - len(digits))
+    digits = digits.rstrip("0")
+    count = len(digits)
+    if count <= point <= 21:
+        text = digits + "0" * (point - count)
+    elif 0 < point <= 21:
+        text = digits[:point] + "." + digits[point:]
+    elif -6 < point <= 0:
+        text = "0." + "0" * -point + digits
+    else:
+        power = point - 1
+        text = digits[0] + ("." + digits[1:] if count > 1 else "") + ("e+" if power >= 0 else "e-") + str(abs(power))
+    return "-" + text if value < 0 else text
+
+
+def _js_json_number(value) -> str:
+    """JSON.stringify's number: _js_number_text, or null for NaN and the
+    infinities."""
+    text = _js_number_text(value)
+    return "null" if text in ("NaN", "Infinity", "-Infinity") else text
+
+
+def _js_json_key(key) -> str:
+    if isinstance(key, str):
+        return key
+    if key is True or key is False or key is None:
+        return {True: "true", False: "false", None: "null"}[key]
+    if isinstance(key, int):
+        return int.__repr__(key)
+    if isinstance(key, float):
+        return _js_number_text(key)
+    raise TypeError(f"keys must be str, int, float, bool or None, not {type(key).__name__}")
+
+
+def _js_array_index(key: str) -> int | None:
+    """The array index a JavaScript property key names: "0" to "4294967294"
+    in canonical form (no sign, no leading zero), else None."""
+    if not key or not key.isascii() or not key.isdigit() or (len(key) > 1 and key[0] == "0"):
+        return None
+    index = int(key)
+    return index if index <= 4294967294 else None
+
+
+def _js_own_key_entries(mapping) -> list:
+    """A dict's entries in JavaScript's own-property order, which
+    JSON.stringify follows: array-index keys first in ascending numeric
+    order, then the other keys in insertion order."""
+    indexed = []
+    named = []
+    for key, element in mapping.items():
+        index = _js_array_index(_js_json_key(key))
+        if index is None:
+            named.append((key, element))
+        else:
+            indexed.append((index, key, element))
+    if not indexed:
+        return named
+    indexed.sort(key=lambda entry: entry[0])
+    return [(key, element) for _, key, element in indexed] + named
+
+
+def _js_json_dumps(value, indent: int | None = None, sort_keys: bool = False, default=None, separators: tuple[str, str] | None = None) -> str:
+    """json.dumps(value, ensure_ascii=False) with JavaScript's output: compact
+    separators by default (JSON.stringify(value)), `indent`-space lines as
+    JSON.stringify(value, null, indent) writes them, floats as
+    _js_json_number, and NaN or Infinity as null. Ints keep their exact digits;
+    dict keys convert and come in JavaScript's own-key order (sort_keys sorts
+    them instead), and `default` and `separators` work, as in json.dumps."""
+    out: list[str] = []
+    active: set[int] = set()
+    item_separator, key_separator = separators or ((",", ":") if indent is None else (",", ": "))
+
+    def write(item, prefix: str) -> None:
+        if isinstance(item, str):
+            out.append(_json_encode_string(item))
+        elif item is None:
+            out.append("null")
+        elif item is True:
+            out.append("true")
+        elif item is False:
+            out.append("false")
+        elif isinstance(item, int):
+            out.append(int.__repr__(item))
+        elif isinstance(item, float):
+            out.append(_js_json_number(item))
+        elif isinstance(item, (dict, list, tuple)):
+            marker = id(item)
+            if marker in active:
+                raise ValueError("Circular reference detected")
+            active.add(marker)
+            inner = prefix + " " * indent if indent is not None else ""
+            if isinstance(item, dict):
+                entries = sorted(item.items(), key=lambda entry: entry[0]) if sort_keys else _js_own_key_entries(item)
+                opening, closing = "{", "}"
+            else:
+                entries = [(None, element) for element in item]
+                opening, closing = "[", "]"
+            if not entries:
+                out.append(opening + closing)
+            else:
+                out.append(opening)
+                for index, (key, element) in enumerate(entries):
+                    if index:
+                        out.append(item_separator)
+                    if indent is not None:
+                        out.append("\n" + inner)
+                    if opening == "{":
+                        out.append(_json_encode_string(_js_json_key(key)))
+                        out.append(key_separator)
+                    write(element, inner)
+                if indent is not None:
+                    out.append("\n" + prefix)
+                out.append(closing)
+            active.discard(marker)
+        elif default is not None:
+            write(default(item), prefix)
+        else:
+            raise TypeError(f"Object of type {type(item).__name__} is not JSON serializable")
+
+    write(value, "")
+    return "".join(out)
+
+
+def _js_date_millis(value):
+    """Epoch milliseconds of a native date or time value, read as TypeScript
+    reads a Date: an aware datetime is its instant, a naive one is local time
+    (as datetime.timestamp() reads it, and as new Date(2024, 4, 9) does), and
+    a date is its UTC midnight (as new Date("2024-05-09") parses it). None
+    for anything else."""
+    import datetime as _datetime
+
+    if isinstance(value, _datetime.datetime):
+        instant = value if value.utcoffset() is not None else value.astimezone()
+        delta = instant - _datetime.datetime(1970, 1, 1, tzinfo=_datetime.timezone.utc)
+        return delta.days * 86400000 + delta.seconds * 1000 + delta.microseconds // 1000
+    if isinstance(value, _datetime.date):
+        return (value.toordinal() - 719163) * 86400000
+    return None
+
+
+def _js_iso_string(millis) -> str:
+    """Date.prototype.toISOString of epoch milliseconds."""
+    import datetime as _datetime
+
+    moment = _datetime.datetime(1970, 1, 1) + _datetime.timedelta(milliseconds=millis)
+    return f"{moment.year:04d}-{moment.month:02d}-{moment.day:02d}T{moment.hour:02d}:{moment.minute:02d}:{moment.second:02d}.{moment.microsecond // 1000:03d}Z"
+
+
+def _js_date_prompt_text(type_name, value):
+    """The prompt text TypeScript writes for a native date in a date-typed
+    field (processValue in src/ax/dsp/prompt.ts), or None when TS would not
+    see a Date: a date field's UTC day, a datetime without milliseconds, and
+    for a range with two dates the {start, end} JSON of those; a range object
+    holding anything else is its JSON with each date as toISOString."""
+    if type_name in ("date", "datetime"):
+        millis = _js_date_millis(value)
+        if millis is None:
+            return None
+        iso = _js_iso_string(millis)
+        return iso[: iso.index("T")] if type_name == "date" else iso[:-5] + "Z"
+    if type_name in ("dateRange", "datetimeRange") and isinstance(value, dict) and "start" in value and "end" in value:
+        start = _js_date_millis(value["start"])
+        end = _js_date_millis(value["end"])
+        if start is not None and end is not None:
+            if type_name == "dateRange":
+                bounds = {"start": _js_iso_string(start)[:10], "end": _js_iso_string(end)[:10]}
+            else:
+                bounds = {"start": _js_iso_string(start)[:-5] + "Z", "end": _js_iso_string(end)[:-5] + "Z"}
+            return _js_json_dumps(bounds, indent=2)
+        if any(_js_date_millis(item) is not None for item in value.values()):
+            dated = {key: (_js_iso_string(_js_date_millis(item)) if _js_date_millis(item) is not None else item) for key, item in value.items()}
+            return _js_json_dumps(dated, indent=2)
+    return None
 
 
 VALID_FIELD_TYPES = {
@@ -43,6 +255,8 @@ class FieldType:
     maximum: float | None = None
     pattern: str | None = None
     pattern_description: str | None = None
+    value_descriptions: dict[str, str] | None = None
+    evidence: dict[str, Any] | None = None
     format: str | None = None
     language: str | None = None
     description: str | None = None
@@ -82,6 +296,19 @@ class FluentField:
         self.is_optional = False
         self.is_internal = False
         self.is_cached = False
+
+    def describe_values(self, descriptions: dict[str, str]):
+        clone = self._clone()
+        clone.type.value_descriptions = copy.deepcopy(descriptions)
+        _signature_validate_value_descriptions_impl(clone.type, clone.type.name)
+        return clone
+
+    def with_evidence(self, *, threshold: float | None = None, on_refusal: str = "throw"):
+        clone = self._clone()
+        clone.type.evidence = {"onRefusal": on_refusal}
+        if threshold is not None: clone.type.evidence["threshold"] = threshold
+        _evidence_validate_type_impl(clone.type)
+        return clone
 
     def optional(self):
         clone = self._clone()
@@ -207,6 +434,13 @@ class FluentFactory:
 
     def string(self, description: str | None = None): return FluentField("string", description)
     def number(self, description: str | None = None): return FluentField("number", description)
+    def box(self, description: str | None = None): return FluentField("box", description)
+    def score(self, levels: list[str], description: str | None = None):
+        item = FluentField("score", description)
+        item.type.options = list(levels)
+        _evidence_validate_type_impl(item.type)
+        return item
+
     def boolean(self, description: str | None = None): return FluentField("boolean", description)
     def json(self, description: str | None = None): return FluentField("json", description)
     def object(self, fields: dict[str, FluentField] | None = None, description: str | None = None): return FluentField("object", description, fields=fields)
@@ -252,12 +486,12 @@ class AxSignature:
     def get_description(self): return self.description
 
     def has_complex_fields(self) -> bool:
-        return self.force_structured or any(field.type.name == "object" or field.type.fields for field in self.output_fields)
+        return self.force_structured or _evidence_has_fields_impl(self.output_fields) or any(field.type.name == "object" or field.type.fields for field in self.output_fields)
 
     def to_json_schema(self, target: str = "outputs", options: dict[str, Any] | None = None):
         from .schema import to_json_schema
         fields = self.input_fields if target == "inputs" else self.output_fields
-        return to_json_schema(fields, options=options)
+        return to_json_schema(fields, options={"decisionMode":"result", **(options or {})})
 
     def toJSONSchema(self, target: str = "outputs", options: dict[str, Any] | None = None):
         return self.to_json_schema(target, options)
@@ -318,6 +552,28 @@ def _core_get(target, key, default=None):
     return getattr(target, key, default)
 
 
+def _core_type_is(value, type_name):
+    if type_name == "object":
+        return isinstance(value, dict)
+    if type_name == "list":
+        return isinstance(value, list)
+    if type_name == "string":
+        return isinstance(value, str)
+    if type_name == "number":
+        return (isinstance(value, (int, float)) and not isinstance(value, bool))
+    if type_name == "boolean":
+        return isinstance(value, bool)
+    if type_name == "null":
+        return value is None
+    if type_name == "json":
+        return value is None or isinstance(value, (dict, list, str, int, float, bool))
+    return False
+
+
+def _core_map_keys(values):
+    return list(values) if isinstance(values, dict) else []
+
+
 def _core_map_merge(left, right):
     merged = dict(left or {})
     merged.update(right or {})
@@ -336,8 +592,62 @@ def _core_regex_match(pattern, value):
     return isinstance(value, str) and re.search(pattern, value) is not None
 
 
+def _js_text(value) -> str:
+    """A value's text in string.format and string.str, as every port writes
+    it: a string as is, None as "null", a bool as "true" or "false", a number
+    as JavaScript's String(x) (an int keeps its exact digits), and a list or
+    dict as compact JSON (JSON.stringify(x), keys in insertion order)."""
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return int.__repr__(value)
+    if isinstance(value, float):
+        return _js_number_text(value)
+    if isinstance(value, (list, tuple, dict)):
+        try:
+            return _js_json_dumps(value)
+        except (TypeError, ValueError):
+            return str(value)
+    return str(value)
+
+
+def _js_format(template, args) -> str:
+    """string.format as every port runs it: each {} takes the next argument's
+    _js_text, from left to right and inserted as is (never read as a
+    template); {{ and }} write one brace, any other brace is kept, and a {}
+    past the last argument stays {}."""
+    text = str(template)
+    out: list[str] = []
+    index = 0
+    next_arg = 0
+    length = len(text)
+    while index < length:
+        pair = text[index:index + 2]
+        if pair == "{{":
+            out.append("{")
+            index += 2
+        elif pair == "}}":
+            out.append("}")
+            index += 2
+        elif pair == "{}":
+            if next_arg < len(args):
+                out.append(_js_text(args[next_arg]))
+                next_arg += 1
+            else:
+                out.append("{}")
+            index += 2
+        else:
+            out.append(text[index])
+            index += 1
+    return "".join(out)
+
+
 def _core_string_format(template, *args):
-    return str(template).format(*args)
+    return _js_format(template, args)
 
 
 def _core_string_join(sep, values):
@@ -592,6 +902,8 @@ def _core_record_new(name, values):
             maximum=values.get("maximum"),
             pattern=values.get("pattern"),
             pattern_description=values.get("pattern_description", values.get("patternDescription")),
+            value_descriptions=values.get("value_descriptions", values.get("valueDescriptions")),
+            evidence=values.get("evidence"),
             format=values.get("format"),
             language=values.get("language"),
             description=values.get("description"),
@@ -621,21 +933,157 @@ def _core_fields_from_map(fields):
     return [item if isinstance(item, Field) else Field(name=name, type=item) for name, item in fields.items()]
 
 
+# A field name's title as TS's toTitle writes it (src/ax/dsp/sig.ts):
+# underscores become spaces, and a word starts at a capital after a lowercase
+# letter or digit, at the last capital of a run that begins a word, and at each
+# run of digits; words are separated by one space. userID is "User ID",
+# parseHTTPResponse "Parse HTTP Response", item123 "Item 123", field_2 "Field 2".
 def _title(name: str) -> str:
-    out = []
-    for i, ch in enumerate(name.replace("_", " ")):
-        if i > 0 and (ch.isupper() or ch.isdigit()):
-            out.append(" ")
-        out.append(ch)
-    text = "".join(out).strip()
+    text = name.replace("_", " ")
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text)
+    text = re.sub(r"([A-Z])([A-Z][a-z])", r"\1 \2", text)
+    text = re.sub(r"([^0-9])([0-9])", r"\1 \2", text)
+    text = re.sub(r"\s+", " ", text).strip()
     return text[:1].upper() + text[1:]
 
 
 # BEGIN AXIR CORE EMITTED FUNCTIONS
+def _box_schema_impl() -> Any:
+    _core_coverage_mark("_box_schema_impl")
+    edges = []
+    edges.append("top")
+    edges.append("bottom")
+    edges.append("left")
+    edges.append("right")
+    properties = {}
+    for edge in edges:
+        number = {}
+        number["type"] = "number"
+        number["minimum"] = 0
+        number["maximum"] = 1
+        properties[edge] = number
+    schema = {}
+    schema["type"] = "object"
+    schema["properties"] = properties
+    schema["required"] = edges
+    schema["additionalProperties"] = False
+    return schema
+
+
+def _signature_value_keys_impl(typ: FieldType) -> list[Any]:
+    _core_coverage_mark("_signature_value_keys_impl")
+    empty_keys = []
+    keys_raw = _core_get(typ, "options", None)
+    keys = _core_coalesce(keys_raw, empty_keys)
+    name = _core_get(typ, "name", None)
+    is_boolean = _core_eq(name, "boolean")
+    if is_boolean:
+        keys = []
+        keys.append("true")
+        keys.append("false")
+    else:
+        pass
+    return keys
+
+
 def parse_signature(signature: str) -> AxSignature:
     _core_coverage_mark("parse_signature")
     parsed = _signature_parse_impl(signature)
     return parsed
+
+
+def _signature_validate_value_descriptions_impl(typ: FieldType, field_name: str) -> None:
+    _core_coverage_mark("_signature_validate_value_descriptions_impl")
+    descriptions = _core_get(typ, "value_descriptions", None)
+    missing = _core_is_none(descriptions)
+    if missing:
+        return None
+    else:
+        pass
+    name = _core_get(typ, "name", None)
+    is_boolean = _core_eq(name, "boolean")
+    is_class = _core_eq(name, "class")
+    supported = _core_or(is_boolean, is_class)
+    object = _core_type_is(descriptions, "object")
+    valid = _core_and(supported, object)
+    invalid = _core_not(valid)
+    if invalid:
+        message = _core_string_format("Field \"{}\": value descriptions require a boolean or class field", field_name)
+        error = _core_signature_error(message)
+        raise error
+    else:
+        pass
+    allowed = _signature_value_keys_impl(typ)
+    keys = _core_map_keys(descriptions)
+    for key in keys:
+        known = _core_contains(allowed, key)
+        unknown = _core_not(known)
+        if unknown:
+            message = _core_string_format("Field \"{}\": unknown described value \"{}\"", field_name, key)
+            error = _core_signature_error(message)
+            raise error
+        else:
+            pass
+        value = _core_get(descriptions, key, None)
+        string = _core_type_is(value, "string")
+        invalid = _core_not(string)
+        if string:
+            trimmed = str(value).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
+            invalid = _core_eq(trimmed, "")
+        else:
+            pass
+        if invalid:
+            message = _core_string_format("Field \"{}\": description for \"{}\" must be a nonempty string", field_name, key)
+            error = _core_signature_error(message)
+            raise error
+        else:
+            pass
+    return None
+
+
+def _box_validate_impl(value: Any, path: str) -> Any:
+    _core_coverage_mark("_box_validate_impl")
+    valid = _core_type_is(value, "object")
+    if valid:
+        count = _core_len(value)
+        valid = _core_eq(count, 4)
+    else:
+        pass
+    edges = []
+    edges.append("top")
+    edges.append("bottom")
+    edges.append("left")
+    edges.append("right")
+    for edge in edges:
+        v = _core_get(value, edge, None)
+        number = _core_type_is(v, "number")
+        if number:
+            finite = _core_math_is_finite(v)
+            low = _core_gte(v, 0)
+            high = _core_lte(v, 1)
+            number = _core_and(low, high)
+            number = _core_and(number, finite)
+        else:
+            pass
+        valid = _core_and(valid, number)
+    if valid:
+        top = _core_get(value, "top", None)
+        bottom = _core_get(value, "bottom", None)
+        left = _core_get(value, "left", None)
+        right = _core_get(value, "right", None)
+        vertical = _core_lt(top, bottom)
+        horizontal = _core_lt(left, right)
+        valid = _core_and(vertical, horizontal)
+    else:
+        pass
+    invalid = _core_not(valid)
+    if invalid:
+        message = _core_string_format("Invalid box for {}: four finite edges in [0, 1], top < bottom and left < right are required", path)
+        error = _core_validation_error(message)
+        raise error
+    else:
+        pass
+    return value
 
 
 def validate_signature(signature: AxSignature) -> None:
@@ -688,9 +1136,66 @@ def _signature_output_fields(signature: AxSignature) -> list[Any]:
     return out
 
 
+def _signature_parse_value_description_impl(raw: str, field_name: str, key: str) -> str:
+    _core_coverage_mark("_signature_parse_value_description_impl")
+    quoted = _core_string_consume_optional_quoted_prefix(raw)
+    found = _core_get(quoted, "found", False)
+    description = _core_get(quoted, "value", "")
+    trimmed = str(description).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
+    empty = _core_eq(trimmed, "")
+    missing = _core_not(found)
+    invalid = _core_or(empty, missing)
+    rest = _core_get(quoted, "rest", "")
+    rest = str(rest).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
+    extra = _core_ne(rest, "")
+    invalid = _core_or(invalid, extra)
+    if invalid:
+        message = _core_string_format("Field \"{}\": \"{}\" requires a nonempty quoted description", field_name, key)
+        error = _core_signature_error(message)
+        raise error
+    else:
+        pass
+    return description
+
+
+def _evidence_is_type_impl(typ: FieldType) -> bool:
+    _core_coverage_mark("_evidence_is_type_impl")
+    evidence = _core_get(typ, "evidence", None)
+    present = _core_is_not_none(evidence)
+    name = _core_get(typ, "name", None)
+    score = _core_eq(name, "score")
+    box = _core_eq(name, "box")
+    result = _core_or(present, score)
+    result = _core_or(result, box)
+    return result
+
+
+def _evidence_has_fields_impl(fields: list[Any]) -> bool:
+    _core_coverage_mark("_evidence_has_fields_impl")
+    for field in fields:
+        typ = _core_get(field, "type", None)
+        decision = _evidence_is_type_impl(typ)
+        if decision:
+            return True
+        else:
+            pass
+        children = _core_get(typ, "fields", None)
+        present = _core_is_not_none(children)
+        if present:
+            nested = _core_fields_from_map(children)
+            decision = _evidence_has_fields_impl(nested)
+            if decision:
+                return True
+            else:
+                pass
+        else:
+            pass
+    return False
+
+
 def _signature_parse_impl(signature: str) -> AxSignature:
     _core_coverage_mark("_signature_parse_impl")
-    text = str(signature).strip()
+    text = str(signature).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
     text_len = _core_len(text)
     is_empty = _core_eq(text_len, 0)
     if is_empty:
@@ -701,7 +1206,7 @@ def _signature_parse_impl(signature: str) -> AxSignature:
     prefix = _core_string_consume_optional_quoted_prefix(text)
     description = _core_get(prefix, "value", None)
     rest = _core_get(prefix, "rest", None)
-    body = str(rest).strip()
+    body = str(rest).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
     arrow = _core_string_find_outside_quotes(body, "->")
     missing_arrow = _core_lt(arrow, 0)
     if missing_arrow:
@@ -718,10 +1223,10 @@ def _signature_parse_impl(signature: str) -> AxSignature:
     else:
         pass
     left_raw = _core_string_slice(body, 0, arrow)
-    left = str(left_raw).strip()
+    left = str(left_raw).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
     right_start = _core_add(arrow, 2)
     right_raw = _core_string_slice(body, right_start)
-    right = str(right_raw).strip()
+    right = str(right_raw).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
     left_len = _core_len(left)
     left_empty = _core_eq(left_len, 0)
     if left_empty:
@@ -746,12 +1251,174 @@ def _signature_parse_impl(signature: str) -> AxSignature:
     return parsed
 
 
+def _signature_parse_class_descriptions_impl(raw: str, field_name: str) -> Any:
+    _core_coverage_mark("_signature_parse_class_descriptions_impl")
+    text = str(raw).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
+    empty = _core_eq(text, "")
+    if empty:
+        message = _core_string_format("Field \"{}\": empty value description list", field_name)
+        error = _core_signature_error(message)
+        raise error
+    else:
+        pass
+    parts = _core_string_split_top_level(text, ",")
+    descriptions = {}
+    for part in parts:
+        entry = str(part).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
+        empty = _core_eq(entry, "")
+        if empty:
+            message = _core_string_format("Field \"{}\": trailing comma in value descriptions", field_name)
+            error = _core_signature_error(message)
+            raise error
+        else:
+            pass
+        quoted = _core_string_consume_optional_quoted_prefix(entry)
+        found = _core_get(quoted, "found", False)
+        key = _core_get(quoted, "value", "")
+        rest = _core_get(quoted, "rest", "")
+        if found:
+            rest = str(rest).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
+        else:
+            words = _core_string_words(entry)
+            key = _core_list_get(words, 0, "")
+            length = _core_len(key)
+            rest = _core_string_slice(entry, length)
+            rest = str(rest).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
+            valid = _core_regex_match("^[A-Za-z_][A-Za-z0-9_.-]*$", key)
+            invalid = _core_not(valid)
+            if invalid:
+                message = _core_string_format("Field \"{}\": expected a class label", field_name)
+                error = _core_signature_error(message)
+                raise error
+            else:
+                pass
+        duplicate = _core_map_contains(descriptions, key)
+        if duplicate:
+            message = _core_string_format("Field \"{}\": duplicate description for \"{}\"", field_name, key)
+            error = _core_signature_error(message)
+            raise error
+        else:
+            pass
+        description = _signature_parse_value_description_impl(rest, field_name, key)
+        descriptions[key] = description
+    return descriptions
+
+
+def _evidence_validate_type_impl(typ: FieldType) -> None:
+    _core_coverage_mark("_evidence_validate_type_impl")
+    name = _core_get(typ, "name", None)
+    evidence = _core_get(typ, "evidence", None)
+    present = _core_is_not_none(evidence)
+    if present:
+        supported = []
+        supported.append("boolean")
+        supported.append("class")
+        supported.append("score")
+        supported.append("box")
+        valid = _core_contains(supported, name)
+        object = _core_type_is(evidence, "object")
+        valid = _core_and(valid, object)
+        invalid = _core_not(valid)
+        if invalid:
+            error = _core_signature_error("Evidence requires a boolean, class, score or box field")
+            raise error
+        else:
+            pass
+        keys = _core_map_keys(evidence)
+        allowed = []
+        allowed.append("threshold")
+        allowed.append("onRefusal")
+        for key in keys:
+            known = _core_contains(allowed, key)
+            unknown = _core_not(known)
+            if unknown:
+                error = _core_signature_error("Unknown evidence option")
+                raise error
+            else:
+                pass
+        threshold = _core_get(evidence, "threshold", None)
+        has_threshold = _core_is_not_none(threshold)
+        if has_threshold:
+            is_boolean = _core_eq(name, "boolean")
+            number = _core_type_is(threshold, "number")
+            valid = _core_and(is_boolean, number)
+            if valid:
+                finite = _core_math_is_finite(threshold)
+                low = _core_gte(threshold, 0)
+                high = _core_lte(threshold, 1)
+                range = _core_and(low, high)
+                valid = _core_and(finite, range)
+            else:
+                pass
+            invalid = _core_not(valid)
+            if invalid:
+                error = _core_signature_error("threshold requires a boolean field and a finite value in [0, 1]")
+                raise error
+            else:
+                pass
+        else:
+            pass
+        policy = _core_get(evidence, "onRefusal", "throw")
+        throw_policy = _core_eq(policy, "throw")
+        return_policy = _core_eq(policy, "return")
+        valid = _core_or(throw_policy, return_policy)
+        invalid = _core_not(valid)
+        if invalid:
+            error = _core_signature_error("onRefusal must be throw or return")
+            raise error
+        else:
+            pass
+    else:
+        pass
+    score = _core_eq(name, "score")
+    if score:
+        labels = _core_get(typ, "options", None)
+        list = _core_type_is(labels, "list")
+        invalid = _core_not(list)
+        if invalid:
+            error = _core_signature_error("Score requires 2-10 distinct, nonempty ordered rubric labels")
+            raise error
+        else:
+            pass
+        count = _core_len(labels)
+        low = _core_lt(count, 2)
+        high = _core_gt(count, 10)
+        invalid = _core_or(low, high)
+        if invalid:
+            error = _core_signature_error("Score requires 2-10 distinct, nonempty ordered rubric labels")
+            raise error
+        else:
+            pass
+        seen = []
+        for label in labels:
+            string = _core_type_is(label, "string")
+            invalid = _core_not(string)
+            if invalid:
+                error = _core_signature_error("Score labels must be strings")
+                raise error
+            else:
+                pass
+            trimmed = str(label).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
+            empty = _core_eq(trimmed, "")
+            duplicate = _core_contains(seen, label)
+            invalid = _core_or(empty, duplicate)
+            if invalid:
+                error = _core_signature_error("Score requires distinct, nonempty ordered rubric labels")
+                raise error
+            else:
+                pass
+            seen.append(label)
+    else:
+        pass
+    return None
+
+
 def _signature_parse_fields_impl(text: str, output: bool) -> list[Any]:
     _core_coverage_mark("_signature_parse_fields_impl")
     parts = _core_string_split_top_level(text, ",")
     fields = []
     for part in parts:
-        trimmed = str(part).strip()
+        trimmed = str(part).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
         empty = _core_eq(trimmed, "")
         if empty:
             error = _core_signature_error("Unexpected content after signature")
@@ -763,15 +1430,73 @@ def _signature_parse_fields_impl(text: str, output: bool) -> list[Any]:
     return fields
 
 
+def _signature_render_value_descriptions_impl(typ: FieldType) -> list[Any]:
+    _core_coverage_mark("_signature_render_value_descriptions_impl")
+    entries = []
+    keys = _signature_value_keys_impl(typ)
+    empty_descriptions = {}
+    descriptions = _core_get(typ, "value_descriptions", empty_descriptions)
+    for key in keys:
+        present = _core_map_contains(descriptions, key)
+        if present:
+            description = _core_get(descriptions, key, None)
+            escaped = _signature_escape_string_impl(description)
+            label = _core_string_format("{}", key)
+            name = _core_get(typ, "name", None)
+            quote = _core_eq(name, "class")
+            if quote:
+                escaped_key = _signature_escape_string_impl(key)
+                label = _core_string_format("\"{}\"", escaped_key)
+            else:
+                pass
+            entry = _core_string_format("{} \"{}\"", label, escaped)
+            entries.append(entry)
+        else:
+            pass
+    return entries
+
+
 def _signature_parse_field_impl(raw: str, output: bool) -> Field:
     _core_coverage_mark("_signature_parse_field_impl")
     field = _signature_parse_field_common_impl(raw, output, False, "")
     return field
 
 
+def _signature_describe_field_values_impl(field: Field) -> Any:
+    _core_coverage_mark("_signature_describe_field_values_impl")
+    description = _core_get(field, "description", None)
+    typ = _core_get(field, "type", None)
+    keys = _signature_value_keys_impl(typ)
+    empty_descriptions = {}
+    descriptions = _core_get(typ, "value_descriptions", empty_descriptions)
+    parts = []
+    has_description = _core_truthy(description)
+    if has_description:
+        parts.append(description)
+    else:
+        pass
+    count = _core_len(parts)
+    for key in keys:
+        present = _core_map_contains(descriptions, key)
+        if present:
+            value = _core_get(descriptions, key, None)
+            part = _core_string_format("{}: {}", key, value)
+            parts.append(part)
+        else:
+            pass
+    size = _core_len(parts)
+    unchanged = _core_eq(size, count)
+    if unchanged:
+        return description
+    else:
+        pass
+    out = _core_string_join("\n", parts)
+    return out
+
+
 def _signature_parse_field_common_impl(raw: str, output: bool, nested: bool, parent: str) -> Field:
     _core_coverage_mark("_signature_parse_field_common_impl")
-    text = str(raw).strip()
+    text = str(raw).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
     head_parts = _core_string_split_once(text, ":")
     has_type = _core_get(head_parts, "found", False)
     name_part_raw = _core_get(head_parts, "left", None)
@@ -798,7 +1523,7 @@ def _signature_parse_field_common_impl(raw: str, output: bool, nested: bool, par
         else:
             pass
         section = _core_get(section_state, "value", None)
-        name_for_error = str(name_part_raw).strip()
+        name_for_error = str(name_part_raw).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
         if nested:
             name_for_error = _core_string_format("{}.{}", parent, name_for_error)
         else:
@@ -816,7 +1541,7 @@ def _signature_parse_field_common_impl(raw: str, output: bool, nested: bool, par
         quoted_info = _core_string_extract_quoted_suffix(name_part_raw)
         quoted = _core_get(quoted_info, "value", None)
         rest_after_quote_raw = _core_get(quoted_info, "rest", None)
-        rest_after_quote = str(rest_after_quote_raw).strip()
+        rest_after_quote = str(rest_after_quote_raw).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
         has_extra = _core_truthy(rest_after_quote)
         if has_extra:
             error = _core_signature_error("Unexpected content after signature")
@@ -827,12 +1552,12 @@ def _signature_parse_field_common_impl(raw: str, output: bool, nested: bool, par
         state["name_part"] = quoted_head
         state["description"] = quoted
     name_part_value = _core_get(state, "name_part", None)
-    name_part = str(name_part_value).strip()
+    name_part = str(name_part_value).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
     is_optional = _core_contains(name_part, "?")
     is_internal = _core_contains(name_part, "!")
     name_without_optional = _core_string_replace(name_part, "?", "")
     name_without_markers = _core_string_replace(name_without_optional, "!", "")
-    name = str(name_without_markers).strip()
+    name = str(name_without_markers).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
     nested_internal = _core_and(nested, is_internal)
     if nested_internal:
         qualified = _core_string_format("{}.{}", parent, name)
@@ -857,6 +1582,8 @@ def _signature_parse_field_common_impl(raw: str, output: bool, nested: bool, par
         type_maximum = _core_get(field_type, "maximum", None)
         type_pattern = _core_get(field_type, "pattern", None)
         type_pattern_description = _core_get(field_type, "pattern_description", None)
+        type_value_descriptions = _core_get(field_type, "value_descriptions", None)
+        type_evidence = _core_get(field_type, "evidence", None)
         type_format = _core_get(field_type, "format", None)
         type_language = _core_get(field_type, "language", None)
         type_attrs["name"] = type_name
@@ -869,6 +1596,8 @@ def _signature_parse_field_common_impl(raw: str, output: bool, nested: bool, par
         type_attrs["maximum"] = type_maximum
         type_attrs["pattern"] = type_pattern
         type_attrs["pattern_description"] = type_pattern_description
+        type_attrs["value_descriptions"] = type_value_descriptions
+        type_attrs["evidence"] = type_evidence
         type_attrs["format"] = type_format
         type_attrs["language"] = type_language
         type_attrs["description"] = description
@@ -888,9 +1617,148 @@ def _signature_parse_field_common_impl(raw: str, output: bool, nested: bool, par
     return field
 
 
+def _evidence_parse_options_impl(raw: str) -> Any:
+    _core_coverage_mark("_evidence_parse_options_impl")
+    parts = _core_string_split_top_level(raw, ",")
+    evidence = {}
+    seen = []
+    remaining = []
+    for part in parts:
+        part = str(part).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
+        words = _core_string_words(part)
+        token = _core_list_get(words, 0, "")
+        e = _core_eq(token, "evidence")
+        t = _core_eq(token, "threshold")
+        r = _core_eq(token, "refusal")
+        modifier = _core_or(e, t)
+        modifier = _core_or(modifier, r)
+        if modifier:
+            duplicate = _core_contains(seen, token)
+            if duplicate:
+                raise RuntimeError("Duplicate evidence modifier")
+            else:
+                pass
+            seen.append(token)
+            count = _core_len(words)
+            arg = _core_list_get(words, 1, "")
+            if e:
+                bad = _core_ne(count, 1)
+                if bad:
+                    raise RuntimeError("evidence does not take an argument")
+                else:
+                    pass
+            else:
+                bad = _core_ne(count, 2)
+                if bad:
+                    raise RuntimeError("Evidence modifier requires one argument")
+                else:
+                    pass
+                if t:
+                    number = _core_json_parse(arg)
+                    evidence["threshold"] = number
+                else:
+                    evidence["onRefusal"] = arg
+        else:
+            remaining.append(part)
+    has_evidence = _core_contains(seen, "evidence")
+    has_policy = _core_truthy(seen)
+    missing_evidence = _core_not(has_evidence)
+    invalid = _core_and(has_policy, missing_evidence)
+    if invalid:
+        raise RuntimeError("threshold and refusal require the evidence modifier")
+    else:
+        pass
+    out = {}
+    if has_evidence:
+        out["evidence"] = evidence
+    else:
+        pass
+    rest = _core_string_join(", ", remaining)
+    out["rest"] = rest
+    return out
+
+
+def _signature_nested_value_descriptions_impl(fields: Any, prefix: str) -> list[Any]:
+    _core_coverage_mark("_signature_nested_value_descriptions_impl")
+    out = []
+    nested_fields = _core_fields_from_map(fields)
+    for field in nested_fields:
+        name = _core_get(field, "name", None)
+        path = _core_string_format("{}.{}", prefix, name)
+        typ = _core_get(field, "type", None)
+        keys = _signature_value_keys_impl(typ)
+        empty = {}
+        descriptions = _core_get(typ, "value_descriptions", empty)
+        for key in keys:
+            present = _core_map_contains(descriptions, key)
+            if present:
+                description = _core_get(descriptions, key, None)
+                line = _core_string_format("{} = {}: {}", path, key, description)
+                out.append(line)
+            else:
+                pass
+        children = _core_get(typ, "fields", None)
+        lines = _signature_nested_value_descriptions_impl(children, path)
+        for line in lines:
+            out.append(line)
+    return out
+
+
+def _signature_output_value_descriptions_impl(fields: list[Any]) -> Any:
+    _core_coverage_mark("_signature_output_value_descriptions_impl")
+    out = {}
+    for field in fields:
+        internal = _core_get(field, "is_internal", False)
+        visible = _core_not(internal)
+        typ = _core_get(field, "type", None)
+        descriptions = _core_get(typ, "value_descriptions", None)
+        has_descriptions = _core_truthy(descriptions)
+        include = _core_and(visible, has_descriptions)
+        if include:
+            name = _core_get(field, "name", None)
+            entry = {}
+            description = _core_get(field, "description", None)
+            has_description = _core_is_not_none(description)
+            if has_description:
+                entry["description"] = description
+            else:
+                pass
+            entry["valueDescriptions"] = descriptions
+            out[name] = entry
+        else:
+            pass
+    return out
+
+
+def _evidence_render_entries_impl(typ: FieldType) -> list[Any]:
+    _core_coverage_mark("_evidence_render_entries_impl")
+    entries = []
+    evidence = _core_get(typ, "evidence", None)
+    present = _core_is_not_none(evidence)
+    if present:
+        entries.append("evidence")
+        threshold = _core_get(evidence, "threshold", None)
+        present = _core_is_not_none(threshold)
+        if present:
+            entry = _core_string_format("threshold {}", threshold)
+            entries.append(entry)
+        else:
+            pass
+        policy = _core_get(evidence, "onRefusal", None)
+        present = _core_is_not_none(policy)
+        if present:
+            entry = _core_string_format("refusal {}", policy)
+            entries.append(entry)
+        else:
+            pass
+    else:
+        pass
+    return entries
+
+
 def _signature_parse_description_impl(raw: str, fallback: Any) -> Any:
     _core_coverage_mark("_signature_parse_description_impl")
-    text = str(raw).strip()
+    text = str(raw).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
     empty = _core_eq(text, "")
     if empty:
         return fallback
@@ -905,7 +1773,7 @@ def _signature_parse_description_impl(raw: str, fallback: Any) -> Any:
     else:
         pass
     rest_raw = _core_get(quoted, "rest", None)
-    rest = str(rest_raw).strip()
+    rest = str(rest_raw).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
     has_extra = _core_truthy(rest)
     if has_extra:
         error = _core_signature_error("Unexpected content after signature")
@@ -913,13 +1781,13 @@ def _signature_parse_description_impl(raw: str, fallback: Any) -> Any:
     else:
         pass
     value_raw = _core_get(quoted, "value", None)
-    value = str(value_raw).strip()
+    value = str(value_raw).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
     return value
 
 
 def _signature_parse_base_type_impl(raw: str) -> Any:
     _core_coverage_mark("_signature_parse_base_type_impl")
-    text = str(raw).strip()
+    text = str(raw).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
     types = []
     types.append("datetimeRange")
     types.append("dateRange")
@@ -929,6 +1797,8 @@ def _signature_parse_base_type_impl(raw: str) -> Any:
     types.append("number")
     types.append("object")
     types.append("class")
+    types.append("score")
+    types.append("box")
     types.append("image")
     types.append("audio")
     types.append("file")
@@ -988,7 +1858,7 @@ def _signature_parse_type_expr_impl(raw: str, section: str, field_name: str) -> 
     base = _signature_parse_base_type_impl(raw)
     type_name = _core_get(base, "name", None)
     base_rest = _core_get(base, "rest", None)
-    rest = str(base_rest).strip()
+    rest = str(base_rest).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
     nested = _core_eq(section, "nested")
     media = []
     media.append("image")
@@ -1003,13 +1873,10 @@ def _signature_parse_type_expr_impl(raw: str, section: str, field_name: str) -> 
     else:
         pass
     is_class = _core_eq(type_name, "class")
-    if is_class:
+    is_score = _core_eq(type_name, "score")
+    is_enum = _core_or(is_class, is_score)
+    if is_enum:
         input = _core_eq(section, "input")
-        if input:
-            error = _core_signature_error("Input field cannot use the \"class\" type")
-            raise error
-        else:
-            pass
         bag = _core_string_starts_with(rest, "(")
         if bag:
             message = _core_string_format("Field \"{}\": constraints are not supported on class fields", field_name)
@@ -1020,7 +1887,7 @@ def _signature_parse_type_expr_impl(raw: str, section: str, field_name: str) -> 
         is_array = _core_string_starts_with(rest, "[]")
         if is_array:
             rest_after_array = _core_string_slice(rest, 2)
-            rest = str(rest_after_array).strip()
+            rest = str(rest_after_array).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
         else:
             pass
         bag_after = _core_string_starts_with(rest, "(")
@@ -1036,6 +1903,14 @@ def _signature_parse_type_expr_impl(raw: str, section: str, field_name: str) -> 
             quoted_value = _core_get(quoted, "value", None)
             option_text = _core_string_replace(quoted_value, "|", ",")
             options = _core_string_split_trim_nonempty(option_text, ",")
+            if is_score:
+                raw_options = _core_string_split_top_level(option_text, ",")
+                options = []
+                for option in raw_options:
+                    option = str(option).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
+                    options.append(option)
+            else:
+                pass
             option_count = _core_len(options)
             empty_options = _core_eq(option_count, 0)
             if empty_options:
@@ -1044,14 +1919,49 @@ def _signature_parse_type_expr_impl(raw: str, section: str, field_name: str) -> 
             else:
                 pass
             attrs = {}
-            attrs["name"] = "class"
+            attrs["name"] = type_name
             attrs["is_array"] = is_array
             attrs["options"] = options
+            quoted_rest = _core_get(quoted, "rest", None)
+            quoted_rest = str(quoted_rest).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
+            has_descriptions = _core_string_starts_with(quoted_rest, "(")
+            if has_descriptions:
+                group = _core_string_extract_leading_group(quoted_rest, "(", ")")
+                balanced = _core_get(group, "balanced", False)
+                unbalanced = _core_not(balanced)
+                if unbalanced:
+                    error = _core_signature_error("Expected closing parenthesis in value descriptions")
+                    raise error
+                else:
+                    pass
+                group_text = _core_get(group, "group", None)
+                policy = _evidence_parse_options_impl(group_text)
+                evidence = _core_get(policy, "evidence", None)
+                attrs["evidence"] = evidence
+                description_text = _core_get(policy, "rest", "")
+                has_description_text = _core_ne(description_text, "")
+                if has_description_text:
+                    descriptions = _signature_parse_class_descriptions_impl(description_text, field_name)
+                    attrs["value_descriptions"] = descriptions
+                else:
+                    pass
+                quoted_rest = _core_get(group, "rest", None)
+            else:
+                pass
+            quoted_rest = str(quoted_rest).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
+            suffix_array = _core_string_starts_with(quoted_rest, "[]")
+            if suffix_array:
+                attrs["is_array"] = True
+                quoted_rest = _core_string_slice(quoted_rest, 2)
+                quoted_rest = str(quoted_rest).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
+            else:
+                pass
             typ = _core_record_new("FieldType", attrs)
+            _evidence_validate_type_impl(typ)
+            _signature_validate_value_descriptions_impl(typ, field_name)
             out = {}
             out["type"] = typ
             out["is_cached"] = False
-            quoted_rest = _core_get(quoted, "rest", None)
             out["rest"] = quoted_rest
             return out
         else:
@@ -1076,11 +1986,11 @@ def _signature_parse_type_expr_impl(raw: str, section: str, field_name: str) -> 
         group_text = _core_get(group, "group", None)
         fields = _signature_parse_object_fields_impl(group_text, section, field_name)
         group_rest = _core_get(group, "rest", None)
-        after = str(group_rest).strip()
+        after = str(group_rest).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
         is_array = _core_string_starts_with(after, "[]")
         if is_array:
             after_array = _core_string_slice(after, 2)
-            after = str(after_array).strip()
+            after = str(after_array).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
         else:
             pass
         attrs = {}
@@ -1124,13 +2034,13 @@ def _signature_parse_type_expr_impl(raw: str, section: str, field_name: str) -> 
         modifier_state["is_cached"] = parsed_cached
         modifier_state["item_description"] = parsed_item
         group_rest = _core_get(group, "rest", None)
-        rest = str(group_rest).strip()
+        rest = str(group_rest).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
     else:
         pass
     is_array = _core_string_starts_with(rest, "[]")
     if is_array:
         rest_after_array = _core_string_slice(rest, 2)
-        rest = str(rest_after_array).strip()
+        rest = str(rest_after_array).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
     else:
         pass
     type_attrs = _core_get(modifier_state, "attrs", None)
@@ -1160,7 +2070,7 @@ def _signature_parse_type_expr_impl(raw: str, section: str, field_name: str) -> 
 
 def _signature_parse_modifier_bag_impl(type_name: str, section: str, field_name: str, raw: str) -> Any:
     _core_coverage_mark("_signature_parse_modifier_bag_impl")
-    text = str(raw).strip()
+    text = str(raw).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
     empty = _core_eq(text, "")
     if empty:
         message = _core_string_format("Field \"{}\": empty modifier list \"()\"", field_name)
@@ -1168,15 +2078,30 @@ def _signature_parse_modifier_bag_impl(type_name: str, section: str, field_name:
         raise error
     else:
         pass
-    parts = _core_string_split_top_level(raw, ",")
     attrs = {}
+    attrs["name"] = type_name
+    decision_options = _evidence_parse_options_impl(raw)
+    evidence = _core_get(decision_options, "evidence", None)
+    attrs["evidence"] = evidence
+    raw = _core_get(decision_options, "rest", "")
+    empty_decision_bag = _core_eq(raw, "")
+    if empty_decision_bag:
+        out = {}
+        out["attrs"] = attrs
+        out["is_cached"] = False
+        typ = _core_record_new("FieldType", attrs)
+        _evidence_validate_type_impl(typ)
+        return out
+    else:
+        pass
+    parts = _core_string_split_top_level(raw, ",")
     seen = []
     state = {}
     state["is_cached"] = False
     none = _core_none()
     state["item_description"] = none
     for part in parts:
-        entry = str(part).strip()
+        entry = str(part).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
         entry_empty = _core_eq(entry, "")
         if entry_empty:
             message = _core_string_format("Field \"{}\": trailing comma in modifier list", field_name)
@@ -1188,9 +2113,37 @@ def _signature_parse_modifier_bag_impl(type_name: str, section: str, field_name:
         token = _core_list_get(words, 0, "")
         token_len = _core_len(token)
         arg_raw = _core_string_slice(entry, token_len)
-        arg = str(arg_raw).strip()
+        arg = str(arg_raw).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
         handled = {}
         handled["value"] = False
+        is_true = _core_eq(token, "true")
+        is_false = _core_eq(token, "false")
+        is_value = _core_or(is_true, is_false)
+        if is_value:
+            duplicate = _core_contains(seen, token)
+            if duplicate:
+                message = _core_string_format("Field \"{}\": duplicate \"{}\" modifier", field_name, token)
+                error = _core_signature_error(message)
+                raise error
+            else:
+                pass
+            seen.append(token)
+            is_boolean = _core_eq(type_name, "boolean")
+            invalid = _core_not(is_boolean)
+            if invalid:
+                message = _core_string_format("Field \"{}\": \"{}\" value descriptions require a boolean field", field_name, token)
+                error = _core_signature_error(message)
+                raise error
+            else:
+                pass
+            description = _signature_parse_value_description_impl(arg, field_name, token)
+            empty_descriptions = {}
+            descriptions = _core_get(attrs, "value_descriptions", empty_descriptions)
+            descriptions[token] = description
+            attrs["value_descriptions"] = descriptions
+            handled["value"] = True
+        else:
+            pass
         is_min = _core_eq(token, "min")
         is_max = _core_eq(token, "max")
         is_bound = _core_or(is_min, is_max)
@@ -1300,7 +2253,7 @@ def _signature_parse_modifier_bag_impl(type_name: str, section: str, field_name:
             pattern_value = _core_get(quoted, "value", None)
             attrs["pattern"] = pattern_value
             pattern_rest_raw = _core_get(quoted, "rest", None)
-            pattern_rest = str(pattern_rest_raw).strip()
+            pattern_rest = str(pattern_rest_raw).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
             has_pattern_rest = _core_truthy(pattern_rest)
             if has_pattern_rest:
                 desc = _core_string_consume_optional_quoted_prefix(pattern_rest)
@@ -1313,7 +2266,7 @@ def _signature_parse_modifier_bag_impl(type_name: str, section: str, field_name:
                 else:
                     pass
                 desc_rest_raw = _core_get(desc, "rest", None)
-                desc_rest = str(desc_rest_raw).strip()
+                desc_rest = str(desc_rest_raw).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
                 desc_extra = _core_truthy(desc_rest)
                 if desc_extra:
                     message = _core_string_format("Field \"{}\": expected \",\" or \")\" in modifier list", field_name)
@@ -1384,7 +2337,7 @@ def _signature_parse_modifier_bag_impl(type_name: str, section: str, field_name:
             else:
                 pass
             remaining_raw = _core_get(quoted, "rest", None)
-            remaining = str(remaining_raw).strip()
+            remaining = str(remaining_raw).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
             extra = _core_truthy(remaining)
             if extra:
                 message = _core_string_format("Field \"{}\": expected \",\" or \")\" in modifier list", field_name)
@@ -1433,9 +2386,91 @@ def _signature_parse_modifier_bag_impl(type_name: str, section: str, field_name:
     return out
 
 
+def _evidence_request_fields_impl(fields: list[Any]) -> Any:
+    _core_coverage_mark("_evidence_request_fields_impl")
+    out = {}
+    for field in fields:
+        typ = _core_get(field, "type", None)
+        decision = _evidence_is_type_impl(typ)
+        if decision:
+            entry = {}
+            name = _core_get(typ, "name", None)
+            labels = _core_get(typ, "options", None)
+            evidence = _core_get(typ, "evidence", None)
+            array = _core_get(typ, "is_array", False)
+            optional = _core_get(field, "is_optional", False)
+            entry["type"] = name
+            entry["options"] = labels
+            entry["evidence"] = evidence
+            entry["isArray"] = array
+            entry["isOptional"] = optional
+            key = _core_get(field, "name", None)
+            out[key] = entry
+        else:
+            pass
+    return out
+
+
+def _evidence_placeholder_impl(typ: FieldType) -> Any:
+    _core_coverage_mark("_evidence_placeholder_impl")
+    name = _core_get(typ, "name", None)
+    is_boolean = _core_eq(name, "boolean")
+    score = _core_eq(name, "score")
+    out = {}
+    if is_boolean:
+        out["probability"] = "<probability of true, 0 to 1>"
+    else:
+        empty = []
+        labels_raw = _core_get(typ, "options", None)
+        labels = _core_coalesce(labels_raw, empty)
+        ps = {}
+        if score:
+            ps = []
+        else:
+            pass
+        for label in labels:
+            if score:
+                ps.append("<probability, 0 to 1>")
+            else:
+                ps[label] = "<probability, 0 to 1>"
+        out["probabilities"] = ps
+    box = _core_eq(name, "box")
+    if box:
+        coordinates = {}
+        coordinates["top"] = "<top edge, 0 to 1>"
+        coordinates["bottom"] = "<bottom edge, greater than top, up to 1>"
+        coordinates["left"] = "<left edge, 0 to 1>"
+        coordinates["right"] = "<right edge, greater than left, up to 1>"
+        out = {}
+        out["box"] = coordinates
+        evidence = _core_get(typ, "evidence", None)
+        plain = _core_is_none(evidence)
+        if plain:
+            out = coordinates
+        else:
+            pass
+    else:
+        pass
+    evidence = _core_get(typ, "evidence", None)
+    policy = _core_get(evidence, "onRefusal", "throw")
+    return_policy = _core_eq(policy, "return")
+    if return_policy:
+        out["status"] = "answered"
+    else:
+        pass
+    array = _core_get(typ, "is_array", False)
+    if array:
+        wrapped = []
+        wrapped.append(out)
+        return wrapped
+    else:
+        pass
+    return out
+
+
 def _signature_parse_object_fields_impl(raw: str, section: str, parent: str) -> Any:
     _core_coverage_mark("_signature_parse_object_fields_impl")
-    text = str(raw).strip()
+    text = str(raw).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
     empty = _core_eq(text, "")
     if empty:
         message = _core_string_format("Field \"{}\": object type requires at least one field", parent)
@@ -1447,7 +2482,7 @@ def _signature_parse_object_fields_impl(raw: str, section: str, parent: str) -> 
     fields = {}
     output = _core_eq(section, "output")
     for part in parts:
-        entry = str(part).strip()
+        entry = str(part).strip("\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
         entry_empty = _core_eq(entry, "")
         if entry_empty:
             message = _core_string_format("Field \"{}\": trailing comma in object type", parent)
@@ -1466,6 +2501,88 @@ def _signature_parse_object_fields_impl(raw: str, section: str, parent: str) -> 
             pass
         fields[name] = field
     return fields
+
+
+def _evidence_example_values_impl(fields: list[Any], values: Any) -> Any:
+    _core_coverage_mark("_evidence_example_values_impl")
+    empty = {}
+    out = _core_map_merge(empty, values)
+    for field in fields:
+        name = _core_get(field, "name", None)
+        typ = _core_get(field, "type", None)
+        value = _core_get(out, name, None)
+        present = _core_is_not_none(value)
+        if present:
+            decision = _evidence_is_type_impl(typ)
+            children = _core_get(typ, "fields", None)
+            has_children = _core_is_not_none(children)
+            array = _core_get(typ, "is_array", False)
+            items = []
+            if array:
+                items = value
+            else:
+                items.append(value)
+            converted = []
+            for item in items:
+                object = _core_type_is(item, "object")
+                if object:
+                    if decision:
+                        raw = {}
+                        status = _core_get(item, "status", None)
+                        refused = _core_eq(status, "refused")
+                        if refused:
+                            raw["status"] = "refused"
+                        else:
+                            type_name = _core_get(typ, "name", None)
+                            is_boolean = _core_eq(type_name, "boolean")
+                            key = "probabilities"
+                            if is_boolean:
+                                key = "probability"
+                            else:
+                                pass
+                            probabilities = _core_get(item, key, None)
+                            raw[key] = probabilities
+                            box = _core_eq(type_name, "box")
+                            if box:
+                                coordinates = _core_get(item, "value", None)
+                                wire_box = _core_get(item, "box", item)
+                                coordinates = _core_coalesce(coordinates, wire_box)
+                                coordinates = _box_validate_impl(coordinates, name)
+                                raw = {}
+                                raw["box"] = coordinates
+                                evidence = _core_get(typ, "evidence", None)
+                                plain = _core_is_none(evidence)
+                                if plain:
+                                    raw = coordinates
+                                else:
+                                    pass
+                            else:
+                                pass
+                            evidence = _core_get(typ, "evidence", None)
+                            policy = _core_get(evidence, "onRefusal", None)
+                            return_policy = _core_eq(policy, "return")
+                            if return_policy:
+                                raw["status"] = "answered"
+                            else:
+                                pass
+                        item = raw
+                    else:
+                        if has_children:
+                            nested = _core_fields_from_map(children)
+                            item = _evidence_example_values_impl(nested, item)
+                        else:
+                            pass
+                else:
+                    pass
+                converted.append(item)
+            if array:
+                out[name] = converted
+            else:
+                single = _core_list_get(converted, 0)
+                out[name] = single
+        else:
+            pass
+    return out
 
 
 def signature_to_string(signature: AxSignature) -> str:
@@ -1506,7 +2623,10 @@ def _signature_escape_string_impl(value: str) -> str:
 
 def _signature_render_modifier_bag_impl(typ: FieldType, is_cached: bool) -> str:
     _core_coverage_mark("_signature_render_modifier_bag_impl")
-    entries = []
+    entries = _signature_render_value_descriptions_impl(typ)
+    evidence_entries = _evidence_render_entries_impl(typ)
+    for entry in evidence_entries:
+        entries.append(entry)
     min_length = _core_get(typ, "min_length", None)
     minimum = _core_get(typ, "minimum", None)
     min = _core_coalesce(min_length, minimum)
@@ -1586,17 +2706,30 @@ def _signature_render_type_impl(typ: FieldType, is_cached: bool) -> str:
     type_name = _core_get(typ, "name", None)
     is_array = _core_get(typ, "is_array", False)
     is_class = _core_eq(type_name, "class")
+    is_score = _core_eq(type_name, "score")
+    is_class = _core_or(is_class, is_score)
     if is_class:
         state = {}
-        state["value"] = "class"
+        state["value"] = type_name
         if is_array:
-            state["value"] = "class[]"
+            array_name = _core_string_format("{}[]", type_name)
+            state["value"] = array_name
         else:
             pass
         options = _core_get(typ, "options", None)
         joined = _core_string_join(" | ", options)
         class_name = _core_get(state, "value", None)
         result = _core_string_format("{} \"{}\"", class_name, joined)
+        entries = _signature_render_value_descriptions_impl(typ)
+        evidence_entries = _evidence_render_entries_impl(typ)
+        for entry in evidence_entries:
+            entries.append(entry)
+        has_entries = _core_truthy(entries)
+        if has_entries:
+            body = _core_string_join(", ", entries)
+            result = _core_string_format("{}({})", result, body)
+        else:
+            pass
         return result
     else:
         pass
@@ -1723,11 +2856,15 @@ def _signature_validate_field_shape_impl(field: Field, output: bool, nested: boo
     else:
         pass
     typ = _core_get(field, "type", None)
+    _signature_validate_value_descriptions_impl(typ, name)
+    _evidence_validate_type_impl(typ)
     type_name = _core_get(typ, "name", None)
     valid_types = []
     valid_types.append("audio")
     valid_types.append("boolean")
     valid_types.append("class")
+    valid_types.append("score")
+    valid_types.append("box")
     valid_types.append("code")
     valid_types.append("date")
     valid_types.append("dateRange")
@@ -1765,6 +2902,9 @@ def _signature_validate_field_shape_impl(field: Field, output: bool, nested: boo
     top_level = _core_not(nested)
     input_class_base = _core_and(is_class, is_input)
     input_class = _core_and(input_class_base, top_level)
+    input_evidence = _core_get(typ, "evidence", None)
+    plain_class = _core_is_none(input_evidence)
+    input_class = _core_and(input_class, plain_class)
     if input_class:
         error = _core_signature_error("Input field cannot use the \"class\" type")
         raise error
@@ -1872,3 +3012,10 @@ def _signature_validate_impl(signature: AxSignature) -> None:
     return None
 
 # END AXIR CORE EMITTED FUNCTIONS
+
+
+def _core_gte(a, b): return a >= b
+def _core_lte(a, b): return a <= b
+def _core_math_is_finite(value):
+    import math
+    return math.isfinite(value)

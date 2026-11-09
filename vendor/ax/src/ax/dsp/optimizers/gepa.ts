@@ -14,7 +14,7 @@ import {
   type AxParetoResult,
 } from '../optimizer.js';
 import { ax } from '../template.js';
-import type { AxGenOut, AxProgrammable } from '../types.js';
+import type { AxGenOut, AxProgramDemos, AxProgrammable } from '../types.js';
 import type { AxGEPAAdapter } from './gepaAdapter.js';
 import {
   bootstrapGEPADemos,
@@ -27,14 +27,13 @@ import {
 import { getGEPAUpdateGroup } from './gepaDependencies.js';
 import {
   type AxGEPABatchEvaluation,
+  type AxGEPAEvaluationState,
   evaluateGEPABatch,
+  getGEPAParetoSetSize,
   normalizeGEPAScores,
   scalarizeGEPAScores,
 } from './gepaEvaluation.js';
-import {
-  proposeGEPAComponentValue,
-  renderReflectiveValue,
-} from './gepaReflection.js';
+import { proposeGEPAComponentValue } from './gepaReflection.js';
 import { AxGEPAComponentSelector } from './gepaSelection.js';
 import {
   average,
@@ -150,8 +149,6 @@ export class AxGEPA extends AxBaseOptimizer {
   // GEPA+ enhancements
   private crossoverEvery: number;
   private tieEpsilon: number;
-  private feedbackMemorySize: number;
-  private feedbackMemory: string[] = [];
   private mergeMax: number;
   private mergesUsed = 0;
   private mergesDue = 0;
@@ -159,20 +156,6 @@ export class AxGEPA extends AxBaseOptimizer {
   private lastIterFoundNewProgram = false;
   private mergeAttemptKeys = new Set<string>();
   private mergeCompositionKeys = new Set<string>();
-
-  // GEPA reflection prompt template (aligned with reference implementation)
-  private static readonly REFLECTION_PROMPT_TEMPLATE =
-    `I provided an assistant with the following instructions to perform a task for me:
-\`\`\`
-<curr_instructions>
-\`\`\`
-
-The following are examples of different task inputs provided to the assistant along with the assistant's response for each of them, and some feedback on how the assistant's response could be better:
-\`\`\`
-<inputs_outputs_feedback>
-\`\`\`
-
-Your task is to write a new instruction for the assistant. Read the inputs carefully and identify the input format and infer detailed task description about the task I wish to solve with the assistant. Read all the assistant responses and the corresponding feedback. Identify all niche and domain specific factual information about the task and include it in the instruction, as a lot of it may not be available to the assistant in the future. The assistant may have utilized a generalizable strategy to solve the task, if so, include that in the instruction as well. Provide the new instructions within \`\`\` blocks.`;
 
   private rngState: number = 123456789;
   private samplerState: {
@@ -203,11 +186,7 @@ Your task is to write a new instruction for the assistant. Read the inputs caref
     this.minImprovementThreshold = args.minImprovementThreshold ?? 0.0;
     this.sampleCount = args.sampleCount ?? 1;
     // How many validation instances to track for Pareto set (cap cost)
-    const argPareto = (args as any)?.paretoSetSize as number | undefined;
-    this.paretoSetSize =
-      argPareto && argPareto > 0
-        ? Math.min(1000, Math.max(5, Math.floor(argPareto)))
-        : Math.max(10, Math.min(200, this.minibatchSize * 3));
+    this.paretoSetSize = getGEPAParetoSetSize(args);
 
     // GEPA+ defaults
     const argCrossoverEvery = (args as any)?.crossoverEvery as
@@ -221,8 +200,6 @@ Your task is to write a new instruction for the assistant. Read the inputs caref
     );
     const argTieEps = (args as any)?.tieEpsilon as number | undefined;
     this.tieEpsilon = Number.isFinite(argTieEps!) ? (argTieEps as number) : 0;
-    const argFbMem = (args as any)?.feedbackMemorySize as number | undefined;
-    this.feedbackMemorySize = Math.max(0, Math.floor(argFbMem ?? 4));
     // Default mergeMax to 5 (aligned with reference DSPy GEPA: use_merge=True, max_merge_invocations=5)
     const argMergeMax = (args as any)?.mergeMax as number | undefined;
     this.mergeMax = Math.max(0, Math.floor(argMergeMax ?? 5));
@@ -239,7 +216,6 @@ Your task is to write a new instruction for the assistant. Read the inputs caref
       this.minImprovementThreshold;
     this.localScoreHistory = [];
     this.localConfigurationHistory = [];
-    this.feedbackMemory = [];
     this.mergesUsed = 0;
     this.mergesDue = 0;
     this.totalMergesTested = 0;
@@ -252,7 +228,40 @@ Your task is to write a new instruction for the assistant. Read the inputs caref
   }
 
   /**
-   * Multi-objective GEPA: reflective evolution with Pareto frontier
+   * Prepare demonstrations after measuring the original program. The optimize()
+   * helper overrides this phase to compose AxBootstrapFewShot with GEPA.
+   */
+  protected async bootstrapProgram<IN, OUT extends AxGenOut>(
+    program: Readonly<AxProgrammable<IN, OUT>>,
+    examples: readonly AxTypedExample<IN>[],
+    metricFn: AxMetricFn | AxMultiMetricFn,
+    options: AxCompileOptions | undefined,
+    cfg: Readonly<Record<string, string>>,
+    state: AxGEPAEvaluationState
+  ): Promise<{ demos: AxProgramDemos<any, OUT>[]; metricCalls: number }> {
+    const bootstrapOptions = resolveBootstrapOptions(
+      options?.bootstrap,
+      examples.length
+    );
+    if (!bootstrapOptions) return { demos: [], metricCalls: 0 };
+
+    return bootstrapGEPADemos({
+      program,
+      ai: this.studentAI,
+      examples,
+      metricFn,
+      cfg,
+      applyConfig: (config) => applyGEPAComponentConfig(program, config),
+      options: bootstrapOptions,
+      state,
+      sampleCount: this.sampleCount,
+    });
+  }
+
+  /**
+   * Multi-objective GEPA: reflective evolution with Pareto frontier.
+   * Baseline scores describe the program before any configured bootstrap phase,
+   * using the same validation subset, sampling and scalarization as bestScore.
    */
   public async compile<IN, OUT extends AxGenOut>(
     program: Readonly<AxProgrammable<IN, OUT>>,
@@ -379,37 +388,36 @@ Your task is to write a new instruction for the assistant. Read the inputs caref
       baseCfg[target.id] = target.current;
     }
 
-    const bootstrapOptions = resolveBootstrapOptions(
-      (options as any)?.bootstrap,
-      examples.length
-    );
-    let bootstrappedDemos: any[] = [];
-    if (bootstrapOptions) {
-      const bootstrapResult = await bootstrapGEPADemos({
-        program,
-        ai: this.studentAI,
-        examples,
-        metricFn,
-        cfg: baseCfg,
-        applyConfig,
-        options: bootstrapOptions,
-        state: evaluationState,
-        sampleCount: this.sampleCount,
-      });
-      bootstrappedDemos = bootstrapResult.demos;
-      bootstrapMetricCalls = bootstrapResult.metricCalls;
-      this.stats.totalCalls = bootstrapMetricCalls;
-      if (bootstrappedDemos.length > 0) {
-        program.setDemos(bootstrappedDemos);
-      }
-    }
-
-    const baseEval = await evalBatch(
+    const baselineEval = (await evalBatch(
       baseCfg,
       paretoSet,
       'initial Pareto evaluation',
       true
+    ))!;
+    const baselineScores = { ...baselineEval.avg };
+    const baselineScore = scalarize(baselineScores);
+
+    const bootstrapResult = await this.bootstrapProgram(
+      program,
+      examples,
+      metricFn,
+      options,
+      baseCfg,
+      evaluationState
     );
+    const bootstrappedDemos = bootstrapResult.demos;
+    bootstrapMetricCalls = bootstrapResult.metricCalls;
+    this.stats.totalCalls = bootstrapMetricCalls + evaluationState.totalCalls;
+    let baseEval = baselineEval;
+    if (bootstrappedDemos.length > 0) {
+      program.setDemos(bootstrappedDemos);
+      baseEval = (await evalBatch(
+        baseCfg,
+        paretoSet,
+        'bootstrapped Pareto evaluation',
+        true
+      ))!;
+    }
     const candidates: {
       cfg: Record<string, string>;
       parent?: number;
@@ -418,11 +426,11 @@ Your task is to write a new instruction for the assistant. Read the inputs caref
       {
         cfg: { ...baseCfg },
         parent: undefined,
-        scores: baseEval!.avg,
+        scores: baseEval.avg,
       },
     ];
 
-    const perInstanceScores: number[][] = [baseEval!.scalars];
+    const perInstanceScores: number[][] = [baseEval.scalars];
 
     optLogger?.({
       name: 'OptimizationStart',
@@ -457,7 +465,8 @@ Your task is to write a new instruction for the assistant. Read the inputs caref
     for (let t = 0; t < this.numTrials; t++) {
       if (
         rolloutBudgetPareto !== undefined &&
-        this.stats.totalCalls >= Math.max(1, Math.floor(rolloutBudgetPareto))
+        evaluationState.totalCalls >=
+          Math.max(1, Math.floor(rolloutBudgetPareto))
       ) {
         break;
       }
@@ -1008,6 +1017,8 @@ Your task is to write a new instruction for the assistant. Read the inputs caref
       demos: bootstrappedDemos,
       stats: this.stats,
       bestScore,
+      baselineScore,
+      baselineScores,
       paretoFront: pareto.map((p) => ({
         demos: bootstrappedDemos,
         scores: p.scores,
@@ -1209,243 +1220,69 @@ Your task is to write a new instruction for the assistant. Read the inputs caref
 
     let feedbackSummary = '';
     try {
-      const out = (await critic.forward(aiToUse, {
-        targetId,
-        minibatch: tuples,
-        evalFeedback: external,
-      } as any)) as any;
+      const out = (await critic.forward(
+        aiToUse,
+        {
+          targetId,
+          minibatch: tuples,
+          evalFeedback: external,
+        } as any,
+        this.teacherOptions
+      )) as any;
       feedbackSummary =
         (out?.feedbackSummary as string | undefined)?.trim() || '';
-    } catch {}
+    } catch (error) {
+      this.logTeacherFailure(
+        `summarizing feedback for ${targetId}; continuing without a feedback summary`,
+        error,
+        options
+      );
+    }
 
-    const proposed = await proposeGEPAComponentValue({
-      ai: aiToUse,
-      target: {
-        id: targetId,
-        kind: targetMeta?.kind ?? 'component',
-        current: currentInstruction,
-        description: targetMeta?.description,
-        constraints: targetMeta?.constraints,
-        preserve: targetMeta?.preserve,
-        maxLength: targetMeta?.maxLength,
-        format: targetMeta?.format,
-        validate: targetMeta?.validate,
-      },
-      currentValue: currentInstruction,
-      tuples,
-      feedbackSummary,
-      traceDataset: targetMeta?.traceDataset,
-      maxAttempts: 2,
-    });
+    let proposed: string | undefined;
+    try {
+      proposed = await proposeGEPAComponentValue({
+        ai: aiToUse,
+        options: this.teacherOptions,
+        target: {
+          id: targetId,
+          kind: targetMeta?.kind ?? 'component',
+          current: currentInstruction,
+          description: targetMeta?.description,
+          constraints: targetMeta?.constraints,
+          preserve: targetMeta?.preserve,
+          maxLength: targetMeta?.maxLength,
+          format: targetMeta?.format,
+          validate: targetMeta?.validate,
+        },
+        currentValue: currentInstruction,
+        tuples,
+        feedbackSummary,
+        traceDataset: targetMeta?.traceDataset,
+        maxAttempts: 2,
+      });
+    } catch (error) {
+      this.logTeacherFailure(
+        `proposing a new value for ${targetId}; keeping the current value`,
+        error,
+        options
+      );
+    }
 
     return proposed ?? currentInstruction;
   }
 
-  private async reflectInstruction<IN, OUT extends AxGenOut>(
-    currentInstruction: string,
-    program: Readonly<AxGen<IN, OUT>>,
-    minibatch: readonly AxTypedExample<IN>[],
-    metricFn: AxMetricFn,
-    options?: AxCompileOptions,
-    // Optional: pre-evaluated tuples to avoid duplicate evaluation
-    preEvaluatedTuples?: Array<{
-      input: AxExample;
-      prediction: unknown;
-      score: number;
-    }>
-  ): Promise<string> {
-    // Collect quick feedback tuples from minibatch (or use pre-evaluated)
-    const tuples: Array<{
-      input: AxExample;
-      prediction: unknown;
-      score: number;
-    }> = preEvaluatedTuples ?? [];
-
-    if (tuples.length === 0) {
-      for (const ex of minibatch) {
-        try {
-          (program as any).setInstruction?.(currentInstruction);
-          const pred = await program.forward(
-            this.studentAI,
-            ex as IN,
-            {
-              sampleCount: this.sampleCount,
-            } as any
-          );
-          this.stats.totalCalls += 1;
-          const score = await metricFn({
-            prediction: pred,
-            example: ex as AxExample,
-          });
-          tuples.push({
-            input: ex as AxExample,
-            prediction: pred,
-            score: typeof score === 'number' ? score : 0,
-          });
-        } catch {
-          tuples.push({ input: ex as AxExample, prediction: {}, score: 0 });
-        }
-      }
-    }
-
-    const aiToUse: AxAIService =
-      (options as any)?.overrideTeacherAI ?? this.teacherAI ?? this.studentAI;
-    const componentId =
-      typeof (program as any)?.getId === 'function'
-        ? ((program as any).getId() as string | undefined)
-        : undefined;
-
-    // Optional: external feedback function
-    const feedbackFn:
-      | ((
-          arg: Readonly<{
-            prediction: any;
-            example: AxExample;
-            componentId?: string;
-          }>
-        ) => string | string[] | undefined)
-      | undefined = (options as any)?.feedbackFn;
-    const feedbackNotes = (
-      ((options as any)?.feedbackNotes as string[] | undefined) ?? []
-    ).filter((note) => typeof note === 'string' && note.trim().length > 0);
-
-    // Build reflective dataset in GEPA format (aligned with reference)
-    const formatReflectiveDataset = (): string => {
-      const examples: string[] = [];
-      for (let i = 0; i < tuples.length; i++) {
-        const t = tuples[i]!;
-        let exampleStr = `# Example ${i + 1}\n`;
-        exampleStr += `## Inputs\n`;
-        if (typeof t.input === 'object' && t.input !== null) {
-          for (const [k, v] of Object.entries(t.input)) {
-            exampleStr += `### ${k}\n${renderReflectiveValue(v)}\n\n`;
-          }
-        } else {
-          exampleStr += `${renderReflectiveValue(t.input)}\n\n`;
-        }
-        exampleStr += `## Generated Outputs\n`;
-        if (typeof t.prediction === 'object' && t.prediction !== null) {
-          for (const [k, v] of Object.entries(t.prediction)) {
-            exampleStr += `### ${k}\n${renderReflectiveValue(v)}\n\n`;
-          }
-        } else {
-          exampleStr += `${renderReflectiveValue(t.prediction)}\n\n`;
-        }
-        exampleStr += `## Feedback\n`;
-        // Get feedback from feedbackFn if available
-        let fb = `This trajectory got a score of ${t.score.toFixed(3)}.`;
-        if (typeof feedbackFn === 'function') {
-          try {
-            const customFb = feedbackFn({
-              prediction: t.prediction,
-              example: t.input,
-              componentId,
-            });
-            if (customFb) {
-              fb = Array.isArray(customFb) ? customFb.join('\n') : customFb;
-            }
-          } catch {}
-        }
-        exampleStr += `${fb}\n`;
-        examples.push(exampleStr);
-      }
-      const extraNotes = feedbackNotes.map(
-        (note, index) => `# Additional Feedback ${index + 1}\n${note}`
-      );
-      return [...extraNotes, ...examples].join('\n\n');
-    };
-
-    // Use the GEPA-style reflection prompt (aligned with reference)
-    const prompt = AxGEPA.REFLECTION_PROMPT_TEMPLATE.replace(
-      '<curr_instructions>',
-      currentInstruction
-    ).replace('<inputs_outputs_feedback>', formatReflectiveDataset());
-
-    try {
-      // Direct LLM call for reflection (more aligned with reference approach)
-      const response = await aiToUse.chat(
-        {
-          chatPrompt: [{ role: 'user', content: prompt }],
-          model: (options as any)?.reflectionModel,
-        },
-        { stream: false }
-      );
-      // Handle both streaming and non-streaming responses
-      if (typeof (response as any).getReader === 'function') {
-        throw new Error('Streaming response not expected for reflection');
-      }
-      const typedResponse =
-        response as import('../../ai/types.js').AxChatResponse;
-      const content = typedResponse.results?.[0]?.content;
-      if (typeof content === 'string') {
-        // Extract instruction from backticks (aligned with reference extractor)
-        const extracted = this.extractInstructionFromBackticks(content);
-        if (extracted && extracted.length > 16) {
-          // Maintain feedback memory for cross-iteration learning
-          const feedbackSummary = `Iteration feedback: ${tuples.map((t) => `score=${t.score.toFixed(2)}`).join(', ')}`;
-          this.feedbackMemory.unshift(feedbackSummary);
-          if (this.feedbackMemory.length > this.feedbackMemorySize) {
-            this.feedbackMemory.pop();
-          }
-          return extracted;
-        }
-      }
-    } catch {}
-
-    // Fallback to signature-based approach
-    const refl = ax(
-      `currentInstruction:string "Current instruction", feedbackSummary?:string "Summarized feedback", recentFeedback?:string[] "Past feedback memory", minibatch:json "Array of {input,prediction,score}" -> newInstruction:string "Improved instruction within 1-6 sentences."`
-    );
-
-    try {
-      const out = (await refl.forward(aiToUse, {
-        currentInstruction,
-        feedbackSummary: this.feedbackMemory[0] || '',
-        recentFeedback: this.feedbackMemory,
-        minibatch: tuples,
-      } as any)) as any;
-      const instr = (out?.newInstruction as string | undefined)?.trim();
-      if (instr && instr.length > 16) return instr;
-    } catch {}
-
-    // Final fallback: tweak the instruction minimally
-    return `${currentInstruction.trim()} Focus on step-by-step evidence-based reasoning. Avoid hallucinations.`.slice(
-      0,
-      2000
-    );
-  }
-
-  /**
-   * Extract instruction text from LLM output enclosed in backticks (aligned with reference)
-   */
-  private extractInstructionFromBackticks(lmOut: string): string {
-    const start = lmOut.indexOf('```') + 3;
-    const end = lmOut.lastIndexOf('```');
-
-    // Handle if the first and last backticks are the same or overlap
-    if (start >= end) {
-      const stripped = lmOut.trim();
-      if (stripped.startsWith('```')) {
-        // Remove opening ``` and optional language specifier
-        const match = stripped.match(/^```\S*\n?/);
-        if (match) {
-          return stripped.slice(match[0].length).trim();
-        }
-      } else if (stripped.endsWith('```')) {
-        // Remove closing ```
-        return stripped.slice(0, -3).trim();
-      }
-      return stripped;
-    }
-
-    // Extract content between backticks
-    let content = lmOut.slice(start, end);
-    // Skip optional language specifier (e.g., ```markdown\n)
-    const langMatch = content.match(/^\S*\n/);
-    if (langMatch) {
-      content = content.slice(langMatch[0].length);
-    }
-    return content.trim();
+  private logTeacherFailure(
+    action: string,
+    error: unknown,
+    options?: AxCompileOptions
+  ): void {
+    const message = error instanceof Error ? error.message : String(error);
+    this.getLogger(options)?.({
+      name: 'Notification',
+      id: 'gepa_teacher',
+      value: `GEPA teacher call failed while ${action}: ${message}`,
+    });
   }
 
   private updateSamplerShuffled(trainSize: number): void {
@@ -1649,37 +1486,5 @@ Your task is to write a new instruction for the assistant. Read the inputs caref
         suggestions,
       },
     };
-  }
-
-  private async mergeInstructions(
-    instructionA: string,
-    instructionB: string,
-    options?: AxCompileOptions
-  ): Promise<string> {
-    const aiToUse: AxAIService =
-      (options as any)?.overrideTeacherAI ?? this.teacherAI ?? this.studentAI;
-
-    // Merge via meta-prompt
-    const merger = ax(
-      `instructionA:string "Parent A instruction",
-       instructionB:string "Parent B instruction",
-       recentFeedback?:string[] "Past feedback memory"
-       -> mergedInstruction:string "Merged instruction (1-6 sentences) combining strengths, fixing weaknesses"`
-    );
-
-    try {
-      const out = (await merger.forward(aiToUse, {
-        instructionA,
-        instructionB,
-        recentFeedback: this.feedbackMemory,
-      } as any)) as any;
-      const instr = (out?.mergedInstruction as string | undefined)?.trim();
-      if (instr && instr.length > 16) return instr;
-    } catch {}
-
-    // Fallback: prefer the longer instruction (richer constraints)
-    return (
-      instructionA.length >= instructionB.length ? instructionA : instructionB
-    ).slice(0, 2000);
   }
 }

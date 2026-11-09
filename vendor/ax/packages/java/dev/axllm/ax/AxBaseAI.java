@@ -5,6 +5,7 @@ import java.util.Map;
 import java.util.UUID;
 
 public abstract class AxBaseAI implements AxAIService {
+  private static final ThreadLocal<AxCancellationToken> ACTIVE_CANCELLATION=new ThreadLocal<>();
   protected final String id = UUID.randomUUID().toString();
   protected final String name;
   protected final String model;
@@ -34,6 +35,7 @@ public abstract class AxBaseAI implements AxAIService {
   public Map<String, Object> getFeatures(String model) { return Core.defaultFeatures(); }
   public Map<String, Object> getMetrics() { return new LinkedHashMap<>(); }
   public java.util.List<Map<String, Object>> getModelList() {
+    for(String key:java.util.List.of("models","model_list","modelList"))if(options.containsKey(key))return Core.asList(options.get(key)).stream().map(Core::asMap).toList();
     java.util.List<Map<String, Object>> models = new java.util.ArrayList<>();
     if (model != null && !model.isBlank()) models.add(Map.of("key", model, "description", name + " chat model", "model", model));
     if (embedModel != null && !embedModel.isBlank()) models.add(Map.of("key", embedModel, "description", name + " embed model", "embedModel", embedModel));
@@ -51,6 +53,9 @@ public abstract class AxBaseAI implements AxAIService {
   public AxBaseAI setMeter(AxMeter meter) { this.runtimeHooks = new AxRuntimeHooks(runtimeHooks.rateLimiter(), runtimeHooks.tracer(), meter); return this; }
   public Map<String, Object> getOptions() { return new LinkedHashMap<>(options); }
 
+  /** Provider key for the model catalog lookup of the expensive-model gate. */
+  protected String modelCatalogProvider() { return name; }
+
   protected Map<String, Object> mergedOptions(Map<String, Object> callOptions) {
     Map<String, Object> overrides = AxRuntimeHooks.strip(callOptions);
     Map<String, Object> merged = Core.asMap(Core.mapMerge(options, overrides));
@@ -64,17 +69,40 @@ public abstract class AxBaseAI implements AxAIService {
     return merged;
   }
 
+  protected static AxCancellationToken cancellation(Map<String,Object> options){
+    if(options==null)return null;
+    Object value=options.getOrDefault("cancellation",options.getOrDefault("cancellationToken",options.get("cancellation_token")));
+    if(value==null)return null;
+    if(!(value instanceof AxCancellationToken token))throw new IllegalArgumentException("cancellation must be an AxCancellationToken");
+    return token;
+  }
+  protected static AxCancellationToken activeCancellation(){return ACTIVE_CANCELLATION.get();}
+
   public Map<String, Object> chat(Map<String, Object> request) throws Exception {
     return chat(request, Map.of());
   }
 
+  // A key from the client's model list stands for that entry's model and brings
+  // the entry's defaults underneath the caller's settings. Returns the resolved
+  // "request" and "options".
+  protected Map<String, Object> resolveModelKey(Map<String, Object> request, Map<String, Object> callOptions, boolean embed) {
+    return Core.asMap(Core.resolve_model_key(options, request, callOptions == null ? Map.of() : callOptions, embed ? embedModel : model, embed));
+  }
+
   public Map<String, Object> chat(Map<String, Object> request, Map<String, Object> callOptions) throws Exception {
+    AxCancellationToken cancellation=cancellation(callOptions);if(cancellation!=null)cancellation.throwIfCancelled();
     AxRuntimeHooks hooks = AxGlobals.effective(callOptions, runtimeHooks);
-    Map<String, Object> req = Core.coerceChatRequest(request);
+    Map<String, Object> resolved = resolveModelKey(Core.coerceChatRequest(request), callOptions, false);
+    Map<String, Object> req = Core.asMap(resolved.get("request"));
+    callOptions = Core.asMap(resolved.get("options"));
     Core.validate_chat_request(req);
     Map<String, Object> mergedOptions = mergedOptions(callOptions);
     Object rawModel = req.get("model");
     String selectedModel = rawModel == null ? model : String.valueOf(rawModel);
+    // Expensive models need confirmation before any request. Only the call
+    // options (or a model-key entry) confirm; the client's own options don't.
+    Core.provider_require_expensive_model_confirmation(modelCatalogProvider(), selectedModel, options, AxRuntimeHooks.strip(callOptions));
+    if(cancellation!=null)ACTIVE_CANCELLATION.set(cancellation);
     Map<String, Object> mergedConfig = Core.asMap(Core.merge_model_config(modelConfig, req.get("model_config"), mergedOptions));
     if (mergedOptions.containsKey("stream")) mergedConfig.put("stream", Boolean.TRUE.equals(mergedOptions.get("stream")));
     req = new LinkedHashMap<>(req);
@@ -86,7 +114,7 @@ public abstract class AxBaseAI implements AxAIService {
     boolean streaming = Boolean.TRUE.equals(mergedConfig.get("stream"));
     Map<String, Object> attributes = Map.of("ax.operation", "chat", "ax.ai", name, "ax.model", selectedModel, "ax.streaming", streaming);
     AxSpan span = AxGlobals.startSpan(hooks, "ax_llm_chat", "client", attributes, AxGlobals.currentSpan());
-    AxGlobals.recordMetric(hooks.meter(), "counter", "ax_llm_requests_total", 1, attributes);
+    AxGlobals.recordMetric(hooks.meter(), "counter", "ax_llm_requests_total", 1, AxGlobals.labeled(attributes, options, callOptions, false));
     long started = System.nanoTime();
     Throwable failure = null;
     try {
@@ -104,8 +132,9 @@ public abstract class AxBaseAI implements AxAIService {
       if (error instanceof Error fatal) throw fatal;
       throw new RuntimeException(error);
     } finally {
-      if (failure != null) AxGlobals.recordMetric(hooks.meter(), "counter", "ax_llm_errors_total", 1, attributes);
-      AxGlobals.recordMetric(hooks.meter(), "histogram", "ax_llm_request_duration_ms", (System.nanoTime() - started) / 1_000_000.0, attributes);
+      if(cancellation!=null)ACTIVE_CANCELLATION.remove();
+      if (failure != null) AxGlobals.recordMetric(hooks.meter(), "counter", "ax_llm_errors_total", 1, AxGlobals.labeled(attributes, options, callOptions, true));
+      AxGlobals.recordMetric(hooks.meter(), "histogram", "ax_llm_request_duration_ms", (System.nanoTime() - started) / 1_000_000.0, AxGlobals.labeled(attributes, options, callOptions, true));
       AxGlobals.finishSpan(span, failure);
     }
   }
@@ -115,7 +144,12 @@ public abstract class AxBaseAI implements AxAIService {
   }
 
   public Map<String, Object> embed(Map<String, Object> request, Map<String, Object> callOptions) throws Exception {
+    AxCancellationToken cancellation=cancellation(callOptions);if(cancellation!=null)cancellation.throwIfCancelled();
+    if(cancellation!=null)ACTIVE_CANCELLATION.set(cancellation);
     AxRuntimeHooks hooks = AxGlobals.effective(callOptions, runtimeHooks);
+    Map<String, Object> resolved = resolveModelKey(request, callOptions, true);
+    request = Core.asMap(resolved.get("request"));
+    callOptions = Core.asMap(resolved.get("options"));
     Object texts = request.get("texts");
     if (!(texts instanceof java.util.List<?> list) || list.isEmpty()) throw new AxAIServiceResponseError("Embed texts is empty");
     Object modelValue = request.getOrDefault("embed_model", request.get("embedModel"));
@@ -127,7 +161,7 @@ public abstract class AxBaseAI implements AxAIService {
     Map<String, Object> mergedOptions = mergedOptions(callOptions);
     Map<String, Object> attributes = Map.of("ax.operation", "embed", "ax.ai", name, "ax.model", selected, "ax.streaming", false);
     AxSpan span = AxGlobals.startSpan(hooks, "ax_llm_embed", "client", attributes, AxGlobals.currentSpan());
-    AxGlobals.recordMetric(hooks.meter(), "counter", "ax_llm_requests_total", 1, attributes);
+    AxGlobals.recordMetric(hooks.meter(), "counter", "ax_llm_requests_total", 1, AxGlobals.labeled(attributes, options, callOptions, false));
     long started = System.nanoTime();
     Throwable failure = null;
     try {
@@ -145,8 +179,9 @@ public abstract class AxBaseAI implements AxAIService {
       if (error instanceof Error fatal) throw fatal;
       throw new RuntimeException(error);
     } finally {
-      if (failure != null) AxGlobals.recordMetric(hooks.meter(), "counter", "ax_llm_errors_total", 1, attributes);
-      AxGlobals.recordMetric(hooks.meter(), "histogram", "ax_llm_request_duration_ms", (System.nanoTime() - started) / 1_000_000.0, attributes);
+      if(cancellation!=null)ACTIVE_CANCELLATION.remove();
+      if (failure != null) AxGlobals.recordMetric(hooks.meter(), "counter", "ax_llm_errors_total", 1, AxGlobals.labeled(attributes, options, callOptions, true));
+      AxGlobals.recordMetric(hooks.meter(), "histogram", "ax_llm_request_duration_ms", (System.nanoTime() - started) / 1_000_000.0, AxGlobals.labeled(attributes, options, callOptions, true));
       AxGlobals.finishSpan(span, failure);
     }
   }

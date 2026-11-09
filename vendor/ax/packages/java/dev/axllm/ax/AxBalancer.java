@@ -10,17 +10,25 @@ import java.util.List;
 import java.util.Map;
 import java.util.function.Consumer;
 
-public final class AxBalancer implements AxAIService {
+public final class AxBalancer implements AxAIService,ChatRunSelector,AxChatSession.Provider {
   public static final String inputOrderComparator = "input_order";
 
   private final List<AxAIService> services;
   private AxAIService currentService;
   private int currentServiceIndex = 0;
-  private final Map<String, Map<String, Object>> serviceFailures = new HashMap<>();
+  private java.util.concurrent.ConcurrentMap<String, Map<String, Object>> serviceFailures = new java.util.concurrent.ConcurrentHashMap<>();
   private final Map<String, Object> policy;
   private AdaptiveState adaptive;
   private boolean debug;
   private int maxRetries;
+
+  public java.util.function.Supplier<AiClient> ownedWorkerFactory() {
+    var factories=new ArrayList<java.util.function.Supplier<AiClient>>();for(var service:services){var factory=service.ownedWorkerFactory();if(factory==null)return null;factories.add(factory);}
+    var policy=Core.asMap(Core.ownedCopy(this.policy));var failures=serviceFailures;var adaptive=this.adaptive;int current=currentServiceIndex;int retries=maxRetries;boolean debug=this.debug;
+    var keys=new ArrayList<String>();var indices=new ArrayList<Integer>();if(adaptive!=null)for(var service:services){keys.add(adaptive.routeKeys.get(service));indices.add(adaptive.indices.get(service));}
+    return ()->{var clients=new ArrayList<AxAIService>();for(var factory:factories)clients.add((AxAIService)factory.get());var worker=new AxBalancer(clients,Map.of("strategy","input_order"));worker.policy.clear();worker.policy.putAll(Core.asMap(Core.ownedCopy(policy)));worker.maxRetries=retries;worker.debug=debug;worker.currentServiceIndex=current;worker.currentService=clients.get(current);worker.serviceFailures=failures;
+      if(adaptive!=null){var routeKeys=new java.util.IdentityHashMap<AxAIService,String>();var positions=new java.util.IdentityHashMap<AxAIService,Integer>();for(int i=0;i<clients.size();i++){routeKeys.put(clients.get(i),keys.get(i));positions.put(clients.get(i),indices.get(i));}worker.adaptive=new AdaptiveState(adaptive.strategy,adaptive.store,routeKeys,positions);}return worker;};
+  }
 
   public AxBalancer(List<? extends AxAIService> services) { this(services, Map.of()); }
 
@@ -117,28 +125,26 @@ public final class AxBalancer implements AxAIService {
   private boolean canRetryService(AxAIService service) { return !serviceFailures.containsKey(service.getId()); }
 
   private void handleFailure(AxAIService service) {
-    Map<String, Object> failure = serviceFailures.getOrDefault(service.getId(), new LinkedHashMap<>());
-    int retries = Core.asInt(failure.getOrDefault("retries", 0)) + 1;
-    Map<String, Object> next = new LinkedHashMap<>();
-    next.put("retries", retries);
-    serviceFailures.put(service.getId(), next);
+    serviceFailures.compute(service.getId(),(id,failure)->Map.of("retries",Core.asInt(failure==null?0:failure.getOrDefault("retries",0))+1));
   }
 
   private void handleSuccess(AxAIService service) { serviceFailures.remove(service.getId()); }
 
   private boolean retryable(AxAIServiceError error) {
-    if (error instanceof AxAIServiceAuthenticationError) return false;
+    if (error instanceof AxAIServiceAuthenticationError || error instanceof AxAIServiceAbortedError) return false;
     if (error instanceof AxAIServiceStatusError) {
       return error.status != null && List.of(408, 429, 500, 502, 503, 504, 529).contains(error.status);
     }
     return error instanceof AxAIServiceNetworkError || error instanceof AxAIServiceResponseError || error instanceof AxAIServiceStreamTerminatedError || error instanceof AxAIServiceTimeoutError;
   }
 
+  public void validateChatRequest(Map<String, Object> request) { candidateServices(request); }
+
   private List<AxAIService> candidateServices(Map<String, Object> request) {
     List<AxAIService> out = new ArrayList<>();
     String model = request.get("model") == null ? null : String.valueOf(request.get("model"));
     for (AxAIService service : services) {
-      if (Core.truthy(Core.provider_balancer_candidate_allowed(service.getFeatures(model), request))) out.add(service);
+      if (AxAIService.acceptsRequest(service, request) && Core.truthy(Core.provider_balancer_candidate_allowed(service.getFeatures(model), request))) out.add(service);
     }
     if (!out.isEmpty()) return out;
     List<String> requirements = new ArrayList<>();
@@ -281,6 +287,9 @@ public final class AxBalancer implements AxAIService {
     out.put("functions", false);
     out.put("streaming", false);
     out.put("thinking", false);
+    out.put("asyncTools", false);
+    out.put("nativeSteering", false);
+    out.put("reasoningUpdates", false);
     out.put("multiTurn", false);
     out.put("structuredOutputs", false);
     Map<String, Object> media = new LinkedHashMap<>();
@@ -323,17 +332,21 @@ public final class AxBalancer implements AxAIService {
     return out;
   }
 
-  public Map<String, Object> getFeatures(String model) {
+  public Map<String, Object> getFeatures(String model) { return mergedFeatures(services,model); }
+
+  static Map<String,Object> mergedFeatures(List<AxAIService> services,String model) {
     Map<String, Object> features = balancerBaseFeatures();
+    if (!services.isEmpty() && services.stream().allMatch(service -> { var raw = service.getFeatures(model); return Core.truthy(raw.getOrDefault("requiresStructuredOutput", raw.getOrDefault("requires_structured_output", false))); })) features.put("requiresStructuredOutput", true);
     Map<String, Object> media = Core.asMap(features.get("media"));
     List<Object> structuredOutputModes = new ArrayList<>();
     boolean allModesAdvertised = !services.isEmpty();
     for (AxAIService service : services) {
       Map<String, Object> raw = service.getFeatures(model);
+      features = Core.asMap(Core.provider_merge_audio_output(features, raw));
       Object rawModes = raw.containsKey("structuredOutputModes") ? raw.get("structuredOutputModes") : raw.get("structured_output_modes");
       if (rawModes == null) allModesAdvertised = false;
       else appendUnique(structuredOutputModes, rawModes);
-      for (String key : List.of("functions", "streaming", "thinking", "multiTurn", "structuredOutputs", "functionCot", "hasThinkingBudget", "hasShowThoughts")) {
+      for (String key : List.of("functions", "streaming", "thinking", "multiTurn", "structuredOutputs", "functionCot", "hasThinkingBudget", "hasShowThoughts", "asyncTools", "nativeSteering", "reasoningUpdates")) {
         String alt = switch (key) {
           case "multiTurn" -> "multi_turn";
           case "structuredOutputs" -> "structured_outputs";
@@ -401,6 +414,19 @@ public final class AxBalancer implements AxAIService {
     return out;
   }
 
+  public AxChatSession openChatSession(Map<String,Object> request,Map<String,Object> options)throws Exception {
+    var selected=pinChatRun(request,options);
+    if(!(selected instanceof AxChatSession.Provider provider))throw new IllegalArgumentException("Selected service does not support chat sessions");
+    return provider.openChatSession(request,options);
+  }
+  public AiClient pinChatRun(Map<String,Object> request,Map<String,Object> options) {
+    AxAIService selected;
+    if(adaptive!=null) {var ranked=rankAdaptive(request,options);selected=ranked.isEmpty()?null:ranked.get(0).service();}
+    else selected=candidateServices(request).stream().filter(this::canRetryService).findFirst().orElse(null);
+    if(selected==null)throw new IllegalArgumentException("No eligible service for this run");
+    currentService=selected;return selected;
+  }
+
   public Map<String, Object> chat(Map<String, Object> request) throws Exception { return chat(request, Map.of()); }
 
   public Map<String, Object> chat(Map<String, Object> request, Map<String, Object> options) throws Exception {
@@ -424,7 +450,7 @@ public final class AxBalancer implements AxAIService {
       } catch (AxAIServiceError e) {
         if (!retryable(e)) throw e;
         handleFailure(service);
-        Map<String, Object> failure = serviceFailures.get(service.getId());
+        Map<String, Object> failure = serviceFailures.getOrDefault(service.getId(),Map.of());
         if (Core.asInt(failure.getOrDefault("retries", 0)) >= maxRetries) {
           service = nextService(candidates, index);
           index++;
@@ -435,7 +461,14 @@ public final class AxBalancer implements AxAIService {
     }
   }
 
-  @Override public AxChatStream openStream(Map<String, Object> request) throws Exception {
+  @Override public AxChatStream openStream(Map<String, Object> request) throws Exception {return openStream(request,null);}
+
+  @Override public AxChatStream openStream(Map<String,Object> request,AxCancellationToken cancellation)throws Exception {return openStream(request,Map.of(),cancellation);}
+
+  // Services gate their own streams; the call options travel with the request.
+  @Override public AxChatStream openStream(Map<String,Object> request,Map<String,Object> options,AxCancellationToken cancellation)throws Exception {
+    Map<String,Object> callOptions=options==null?Map.of():options;
+    if(cancellation!=null)cancellation.throwIfCancelled();
     if (adaptive == null) {
       List<AxAIService> candidates = candidateServices(request);
       AxAIServiceError last = null;
@@ -444,7 +477,7 @@ public final class AxBalancer implements AxAIService {
         while (canRetryService(service)) {
           AxChatStream stream = null;
           try {
-            stream = service.openStream(request);
+            stream = service.openStream(request,callOptions,cancellation);
             Iterator<Map<String, Object>> iterator = stream.iterator();
             Map<String, Object> first = iterator.hasNext() ? iterator.next() : null;
             boolean[] firstPending = {first != null};
@@ -462,7 +495,7 @@ public final class AxBalancer implements AxAIService {
             if (!retryable(error)) throw error;
             last = error;
             handleFailure(service);
-            Map<String, Object> failure = serviceFailures.get(service.getId());
+            Map<String, Object> failure = serviceFailures.getOrDefault(service.getId(),Map.of());
             if (Core.asInt(failure.getOrDefault("retries", 0)) >= maxRetries) break;
           }
         }
@@ -470,14 +503,15 @@ public final class AxBalancer implements AxAIService {
       if (last != null) throw last;
       throw new IllegalArgumentException("All candidate services exhausted (tried " + candidates.size() + " service(s))");
     }
-    List<AdaptiveCandidate> ranked = rankAdaptive(request, Map.of()); AxAIServiceError last = null;
+    Map<String,Object> streamOptions=new LinkedHashMap<>(callOptions);if(cancellation!=null)streamOptions.put("cancellation",cancellation);
+    List<AdaptiveCandidate> ranked = rankAdaptive(request, streamOptions); AxAIServiceError last = null;
     for (int index = 0; index < ranked.size(); index++) {
       AdaptiveCandidate candidate = ranked.get(index); currentService = candidate.service(); Map<String, Object> selected = eventBase("selected", candidate.statsKey());
       selected.put("routeKey", candidate.routeKey()); selected.put("serviceName", candidate.service().getName()); selected.put("attempt", index + 1); emitRoutingEvent(selected);
       long started = System.nanoTime();
       AxChatStream stream = null;
       try {
-        stream = candidate.service().openStream(request);
+        stream = candidate.service().openStream(request,callOptions,cancellation);
         Iterator<Map<String, Object>> iterator = stream.iterator();
         Map<String, Object> first = iterator.hasNext() ? iterator.next() : null;
         boolean[] firstPending = {first != null};
@@ -507,6 +541,7 @@ public final class AxBalancer implements AxAIService {
   }
 
   @Override public AxChatStream stream(Map<String, Object> request) { return AxChatStream.lazy(() -> openStream(request)); }
+  @Override public Iterable<Map<String,Object>> stream(Map<String,Object> request,AxCancellationToken cancellation){return AxChatStream.lazy(()->openStream(request,cancellation));}
 
   public Map<String, Object> embed(Map<String, Object> request) throws Exception { return embed(request, Map.of()); }
 
@@ -529,7 +564,7 @@ public final class AxBalancer implements AxAIService {
       } catch (AxAIServiceError e) {
         if (!retryable(e)) throw e;
         handleFailure(currentService);
-        Map<String, Object> failure = serviceFailures.get(currentService.getId());
+        Map<String, Object> failure = serviceFailures.getOrDefault(currentService.getId(),Map.of());
         if (Core.asInt(failure.getOrDefault("retries", 0)) >= maxRetries) {
           AxAIService next = nextService(services, index);
           index++;

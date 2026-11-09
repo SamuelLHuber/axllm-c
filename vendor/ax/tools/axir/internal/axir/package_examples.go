@@ -1,5 +1,171 @@
 package axir
 
+const pyModelCatalogExample = `from axllm import get_supported_ai_models
+
+
+catalog = get_supported_ai_models()
+providers = {entry["name"]: entry for entry in catalog}
+azure = providers["azure-openai"]
+openrouter = providers["openrouter"]
+
+assert azure["isDynamic"] is True and azure["models"] == []
+assert "high" in azure["capabilities"]["thinkingLevels"]
+assert "priority" in azure["capabilities"]["serviceTiers"]
+assert openrouter["isDynamic"] is True and "flex" in openrouter["capabilities"]["serviceTiers"]
+assert all(entry["name"] in {item["name"] for item in get_supported_ai_models("text")} for entry in (azure, openrouter))
+
+print("python-model-catalog-ok")
+`
+
+const javaModelCatalogExample = `import dev.axllm.ax.Ax;
+import java.util.*;
+
+public final class ModelCatalogExample {
+  private static Map<?, ?> provider(List<Object> catalog, String name) {
+    return catalog.stream()
+      .map(entry -> (Map<?, ?>) entry)
+      .filter(entry -> name.equals(entry.get("name")))
+      .findFirst()
+      .orElseThrow();
+  }
+
+  public static void main(String[] args) {
+    List<Object> catalog = Ax.getSupportedAIModels();
+    Map<?, ?> azure = provider(catalog, "azure-openai");
+    Map<?, ?> openrouter = provider(catalog, "openrouter");
+    Map<?, ?> azureCapabilities = (Map<?, ?>) azure.get("capabilities");
+    Map<?, ?> openrouterCapabilities = (Map<?, ?>) openrouter.get("capabilities");
+
+    if (!Boolean.TRUE.equals(azure.get("isDynamic")) || !((List<?>) azure.get("models")).isEmpty()) throw new AssertionError();
+    if (!((List<?>) azureCapabilities.get("thinkingLevels")).contains("high")) throw new AssertionError();
+    if (!((List<?>) azureCapabilities.get("serviceTiers")).contains("priority")) throw new AssertionError();
+    if (!((List<?>) openrouterCapabilities.get("serviceTiers")).contains("flex")) throw new AssertionError();
+    provider(Ax.getSupportedAIModels("text"), "azure-openai");
+
+    System.out.println("java-model-catalog-ok");
+  }
+}
+`
+
+const cppModelCatalogExample = `#include "axllm/axllm.hpp"
+#include <iostream>
+#include <stdexcept>
+#include <string>
+
+axllm::Value provider(const axllm::Value& catalog, const std::string& name) {
+  for (const auto& entry : axllm::Core::iter(catalog)) {
+    if (axllm::display(axllm::Core::get(entry, "name")) == name) return entry;
+  }
+  throw std::runtime_error("missing provider " + name);
+}
+
+int main() {
+  const auto catalog = axllm::get_supported_ai_models();
+  const auto azure = provider(catalog, "azure-openai");
+  const auto openrouter = provider(catalog, "openrouter");
+  const auto azure_capabilities = axllm::Core::get(azure, "capabilities");
+  const auto openrouter_capabilities = axllm::Core::get(openrouter, "capabilities");
+
+  if (!axllm::equal(axllm::Core::get(azure, "isDynamic"), true)) return 2;
+  if (!axllm::Core::iter(axllm::Core::get(azure, "models")).empty()) return 3;
+  if (axllm::Core::iter(axllm::Core::get(azure_capabilities, "thinkingLevels")).empty()) return 4;
+  if (axllm::Core::iter(axllm::Core::get(openrouter_capabilities, "serviceTiers")).size() != 3) return 5;
+  provider(axllm::get_supported_ai_models(axllm::object({{"type", "text"}})), "azure-openai");
+
+  std::cout << "cpp-model-catalog-ok\n";
+}
+`
+
+const goModelCatalogExample = `package main
+
+import (
+  "fmt"
+  ax "github.com/ax-llm/ax/packages/go"
+)
+
+func values(value ax.Value) []ax.Value {
+  switch items := value.(type) {
+  case []ax.Value:
+    return items
+  case *ax.AxArray:
+    return items.Items
+  default:
+    panic(fmt.Sprintf("expected catalog array, got %T", value))
+  }
+}
+
+func provider(catalog ax.Value, name string) map[string]ax.Value {
+  for _, item := range values(catalog) {
+    entry := item.(map[string]ax.Value)
+    if entry["name"] == name {
+      return entry
+    }
+  }
+  panic("missing provider " + name)
+}
+
+func contains(items ax.Value, expected string) bool {
+  for _, item := range values(items) {
+    if item == expected {
+      return true
+    }
+  }
+  return false
+}
+
+func main() {
+  catalog := ax.GetSupportedAIModels(map[string]ax.Value{})
+  azure := provider(catalog, "azure-openai")
+  openrouter := provider(catalog, "openrouter")
+  azureCapabilities := azure["capabilities"].(map[string]ax.Value)
+  openrouterCapabilities := openrouter["capabilities"].(map[string]ax.Value)
+
+  if azure["isDynamic"] != true || len(values(azure["models"])) != 0 { panic("unexpected Azure profile") }
+  if !contains(azureCapabilities["thinkingLevels"], "high") { panic("missing Azure thinking levels") }
+  if !contains(azureCapabilities["serviceTiers"], "priority") { panic("missing Azure service tier") }
+  if !contains(openrouterCapabilities["serviceTiers"], "flex") { panic("missing OpenRouter service tier") }
+  provider(ax.GetSupportedAIModels(map[string]ax.Value{"type": "text"}), "azure-openai")
+
+  fmt.Println("go-model-catalog-ok")
+}
+`
+
+const rustModelCatalogExample = `use axllm::{
+    get_supported_ai_models, get_supported_ai_models_with_options, AxResult,
+};
+use serde_json::{json, Value};
+
+fn provider<'a>(catalog: &'a [Value], name: &str) -> &'a Value {
+    catalog
+        .iter()
+        .find(|entry| entry["name"] == name)
+        .unwrap_or_else(|| panic!("missing provider {name}"))
+}
+
+fn main() -> AxResult<()> {
+    let catalog = get_supported_ai_models()?;
+    let azure = provider(&catalog, "azure-openai");
+    let openrouter = provider(&catalog, "openrouter");
+
+    assert_eq!(azure["isDynamic"], true);
+    assert_eq!(azure["models"], json!([]));
+    assert!(azure["capabilities"]["thinkingLevels"]
+        .as_array()
+        .is_some_and(|levels| levels.iter().any(|level| level == "high")));
+    assert!(azure["capabilities"]["serviceTiers"]
+        .as_array()
+        .is_some_and(|tiers| tiers.iter().any(|tier| tier == "priority")));
+    assert!(openrouter["capabilities"]["serviceTiers"]
+        .as_array()
+        .is_some_and(|tiers| tiers.iter().any(|tier| tier == "flex")));
+
+    let text = get_supported_ai_models_with_options(json!({"type": "text"}))?;
+    provider(&text, "azure-openai");
+    println!("rust-model-catalog-ok");
+    Ok(())
+}
+`
+
 const pyContextCacheRecoveryExample = `import json
 import os
 import time
@@ -22,7 +188,7 @@ class ScriptedTransport:
 
 
 def client(transport):
-    return GoogleGeminiClient(model="gemini-3.5-flash", api_key="gemini-key", transport=transport, contextCache={"minTokens": 0, "ttlSeconds": 3600, "refreshWindowSeconds": 300})
+    return GoogleGeminiClient(model="gemini-3.8-flash", api_key="gemini-key", transport=transport, retry={"maxRetries": 1, "initialDelayMs": 1, "maxDelayMs": 1}, contextCache={"minTokens": 0, "ttlSeconds": 3600, "refreshWindowSeconds": 300})
 
 
 request = {"chat_prompt": [{"role": "system", "content": "stable context"}, {"role": "user", "content": "answer briefly"}]}
@@ -37,25 +203,31 @@ assert client(recovery).chat(request)["results"][0]["content"] == "uncached reco
 assert [item["method"] for item in recovery.requests] == ["POST", "POST", "POST"]
 assert "cachedContent" in recovery.requests[1]["json"] and "cachedContent" not in recovery.requests[2]["json"]
 
+# The old caches expire in two minutes: inside the 300-second refresh window,
+# so the second chat refreshes them, and far enough out that a slow first chat
+# cannot let them expire first.
 refresh = ScriptedTransport([
-    {"status": 200, "json": {"name": "cachedContents/old", "expireTime": future(1)}}, chat_response("old"),
+    {"status": 200, "json": {"name": "cachedContents/old", "expireTime": future(120)}}, chat_response("old"),
+    {"status": 500, "json": {"error": {"message": "refresh failed"}}},
     {"status": 500, "json": {"error": {"message": "refresh failed"}}},
     {"status": 200, "json": {"name": "cachedContents/new", "expireTime": future(3600)}}, chat_response("recreated"),
 ])
 refresh_client = client(refresh)
 refresh_client.chat(request)
 assert refresh_client.chat(request)["results"][0]["content"] == "recreated"
-assert [item["method"] for item in refresh.requests] == ["POST", "POST", "PATCH", "POST", "POST"]
+assert [item["method"] for item in refresh.requests] == ["POST", "POST", "PATCH", "PATCH", "POST", "POST"]
 
 fallback = ScriptedTransport([
-    {"status": 200, "json": {"name": "cachedContents/old", "expireTime": future(1)}}, chat_response("old"),
+    {"status": 200, "json": {"name": "cachedContents/old", "expireTime": future(120)}}, chat_response("old"),
     {"status": 500, "json": {"error": {"message": "refresh failed"}}},
+    {"status": 500, "json": {"error": {"message": "refresh failed"}}},
+    {"status": 500, "json": {"error": {"message": "recreate failed"}}},
     {"status": 500, "json": {"error": {"message": "recreate failed"}}}, chat_response("uncached fallback"),
 ])
 fallback_client = client(fallback)
 fallback_client.chat(request)
 assert fallback_client.chat(request)["results"][0]["content"] == "uncached fallback"
-assert [item["method"] for item in fallback.requests] == ["POST", "POST", "PATCH", "POST", "POST"]
+assert [item["method"] for item in fallback.requests] == ["POST", "POST", "PATCH", "PATCH", "POST", "POST", "POST"]
 
 if os.getenv("AX_CONTEXT_CACHE_LIVE") == "1":
     key = os.getenv("GOOGLE_APIKEY") or os.getenv("GOOGLE_API_KEY")
@@ -63,7 +235,7 @@ if os.getenv("AX_CONTEXT_CACHE_LIVE") == "1":
         raise SystemExit("Set GOOGLE_APIKEY to run the live Gemini cache exercise")
     entries = {}
     registry = {"get": lambda namespace, cache_key: entries.get((namespace, cache_key)), "set": lambda namespace, cache_key, entry: entries.__setitem__((namespace, cache_key), entry)}
-    live = GoogleGeminiClient(model=os.getenv("AX_GEMINI_MODEL", "gemini-3.5-flash"), api_key=key, contextCache={"minTokens": 0, "ttlSeconds": 60, "refreshWindowSeconds": 120, "namespace": "live-example", "registry": registry})
+    live = GoogleGeminiClient(model=os.getenv("AX_GEMINI_MODEL", "gemini-3.8-flash"), api_key=key, contextCache={"minTokens": 0, "ttlSeconds": 60, "refreshWindowSeconds": 120, "namespace": "live-example", "registry": registry})
     live_request = {"chat_prompt": [{"role": "system", "content": "This is stable reference context. " * 4000}, {"role": "user", "content": "Reply with the word ready."}]}
     live.chat(live_request)
     first_expiry = next(iter(entries.values()))["expiresAt"]
@@ -87,7 +259,7 @@ import (
 func success(text string) ax.Value { return ax.Object("status", 200.0, "json", ax.Object("candidates", ax.Array(ax.Object("content", ax.Object("parts", ax.Array(ax.Object("text", text)))), "finishReason", "STOP"))) }
 func cache(name string, seconds int64) ax.Value { return ax.Object("status", 200.0, "json", ax.Object("name", name, "expireTime", float64(time.Now().Add(time.Duration(seconds)*time.Second).UnixMilli()))) }
 func failure(status float64, message string) ax.Value { return ax.Object("status", status, "json", ax.Object("error", ax.Object("message", message))) }
-func service(transport *ax.ScriptedTransport) *ax.GoogleGeminiClient { return ax.NewGoogleGeminiClient(map[string]ax.Value{"model":"gemini-3.5-flash", "api_key":"gemini-key", "transport":transport, "contextCache":ax.Object("minTokens",0.0,"ttlSeconds",3600.0,"refreshWindowSeconds",300.0)}) }
+func service(transport *ax.ScriptedTransport) *ax.GoogleGeminiClient { return ax.NewGoogleGeminiClient(map[string]ax.Value{"model":"gemini-3.8-flash", "api_key":"gemini-key", "transport":transport, "retry":ax.Object("maxRetries",1,"initialDelayMs",1,"maxDelayMs",1), "contextCache":ax.Object("minTokens",0.0,"ttlSeconds",3600.0,"refreshWindowSeconds",300.0)}) }
 func methods(requests []ax.Value) []string { out:=[]string{}; for _,request:=range requests { out=append(out, request.(map[string]ax.Value)["method"].(string)) }; return out }
 func same(actual []string, expected ...string) bool { if len(actual)!=len(expected){return false}; for i:=range actual{if actual[i]!=expected[i]{return false}}; return true }
 
@@ -95,10 +267,13 @@ func main() {
   request:=map[string]ax.Value{"chat_prompt":ax.Array(ax.Object("role","system","content","stable context"),ax.Object("role","user","content","answer briefly"))}
   recovery:=ax.NewScriptedTransport([]ax.Value{cache("cachedContents/cache-1",3600),failure(400,"cachedContent is invalid"),success("uncached recovery")})
   out,err:=service(recovery).Chat(context.Background(),request,nil); if err!=nil||out==nil||!same(methods(recovery.Requests),"POST","POST","POST"){panic(fmt.Sprint(out,err,recovery.Requests))}
-  refresh:=ax.NewScriptedTransport([]ax.Value{cache("cachedContents/old",1),success("old"),failure(500,"refresh failed"),cache("cachedContents/new",3600),success("recreated")})
-  refreshClient:=service(refresh); if _,err=refreshClient.Chat(context.Background(),request,nil);err!=nil{panic(err)}; if _,err=refreshClient.Chat(context.Background(),request,nil);err!=nil||!same(methods(refresh.Requests),"POST","POST","PATCH","POST","POST"){panic(fmt.Sprint(err,refresh.Requests))}
-  fallback:=ax.NewScriptedTransport([]ax.Value{cache("cachedContents/old",1),success("old"),failure(500,"refresh failed"),failure(500,"recreate failed"),success("uncached fallback")})
-  fallbackClient:=service(fallback); if _,err=fallbackClient.Chat(context.Background(),request,nil);err!=nil{panic(err)}; if _,err=fallbackClient.Chat(context.Background(),request,nil);err!=nil||!same(methods(fallback.Requests),"POST","POST","PATCH","POST","POST"){panic(fmt.Sprint(err,fallback.Requests))}
+  // The old caches expire in two minutes: inside the 300-second refresh window,
+  // so the second chat refreshes them, and far enough out that a slow first
+  // chat cannot let them expire first.
+  refresh:=ax.NewScriptedTransport([]ax.Value{cache("cachedContents/old",120),success("old"),failure(500,"refresh failed"),failure(500,"refresh failed"),cache("cachedContents/new",3600),success("recreated")})
+  refreshClient:=service(refresh); if _,err=refreshClient.Chat(context.Background(),request,nil);err!=nil{panic(err)}; if _,err=refreshClient.Chat(context.Background(),request,nil);err!=nil||!same(methods(refresh.Requests),"POST","POST","PATCH","PATCH","POST","POST"){panic(fmt.Sprint(err,refresh.Requests))}
+  fallback:=ax.NewScriptedTransport([]ax.Value{cache("cachedContents/old",120),success("old"),failure(500,"refresh failed"),failure(500,"refresh failed"),failure(500,"recreate failed"),failure(500,"recreate failed"),success("uncached fallback")})
+  fallbackClient:=service(fallback); if _,err=fallbackClient.Chat(context.Background(),request,nil);err!=nil{panic(err)}; if _,err=fallbackClient.Chat(context.Background(),request,nil);err!=nil||!same(methods(fallback.Requests),"POST","POST","PATCH","PATCH","POST","POST","POST"){panic(fmt.Sprint(err,fallback.Requests))}
   fmt.Println("go-context-cache-recovery-ok")
 }
 `
@@ -245,12 +420,15 @@ public class ContextCacheRecoveryExample {
     public Object call(Map<String,Object> request){requests.add(new LinkedHashMap<>(request));return responses.removeFirst();}
     List<String> methods(){return requests.stream().map(value->String.valueOf(value.get("method"))).toList();}
   }
-  static GoogleGeminiClient service(Script script){return new GoogleGeminiClient(Map.of("model","gemini-3.5-flash","api_key","gemini-key","transport",script,"contextCache",Map.of("minTokens",0,"ttlSeconds",3600,"refreshWindowSeconds",300)));}
+  static GoogleGeminiClient service(Script script){return new GoogleGeminiClient(Map.of("model","gemini-3.8-flash","api_key","gemini-key","transport",script,"retry",Map.of("maxRetries",1,"initialDelayMs",1,"maxDelayMs",1),"contextCache",Map.of("minTokens",0,"ttlSeconds",3600,"refreshWindowSeconds",300)));}
   public static void main(String[] args) throws Exception {
     Map<String,Object> request=Map.of("chat_prompt",List.of(Map.of("role","system","content","stable context"),Map.of("role","user","content","answer briefly")));
     Script recovery=new Script(cache("cachedContents/cache-1",3600),failure(400,"cachedContent is invalid"),success("uncached recovery")); service(recovery).chat(request); if(!recovery.methods().equals(List.of("POST","POST","POST")))throw new AssertionError(recovery.methods());
-    Script refresh=new Script(cache("cachedContents/old",1),success("old"),failure(500,"refresh failed"),cache("cachedContents/new",3600),success("recreated")); GoogleGeminiClient refreshClient=service(refresh);refreshClient.chat(request);refreshClient.chat(request);if(!refresh.methods().equals(List.of("POST","POST","PATCH","POST","POST")))throw new AssertionError(refresh.methods());
-    Script fallback=new Script(cache("cachedContents/old",1),success("old"),failure(500,"refresh failed"),failure(500,"recreate failed"),success("uncached fallback"));GoogleGeminiClient fallbackClient=service(fallback);fallbackClient.chat(request);fallbackClient.chat(request);if(!fallback.methods().equals(List.of("POST","POST","PATCH","POST","POST")))throw new AssertionError(fallback.methods());
+    // The old caches expire in two minutes: inside the 300-second refresh window,
+    // so the second chat refreshes them, and far enough out that a slow first
+    // chat cannot let them expire first.
+    Script refresh=new Script(cache("cachedContents/old",120),success("old"),failure(500,"refresh failed"),failure(500,"refresh failed"),cache("cachedContents/new",3600),success("recreated")); GoogleGeminiClient refreshClient=service(refresh);refreshClient.chat(request);refreshClient.chat(request);if(!refresh.methods().equals(List.of("POST","POST","PATCH","PATCH","POST","POST")))throw new AssertionError(refresh.methods());
+    Script fallback=new Script(cache("cachedContents/old",120),success("old"),failure(500,"refresh failed"),failure(500,"refresh failed"),failure(500,"recreate failed"),failure(500,"recreate failed"),success("uncached fallback"));GoogleGeminiClient fallbackClient=service(fallback);fallbackClient.chat(request);fallbackClient.chat(request);if(!fallback.methods().equals(List.of("POST","POST","PATCH","PATCH","POST","POST","POST")))throw new AssertionError(fallback.methods());
     System.out.println("java-context-cache-recovery-ok");
   }
 }
@@ -269,12 +447,15 @@ fn now()->u64{SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()a
 fn success(text:&str)->Value{json!({"status":200,"json":{"candidates":[{"content":{"parts":[{"text":text}]},"finishReason":"STOP"}]}})}
 fn cache(name:&str,seconds:u64)->Value{json!({"status":200,"json":{"name":name,"expireTime":now()+seconds*1000}})}
 fn failure(status:u16,message:&str)->Value{json!({"status":status,"json":{"error":{"message":message}}})}
-fn service(script:Script)->OpenAICompatibleClient{OpenAICompatibleClient::new("gemini-key","gemini-3.5-flash").with_profile("google-gemini").with_options(json!({"contextCache":{"minTokens":0,"ttlSeconds":3600,"refreshWindowSeconds":300}})).with_transport(script)}
+fn service(script:Script)->OpenAICompatibleClient{OpenAICompatibleClient::new("gemini-key","gemini-3.8-flash").with_profile("google-gemini").with_options(json!({"retry":{"maxRetries":1,"initialDelayMs":1,"maxDelayMs":1},"contextCache":{"minTokens":0,"ttlSeconds":3600,"refreshWindowSeconds":300}})).with_transport(script)}
 fn main()->AxResult<()>{
  let request=json!({"chat_prompt":[{"role":"system","content":"stable context"},{"role":"user","content":"answer briefly"}]});
  let recovery=Script::new(vec![cache("cachedContents/cache-1",3600),failure(400,"cachedContent is invalid"),success("uncached recovery")]);service(recovery.clone()).chat(request.clone())?;assert_eq!(recovery.methods(),vec!["POST","POST","POST"]);
- let refresh=Script::new(vec![cache("cachedContents/old",1),success("old"),failure(500,"refresh failed"),cache("cachedContents/new",3600),success("recreated")]);let mut refresh_client=service(refresh.clone());refresh_client.chat(request.clone())?;refresh_client.chat(request.clone())?;assert_eq!(refresh.methods(),vec!["POST","POST","PATCH","POST","POST"]);
- let fallback=Script::new(vec![cache("cachedContents/old",1),success("old"),failure(500,"refresh failed"),failure(500,"recreate failed"),success("uncached fallback")]);let mut fallback_client=service(fallback.clone());fallback_client.chat(request.clone())?;fallback_client.chat(request)?;assert_eq!(fallback.methods(),vec!["POST","POST","PATCH","POST","POST"]);
+ // The old caches expire in two minutes: inside the 300-second refresh window,
+ // so the second chat refreshes them, and far enough out that a slow first
+ // chat cannot let them expire first.
+ let refresh=Script::new(vec![cache("cachedContents/old",120),success("old"),failure(500,"refresh failed"),failure(500,"refresh failed"),cache("cachedContents/new",3600),success("recreated")]);let mut refresh_client=service(refresh.clone());refresh_client.chat(request.clone())?;refresh_client.chat(request.clone())?;assert_eq!(refresh.methods(),vec!["POST","POST","PATCH","PATCH","POST","POST"]);
+ let fallback=Script::new(vec![cache("cachedContents/old",120),success("old"),failure(500,"refresh failed"),failure(500,"refresh failed"),failure(500,"recreate failed"),failure(500,"recreate failed"),success("uncached fallback")]);let mut fallback_client=service(fallback.clone());fallback_client.chat(request.clone())?;fallback_client.chat(request)?;assert_eq!(fallback.methods(),vec!["POST","POST","PATCH","PATCH","POST","POST","POST"]);
  println!("rust-context-cache-recovery-ok");Ok(())
 }
 `
@@ -305,6 +486,7 @@ fn main() -> AxResult<()> {
 
 const cppContextCacheRecoveryExample = `#include "axllm/axllm.hpp"
 #include <chrono>
+#include <csignal>
 #include <iostream>
 
 struct Script : axllm::Transport {
@@ -317,12 +499,12 @@ double now_ms(){return std::chrono::duration_cast<std::chrono::milliseconds>(std
 axllm::Value success(std::string text){return axllm::object({{"status",200},{"json",axllm::object({{"candidates",axllm::array({axllm::object({{"content",axllm::object({{"parts",axllm::array({axllm::object({{"text",text}})})}})},{"finishReason","STOP"}})})}})}});}
 axllm::Value cache(std::string name,int seconds){return axllm::object({{"status",200},{"json",axllm::object({{"name",name},{"expireTime",now_ms()+seconds*1000}})}});}
 axllm::Value failure(int status,std::string message){return axllm::object({{"status",status},{"json",axllm::object({{"error",axllm::object({{"message",message}})}})}});}
-axllm::GoogleGeminiClient service(Script* script){return axllm::GoogleGeminiClient(axllm::object({{"model","gemini-3.5-flash"},{"api_key","gemini-key"},{"contextCache",axllm::object({{"minTokens",0},{"ttlSeconds",3600},{"refreshWindowSeconds",300}})}}),script);}
+axllm::GoogleGeminiClient service(Script* script){return axllm::GoogleGeminiClient(axllm::object({{"model","gemini-3.8-flash"},{"api_key","gemini-key"},{"retry",axllm::object({{"maxRetries",1},{"initialDelayMs",1},{"maxDelayMs",1}})},{"contextCache",axllm::object({{"minTokens",0},{"ttlSeconds",3600},{"refreshWindowSeconds",300}})}}),script);}
 int main(){
  auto request=axllm::object({{"chat_prompt",axllm::array({axllm::object({{"role","system"},{"content","stable context"}}),axllm::object({{"role","user"},{"content","answer briefly"}})})}});
  Script recovery({cache("cachedContents/cache-1",3600),failure(400,"cachedContent is invalid"),success("uncached recovery")});auto recovery_client=service(&recovery);recovery_client.chat(request);if(recovery.methods()!=std::vector<std::string>({"POST","POST","POST"}))return 1;
- Script refresh({cache("cachedContents/old",120),success("old"),failure(500,"refresh failed"),cache("cachedContents/new",3600),success("recreated")});auto refresh_client=service(&refresh);refresh_client.chat(request);refresh_client.chat(request);if(refresh.methods()!=std::vector<std::string>({"POST","POST","PATCH","POST","POST"}))return 2;
- Script fallback({cache("cachedContents/old",120),success("old"),failure(500,"refresh failed"),failure(500,"recreate failed"),success("uncached fallback")});auto fallback_client=service(&fallback);fallback_client.chat(request);fallback_client.chat(request);if(fallback.methods()!=std::vector<std::string>({"POST","POST","PATCH","POST","POST"}))return 3;
+ Script refresh({cache("cachedContents/old",120),success("old"),failure(500,"refresh failed"),failure(500,"refresh failed"),cache("cachedContents/new",3600),success("recreated")});auto refresh_client=service(&refresh);refresh_client.chat(request);refresh_client.chat(request);if(refresh.methods()!=std::vector<std::string>({"POST","POST","PATCH","PATCH","POST","POST"}))return 2;
+ Script fallback({cache("cachedContents/old",120),success("old"),failure(500,"refresh failed"),failure(500,"refresh failed"),failure(500,"recreate failed"),failure(500,"recreate failed"),success("uncached fallback")});auto fallback_client=service(&fallback);fallback_client.chat(request);fallback_client.chat(request);if(fallback.methods()!=std::vector<std::string>({"POST","POST","PATCH","PATCH","POST","POST","POST"}))return 3;
  std::cout<<"cpp-context-cache-recovery-ok\n";
 }
 `
@@ -335,7 +517,7 @@ assert "answer" in schema["properties"], schema
 print("python-signature-schema-ok")
 `
 
-const pyAxGenScriptedClientToolExample = `from axllm import ax, f, fn
+const pyAxGenScriptedClientToolExample = `from axllm import ax, f, fn, run_control, set_caching_function
 
 
 class ScriptedClient:
@@ -351,40 +533,128 @@ class ScriptedClient:
                     {"id": "call_1", "name": "search", "params": {"query": "ax docs"}}
                 ],
             }
-        return {"content": "{\"answer\":\"Found Ax docs\"}"}
+        return {"content": "Answer:  Found Ax docs "}
+
+
+searches = []
+
+
+def search_docs(args):
+    searches.append(args)
+    return {"title": "Ax docs"}
 
 
 search = (
     fn("search")
     .description("Search docs")
     .arg("query", f.string().min(1))
-    .handler(lambda args: {"title": "Ax docs"})
+    .handler(search_docs)
     .build()
 )
 
 qa = ax("query:string -> answer:string", {"functions": [search]})
 qa.add_assert({"field": "answer", "contains": "Ax", "message": "answer should mention Ax"})
-qa.add_field_processor("answer", "trim")
+qa.add_field_transform("answer", "trim")
 out = qa.forward(ScriptedClient(), {"query": "ax docs"})
 assert out == {"answer": "Found Ax docs"}, out
+# The tool ran once, with the model's arguments.
+assert searches == [{"query": "ax docs"}], searches
 assert qa.get_traces()[-1]["output"] == out
+
+# A caching function reads with fn(key), which returns a stored output or
+# None, and stores with fn(key, output). As in TypeScript, a hit sends no
+# request and records no span or metric, and a streamed hit is one delta.
+class Span:
+    def __init__(self, name, ended):
+        self.name, self.ended = name, ended
+    def set_attributes(self, attributes): pass
+    def add_event(self, name, attributes=None): pass
+    def record_exception(self, error): pass
+    def set_status(self, status, description=None): pass
+    def end(self): self.ended.append(self.name)
+
+
+class Tracer:
+    def __init__(self):
+        self.spans = []
+    def start_span(self, name, *, kind="internal", attributes=None, parent=None):
+        return Span(name, self.spans)
+
+
+class Meter:
+    def __init__(self):
+        self.recorded = []
+    def instrument(self, name, **options):
+        recorded = self.recorded
+        class Instrument:
+            def add(self, value, attributes=None): recorded.append(name)
+            def record(self, value, attributes=None): recorded.append(name)
+        return Instrument()
+    create_counter = create_histogram = create_gauge = instrument
+
+
+class CountingClient:
+    def __init__(self):
+        self.calls = 0
+    def complete(self, request):
+        self.calls += 1
+        return {"content": "Answer: Paris"}
+
+
+def memory_cache(store):
+    def cache(key, output=None):
+        if output is None:
+            return store.get(key)
+        store[key] = output
+    return cache
+
+
+store, tracer, meter, client = {}, Tracer(), Meter(), CountingClient()
+cached = ax("question:string -> answer:string", {"caching_function": memory_cache(store)})
+cached.set_tracer(tracer).set_meter(meter)
+france = {"question": "Capital of France?"}
+assert cached.forward(client, france) == {"answer": "Paris"}
+assert client.calls == 1 and len(store) == 1, store
+assert "ax_gen_forward" in tracer.spans and "ax_gen_generation_requests_total" in meter.recorded
+spans, metrics = len(tracer.spans), len(meter.recorded)
+assert cached.forward(client, france) == {"answer": "Paris"}
+deltas = list(cached.streaming_forward(client, france))
+assert deltas == [{"version": 0, "index": 0, "delta": {"answer": "Paris"}}], deltas
+assert client.calls == 1, "a cache hit sent a request"
+assert tracer.spans[spans:] == [] and meter.recorded[metrics:] == [], (tracer.spans[spans:], meter.recorded[metrics:])
+# The forward call's function comes before the constructor's, and
+# set_caching_function covers programs that set none; a control skips it.
+call_store = {}
+cached.forward(client, france, {"cachingFunction": memory_cache(call_store)})
+assert client.calls == 2 and len(call_store) == 1
+global_store = {}
+set_caching_function(memory_cache(global_store))
+try:
+    plain = ax("question:string -> answer:string")
+    plain.forward(client, france)
+    plain.forward(client, france)
+    assert client.calls == 3 and len(global_store) == 1
+    plain.forward(client, france, {"control": run_control()})
+    assert client.calls == 4
+finally:
+    set_caching_function(None)
 print("python-axgen-ok")
 `
 
 const pyAxGenOpenAIExample = `import json
 import os
 
-from axllm import OpenAICompatibleClient, ax
+from axllm import ai, ax
 
 
 api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_APIKEY")
 if not api_key:
     raise SystemExit("Set OPENAI_API_KEY to run this provider API example.")
 
-client = OpenAICompatibleClient(
+client = ai(
+    "openai",
     api_key=api_key,
     model=os.getenv("AX_OPENAI_MODEL", "gpt-5.6-luna"),
-    model_config={"temperature": 0},
 )
 program = ax("question:string -> answer:string")
 out = program.forward(
@@ -472,8 +742,12 @@ const pyAxFlowProgramGraphExample = `from axllm import ax, flow
 
 
 class ScriptedClient:
+    def __init__(self):
+        self.calls = 0
+
     def complete(self, request):
-        return {"content": "{\"answer\":\"Paris\"}"}
+        self.calls += 1
+        return {"content": "Answer: Paris"}
 
 
 qa = ax("question:string -> answer:string")
@@ -481,6 +755,57 @@ program = flow({"id": "example.flow"}).execute("qa", qa).returns({"answer": "ans
 out = program.forward(ScriptedClient(), {"question": "Capital of France?"})
 assert out == {"answer": "Paris"}, out
 assert program.get_plan()["steps"][0]["name"] == "qa"
+
+
+# A caching function on the forward call caches the flow's output (and its
+# AxGen nodes' outputs). As in TypeScript, a flow hit runs no node and records
+# no span or metric.
+class Span:
+    def __init__(self, name, ended):
+        self.name, self.ended = name, ended
+    def set_attributes(self, attributes): pass
+    def add_event(self, name, attributes=None): pass
+    def record_exception(self, error): pass
+    def set_status(self, status, description=None): pass
+    def end(self): self.ended.append(self.name)
+
+
+class Tracer:
+    def __init__(self):
+        self.spans = []
+    def start_span(self, name, *, kind="internal", attributes=None, parent=None):
+        return Span(name, self.spans)
+
+
+class Meter:
+    def __init__(self):
+        self.recorded = []
+    def instrument(self, name, **options):
+        recorded = self.recorded
+        class Instrument:
+            def add(self, value, attributes=None): recorded.append(name)
+            def record(self, value, attributes=None): recorded.append(name)
+        return Instrument()
+    create_counter = create_histogram = create_gauge = instrument
+
+
+store = {}
+def cache(key, output=None):
+    if output is None:
+        return store.get(key)
+    store[key] = output
+
+
+tracer, meter, client = Tracer(), Meter(), ScriptedClient()
+program.set_tracer(tracer).set_meter(meter)
+france = {"question": "Capital of France?"}
+assert program.forward(client, france, {"caching_function": cache}) == {"answer": "Paris"}
+assert client.calls == 1 and len(store) == 2, store
+assert "ax_gen_flow_forward" in tracer.spans
+spans, metrics = len(tracer.spans), len(meter.recorded)
+assert program.forward(client, france, {"caching_function": cache}) == {"answer": "Paris"}
+assert client.calls == 1, "a flow cache hit ran its nodes"
+assert tracer.spans[spans:] == [] and meter.recorded[metrics:] == [], (tracer.spans[spans:], meter.recorded[metrics:])
 print("python-axflow-ok")
 `
 
@@ -632,31 +957,32 @@ from axllm import ax, playbook
 
 # A scripted client stands in for a real provider so this example runs without
 # a key. Swap it for ai("openai", api_key=...) to grow a playbook against a live
-# model. The canned JSON satisfies the bound program AND the playbook's internal
-# reflector/curator sub-programs, so the full ACE loop is exercised offline.
+# model. Each program answers in its own output format, chosen by the output
+# wire keys in its prompt: the bound program, then the playbook's reflector and
+# curator, so the full ACE loop is exercised offline.
 class ScriptedClient:
+    @staticmethod
+    def outputs(request, key):
+        return "(wire key: " + chr(96) + key + chr(96) + ")" in json.dumps(request.get("chat_prompt"))
+
     def complete(self, request):
-        return {
-            "content": json.dumps(
-                {
-                    "answer": "Ax composes typed LLM programs.",
-                    "reasoning": "The playbook lacked a brevity rule.",
-                    "errorIdentification": "Answer was too verbose.",
-                    "rootCauseAnalysis": "No guidance on conciseness.",
-                    "correctApproach": "Add a concise-answer guideline.",
-                    "keyInsight": "Prefer one-sentence answers.",
-                    "weaknessDescription": "The agent does not verify its final step.",
-                    "rootCause": "The final step is accepted without a check.",
-                    "proposedGuidance": "Verify the final step before completing the task.",
-                    "evidenceQuotes": ["final", "snapshot", "Answer"],
-                    "configRecommendations": [],
-                    "bulletTags": [],
-                    "operations": [
-                        {"type": "ADD", "section": "Guidelines", "content": "Answer in one concise sentence."}
-                    ],
-                }
-            )
-        }
+        if self.outputs(request, "errorIdentification"):
+            content = "\n".join([
+                "Reasoning: The playbook lacked a brevity rule.",
+                "Error Identification: Answer was too verbose.",
+                "Root Cause Analysis: No guidance on conciseness.",
+                "Correct Approach: Add a concise-answer guideline.",
+                "Key Insight: Prefer one-sentence answers.",
+                "Bullet Tags: []",
+            ])
+        elif self.outputs(request, "operations"):
+            content = "\n".join([
+                "Reasoning: The playbook lacked a brevity rule.",
+                'Operations: [{"type": "ADD", "section": "Guidelines", "content": "Answer in one concise sentence."}]',
+            ])
+        else:
+            content = "Answer: Ax composes typed LLM programs."
+        return {"content": content}
 
 
 client = ScriptedClient()
@@ -677,6 +1003,7 @@ rendered = pb.render()
 state = pb.to_json()
 assert "bestScore" in result, result
 assert "playbook" in state and "artifact" in state, state
+assert "Answer in one concise sentence." in rendered, rendered
 print(json.dumps({"bestScore": result["bestScore"], "rendered": rendered}, indent=2, sort_keys=True))
 print("python-ace-playbook-ok")
 `
@@ -687,31 +1014,41 @@ from axllm import AxCodeRuntime, AxCodeSession, RuntimeEnvelope, agent
 
 
 # The actor returns model-authored Python code and a real runtime executes it.
-# The same offline response also satisfies the playbook reflector and curator.
+# Each stage answers in its own output format: the actor's code as JSON, and
+# the responder, weakness miner, reflector and curator as field lines.
 class ScriptedClient:
+    @staticmethod
+    def outputs(request, key):
+        return "(wire key: " + chr(96) + key + chr(96) + ")" in json.dumps(request.get("chat_prompt"))
+
     def complete(self, request):
-        return {
-            "content": json.dumps(
-                {
-                    "pythonCode": "final('Answer', {'answer': 'Ax composes typed LLM programs.'})",
-                    "answer": "Ax composes typed LLM programs.",
-                    "reasoning": "The playbook lacked a brevity rule.",
-                    "errorIdentification": "Answer was too verbose.",
-                    "rootCauseAnalysis": "No guidance on conciseness.",
-                    "correctApproach": "Add a concise-answer guideline.",
-                    "keyInsight": "Prefer one-sentence answers.",
-                    "weaknessDescription": "The agent does not verify its final step.",
-                    "rootCause": "The final step is accepted without a check.",
-                    "proposedGuidance": "Verify the final step before completing the task.",
-                    "evidenceQuotes": ["final", "snapshot", "Answer"],
-                    "configRecommendations": [],
-                    "bulletTags": [],
-                    "operations": [
-                        {"type": "ADD", "section": "Guidelines", "content": "Answer in one concise sentence."}
-                    ],
-                }
-            )
-        }
+        if self.outputs(request, "pythonCode"):
+            content = json.dumps({"pythonCode": "final('Answer', {'answer': 'Ax composes typed LLM programs.'})"})
+        elif self.outputs(request, "weaknessDescription"):
+            content = "\n".join([
+                "Weakness Description: The agent does not verify its final step.",
+                "Root Cause: The final step is accepted without a check.",
+                "Proposed Guidance: Verify the final step before completing the task.",
+                'Evidence Quotes: ["final", "snapshot", "Answer"]',
+                "Config Recommendations: []",
+            ])
+        elif self.outputs(request, "errorIdentification"):
+            content = "\n".join([
+                "Reasoning: The playbook lacked a brevity rule.",
+                "Error Identification: Answer was too verbose.",
+                "Root Cause Analysis: No guidance on conciseness.",
+                "Correct Approach: Add a concise-answer guideline.",
+                "Key Insight: Prefer one-sentence answers.",
+                "Bullet Tags: []",
+            ])
+        elif self.outputs(request, "operations"):
+            content = "\n".join([
+                "Reasoning: The playbook lacked a brevity rule.",
+                'Operations: [{"type": "ADD", "section": "Guidelines", "content": "Answer in one concise sentence."}]',
+            ])
+        else:
+            content = "Answer: Ax composes typed LLM programs."
+        return {"content": content}
 
 
 class RuntimeSession(AxCodeSession):
@@ -797,24 +1134,314 @@ public final class AxGenScriptedClientToolExample {
           "function_calls", List.of(Map.of("id", "call_1", "name", "search", "params", Map.of("query", "ax docs")))
         );
       }
-      return Map.of("content", "{\"answer\":\"Found Ax docs\"}");
+      return Map.of("content", "Answer: Found Ax docs");
     }
   }
 
   public static void main(String[] args) {
+    List<Map<String, Object>> searches = new ArrayList<>();
     Tool search = Ax.fn("search")
       .description("Search docs")
       .arg("query", Ax.f().string().min(1))
-      .handler(values -> Map.of("title", "Ax docs"))
+      .handler(values -> {
+        searches.add(values);
+        return Map.of("title", "Ax docs");
+      })
       .build();
     AxGen qa = Ax.ax("query:string -> answer:string")
       .addTool(search)
       .addAssert(Map.of("field", "answer", "contains", "Ax", "message", "answer should mention Ax"))
-      .addFieldProcessor("answer", "trim");
+      .addFieldTransform("answer", "trim");
     Map<String, Object> out = qa.forward(new ScriptedClient(), Map.of("query", "ax docs"));
     if (!"Found Ax docs".equals(out.get("answer"))) throw new RuntimeException("bad output: " + out);
+    // The tool ran once, with the model's arguments.
+    if (!List.of(Map.of("query", "ax docs")).equals(searches)) throw new RuntimeException("search did not run once: " + searches);
     if (qa.getTraces().isEmpty()) throw new RuntimeException("missing trace");
     System.out.println("java-axgen-ok");
+  }
+}
+`
+
+const javaAxGenStreamingNoKeyExample = `import dev.axllm.ax.*;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.*;
+
+public final class AxGenStreamingNoKeyExample {
+  // Streams one scripted reply per request, chunk by chunk, and records the
+  // requests and whether each provider stream was closed.
+  static final class ScriptedStreamClient implements AiClient {
+    final List<List<String>> replies;
+    final List<Map<String, Object>> requests = new ArrayList<>();
+    final AtomicInteger closedStreams = new AtomicInteger();
+
+    ScriptedStreamClient(List<List<String>> replies) {
+      this.replies = new ArrayList<>(replies);
+    }
+
+    public Map<String, Object> complete(Map<String, Object> request) {
+      throw new UnsupportedOperationException("this client only streams");
+    }
+
+    @Override
+    public AxChatStream openStream(Map<String, Object> request) {
+      requests.add(request);
+      if (replies.isEmpty()) throw new IllegalStateException("scripted client exhausted");
+      Iterator<String> chunks = replies.remove(0).iterator();
+      boolean[] finished = {false};
+      return new AxChatStream(() -> {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("index", 0);
+        if (chunks.hasNext()) result.put("content", chunks.next());
+        else if (!finished[0]) { finished[0] = true; result.put("finish_reason", "stop"); }
+        else return null;
+        Map<String, Object> event = new LinkedHashMap<>();
+        event.put("results", new ArrayList<>(List.of(result)));
+        return event;
+      }, closedStreams::incrementAndGet);
+    }
+  }
+
+  // Merges a delta as TypeScript consumers do: strings and lists append, other
+  // values replace, and a new version starts the sample over.
+  static int merge(Map<String, Object> merged, int version, AxGenDelta delta) {
+    if (delta.version() != version) merged.clear();
+    for (Map.Entry<String, Object> entry : delta.delta().entrySet()) {
+      Object previous = merged.get(entry.getKey());
+      if (previous instanceof String text && entry.getValue() instanceof String more) merged.put(entry.getKey(), text + more);
+      else if (previous instanceof List<?> items && entry.getValue() instanceof List<?> more) {
+        List<Object> joined = new ArrayList<>(items);
+        joined.addAll(more);
+        merged.put(entry.getKey(), joined);
+      } else merged.put(entry.getKey(), entry.getValue());
+    }
+    return delta.version();
+  }
+
+  static void check(boolean condition, String message) {
+    if (!condition) throw new RuntimeException(message);
+  }
+
+  // An in-memory cachingFunction: apply(key, null) reads the stored output
+  // (null for a miss) and apply(key, output) stores one.
+  static AxCachingFunction memoryCache(Map<String, Map<String, Object>> store) {
+    return (key, value) -> {
+      if (value == null) return store.get(key);
+      store.put(key, value);
+      return null;
+    };
+  }
+
+  // A tracer and meter that record span and metric names.
+  static final class Telemetry implements AxTracer, AxMeter {
+    final List<String> names = Collections.synchronizedList(new ArrayList<>());
+
+    public AxSpan startSpan(AxSpanStart start) {
+      names.add(start.name());
+      return new AxSpan() {
+        public void setAttributes(Map<String, Object> attributes) {}
+        public void addEvent(String name, Map<String, Object> attributes) {}
+        public void recordException(Throwable error) {}
+        public void setStatus(String status, String description) {}
+        public void end() {}
+      };
+    }
+
+    public AxCounter createCounter(String name, AxMetricInstrumentOptions options) { return (value, attributes) -> names.add(name); }
+    public AxHistogram createHistogram(String name, AxMetricInstrumentOptions options) { return (value, attributes) -> names.add(name); }
+    public AxGauge createGauge(String name, AxMetricInstrumentOptions options) { return (value, attributes) -> names.add(name); }
+
+    // The AxGen run telemetry recorded since the last call: ax_gen_forward
+    // spans and ax_gen_generation_* metrics.
+    List<String> takeRun() {
+      synchronized (names) {
+        List<String> run = new ArrayList<>();
+        for (String name : names) if (name.equals("ax_gen_forward") || name.startsWith("ax_gen_generation_")) run.add(name);
+        names.clear();
+        return run;
+      }
+    }
+  }
+
+  public static void main(String[] args) throws Exception {
+    // 1. A streamed forward with a streaming assertion, a streaming field
+    //    processor, a TypeScript feedback processor, and field transforms.
+    ScriptedStreamClient client = new ScriptedStreamClient(List.of(
+        List.of("Answer: the ", "forbidden", " city\nNote: capital"),
+        List.of("Answer: Pari", "ss\nNote:  capital  "),
+        List.of("Answer: Paris\n", "Note:  capital  ")));
+    List<String> streamedAnswers = new ArrayList<>();
+    List<Object> feedbackValues = new ArrayList<>();
+    AxGen gen = Ax.ax("question:string -> answer:string, note:string")
+        .addStreamingAssert("answer", (text, done) -> text.contains("forbidden") ? "Do not say forbidden." : null, "Answer without forbidden words.")
+        .addStreamingFieldProcessor("answer", (text, context) -> {
+          streamedAnswers.add(String.valueOf(text));
+          return null;
+        })
+        .addFieldProcessor("answer", (value, context) -> {
+          feedbackValues.add(value);
+          check(context.done() && context.values().containsKey("answer"), "feedback context: " + context);
+          return "Pariss".equals(value) ? "Check the spelling." : null;
+        }, AxFieldProcessorMode.FEEDBACK)
+        .addFieldTransform("note", "trim")
+        .addFieldProcessor("note", (value, context) -> String.valueOf(value).toUpperCase(), AxFieldProcessorMode.TRANSFORM);
+
+    Map<String, Object> merged = new LinkedHashMap<>();
+    int version = 0;
+    SortedSet<Integer> versions = new TreeSet<>();
+    try (AxGenDeltaStream stream = gen.streamingForward(client, Map.of("question", "Capital of France?"), Map.of())) {
+      for (AxGenDelta delta : stream) {
+        versions.add(delta.version());
+        version = merge(merged, version, delta);
+      }
+    }
+    check(Map.of("answer", "Paris", "note", "CAPITAL").equals(merged), "merged output: " + merged);
+    check(versions.equals(new TreeSet<>(List.of(0, 1, 2))), "versions: " + versions);
+    check(client.requests.size() == 3, "requests: " + client.requests.size());
+    check(client.closedStreams.get() == 3, "closed provider streams: " + client.closedStreams.get());
+    check(feedbackValues.equals(List.of("Pariss", "Paris")), "feedback processor values: " + feedbackValues);
+    // A streaming processor sees the field's raw text so far.
+    check(streamedAnswers.contains(" Pari"), "streaming processor chunks: " + streamedAnswers);
+    String lastPrompt = Json.stringify(client.requests.get(2).get("chat_prompt"));
+    check(lastPrompt.contains("Check the spelling."), "feedback missing from the next step: " + lastPrompt);
+    String retryPrompt = Json.stringify(client.requests.get(1).get("chat_prompt"));
+    check(retryPrompt.contains("Do not say forbidden."), "assertion correction missing from the retry: " + retryPrompt);
+
+    // 2. Closing the stream early stops the run and closes the provider stream.
+    ScriptedStreamClient early = new ScriptedStreamClient(List.of(List.of("Answer: one", " two", " three\nNote: n")));
+    AxGen plain = Ax.ax("question:string -> answer:string, note:string");
+    AxGenDeltaStream stopped = plain.streamingForward(early, Map.of("question", "Count"), Map.of());
+    Iterator<AxGenDelta> iterator = stopped.iterator();
+    check(iterator.hasNext(), "missing first delta");
+    AxGenDelta first = iterator.next();
+    check("one".equals(first.delta().get("answer")), "first delta: " + first);
+    stopped.close();
+    check(!iterator.hasNext(), "a closed stream kept yielding");
+    check(early.closedStreams.get() == 1, "closing the stream left the provider stream open");
+    check(early.requests.size() == 1, "closing the stream retried the request");
+    try {
+      stopped.iterator();
+      throw new RuntimeException("a stream was consumed twice");
+    } catch (IllegalStateException expected) {
+      // single use
+    }
+
+    // 3. An exception a streaming assertion throws ends the forward without a
+    //    retry. It reaches the consumer as "Generate failed: ...", with the
+    //    exception it wraps as its cause, as TypeScript's AxGenerateError.
+    ScriptedStreamClient failing = new ScriptedStreamClient(List.of(List.of("Answer: fine", " then boom", "\nNote: n")));
+    AxGen strict = Ax.ax("question:string -> answer:string, note:string")
+        .addStreamingAssert("answer", (text, done) -> {
+          if (text.contains("boom")) throw new IllegalStateException("assertion exploded");
+          return true;
+        });
+    List<AxGenDelta> beforeError = new ArrayList<>();
+    try (AxGenDeltaStream stream = strict.streamingForward(failing, Map.of("question", "Status?"), Map.of())) {
+      for (AxGenDelta delta : stream) beforeError.add(delta);
+      throw new RuntimeException("the assertion error was not rethrown");
+    } catch (AxGenerateError expected) {
+      check(expected.getCause() instanceof IllegalStateException, "original assertion type was lost");
+      check("Generate failed: assertion exploded".equals(expected.getMessage()), "error message: " + expected.getMessage());
+      check(expected.getCause() != null && "assertion exploded".equals(expected.getCause().getMessage()), "error cause: " + expected.getCause());
+    }
+    check(!beforeError.isEmpty(), "deltas before the error were not delivered");
+    check(failing.requests.size() == 1, "an assertion error was retried");
+
+    // 4. Cancelling the token aborts the run with AxAIServiceAbortedError.
+    ScriptedStreamClient slow = new ScriptedStreamClient(List.of(List.of("Answer: first", " second", " third\nNote: n")));
+    AxCancellationToken token = new AxCancellationToken();
+    try (AxGenDeltaStream stream = plain.streamingForward(slow, Map.of("question", "Count"), Map.of(), token)) {
+      for (AxGenDelta delta : stream) token.cancel("user stopped");
+      throw new RuntimeException("cancellation did not abort the stream");
+    } catch (AxAIServiceAbortedError expected) {
+      check(expected.getMessage().contains("user stopped"), "abort message: " + expected.getMessage());
+    }
+
+    // 5. Through a provider client and its SSE parser: a forward that names no
+    //    model streams with the client's model.
+    List<Object> sentModels = new ArrayList<>();
+    OpenAICompatibleClient.Transport transport = call -> {
+      sentModels.add(((Map<?, ?>) call.get("json")).get("model"));
+      return Map.of("status", 200, "body",
+          "data: {\"id\":\"c1\",\"model\":\"gpt-5.4-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Answer: Par\"}}]}\n\n"
+              + "data: {\"id\":\"c1\",\"model\":\"gpt-5.4-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"is\"},\"finish_reason\":\"stop\"}]}\n\n"
+              + "data: [DONE]\n\n");
+    };
+    OpenAICompatibleClient provider = new OpenAICompatibleClient(Map.of("api_key", "test-key", "model", "gpt-5.4-mini", "transport", transport));
+    Map<String, Object> providerMerged = new LinkedHashMap<>();
+    int providerVersion = 0;
+    try (AxGenDeltaStream stream = Ax.ax("question:string -> answer:string").streamingForward(provider, Map.of("question", "Capital of France?"), Map.of())) {
+      for (AxGenDelta delta : stream) providerVersion = merge(providerMerged, providerVersion, delta);
+    }
+    check(Map.of("answer", "Paris").equals(providerMerged), "provider stream output: " + providerMerged);
+    check(sentModels.equals(List.of("gpt-5.4-mini")), "streamed request models: " + sentModels);
+
+    // 6. A cachingFunction from the constructor, the forward call or
+    //    AxGlobals: a hit sends no request, and streamingForward yields it as
+    //    one delta. As in TypeScript, the cache is read before the run
+    //    starts, so a hit records no ax_gen_forward span and no
+    //    ax_gen_generation_* metric.
+    AtomicInteger completions = new AtomicInteger();
+    AiClient counting = request -> {
+      completions.incrementAndGet();
+      return Map.of("content", "Answer: Paris");
+    };
+    Map<String, Object> france = Map.of("question", "Capital of France?");
+    Map<String, Map<String, Object>> store = new ConcurrentHashMap<>();
+    Telemetry telemetry = new Telemetry();
+    AxGen cachedGen = new AxGen(Ax.s("question:string -> answer:string"), Map.of("cachingFunction", memoryCache(store)))
+        .setTracer(telemetry)
+        .setMeter(telemetry);
+    Map<String, Object> stored = cachedGen.forward(counting, france);
+    List<String> missRun = telemetry.takeRun();
+    check(missRun.contains("ax_gen_forward") && missRun.contains("ax_gen_generation_requests_total"), "a cache miss run: " + missRun);
+    Map<String, Object> hit = cachedGen.forward(counting, france);
+    Map<String, Object> streamedHit = cachedGen.forward(counting, france, Map.of("stream", true));
+    check(Map.of("answer", "Paris").equals(stored) && stored.equals(hit) && stored.equals(streamedHit), "cached outputs: " + stored + ", " + hit + ", " + streamedHit);
+    check(completions.get() == 1 && store.size() == 1, "a cache hit sent a request: " + completions.get());
+    List<String> hitRun = telemetry.takeRun();
+    check(hitRun.isEmpty(), "forward cache hits recorded run telemetry: " + hitRun);
+    List<AxGenDelta> cachedDeltas = new ArrayList<>();
+    try (AxGenDeltaStream stream = cachedGen.streamingForward(counting, france, Map.of())) {
+      for (AxGenDelta delta : stream) cachedDeltas.add(delta);
+    }
+    check(cachedDeltas.equals(List.of(new AxGenDelta(0, 0, Map.of("answer", "Paris")))), "cached deltas: " + cachedDeltas);
+    check(completions.get() == 1, "a streamed cache hit sent a request");
+    List<String> streamedHitRun = telemetry.takeRun();
+    check(streamedHitRun.isEmpty(), "a streamed cache hit recorded run telemetry: " + streamedHitRun);
+    // A streamed miss runs, and records its run telemetry.
+    Map<String, Object> spain = Map.of("question", "Capital of Spain?");
+    try (AxGenDeltaStream stream = cachedGen.streamingForward(counting, spain, Map.of())) {
+      for (AxGenDelta delta : stream) check(delta.version() == 0, "streamed miss delta: " + delta);
+    }
+    List<String> streamedMissRun = telemetry.takeRun();
+    check(completions.get() == 2 && store.size() == 2, "a streamed cache miss: " + completions.get());
+    check(streamedMissRun.contains("ax_gen_forward") && streamedMissRun.contains("ax_gen_generation_requests_total"), "a streamed cache miss run: " + streamedMissRun);
+    // The forward call's function comes before the constructor's; the
+    // caching_function key works too.
+    Map<String, Map<String, Object>> callStore = new ConcurrentHashMap<>();
+    cachedGen.forward(counting, france, Map.of("cachingFunction", memoryCache(callStore)));
+    cachedGen.forward(counting, Map.of("question", "Capital of Italy?"), Map.of("caching_function", memoryCache(callStore)));
+    check(completions.get() == 4 && callStore.size() == 2 && store.size() == 2, "per-call cache: " + callStore.keySet());
+    // A run control skips the cache.
+    cachedGen.forward(counting, france, Map.of("control", new AxRunControl()));
+    check(completions.get() == 5, "a controlled run read the cache");
+    // The process-wide function applies when neither the call nor the
+    // constructor sets one; null clears it.
+    Map<String, Map<String, Object>> globalStore = new ConcurrentHashMap<>();
+    AxGlobals.setCachingFunction(memoryCache(globalStore));
+    try {
+      AxGen globalGen = Ax.ax("question:string -> answer:string");
+      globalGen.forward(counting, france);
+      globalGen.forward(counting, france);
+      check(completions.get() == 6 && globalStore.size() == 1, "global cache: " + completions.get());
+    } finally {
+      AxGlobals.setCachingFunction(null);
+    }
+    Ax.ax("question:string -> answer:string").forward(counting, france);
+    check(completions.get() == 7, "a cleared global cache still answered");
+
+    System.out.println("java-axgen-streaming-ok " + merged);
   }
 }
 `
@@ -829,10 +1456,9 @@ public final class AxGenOpenAIExample {
     if (apiKey == null || apiKey.isBlank()) {
       throw new IllegalStateException("Set OPENAI_API_KEY to run this provider API example.");
     }
-    OpenAICompatibleClient client = new OpenAICompatibleClient(Map.of(
+    AxAIService client = Ax.ai("openai", Map.of(
       "api_key", apiKey,
-      "model", System.getenv().getOrDefault("AX_OPENAI_MODEL", "gpt-5.6-luna"),
-      "model_config", Map.of("temperature", 0.0)
+      "model", System.getenv().getOrDefault("AX_OPENAI_MODEL", "gpt-5.6-luna")
     ));
     AxGen program = Ax.ax("question:string -> answer:string");
     Map<String, Object> out = program.forward(client, Map.of(
@@ -916,12 +1542,42 @@ public final class ProviderMappingNoKeyExample {
 
 const javaAxFlowProgramGraphExample = `import dev.axllm.ax.*;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public final class AxFlowProgramGraphExample {
   static final class ScriptedClient implements AiClient {
+    final AtomicInteger calls = new AtomicInteger();
+
     public Map<String, Object> complete(Map<String, Object> request) {
-      return Map.of("content", "{\"answer\":\"Paris\"}");
+      calls.incrementAndGet();
+      return Map.of("content", "Answer: Paris");
     }
+  }
+
+  // A tracer and meter that record span and metric names.
+  static final class Telemetry implements AxTracer, AxMeter {
+    final List<String> spans = Collections.synchronizedList(new ArrayList<>());
+    final List<String> metrics = Collections.synchronizedList(new ArrayList<>());
+
+    public AxSpan startSpan(AxSpanStart start) {
+      spans.add(start.name());
+      return new AxSpan() {
+        public void setAttributes(Map<String, Object> attributes) {}
+        public void addEvent(String name, Map<String, Object> attributes) {}
+        public void recordException(Throwable error) {}
+        public void setStatus(String status, String description) {}
+        public void end() {}
+      };
+    }
+
+    public AxCounter createCounter(String name, AxMetricInstrumentOptions options) { return (value, attributes) -> metrics.add(name); }
+    public AxHistogram createHistogram(String name, AxMetricInstrumentOptions options) { return (value, attributes) -> metrics.add(name); }
+    public AxGauge createGauge(String name, AxMetricInstrumentOptions options) { return (value, attributes) -> metrics.add(name); }
+  }
+
+  static void check(boolean condition, String message) {
+    if (!condition) throw new RuntimeException(message);
   }
 
   public static void main(String[] args) {
@@ -930,6 +1586,33 @@ public final class AxFlowProgramGraphExample {
     Map<String, Object> out = program.forward(new ScriptedClient(), Map.of("question", "Capital of France?"));
     if (!"Paris".equals(out.get("answer"))) throw new RuntimeException("bad output: " + out);
     if (!"qa".equals(((Map<?, ?>) ((List<?>) program.getPlan().get("steps")).get(0)).get("name"))) throw new RuntimeException("bad plan");
+
+    // A caching function on the forward call caches the flow's output (and
+    // its AxGen nodes' outputs). As in TypeScript, a flow hit runs no node and
+    // records no span or metric.
+    Map<String, Map<String, Object>> store = new ConcurrentHashMap<>();
+    AxCachingFunction cache = (key, value) -> {
+      if (value == null) return store.get(key);
+      store.put(key, value);
+      return null;
+    };
+    Telemetry telemetry = new Telemetry();
+    program.setTracer(telemetry).setMeter(telemetry);
+    ScriptedClient client = new ScriptedClient();
+    Map<String, Object> france = Map.of("question", "Capital of France?");
+    Map<String, Object> answer = Map.of("answer", "Paris");
+    check(answer.equals(program.forward(client, france, Map.of("cachingFunction", cache))), "flow cache miss output");
+    check(client.calls.get() == 1 && store.size() == 2, "a flow cache miss stores the flow's and its node's outputs: " + store.size());
+    check(telemetry.spans.contains("ax_gen_flow_forward") && telemetry.metrics.contains("ax_gen_flow_requests_total"), "a flow cache miss run: " + telemetry.spans + " " + telemetry.metrics);
+    int spans = telemetry.spans.size();
+    int metrics = telemetry.metrics.size();
+    check(answer.equals(program.forward(client, france, Map.of("cachingFunction", cache))), "flow cache hit output");
+    List<Map<String, Object>> deltas = program.streamingForward(client, france, Map.of("cachingFunction", cache));
+    check(deltas.equals(List.of(Map.of("version", 1, "index", 0, "delta", answer))), "streamed flow cache hit: " + deltas);
+    check(client.calls.get() == 1, "a flow cache hit ran its nodes");
+    List<String> hitSpans = new ArrayList<>(telemetry.spans.subList(spans, telemetry.spans.size()));
+    List<String> hitMetrics = new ArrayList<>(telemetry.metrics.subList(metrics, telemetry.metrics.size()));
+    check(hitSpans.isEmpty() && hitMetrics.isEmpty(), "flow cache hits recorded telemetry: " + hitSpans + " " + hitMetrics);
     System.out.println("java-axflow-ok");
   }
 }
@@ -1126,7 +1809,7 @@ struct ScriptedClient : axllm::AIClient {
         })}
       });
     }
-    return axllm::object({{"content", "{\"answer\":\"Found Ax docs\"}"}});
+    return axllm::object({{"content", "Answer: Found Ax docs"}});
   }
 };
 
@@ -1136,18 +1819,284 @@ int main() {
     {"properties", axllm::object({{"query", axllm::object({{"type", "string"}})}})},
     {"required", axllm::array({"query"})}
   });
-  axllm::Tool search("search", "Search docs", parameters, [](axllm::Value) {
+  axllm::Value searches = axllm::array({});
+  axllm::Tool search("search", "Search docs", parameters, [&searches](axllm::Value args) {
+    axllm::Core::append(searches, args);
     return axllm::object({{"title", "Ax docs"}});
   });
   auto qa = axllm::ax("query:string -> answer:string")
       .add_tool(search)
       .add_assert(axllm::object({{"field", "answer"}, {"contains", "Ax"}, {"message", "answer should mention Ax"}}))
-      .add_field_processor("answer", "trim");
+      .add_field_transform("answer", "trim");
   ScriptedClient client;
   axllm::Value out = qa.forward(client, axllm::object({{"query", "ax docs"}}));
   if (!axllm::equal(axllm::Core::get(out, "answer"), "Found Ax docs")) return 1;
+  // The tool ran once, with the model's arguments.
+  if (!axllm::equal(searches, axllm::array({axllm::object({{"query", "ax docs"}})}))) {
+    std::cerr << "search did not run once: " << axllm::stringify(searches) << "\n";
+    return 1;
+  }
   if (axllm::Core::truthy(axllm::Core::is_none(axllm::Core::get(qa.get_traces(), 0)))) return 1;
   std::cout << "cpp-axgen-ok\n";
+}
+`
+
+const cppAxGenStreamingNoKeyExample = `#include "axllm/axllm.hpp"
+#include <cctype>
+#include <iostream>
+#include <map>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <vector>
+
+// Streams one scripted answer per request as OpenAI SSE chunks of a few
+// characters, the way a provider streams text.
+struct ScriptedStream : axllm::Transport {
+  std::vector<std::string> answers;
+  std::vector<axllm::Value> requests;
+
+  explicit ScriptedStream(std::vector<std::string> scripted) : answers(std::move(scripted)) {}
+
+  axllm::Value call(axllm::Value) override { return axllm::Value::object(); }
+
+  void stream(axllm::Value request, axllm::AxTransportStreamHandler handler) override {
+    requests.push_back(request);
+    const std::string answer = answers.at(requests.size() - 1);
+    for (std::size_t at = 0; at < answer.size(); at += 5) {
+      if (!handler(chunk(axllm::object({{"content", answer.substr(at, 5)}}), axllm::Value()))) return;
+    }
+    if (!handler(chunk(axllm::Value::object(), "stop"))) return;
+    handler(std::string("data: [DONE]\n\n"));
+  }
+
+  static std::string chunk(axllm::Value delta, axllm::Value finish_reason) {
+    axllm::Value choice = axllm::object({{"index", 0}, {"delta", delta}, {"finish_reason", finish_reason}});
+    axllm::Value event = axllm::object({{"id", "chatcmpl_story"}, {"model", "gpt-5.4-mini"}, {"choices", axllm::array({choice})}});
+    return "data: " + axllm::stringify(event) + "\n\n";
+  }
+
+  bool sent(std::size_t index, const std::string& text) const {
+    return index < requests.size() && axllm::stringify(requests[index]).find(text) != std::string::npos;
+  }
+};
+
+struct Interrupted {};
+
+int main() {
+  ScriptedStream transport({
+      "Title: night watch\nStory: A dragon guards the lighthouse.",
+      "Title: night watch\nStory: The cat keeps the lamp lit through every storm while the keeper sleeps.",
+      "Title: night watch\nStory: The cat keeps the lamp lit.",
+      "Title: cut short\nStory: This run stops early.",
+      "Title: cut short\nStory: This handler gives up.",
+      "Title: calm sea\nStory: The sea rests under a quiet moon.",
+      "Title: still water\nStory: The pond holds the sky.",
+      "Title: still water\nStory: The reeds stay quiet.",
+      "Title: paper boat\nStory: The boat sails the gutter.",
+      "Title: paper boat\nStory: The boat carries a letter.",
+      "Title: paper boat\nStory: Rain folds the boat flat.",
+  });
+  axllm::OpenAICompatibleClient client(axllm::object({{"api_key", "test-key"}, {"model", "gpt-5.4-mini"}}), &transport);
+  auto story = axllm::ax("topic:string -> title:string, story:string");
+
+  // A callable streaming assertion checks the story as it streams; a failure
+  // retries the attempt with the message as the correction.
+  story.add_streaming_assert("story", [](const std::string& text, bool) -> axllm::Value {
+    if (text.find("dragon") == std::string::npos) return true;
+    return "Keep dragons out of the story.";
+  });
+  // A Feedback processor sends its note back to the model for another step,
+  // whose answer replaces this one, as TypeScript's addFieldProcessor does.
+  story.add_field_processor(
+      "story",
+      [](const axllm::Value& value, const axllm::AxFieldProcessorContext&) -> axllm::Value {
+        std::istringstream words(axllm::display(value));
+        int count = 0;
+        for (std::string word; words >> word;) ++count;
+        if (count <= 8) return nullptr;
+        return "Answer again in at most 8 words.";
+      },
+      axllm::AxFieldProcessorMode::Feedback);
+  // A streaming field processor sees the story's text so far as it streams.
+  std::vector<std::string> seen;
+  bool saw_done = false;
+  story.add_streaming_field_processor("story", [&](const axllm::Value& text, const axllm::AxFieldProcessorContext& context) -> axllm::Value {
+    seen.push_back(axllm::display(text));
+    saw_done = saw_done || context.done;
+    return nullptr;
+  });
+  // A Transform processor rewrites the final title, with the output at hand;
+  // streaming holds the title back and sends it once, rewritten.
+  bool title_saw_story = false;
+  story.add_field_processor(
+      "title",
+      [&](const axllm::Value& value, const axllm::AxFieldProcessorContext& context) -> axllm::Value {
+        title_saw_story = context.done && axllm::Core::get(context.values, "story").is_string();
+        std::string title = axllm::display(value);
+        bool word_start = true;
+        for (char& c : title) {
+          if (word_start) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+          word_start = c == ' ';
+        }
+        return title;
+      },
+      axllm::AxFieldProcessorMode::Transform);
+
+  // Merge each index's deltas (strings append, other values replace) and
+  // start over when the version changes: the assertion's retry and the
+  // feedback step each start a new version.
+  axllm::Value merged = axllm::Value::object();
+  int64_t version = 0;
+  axllm::Value output = story.streaming_forward(
+      client, axllm::object({{"topic", "a lighthouse keeper's cat"}}), axllm::Value::object(),
+      [&](const axllm::AxGenDelta& delta) {
+        if (delta.version != version) {
+          merged = axllm::Value::object();
+          version = delta.version;
+        }
+        for (const auto& key : axllm::Core::iter(delta.delta)) {
+          std::string field = axllm::display(key);
+          axllm::Value value = axllm::Core::get(delta.delta, field);
+          axllm::Value previous = axllm::Core::get(merged, field);
+          bool append = value.is_string() && (previous.is_null() || previous.is_string());
+          axllm::Core::set(merged, field, append ? axllm::Value(axllm::display(previous) + axllm::display(value)) : value);
+        }
+        return true;
+      });
+  const std::string title = axllm::display(axllm::Core::get(output, "title"));
+  const std::string text = axllm::display(axllm::Core::get(output, "story"));
+  if (title != "Night Watch" || text != "The cat keeps the lamp lit.") return 1;
+  if (axllm::display(axllm::Core::get(merged, "title")) != title || axllm::display(axllm::Core::get(merged, "story")) != text) return 2;
+  if (version != 2 || transport.requests.size() != 3) return 3;
+  if (!transport.sent(1, "Keep dragons out of the story.") || !transport.sent(2, "Answer again in at most 8 words.")) return 4;
+  if (seen.empty() || !saw_done || !title_saw_story) return 5;
+
+  // Returning false stops the run: the stream closes, nothing is thrown, and
+  // the result is what was merged so far.
+  axllm::Value partial = story.streaming_forward(
+      client, axllm::object({{"topic", "a short one"}}), axllm::Value::object(),
+      [](const axllm::AxGenDelta&) { return false; });
+  const std::string partial_story = axllm::display(axllm::Core::get(partial, "story"));
+  if (transport.requests.size() != 4 || partial_story.empty() || std::string("This run stops early.").rfind(partial_story, 0) != 0) return 6;
+
+  // An exception from the handler stops the run and reaches the caller as is.
+  try {
+    story.streaming_forward(client, axllm::object({{"topic", "a short one"}}), axllm::Value::object(),
+                            [](const axllm::AxGenDelta&) -> bool { throw Interrupted{}; });
+    return 7;
+  } catch (const Interrupted&) {
+  }
+  if (transport.requests.size() != 5) return 8;
+
+  // A cancelled token stops the run before a request goes out.
+  axllm::AxCancellationToken token;
+  token.cancel("user left");
+  try {
+    story.streaming_forward(client, axllm::object({{"topic", "a short one"}}), axllm::Value::object(),
+                            [](const axllm::AxGenDelta&) { return true; }, &token);
+    return 9;
+  } catch (const axllm::AxAIServiceAbortedError&) {
+  }
+  if (transport.requests.size() != 5) return 10;
+
+  // Under run control the model call streams through the run's response
+  // boundary, where queued steering joins the request, and the control hears
+  // the run's lifecycle.
+  std::vector<std::string> lifecycle;
+  auto listen = [&lifecycle](const axllm::AxRunControl& run) {
+    run.on_event([&lifecycle](axllm::Value event) {
+      std::string type = axllm::display(axllm::Core::get(event, "type"));
+      if (type == "started" || type == "completed" || type == "failed" || type == "aborted") lifecycle.push_back(type);
+    });
+  };
+  auto control = axllm::run_control();
+  listen(control);
+  control.steer("Keep it gentle.");
+  int steered_deltas = 0;
+  axllm::Value calm = story.streaming_forward(
+      client, axllm::object({{"topic", "a calm sea"}}), axllm::object({{"control", control.value()}}),
+      [&](const axllm::AxGenDelta&) {
+        ++steered_deltas;
+        return true;
+      });
+  if (!transport.sent(5, "Keep it gentle.") || steered_deltas < 2) return 11;
+  if (axllm::display(axllm::Core::get(calm, "story")) != "The sea rests under a quiet moon.") return 12;
+  if (lifecycle != std::vector<std::string>{"started", "completed"}) return 13;
+
+  // A handler that stops a controlled run early, by returning false or by
+  // throwing, ends the run with an aborted event rather than failed.
+  lifecycle.clear();
+  auto stopped = axllm::run_control();
+  listen(stopped);
+  story.streaming_forward(client, axllm::object({{"topic", "still water"}}), axllm::object({{"control", stopped.value()}}),
+                          [](const axllm::AxGenDelta&) { return false; });
+  if (lifecycle != std::vector<std::string>{"started", "aborted"}) return 14;
+  lifecycle.clear();
+  auto interrupted = axllm::run_control();
+  listen(interrupted);
+  try {
+    story.streaming_forward(client, axllm::object({{"topic", "still water"}}), axllm::object({{"control", interrupted.value()}}),
+                            [](const axllm::AxGenDelta&) -> bool { throw Interrupted{}; });
+    return 15;
+  } catch (const Interrupted&) {
+  }
+  if (lifecycle != std::vector<std::string>{"started", "aborted"} || transport.requests.size() != 8) return 16;
+
+  // A caching function, as TypeScript's cachingFunction: fn(key, nullptr)
+  // returns a stored output (std::nullopt is a miss) and fn(key, &output)
+  // stores one. A stored output comes back without a request, and
+  // streaming_forward sends it as one delta.
+  std::map<std::string, axllm::Value> shelf;
+  int shelf_reads = 0;
+  axllm::AxCachingFunction shelf_cache = [&](const std::string& key, const axllm::Value* output) -> std::optional<axllm::Value> {
+    if (output != nullptr) {
+      shelf[key] = *output;
+      return std::nullopt;
+    }
+    ++shelf_reads;
+    auto stored = shelf.find(key);
+    if (stored == shelf.end()) return std::nullopt;
+    return stored->second;
+  };
+  auto boat = axllm::ax("topic:string -> title:string, story:string");
+  boat.set_caching_function(shelf_cache);
+  const axllm::Value paper_boat = axllm::object({{"topic", "a paper boat"}});
+  axllm::Value fresh = boat.streaming_forward(client, paper_boat, axllm::Value::object(), [](const axllm::AxGenDelta&) { return true; });
+  if (transport.requests.size() != 9 || shelf.size() != 1) return 17;
+  std::vector<axllm::AxGenDelta> replayed;
+  axllm::Value replay = boat.streaming_forward(client, paper_boat, axllm::Value::object(), [&](const axllm::AxGenDelta& delta) {
+    replayed.push_back(delta);
+    return true;
+  });
+  if (replayed.size() != 1 || !axllm::equal(replayed[0].delta, fresh) || !axllm::equal(replay, fresh)) return 18;
+  if (!axllm::equal(boat.forward(client, paper_boat), fresh) || transport.requests.size() != 9 || shelf_reads != 3) return 19;
+
+  // A call's own caching function comes first. It is passed as a run control
+  // is: a handle's value() in the call options.
+  std::map<std::string, axllm::Value> drawer;
+  auto drawer_cache = axllm::caching_function([&](const std::string& key, const axllm::Value* output) -> std::optional<axllm::Value> {
+    if (output != nullptr) {
+      drawer[key] = *output;
+      return std::nullopt;
+    }
+    auto stored = drawer.find(key);
+    if (stored == drawer.end()) return std::nullopt;
+    return stored->second;
+  });
+  axllm::Value drawn = boat.forward(client, paper_boat, axllm::object({{"caching_function", drawer_cache.value()}, {"stream", true}}));
+  if (transport.requests.size() != 10 || drawer.size() != 1 || shelf_reads != 3 || axllm::equal(drawn, fresh)) return 20;
+
+  // The process-wide caching function applies when neither the call nor the
+  // AxGen sets one, and an empty function clears it.
+  auto plain = axllm::ax("topic:string -> title:string, story:string");
+  axllm::set_caching_function(shelf_cache);
+  axllm::Value shelved = plain.forward(client, paper_boat, axllm::object({{"stream", true}}));
+  axllm::set_caching_function({});
+  if (!axllm::equal(shelved, fresh) || transport.requests.size() != 10 || shelf_reads != 4) return 21;
+  plain.forward(client, paper_boat, axllm::object({{"stream", true}}));
+  if (transport.requests.size() != 11 || shelf_reads != 4) return 22;
+  std::cout << "cpp-axgen-streaming-ok " << title << ": " << text << "\n";
 }
 `
 
@@ -1163,13 +2112,12 @@ int main() {
     return 2;
   }
 
-  axllm::OpenAICompatibleClient client(axllm::object({
+  auto client = axllm::ai("openai", axllm::object({
     {"api_key", key},
-    {"model", std::getenv("AX_OPENAI_MODEL") ? std::getenv("AX_OPENAI_MODEL") : "gpt-5.6-luna"},
-    {"model_config", axllm::object({{"temperature", 0}})}
+    {"model", std::getenv("AX_OPENAI_MODEL") ? std::getenv("AX_OPENAI_MODEL") : "gpt-5.6-luna"}
   }));
   auto program = axllm::ax("question:string -> answer:string");
-  axllm::Value out = program.forward(client, axllm::object({
+  axllm::Value out = program.forward(*client, axllm::object({
     {"question", "In one sentence, explain Ax as a language-agnostic LLM programming library."}
   }), axllm::object({
     {"promptCacheKey", "ax-openai-example"},
@@ -1263,7 +2211,7 @@ const cppAxFlowProgramGraphExample = `#include "axllm/axllm.hpp"
 
 struct ScriptedClient : axllm::AIClient {
   axllm::Value complete(axllm::Value) override {
-    return axllm::object({{"content", "{\"answer\":\"Paris\"}"}});
+    return axllm::object({{"content", "Answer: Paris"}});
   }
 };
 
@@ -1528,14 +2476,15 @@ print("python-provider-stream-no-key", text)
 const pyAxFlowOpenAIExample = `import json
 import os
 
-from axllm import OpenAICompatibleClient, ax, flow
+from axllm import ai, ax, flow
 
 
 api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_APIKEY")
 if not api_key:
     raise SystemExit("Set OPENAI_API_KEY or OPENAI_APIKEY to run this provider API example.")
 
-client = OpenAICompatibleClient(
+client = ai(
+    "openai",
     api_key=api_key,
     model=os.getenv("AX_OPENAI_MODEL", "gpt-5.4-mini"),
     model_config={"temperature": 0},
@@ -1549,6 +2498,7 @@ program = (
 )
 output = program.forward(client, {"topic": "how Ax composes typed LLM programs"})
 
+assert all(output.get(key) for key in ("outline", "summary")), output
 print(json.dumps(output, indent=2, sort_keys=True))
 `
 
@@ -1563,7 +2513,7 @@ transport_requests = []
 def scripted_transport(request):
     transport_requests.append(request)
     if request["url"].endswith("/audio/speech"):
-        return {"status": 200, "json": {"audio": "base64-speech"}}
+        return {"status": 200, "json": {"data": "base64-speech"}}
     if request["url"].endswith("/audio/transcriptions"):
         return {
             "status": 200,
@@ -1577,7 +2527,7 @@ speech = client.speak({"text": "hello", "voice": "alloy", "format": "mp3"})
 transcript = client.transcribe(
     {"audio": "base64-audio", "language": "en", "model": "whisper-1", "format": "json"}
 )
-assert speech["audio"] == "base64-speech", speech
+assert speech["data"] == "base64-speech", speech
 assert transcript["text"] == "hello world", transcript
 
 print("normalized output:")
@@ -1674,7 +2624,7 @@ try:
     speech = client.speak(
         {"text": "hello", "voice": "alloy", "format": "mp3", "model": "gpt-4o-mini-tts"}
     )
-    assert speech["audio"] == want_audio, f"speak binary base64 mismatch: {speech}"
+    assert speech["data"] == want_audio, f"speak binary base64 mismatch: {speech}"
 finally:
     server.shutdown()
 
@@ -1856,7 +2806,6 @@ end-to-end coverage for the SSE line-folding that src/ax/util/sse.ts performs.
 Exits non-zero on any mismatch so ` + "`axir verify`" + ` fails if it regresses."""
 
 import threading
-import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from axllm import OpenAICompatibleClient
@@ -1875,6 +2824,12 @@ SSE_FIRST = (
 ).encode()
 SSE_REST = ("data: " + EVENT2).encode()
 
+# The server holds the rest of the body back until the client has taken the
+# first event, and records whether the client did: the order proves incremental
+# delivery, so a slow machine cannot fail it. The 30 s bound only runs out when
+# the client yields nothing before the body ends.
+FIRST_TAKEN = threading.Event()
+HELD = {}
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
@@ -1890,7 +2845,7 @@ class Handler(BaseHTTPRequestHandler):
         for byte in SSE_FIRST:
             self.wfile.write(bytes([byte]))
             self.wfile.flush()
-        time.sleep(0.3)
+        HELD["incremental"] = FIRST_TAKEN.wait(timeout=30)
         self.wfile.write(SSE_REST)
         self.wfile.flush()
 
@@ -1904,13 +2859,13 @@ try:
     client = OpenAICompatibleClient(
         api_key="test-key", base_url=f"http://127.0.0.1:{port}", model="gpt-5.4-mini"
     )
-    started = time.perf_counter()
     stream = client.stream({"chat_prompt": [{"role": "user", "content": "stream"}]})
     first = next(stream)
-    ttft = time.perf_counter() - started
+    FIRST_TAKEN.set()
     events = [first, *stream]
-    completion = time.perf_counter() - started
-    assert completion - ttft >= 0.2, f"first event was not incremental: ttft={ttft} completion={completion}"
+    assert HELD.get("incremental"), (
+        "first event was not incremental: the client yielded it only after the server sent the rest of the body"
+    )
     deltas = [(event.get("results") or [{}])[0].get("content") for event in events]
     deltas = [delta for delta in deltas if delta]
     assert deltas[:1] == ["Hello 🌍 "], (
@@ -2055,6 +3010,123 @@ assert sent_types == ["session.update", "conversation.item.create", "response.cr
 assert result["content"] == "hello", result
 assert result["finish_reason"] == "stop", result
 assert result.get("audio", {}).get("data") == "AQI=", result
+from axllm import ai
+meta = ai("meta", model="muse-voice-transcribe-1.0", api_key="test-key")
+assert meta.realtime_audio_setup({"model": "muse-voice-transcribe-1.0"})["authorization"]["accessToken"] == "Bearer test-key"
+custom_meta = ai("meta", model="muse-voice-transcribe-1.0", api_key="test-key", base_url="https://proxy.example/v1")
+assert custom_meta._realtime_ws_target("muse-voice-transcribe-1.0")[0] == "wss://proxy.example/v1/asr/realtime"
+meta_request = {
+    "model": "muse-voice-transcribe-1.0",
+    "chat_prompt": [{"role": "user", "content": [{"type": "audio", "data": "AAE=", "format": "pcm16"}]}],
+    "audio": {"input": {"sampleRate": 16000, "channels": 1}},
+    "model_config": {"realtimeTranscription": {"partialMode": "delta"}},
+}
+meta_transport = ScriptedRealtimeTransport([
+    {"sessionId": "meta-session"},
+    {"type": "speechStart", "turnId": "one"},
+    {"type": "transcript", "transcript": "Hello"},
+    {"type": "transcript", "transcript": " world"},
+    {"type": "speaker", "speaker": "A"},
+    {"type": "speechStart", "turnId": "two"},
+    {"type": "transcript", "transcript": "Second"},
+    {"type": "speechComplete", "turnId": "one", "transcript": "Hello world!"},
+    {"type": "speechComplete", "turnId": "two", "transcript": "Second turn"},
+])
+meta_final = meta.realtime_chat(meta_request, transport=meta_transport)
+assert meta_final["remote_session_id"] == "meta-session", meta_final
+assert [r["content"] for r in meta_final["results"]] == ["Hello world!", "Second turn"], meta_final
+assert meta_transport.sent[0]["authorization"]["accessToken"] == "Bearer test-key", meta_transport.sent
+assert [e.get("type") for e in meta_transport.sent] == [None, "binary", "endStream"], meta_transport.sent
+import base64
+import queue
+import importlib
+wire = importlib.import_module('axllm.ai')
+
+class DuplexProbe:
+    instance = None
+    def __init__(self, *args):
+        DuplexProbe.instance = self
+        self.inbound = queue.Queue()
+        self.sent = []
+        self.closed = False
+    def send(self, event):
+        self.sent.append(event)
+        if 'authorization' in event:
+            self.inbound.put({'sessionId': 'duplex'})
+        elif event.get('type') == 'binary' and len(self.sent) == 2:
+            self.inbound.put({'type': 'transcript', 'transcript': 'wrong hypothesis'})
+        elif event.get('type') == 'endStream':
+            self.inbound.put({'type': 'transcript', 'transcript': 'Correct final.', 'final': True})
+            self.inbound.put(None)
+    def recv(self):
+        return self.inbound.get(timeout=3)
+    def close(self):
+        self.closed = True
+        self.inbound.put(None)
+
+original_socket = wire._WebSocketRealtimeTransport
+wire._WebSocketRealtimeTransport = DuplexProbe
+try:
+    duplex_request = {**meta_request, 'model_config': {}, 'chat_prompt': [{'role': 'user', 'content': [{'type': 'audio', 'data': base64.b64encode(bytes(9600)).decode(), 'format': 'pcm16'}]}]}
+    stream = meta.stream(duplex_request)
+    partial = next(stream)
+    assert partial['results'][0]['transcript']['text'] == 'wrong hypothesis', partial
+    assert not any(x.get('type') == 'endStream' for x in DuplexProbe.instance.sent)
+    content = ''.join(r.get('content', '') for chunk in stream for r in chunk['results'])
+    assert content == 'Correct final.', content
+    assert DuplexProbe.instance.closed
+    stream = meta.stream(duplex_request)
+    next(stream)
+    stream.close()
+    assert DuplexProbe.instance.closed
+    assert not any(x.get('type') == 'endStream' for x in DuplexProbe.instance.sent)
+finally:
+    wire._WebSocketRealtimeTransport = original_socket
+class EarlyCloseProbe(DuplexProbe):
+    def send(self, event):
+        super().send(event)
+        if event.get('type') == 'binary':
+            self.inbound.put(None)
+
+wire._WebSocketRealtimeTransport = EarlyCloseProbe
+try:
+    for streaming in (False, True):
+        try:
+            if streaming:
+                list(meta.stream(duplex_request))
+            else:
+                meta.realtime_chat(duplex_request)
+        except Exception as error:
+            assert 'closed before audio upload completed' in str(error), error
+        else:
+            raise AssertionError('early close accepted an incomplete upload')
+finally:
+    wire._WebSocketRealtimeTransport = original_socket
+# Gemini Live extended thinking: an acknowledgement turn ends IN_PROGRESS and the
+# answer follows in a second turn, so the driver must keep reading past it.
+gemini = ai("google-gemini", model="gemini-3.8-live-extended-thinking", api_key="test-key")
+gemini_transport = ScriptedRealtimeTransport([
+    {"setupComplete": {}},
+    {"serverContent": {"outputTranscription": {"text": "Let me think."}}},
+    {"serverContent": {"turnComplete": True, "interactionStatus": "IN_PROGRESS"}},
+    {"serverContent": {"outputTranscription": {"text": "Hello there."}}},
+    {"serverContent": {"modelTurn": {"parts": [{"inlineData": {"mimeType": "audio/pcm", "data": "AQI="}}]}}},
+    {"serverContent": {"turnComplete": True, "interactionStatus": "IDLE"}},
+])
+gemini_final = gemini.realtime_chat(
+    {"model": "gemini-3.8-live-extended-thinking", "chat_prompt": [{"role": "user", "content": "Say hello."}]},
+    transport=gemini_transport,
+)
+gemini_result = gemini_final["results"][0]
+assert gemini_result["content"] == "Let me think. Hello there.", gemini_result
+assert gemini_result["finish_reason"] == "stop", gemini_result
+assert gemini_result.get("audio", {}).get("data") == "AQI=", gemini_result
+from axllm import AxMemory
+memory = AxMemory()
+memory.update_result({"thought_blocks": [{"id": "r", "data": "Plan"}], "images": [{"id": "image", "data": "partial"}]})
+memory.update_result({"thought_blocks": [{"id": "r", "data": "Plan.", "summary": "Plan.", "encrypted_content": "opaque"}]})
+assert memory.get_last()["response"]["thought_blocks"] == [{"id": "r", "data": "Plan.", "summary": "Plan.", "encrypted_content": "opaque"}]
+assert memory.get_last()["response"]["images"][0]["id"] == "image"
 print("realtime-audio-turn-ok")
 `
 
@@ -2208,8 +3280,9 @@ public final class FlowOpenAIExample {
       throw new IllegalStateException("Set OPENAI_API_KEY or OPENAI_APIKEY to run this provider API example.");
     }
     String model = System.getenv().getOrDefault("AX_OPENAI_MODEL", "gpt-5.4-mini");
-    OpenAICompatibleClient client =
-        new OpenAICompatibleClient(
+    AxAIService client =
+        Ax.ai(
+            "openai",
             Map.of("api_key", apiKey, "model", model, "model_config", Map.of("temperature", 0.0)));
 
     AxGen outline = Ax.ax("topic:string -> outline:string");
@@ -2222,6 +3295,11 @@ public final class FlowOpenAIExample {
             .returns(Map.of("outline", "outline", "summary", "summary"));
     Map<String, Object> output =
         program.forward(client, Map.of("topic", "how Ax composes typed LLM programs"));
+    for (String key : List.of("outline", "summary")) {
+      if (List.of("null", "\"\"", "[]").contains(Json.stringify(output.get(key)))) {
+        throw new AssertionError("flow output field " + key + " is empty: " + Json.stringify(output));
+      }
+    }
     System.out.println(Json.stringify(output));
   }
 }
@@ -2238,7 +3316,7 @@ public final class AudioResponsesMappingExample {
           transportRequests.add(new LinkedHashMap<>(request));
           String url = String.valueOf(request.get("url"));
           if (url.endsWith("/audio/speech")) {
-            return Map.of("status", 200, "json", Map.of("audio", "base64-speech"));
+            return Map.of("status", 200, "json", Map.of("data", "base64-speech"));
           }
           if (url.endsWith("/audio/transcriptions")) {
             return Map.of(
@@ -2257,7 +3335,7 @@ public final class AudioResponsesMappingExample {
     Map<String, Object> transcript =
         client.transcribe(
             Map.of("audio", "base64-audio", "language", "en", "model", "whisper-1", "format", "json"));
-    if (!"base64-speech".equals(speech.get("audio"))) throw new RuntimeException("bad speech: " + speech);
+    if (!"base64-speech".equals(speech.get("data"))) throw new RuntimeException("bad speech: " + speech);
     if (!"hello world".equals(transcript.get("text"))) throw new RuntimeException("bad transcript: " + transcript);
 
     System.out.println("normalized output:");
@@ -2344,7 +3422,7 @@ public final class AudioHTTPRoundtripExample {
       Map<String, Object> speech =
           client.speak(
               Map.of("text", "hello", "voice", "alloy", "format", "mp3", "model", "gpt-4o-mini-tts"));
-      if (!wantAudio.equals(speech.get("audio")))
+      if (!wantAudio.equals(speech.get("data")))
         throw new RuntimeException("speak binary response not base64-encoded as expected: " + speech);
     } finally {
       server.stop(0);
@@ -2535,6 +3613,10 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 // Drive a streaming stream() through the REAL HttpClient transport against an
 // in-process com.sun.net.httpserver loopback that returns a spec-legal
@@ -2558,6 +3640,15 @@ public final class StreamHTTPRoundtripExample {
     String sseRest = "data: " + event2;
     byte[] firstBytes = sseFirst.getBytes(StandardCharsets.UTF_8);
     byte[] restBytes = sseRest.getBytes(StandardCharsets.UTF_8);
+    // Both requests hold the rest of the body back and record whether the
+    // client got there first: the order proves incremental delivery and prompt
+    // cancellation, so a slow machine cannot fail either check. The 30 s
+    // bounds only run out when the client never gets there.
+    CountDownLatch releaseRest = new CountDownLatch(1);
+    CountDownLatch releaseCancelledRest = new CountDownLatch(1);
+    AtomicBoolean firstHoldExpired = new AtomicBoolean(false);
+    AtomicBoolean cancelHoldExpired = new AtomicBoolean(false);
+    AtomicInteger requests = new AtomicInteger();
 
     HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
     server.createContext(
@@ -2568,7 +3659,14 @@ public final class StreamHTTPRoundtripExample {
           exchange.sendResponseHeaders(200, firstBytes.length + restBytes.length);
           try (OutputStream os = exchange.getResponseBody()) {
             for (byte value : firstBytes) { os.write(value); os.flush(); }
-            try { Thread.sleep(300); } catch (InterruptedException error) { Thread.currentThread().interrupt(); }
+            boolean cancelled = requests.incrementAndGet() == 2;
+            AtomicBoolean expired = cancelled ? cancelHoldExpired : firstHoldExpired;
+            try {
+              if (!(cancelled ? releaseCancelledRest : releaseRest).await(30, TimeUnit.SECONDS)) expired.set(true);
+            } catch (InterruptedException error) {
+              Thread.currentThread().interrupt();
+              expired.set(true);
+            }
             os.write(restBytes);
             os.flush();
           }
@@ -2581,17 +3679,16 @@ public final class StreamHTTPRoundtripExample {
           new OpenAICompatibleClient(
               Map.of("api_key", "test-key", "base_url", "http://127.0.0.1:" + port, "model", "gpt-5.4-mini"));
       List<String> deltas = new ArrayList<>();
-      long started = System.nanoTime();
       try (AxChatStream stream = client.openStream(Map.of("chat_prompt", List.of(Map.of("role", "user", "content", "stream"))))) {
         Iterator<Map<String, Object>> iterator = stream.iterator();
         if (!iterator.hasNext()) throw new RuntimeException("stream ended before first event");
         Map<String, Object> firstEvent = iterator.next();
-        long ttft = System.nanoTime() - started;
+        releaseRest.countDown();
         List<Map<String, Object>> events = new ArrayList<>();
         events.add(firstEvent);
         iterator.forEachRemaining(events::add);
-        long completion = System.nanoTime() - started;
-        if (completion - ttft < 200_000_000L) throw new RuntimeException("first event was not incremental");
+        if (firstHoldExpired.get())
+          throw new RuntimeException("first event was not incremental: the client yielded it only after the server sent the rest of the body");
         for (Map<String, Object> event : events) {
         Object results = event.get("results");
         if (results instanceof List<?> list && !list.isEmpty() && list.get(0) instanceof Map<?, ?> first) {
@@ -2604,7 +3701,31 @@ public final class StreamHTTPRoundtripExample {
         throw new RuntimeException("multi-line data: event was not folded into one JSON value: " + deltas);
       if (!"Hello 🌍 world".equals(String.join("", deltas)))
         throw new RuntimeException("bad stream fold: " + deltas);
+
+      AxCancellationToken token = new AxCancellationToken();
+      try (AxChatStream cancelled = client.openStream(
+          Map.of("chat_prompt", List.of(Map.of("role", "user", "content", "cancel stream"))), token)) {
+        Iterator<Map<String, Object>> iterator = cancelled.iterator();
+        if (!iterator.hasNext()) throw new RuntimeException("cancel stream ended before first event");
+        iterator.next();
+        token.cancel("loopback stopped");
+        try {
+          iterator.hasNext();
+          throw new RuntimeException("cancelled stream did not raise an aborted error");
+        } catch (AxAIServiceAbortedError error) {
+          if (!"loopback stopped".equals(error.reason()) || error.retryable)
+            throw new RuntimeException("wrong cancellation error", error);
+        }
+        if (cancelHoldExpired.get())
+          throw new RuntimeException("cancelled stream did not return promptly: it waited for the server to end the body");
+        if (token.subscriptionCount() != 0)
+          throw new RuntimeException("cancelled stream retained a body-close subscription");
+      } finally {
+        releaseCancelledRest.countDown();
+      }
     } finally {
+      releaseRest.countDown();
+      releaseCancelledRest.countDown();
       server.stop(0);
     }
     System.out.println("stream-http-roundtrip-ok");
@@ -2758,6 +3879,95 @@ public final class RealtimeAudioTurnExample {
     if (!(audio instanceof Map) || !"AQI=".equals(((Map<?, ?>) audio).get("data"))) {
       fail("audio chunk not surfaced", finalResponse);
     }
+    OpenAICompatibleClient meta = (OpenAICompatibleClient) Ax.ai("meta", Map.of("model", "muse-voice-transcribe-1.0", "api_key", "test-key"));
+    Map<String, Object> metaRequest = Map.of(
+        "model", "muse-voice-transcribe-1.0",
+        "chat_prompt", List.of(Map.of("role", "user", "content", List.of(Map.of("type", "audio", "data", "AAE=", "format", "pcm16")))),
+        "audio", Map.of("input", Map.of("sampleRate", 16000, "channels", 1)),
+        "model_config", Map.of("realtimeTranscription", Map.of("partialMode", "delta")));
+    OpenAICompatibleClient.ScriptedRealtimeTransport metaTransport = new OpenAICompatibleClient.ScriptedRealtimeTransport(List.of(
+        Map.of("sessionId", "meta-session"),
+        Map.of("type", "speechStart", "turnId", "one"),
+        Map.of("type", "transcript", "transcript", "Hello"),
+        Map.of("type", "transcript", "transcript", " world"),
+        Map.of("type", "speaker", "speaker", "A"),
+        Map.of("type", "speechStart", "turnId", "two"),
+        Map.of("type", "transcript", "transcript", "Second"),
+        Map.of("type", "speechComplete", "turnId", "one", "transcript", "Hello world!"),
+        Map.of("type", "speechComplete", "turnId", "two", "transcript", "Second turn")));
+    Map<String, Object> metaFinal = meta.realtimeChat(metaRequest, metaTransport);
+    List<?> metaResults = (List<?>) metaFinal.get("results");
+    if (!"meta-session".equals(metaFinal.get("remote_session_id")) || metaResults.size() != 2 || !"Hello world!".equals(((Map<?, ?>) metaResults.get(0)).get("content")) || !"Second turn".equals(((Map<?, ?>) metaResults.get(1)).get("content"))) fail("Meta overlapping turns or session lost", metaFinal);
+    if (metaTransport.sent.size() != 3 || !"binary".equals(metaTransport.sent.get(1).get("type")) || !"endStream".equals(metaTransport.sent.get(2).get("type"))) fail("Meta input order", metaTransport.sent);
+    OpenAICompatibleClient.RealtimeTransport duplex = new OpenAICompatibleClient.RealtimeTransport() {
+      final java.util.concurrent.BlockingQueue<Map<String, Object>> frames = new java.util.concurrent.LinkedBlockingQueue<>();
+      volatile boolean ended = false;
+      int chunks = 0;
+      public void send(Map<String, Object> event) {
+        if (event.containsKey("authorization")) frames.offer(Map.of("sessionId", "duplex"));
+        else if ("binary".equals(event.get("type")) && ++chunks == 1) frames.offer(Map.of("type", "transcript", "transcript", "wrong hypothesis"));
+        else if ("endStream".equals(event.get("type"))) { ended = true; frames.offer(Map.of("type", "transcript", "transcript", "Correct final.", "final", true)); frames.offer(Map.of()); }
+      }
+      public Map<String, Object> recv() {
+        try {
+          Map<String, Object> event = frames.poll(3, java.util.concurrent.TimeUnit.SECONDS);
+          if (event == null) throw new IllegalStateException("duplex receiver timed out");
+          if ("wrong hypothesis".equals(event.get("transcript")) && ended) throw new IllegalStateException("partial delayed until endStream");
+          return event.isEmpty() ? null : event;
+        } catch (InterruptedException error) { Thread.currentThread().interrupt(); throw new IllegalStateException(error); }
+      }
+      public void close() { frames.offer(Map.of()); }
+    };
+    Map<String, Object> duplexRequest = new LinkedHashMap<>(metaRequest);
+    duplexRequest.put("model_config", Map.of());
+    duplexRequest.put("chat_prompt", List.of(Map.of("role", "user", "content", List.of(Map.of("type", "audio", "format", "pcm16", "data", Base64.getEncoder().encodeToString(new byte[9600]))))));
+    Map<String, Object> duplexResult = meta.realtimeChat(duplexRequest, duplex);
+    if (!"Correct final.".equals(((Map<?, ?>)((List<?>)duplexResult.get("results")).get(0)).get("content"))) fail("duplex final lost", duplexResult);
+    OpenAICompatibleClient.RealtimeTransport earlyClose = new OpenAICompatibleClient.RealtimeTransport() {
+      final java.util.concurrent.BlockingQueue<Map<String, Object>> frames = new java.util.concurrent.LinkedBlockingQueue<>();
+      public void send(Map<String, Object> event) {
+        if (event.containsKey("authorization")) frames.offer(Map.of("sessionId", "early"));
+        else if ("binary".equals(event.get("type"))) frames.offer(Map.of());
+      }
+      public Map<String, Object> recv() {
+        try {
+          Map<String, Object> event = frames.poll(3, java.util.concurrent.TimeUnit.SECONDS);
+          if (event == null) throw new IllegalStateException("early-close receiver timed out");
+          return event.isEmpty() ? null : event;
+        } catch (InterruptedException error) { Thread.currentThread().interrupt(); throw new IllegalStateException(error); }
+      }
+      public void close() { frames.offer(Map.of()); }
+    };
+    try {
+      meta.realtimeChat(duplexRequest, earlyClose);
+      fail("early close accepted an incomplete upload", Map.of());
+    } catch (RuntimeException error) {
+      if (!error.getMessage().contains("closed before audio upload completed")) throw error;
+    }
+    // Gemini Live extended thinking: an acknowledgement turn ends IN_PROGRESS and the
+    // answer follows in a second turn, so the driver must keep reading past it.
+    OpenAICompatibleClient gemini = (OpenAICompatibleClient) Ax.ai("google-gemini", Map.of("model", "gemini-3.8-live-extended-thinking", "api_key", "test-key"));
+    OpenAICompatibleClient.ScriptedRealtimeTransport geminiTransport = new OpenAICompatibleClient.ScriptedRealtimeTransport(List.of(
+        Map.of("setupComplete", Map.of()),
+        Map.of("serverContent", Map.of("outputTranscription", Map.of("text", "Let me think."))),
+        Map.of("serverContent", Map.of("turnComplete", true, "interactionStatus", "IN_PROGRESS")),
+        Map.of("serverContent", Map.of("outputTranscription", Map.of("text", "Hello there."))),
+        Map.of("serverContent", Map.of("modelTurn", Map.of("parts", List.of(Map.of("inlineData", Map.of("mimeType", "audio/pcm", "data", "AQI=")))))),
+        Map.of("serverContent", Map.of("turnComplete", true, "interactionStatus", "IDLE"))));
+    Map<String, Object> geminiFinal = gemini.realtimeChat(
+        Map.of("model", "gemini-3.8-live-extended-thinking", "chat_prompt", List.of(Map.of("role", "user", "content", "Say hello."))),
+        geminiTransport);
+    Map<?, ?> geminiResult = (Map<?, ?>) ((List<?>) geminiFinal.get("results")).get(0);
+    Object geminiAudio = geminiResult.get("audio");
+    if (!"Let me think. Hello there.".equals(geminiResult.get("content")) || !"stop".equals(geminiResult.get("finish_reason"))
+        || !(geminiAudio instanceof Map) || !"AQI=".equals(((Map<?, ?>) geminiAudio).get("data"))) {
+      fail("Gemini extended-thinking turn cut short", geminiFinal);
+    }
+    AxMemory memory = new AxMemory();
+    memory.updateResult(Map.of("thought_blocks", List.of(Map.of("id", "r", "data", "Plan")), "images", List.of(Map.of("id", "image", "data", "partial"))));
+    memory.updateResult(Map.of("thought_blocks", List.of(Map.of("id", "r", "data", "Plan.", "summary", "Plan.", "encrypted_content", "opaque"))));
+    String replay = Json.stringify(memory.getLast());
+    if (!replay.contains("opaque") || !replay.contains("image") || replay.contains("PlanPlan")) fail("replay metadata lost", replay);
     System.out.println("realtime-audio-turn-ok");
   }
 
@@ -2838,25 +4048,29 @@ import java.util.function.Function;
 public final class ACEPlaybookExample {
   // A scripted client stands in for a real provider so this example runs without
   // a key. Swap it for Ax.ai("openai", ...) to grow a playbook against a live
-  // model. The canned JSON satisfies the bound program AND the playbook's internal
-  // reflector/curator sub-programs, so the full ACE loop is exercised offline.
+  // model. Each program answers in its own output format, chosen by the output
+  // wire keys in its prompt: the bound program, then the playbook's reflector and
+  // curator, so the full ACE loop is exercised offline.
   static final class ScriptedClient implements AiClient {
+    static boolean outputs(Map<String, Object> request, String key) {
+      return Json.stringify(request.get("chat_prompt")).contains("(wire key: " + (char) 96 + key + (char) 96 + ")");
+    }
+
     public Map<String, Object> complete(Map<String, Object> request) {
-      String content = "{"
-          + "\"answer\":\"Ax composes typed LLM programs.\","
-          + "\"reasoning\":\"The playbook lacked a brevity rule.\","
-          + "\"errorIdentification\":\"Answer was too verbose.\","
-          + "\"rootCauseAnalysis\":\"No guidance on conciseness.\","
-          + "\"correctApproach\":\"Add a concise-answer guideline.\","
-          + "\"keyInsight\":\"Prefer one-sentence answers.\","
-          + "\"weaknessDescription\":\"The agent does not verify its final step.\","
-          + "\"rootCause\":\"The final step is accepted without a check.\","
-          + "\"proposedGuidance\":\"Verify the final step before completing the task.\","
-          + "\"evidenceQuotes\":[\"final\",\"snapshot\",\"Answer\"],"
-          + "\"configRecommendations\":[],"
-          + "\"bulletTags\":[],"
-          + "\"operations\":[{\"type\":\"ADD\",\"section\":\"Guidelines\",\"content\":\"Answer in one concise sentence.\"}]"
-          + "}";
+      String content;
+      if (outputs(request, "errorIdentification")) {
+        content = "Reasoning: The playbook lacked a brevity rule.\n"
+            + "Error Identification: Answer was too verbose.\n"
+            + "Root Cause Analysis: No guidance on conciseness.\n"
+            + "Correct Approach: Add a concise-answer guideline.\n"
+            + "Key Insight: Prefer one-sentence answers.\n"
+            + "Bullet Tags: []";
+      } else if (outputs(request, "operations")) {
+        content = "Reasoning: The playbook lacked a brevity rule.\n"
+            + "Operations: [{\"type\":\"ADD\",\"section\":\"Guidelines\",\"content\":\"Answer in one concise sentence.\"}]";
+      } else {
+        content = "Answer: Ax composes typed LLM programs.";
+      }
       return Map.of("content", content);
     }
   }
@@ -2883,6 +4097,7 @@ public final class ACEPlaybookExample {
     Map<String, Object> state = pb.toJson();
     if (!result.containsKey("bestScore")) throw new RuntimeException("missing bestScore: " + result);
     if (!state.containsKey("playbook")) throw new RuntimeException("missing playbook: " + state);
+    if (!rendered.contains("Answer in one concise sentence.")) throw new RuntimeException("playbook did not grow: " + rendered);
     System.out.println("rendered: " + rendered);
     System.out.println("java-ace-playbook-ok");
   }
@@ -2894,25 +4109,36 @@ import java.util.*;
 
 public final class AgentPlaybookExample {
   // The actor returns model-authored Python code and a real runtime executes it.
-  // The same offline response also satisfies the playbook reflector and curator.
+  // Each stage answers in its own output format: the actor's code as JSON, and
+  // the responder, weakness miner, reflector and curator as field lines.
   static final class ScriptedClient implements AiClient {
+    static boolean outputs(Map<String, Object> request, String key) {
+      return Json.stringify(request.get("chat_prompt")).contains("(wire key: " + (char) 96 + key + (char) 96 + ")");
+    }
+
     public Map<String, Object> complete(Map<String, Object> request) {
-      String content = "{"
-          + "\"pythonCode\":\"final('Answer', {'answer': 'Ax composes typed LLM programs.'})\","
-          + "\"answer\":\"Ax composes typed LLM programs.\","
-          + "\"reasoning\":\"The playbook lacked a brevity rule.\","
-          + "\"errorIdentification\":\"Answer was too verbose.\","
-          + "\"rootCauseAnalysis\":\"No guidance on conciseness.\","
-          + "\"correctApproach\":\"Add a concise-answer guideline.\","
-          + "\"keyInsight\":\"Prefer one-sentence answers.\","
-          + "\"weaknessDescription\":\"The agent does not verify its final step.\","
-          + "\"rootCause\":\"The final step is accepted without a check.\","
-          + "\"proposedGuidance\":\"Verify the final step before completing the task.\","
-          + "\"evidenceQuotes\":[\"final\",\"snapshot\",\"Answer\"],"
-          + "\"configRecommendations\":[],"
-          + "\"bulletTags\":[],"
-          + "\"operations\":[{\"type\":\"ADD\",\"section\":\"Guidelines\",\"content\":\"Answer in one concise sentence.\"}]"
-          + "}";
+      String content;
+      if (outputs(request, "pythonCode")) {
+        content = "{\"pythonCode\":\"final('Answer', {'answer': 'Ax composes typed LLM programs.'})\"}";
+      } else if (outputs(request, "weaknessDescription")) {
+        content = "Weakness Description: The agent does not verify its final step.\n"
+            + "Root Cause: The final step is accepted without a check.\n"
+            + "Proposed Guidance: Verify the final step before completing the task.\n"
+            + "Evidence Quotes: [\"final\", \"snapshot\", \"Answer\"]\n"
+            + "Config Recommendations: []";
+      } else if (outputs(request, "errorIdentification")) {
+        content = "Reasoning: The playbook lacked a brevity rule.\n"
+            + "Error Identification: Answer was too verbose.\n"
+            + "Root Cause Analysis: No guidance on conciseness.\n"
+            + "Correct Approach: Add a concise-answer guideline.\n"
+            + "Key Insight: Prefer one-sentence answers.\n"
+            + "Bullet Tags: []";
+      } else if (outputs(request, "operations")) {
+        content = "Reasoning: The playbook lacked a brevity rule.\n"
+            + "Operations: [{\"type\":\"ADD\",\"section\":\"Guidelines\",\"content\":\"Answer in one concise sentence.\"}]";
+      } else {
+        content = "Answer: Ax composes typed LLM programs.";
+      }
       return Map.of("content", content);
     }
   }
@@ -3225,7 +4451,7 @@ int main() {
     std::cerr << "transcribe response not normalized: " << axllm::stringify(transcript) << "\n";
     return 1;
   }
-  if (!axllm::equal(axllm::Core::get(speech, "audio"), want_audio)) {
+  if (!axllm::equal(axllm::Core::get(speech, "data"), want_audio)) {
     std::cerr << "speak binary response not base64-encoded as expected: "
               << axllm::stringify(speech) << "\n";
     return 1;
@@ -3452,6 +4678,8 @@ const cppStreamHTTPRoundtripExample = `#include "axllm/axllm.hpp"
 #include <unistd.h>
 
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -3503,7 +4731,8 @@ void drain_request(int fd) {
   }
 }
 
-void write_response(int fd, const std::string& content_type, const std::string& first, const std::string& rest) {
+void write_response(int fd, const std::string& content_type, const std::string& first, const std::string& rest,
+                    std::chrono::milliseconds delay, const std::function<void()>& release = {}) {
   std::string out = "HTTP/1.1 200 OK\r\nContent-Type: " + content_type +
                     "\r\nContent-Length: " + std::to_string(first.size() + rest.size()) +
                     "\r\nConnection: close\r\n\r\n";
@@ -3514,13 +4743,45 @@ void write_response(int fd, const std::string& content_type, const std::string& 
     off += static_cast<size_t>(n);
   }
   for (char byte : first) send(fd, &byte, 1, 0);
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  if (release) release();
+  else std::this_thread::sleep_for(delay);
   send(fd, rest.data(), rest.size(), 0);
+}
+
+
+// The server waits for the client to close the connection once the run is
+// aborted. The 30 s receive timeout only runs out when the client keeps the
+// connection; it is generous so that a slow machine cannot trip it.
+void stalled_http_cancellation() {
+  using namespace axllm;
+  int listener=socket(AF_INET,SOCK_STREAM,0);
+  if(listener<0)throw std::runtime_error("socket failed");
+  sockaddr_in address{};address.sin_family=AF_INET;address.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
+  if(bind(listener,reinterpret_cast<sockaddr*>(&address),sizeof(address))<0||listen(listener,1)<0)throw std::runtime_error("listen failed");
+  socklen_t size=sizeof(address);getsockname(listener,reinterpret_cast<sockaddr*>(&address),&size);
+  std::atomic<bool> closed{false};
+  std::thread server([&]{
+    int connection=accept(listener,nullptr,nullptr);if(connection<0)return;
+    drain_request(connection);timeval timeout{30,0};setsockopt(connection,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout));
+    const std::string event="data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"item\",\"call_id\":\"http-pending\",\"name\":\"lookup\",\"arguments\":\"{}\"}}\n\n";
+    const std::string response="HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100000\r\n\r\n"+event;
+    size_t offset=0;while(offset<response.size()){auto written=send(connection,response.data()+offset,response.size()-offset,0);if(written<=0)break;offset+=written;}
+    char byte;auto count=recv(connection,&byte,1,0);closed.store(count==0||(count<0&&(errno==ECONNRESET||errno==ECONNABORTED)));close(connection);
+  });
+  auto control=run_control();Tool lookup("lookup","Lookup");lookup.execution("background").context_handler([control](Value,const AxToolContext&){control.abort();return Value("LATE");});
+  auto program=ax("question -> answer");program.add_tool(lookup);
+  auto client=ai("openai",object({{"api_key","test"},{"model","gpt-6-astra"},{"base_url","http://127.0.0.1:"+std::to_string(ntohs(address.sin_port))}}));
+  std::string failure;
+  try{program.forward(*client,object({{"question","Lookup"}}),object({{"control",control.value()}}));}catch(const std::exception& error){failure=error.what();}
+  server.join();close(listener);
+  if(failure.find("http-pending")==std::string::npos||!closed.load())throw std::runtime_error("Cancelled HTTP run retained its connection: "+failure);
+  std::cout<<"cpp cancellation closes a stalled native HTTP connection\n";
 }
 
 }  // namespace
 
 int main() {
+  ::signal(SIGPIPE, SIG_IGN);
   // One logical delta whose JSON is split across two data: lines (folded with
   // "\n"), then a single-line delta accepted at EOF without a delimiter.
   const std::string event1a =
@@ -3554,12 +4815,38 @@ int main() {
   getsockname(server_fd, reinterpret_cast<sockaddr*>(&addr), &alen);
   int port = ntohs(addr.sin_port);
 
+  // Both requests hold the rest of the body back and record whether the
+  // client got there first: the order proves incremental delivery and prompt
+  // cancellation, so a slow machine cannot fail either check. The 30 s bounds
+  // only run out when the client never gets there.
+  std::mutex release_mutex;
+  std::condition_variable release_rest;
+  bool first_received = false;
+  bool cancel_returned = false;
+  std::atomic<bool> release_timed_out{false};
+  std::atomic<bool> cancel_hold_expired{false};
   std::thread server([&]() {
-    int fd = accept(server_fd, nullptr, nullptr);
-    if (fd < 0) return;
-    drain_request(fd);
-    write_response(fd, "text/event-stream", sse_first, sse_rest);
-    close(fd);
+    for (int request = 0; request < 2; ++request) {
+      int fd = accept(server_fd, nullptr, nullptr);
+      if (fd < 0) return;
+      drain_request(fd);
+      if (request == 0) {
+        write_response(fd, "text/event-stream", sse_first, sse_rest,
+                       std::chrono::milliseconds(0), [&] {
+          std::unique_lock<std::mutex> lock(release_mutex);
+          if (!release_rest.wait_for(lock, std::chrono::seconds(30), [&] { return first_received; }))
+            release_timed_out.store(true);
+        });
+      } else {
+        write_response(fd, "text/event-stream", sse_first, sse_rest,
+                       std::chrono::milliseconds(0), [&] {
+          std::unique_lock<std::mutex> lock(release_mutex);
+          if (!release_rest.wait_for(lock, std::chrono::seconds(30), [&] { return cancel_returned; }))
+            cancel_hold_expired.store(true);
+        });
+      }
+      close(fd);
+    }
   });
 
   axllm::OpenAICompatibleClient client(
@@ -3568,20 +4855,18 @@ int main() {
                      {"model", "gpt-5.4-mini"}}),
       nullptr);
   std::vector<std::string> deltas;
-  auto started = std::chrono::steady_clock::now();
-  std::chrono::steady_clock::time_point first_at;
   client.stream_each(axllm::object({{"chat_prompt", axllm::array({axllm::object({{"role", "user"}, {"content", "stream"}})})}}), [&](const axllm::Value& event) {
-    if (first_at.time_since_epoch().count() == 0) first_at = std::chrono::steady_clock::now();
+    {
+      std::lock_guard<std::mutex> lock(release_mutex);
+      first_received = true;
+    }
+    release_rest.notify_one();
     std::string content = axllm::display(
         axllm::Core::get(axllm::Core::get(axllm::Core::get(event, "results"), 0), "content", ""));
     if (!content.empty()) deltas.push_back(content);
     return true;
   });
-  auto completed = std::chrono::steady_clock::now();
-  if (completed - first_at < std::chrono::milliseconds(200)) { std::cerr << "first event was not incremental\n"; return 1; }
-
-  server.join();
-  close(server_fd);
+  if (release_timed_out.load()) { std::cerr << "first event was not incremental\n"; return 1; }
 
   if (deltas.empty() || deltas.front() != "Hello 🌍 ") {
     std::cerr << "multi-line data: event was not folded into one JSON value\n";
@@ -3593,6 +4878,42 @@ int main() {
     std::cerr << "bad stream fold: " << text << "\n";
     return 1;
   }
+  stalled_http_cancellation();
+
+  axllm::AxCancellationToken token;
+  bool aborted = false;
+  bool cancelled = false;
+  try {
+    client.stream_each(
+        axllm::object({{"chat_prompt", axllm::array({axllm::object({
+            {"role", "user"}, {"content", "cancel stream"}})})}}),
+        [&](const axllm::Value&) {
+          cancelled = true;
+          token.cancel("loopback stopped");
+          return true;
+        },
+        &token);
+  } catch (const axllm::AxAIServiceAbortedError& error) {
+    aborted = true;
+    if (error.retryable || std::string(error.what()).find("loopback stopped") == std::string::npos) {
+      std::cerr << "wrong cancellation error: " << error.what() << "\n";
+      return 1;
+    }
+  }
+  bool held = !cancel_hold_expired.load();
+  {
+    std::lock_guard<std::mutex> lock(release_mutex);
+    cancel_returned = true;
+  }
+  release_rest.notify_one();
+  if (!aborted || !cancelled || !held) {
+    std::cerr << "real HTTP stream cancellation was not prompt\n";
+    server.join();
+    return 1;
+  }
+
+  server.join();
+  close(server_fd);
   std::cout << "stream-http-roundtrip-ok\n";
   return 0;
 }
@@ -3612,7 +4933,7 @@ int main() {
   }
 
   const char* model = std::getenv("AX_OPENAI_MODEL");
-  axllm::OpenAICompatibleClient client(axllm::object({
+  auto client = axllm::ai("openai", axllm::object({
       {"api_key", key},
       {"model", model == nullptr || std::string(model).empty() ? "gpt-5.4-mini" : model},
       {"model_config", axllm::object({{"temperature", 0}})},
@@ -3626,8 +4947,12 @@ int main() {
            })
       .returns(axllm::object({{"outline", "outline"}, {"summary", "summary"}}));
   axllm::Value output = program.forward(
-      client,
+      *client,
       axllm::object({{"topic", "how Ax composes typed LLM programs"}}));
+  for (const char* key : {"outline", "summary"}) {
+    std::string text = axllm::stringify(axllm::Core::get(output, key));
+    if (text == "null" || text == "\"\"" || text == "[]") throw std::runtime_error(std::string("flow output field ") + key + " is empty: " + axllm::stringify(output));
+  }
   std::cout << axllm::stringify(output) << "\n";
 }
 `
@@ -3644,7 +4969,7 @@ struct ScriptedTransport : axllm::Transport {
     requests.push_back(request);
     std::string url = axllm::stringify(axllm::Core::get(request, "url"));
     if (url.find("/audio/speech") != std::string::npos) {
-      return axllm::object({{"status", 200}, {"json", axllm::object({{"audio", "base64-speech"}})}});
+      return axllm::object({{"status", 200}, {"json", axllm::object({{"data", "base64-speech"}})}});
     }
     if (url.find("/audio/transcriptions") != std::string::npos) {
       return axllm::object({
@@ -3667,7 +4992,7 @@ int main() {
       {"model", "whisper-1"},
       {"format", "json"},
   }));
-  if (!axllm::equal(axllm::Core::get(speech, "audio"), "base64-speech")) return 1;
+  if (!axllm::equal(axllm::Core::get(speech, "data"), "base64-speech")) return 1;
   if (!axllm::equal(axllm::Core::get(transcript, "text"), "hello world")) return 2;
 
   std::cout << "normalized output:\n"
@@ -3836,6 +5161,99 @@ int main() {
   if (axllm::stringify(axllm::Core::get(axllm::Core::get(result, "audio"), "data")) != "\"AQI=\"") {
     fail("audio chunk not surfaced", final_response);
   }
+  auto meta = std::dynamic_pointer_cast<axllm::OpenAICompatibleClient>(axllm::ai("meta", axllm::parse_json(R"({"model":"muse-voice-transcribe-1.0","api_key":"test-key"})")));
+  auto meta_request = axllm::parse_json(R"({"model":"muse-voice-transcribe-1.0","chat_prompt":[{"role":"user","content":[{"type":"audio","data":"AAE=","format":"pcm16"}]}],"audio":{"input":{"sampleRate":16000,"channels":1}},"model_config":{"realtimeTranscription":{"partialMode":"delta"}}})");
+  std::vector<axllm::Value> meta_inbound = {
+    axllm::parse_json(R"({"sessionId":"meta-session"})"),
+    axllm::parse_json(R"({"type":"speechStart","turnId":"one"})"),
+    axllm::parse_json(R"({"type":"transcript","transcript":"Hello"})"),
+    axllm::parse_json(R"({"type":"transcript","transcript":" world"})"),
+    axllm::parse_json(R"({"type":"speaker","speaker":"A"})"),
+    axllm::parse_json(R"({"type":"speechStart","turnId":"two"})"),
+    axllm::parse_json(R"({"type":"transcript","transcript":"Second"})"),
+    axllm::parse_json(R"({"type":"speechComplete","turnId":"one","transcript":"Hello world!"})"),
+    axllm::parse_json(R"({"type":"speechComplete","turnId":"two","transcript":"Second turn"})"),
+  };
+  axllm::ScriptedRealtimeTransport meta_transport(meta_inbound);
+  auto meta_final = meta->realtime_chat(meta_request, &meta_transport);
+  auto meta_results = axllm::Core::iter(axllm::Core::get(meta_final, "results"));
+  if (axllm::stringify(axllm::Core::get(meta_final, "remote_session_id")) != "\"meta-session\"" || meta_results.size() != 2 || axllm::stringify(axllm::Core::get(meta_results[0], "content")) != "\"Hello world!\"" || axllm::stringify(axllm::Core::get(meta_results[1], "content")) != "\"Second turn\"") fail("Meta overlapping turns or session lost", meta_final);
+  if (meta_transport.sent.size() != 3) fail("Meta setup/audio/shutdown order", meta_final);
+  class DuplexProbe : public axllm::RealtimeTransport {
+   public:
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::vector<axllm::Value> frames;
+    bool ended = false;
+    int chunks = 0;
+    void send(const axllm::Value& event) override {
+      std::lock_guard<std::mutex> lock(mutex);
+      auto type = axllm::stringify(axllm::Core::get(event, "type"));
+      if (!axllm::Core::get(event, "authorization").is_null()) frames.push_back(axllm::object({{"sessionId", "duplex"}}));
+      else if (type == "\"binary\"" && ++chunks == 1) frames.push_back(axllm::object({{"type", "transcript"}, {"transcript", "wrong hypothesis"}}));
+      else if (type == "\"endStream\"") { ended = true; frames.push_back(axllm::object({{"type", "transcript"}, {"transcript", "Correct final."}, {"final", true}})); frames.push_back(axllm::Value()); }
+      ready.notify_all();
+    }
+    bool recv(axllm::Value& event) override {
+      std::unique_lock<std::mutex> lock(mutex);
+      if (!ready.wait_for(lock, std::chrono::seconds(3), [&] { return !frames.empty(); })) throw std::runtime_error("duplex receiver timed out");
+      event = frames.front(); frames.erase(frames.begin());
+      if (axllm::stringify(axllm::Core::get(event, "transcript")) == "\"wrong hypothesis\"" && ended) throw std::runtime_error("partial delayed until endStream");
+      return !event.is_null();
+    }
+    void close() override { std::lock_guard<std::mutex> lock(mutex); frames.push_back(axllm::Value()); ready.notify_all(); }
+  } duplex;
+  auto duplex_request = axllm::parse_json(R"({"model":"muse-voice-transcribe-1.0","chat_prompt":[{"role":"user","content":[{"type":"audio","data":"","format":"pcm16"}]}],"audio":{"input":{"sampleRate":16000,"channels":1}}})");
+  axllm::Core::set(duplex_request, "chat_prompt", axllm::array({axllm::object({{"role", "user"}, {"content", axllm::array({axllm::object({{"type", "audio"}, {"format", "pcm16"}, {"data", std::string(12800, 'A')}})})}})}));
+  auto duplex_final = meta->realtime_chat(duplex_request, &duplex);
+  if (axllm::stringify(axllm::Core::get(axllm::Core::iter(axllm::Core::get(duplex_final, "results"))[0], "content")) != "\"Correct final.\"") fail("duplex final lost", duplex_final);
+  class EarlyCloseProbe : public DuplexProbe {
+   public:
+    void send(const axllm::Value& event) override {
+      DuplexProbe::send(event);
+      if (axllm::stringify(axllm::Core::get(event, "type")) == "\"binary\"") {
+        std::lock_guard<std::mutex> lock(mutex);
+        frames.push_back(axllm::Value());
+        ready.notify_all();
+      }
+    }
+  } early_close;
+  try {
+    meta->realtime_chat(duplex_request, &early_close);
+    fail("early close accepted an incomplete upload", axllm::Value());
+  } catch (const std::exception& error) {
+    if (std::string(error.what()).find("closed before audio upload completed") == std::string::npos) throw;
+  }
+  // Gemini Live extended thinking: an acknowledgement turn ends IN_PROGRESS and the
+  // answer follows in a second turn, so the driver must keep reading past it.
+  auto gemini = std::dynamic_pointer_cast<axllm::OpenAICompatibleClient>(axllm::ai("google-gemini", axllm::parse_json(R"({"model":"gemini-3.8-live-extended-thinking","api_key":"test-key"})")));
+  std::vector<axllm::Value> gemini_inbound = {
+      axllm::parse_json(R"({"setupComplete":{}})"),
+      axllm::parse_json(R"({"serverContent":{"outputTranscription":{"text":"Let me think."}}})"),
+      axllm::parse_json(R"({"serverContent":{"turnComplete":true,"interactionStatus":"IN_PROGRESS"}})"),
+      axllm::parse_json(R"({"serverContent":{"outputTranscription":{"text":"Hello there."}}})"),
+      axllm::parse_json(R"({"serverContent":{"modelTurn":{"parts":[{"inlineData":{"mimeType":"audio/pcm","data":"AQI="}}]}}})"),
+      axllm::parse_json(R"({"serverContent":{"turnComplete":true,"interactionStatus":"IDLE"}})"),
+  };
+  axllm::ScriptedRealtimeTransport gemini_transport(gemini_inbound);
+  axllm::Value gemini_final = gemini->realtime_chat(
+      axllm::parse_json(R"({"model":"gemini-3.8-live-extended-thinking","chat_prompt":[{"role":"user","content":"Say hello."}]})"),
+      &gemini_transport);
+  axllm::Value gemini_result;
+  for (const auto& entry : axllm::Core::iter(axllm::Core::get(gemini_final, "results"))) {
+    gemini_result = entry;
+    break;
+  }
+  if (axllm::stringify(axllm::Core::get(gemini_result, "content")) != "\"Let me think. Hello there.\"" ||
+      axllm::stringify(axllm::Core::get(gemini_result, "finish_reason")) != "\"stop\"" ||
+      axllm::stringify(axllm::Core::get(axllm::Core::get(gemini_result, "audio"), "data")) != "\"AQI=\"") {
+    fail("Gemini extended-thinking turn cut short", gemini_final);
+  }
+  axllm::AxMemory memory;
+  memory.update_result(axllm::parse_json(R"({"thought_blocks":[{"id":"r","data":"Plan"}],"images":[{"id":"image","data":"partial"}]})"));
+  memory.update_result(axllm::parse_json(R"({"thought_blocks":[{"id":"r","data":"Plan.","summary":"Plan.","encrypted_content":"opaque"}]})"));
+  auto replay = axllm::stringify(memory.history());
+  if (replay.find("opaque") == std::string::npos || replay.find("image") == std::string::npos || replay.find("PlanPlan") != std::string::npos) fail("replay metadata lost", replay);
   std::cout << "realtime-audio-turn-ok\n";
   return 0;
 }
@@ -3908,27 +5326,35 @@ int main() {
 const cppACEPlaybookExample = `#include "axllm/axllm.hpp"
 
 #include <iostream>
+#include <string>
 
 // A scripted client stands in for a real provider so this example runs without a
 // key. Swap it for axllm::ai("openai", ...) to grow a playbook against a live
-// model. The canned JSON satisfies the bound program AND the playbook's internal
-// reflector/curator sub-programs, so the full ACE loop is exercised offline.
+// model. Each program answers in its own output format, chosen by the output
+// wire keys in its prompt: the bound program, then the playbook's reflector and
+// curator, so the full ACE loop is exercised offline.
 struct ScriptedClient : axllm::AIClient {
-  axllm::Value complete(axllm::Value) override {
-    return axllm::object({{"content",
-        "{\"answer\":\"Ax composes typed LLM programs.\","
-        "\"reasoning\":\"The playbook lacked a brevity rule.\","
-        "\"errorIdentification\":\"Answer was too verbose.\","
-        "\"rootCauseAnalysis\":\"No guidance on conciseness.\","
-        "\"correctApproach\":\"Add a concise-answer guideline.\","
-        "\"keyInsight\":\"Prefer one-sentence answers.\","
-        "\"weaknessDescription\":\"The agent does not verify its final step.\","
-        "\"rootCause\":\"The final step is accepted without a check.\","
-        "\"proposedGuidance\":\"Verify the final step before completing the task.\","
-        "\"evidenceQuotes\":[\"final\",\"snapshot\",\"Answer\"],"
-        "\"configRecommendations\":[],"
-        "\"bulletTags\":[],"
-        "\"operations\":[{\"type\":\"ADD\",\"section\":\"Guidelines\",\"content\":\"Answer in one concise sentence.\"}]}"}});
+  axllm::Value complete(axllm::Value request) override {
+    const std::string prompt = axllm::stringify(axllm::Core::get(request, "chat_prompt"));
+    const std::string tick(1, static_cast<char>(96));
+    auto outputs = [&](const std::string& key) {
+      return prompt.find("(wire key: " + tick + key + tick + ")") != std::string::npos;
+    };
+    std::string content = "Answer: Ax composes typed LLM programs.";
+    if (outputs("errorIdentification")) {
+      content =
+          "Reasoning: The playbook lacked a brevity rule.\n"
+          "Error Identification: Answer was too verbose.\n"
+          "Root Cause Analysis: No guidance on conciseness.\n"
+          "Correct Approach: Add a concise-answer guideline.\n"
+          "Key Insight: Prefer one-sentence answers.\n"
+          "Bullet Tags: []";
+    } else if (outputs("operations")) {
+      content =
+          "Reasoning: The playbook lacked a brevity rule.\n"
+          "Operations: [{\"type\": \"ADD\", \"section\": \"Guidelines\", \"content\": \"Answer in one concise sentence.\"}]";
+    }
+    return axllm::object({{"content", content}});
   }
 };
 
@@ -3953,6 +5379,10 @@ int main() {
   axllm::Value state = pb.to_json();
   if (axllm::Core::get(result, "bestScore", axllm::Value()).is_null()) return 1;
   if (axllm::Core::get(state, "playbook", axllm::Value()).is_null()) return 1;
+  if (rendered.find("Answer in one concise sentence.") == std::string::npos) {
+    std::cerr << "the playbook did not grow: " << rendered << "\n";
+    return 1;
+  }
   std::cout << "rendered: " << rendered << "\n";
   std::cout << "cpp-ace-playbook-ok\n";
 }
@@ -3961,26 +5391,43 @@ int main() {
 const cppAgentPlaybookExample = `#include "axllm/axllm.hpp"
 
 #include <iostream>
+#include <string>
 
-// The actor returns model-authored Python code and a real runtime executes it.
-// The same offline response also satisfies the playbook reflector and curator.
+// An offline model: each stage answers in its own output contract, found by
+// the output wire keys its prompt asks for. The actor returns model-authored
+// Python code that a real runtime executes; the evolve weakness miner and the
+// playbook reflector and curator answer with "Label: value" lines.
 struct ScriptedClient : axllm::AIClient {
-  axllm::Value complete(axllm::Value) override {
-    return axllm::object({{"content",
-        "{\"pythonCode\":\"final('Answer', {'answer': 'Ax composes typed LLM programs.'})\","
-        "\"answer\":\"Ax composes typed LLM programs.\","
-        "\"reasoning\":\"The playbook lacked a brevity rule.\","
-        "\"errorIdentification\":\"Answer was too verbose.\","
-        "\"rootCauseAnalysis\":\"No guidance on conciseness.\","
-        "\"correctApproach\":\"Add a concise-answer guideline.\","
-        "\"keyInsight\":\"Prefer one-sentence answers.\","
-        "\"weaknessDescription\":\"The agent does not verify its final step.\","
-        "\"rootCause\":\"The final step is accepted without a check.\","
-        "\"proposedGuidance\":\"Verify the final step before completing the task.\","
-        "\"evidenceQuotes\":[\"final\",\"snapshot\",\"Answer\"],"
-        "\"configRecommendations\":[],"
-        "\"bulletTags\":[],"
-        "\"operations\":[{\"type\":\"ADD\",\"section\":\"Guidelines\",\"content\":\"Answer in one concise sentence.\"}]}"}});
+  axllm::Value complete(axllm::Value request) override {
+    const std::string prompt = axllm::stringify(request);
+    const std::string tick(1, static_cast<char>(96));
+    auto asks = [&](const std::string& key) {
+      return prompt.find("(wire key: " + tick + key + tick + ")") != std::string::npos;
+    };
+    std::string content = "Answer: Ax composes typed LLM programs.";
+    if (asks("pythonCode")) {
+      content = "{\"pythonCode\":\"final('Answer', {'answer': 'Ax composes typed LLM programs.'})\"}";
+    } else if (asks("weaknessDescription")) {
+      content =
+          "Weakness Description: The agent does not verify its final step.\n"
+          "Root Cause: The final step is accepted without a check.\n"
+          "Proposed Guidance: Verify the final step before completing the task.\n"
+          "Evidence Quotes: [\"final\", \"snapshot\", \"Answer\"]\n"
+          "Config Recommendations: []";
+    } else if (asks("errorIdentification")) {
+      content =
+          "Reasoning: The playbook lacked a brevity rule.\n"
+          "Error Identification: Answer was too verbose.\n"
+          "Root Cause Analysis: No guidance on conciseness.\n"
+          "Correct Approach: Add a concise-answer guideline.\n"
+          "Key Insight: Prefer one-sentence answers.\n"
+          "Bullet Tags: []";
+    } else if (asks("operations")) {
+      content =
+          "Reasoning: The playbook lacked a brevity rule.\n"
+          "Operations: [{\"type\":\"ADD\",\"section\":\"Guidelines\",\"content\":\"Answer in one concise sentence.\"}]";
+    }
+    return axllm::object({{"content", content}});
   }
 };
 
@@ -4048,5 +5495,1063 @@ int main() {
   std::cout << "accepted: " << axllm::stringify(accepted_outcome) << "\n";
   std::cout << "rejected: " << axllm::stringify(rejected_outcome) << "\n";
   std::cout << "cpp-agent-playbook-ok\n";
+}
+`
+
+const pyTimeoutHTTPRoundtripExample = `"""Time requests out through the REAL urllib transport against in-process
+loopback servers. A call's timeout (TypeScript's per-call timeout, in
+milliseconds) ends a chat or a stream whose response has not started, and the
+request layer does not retry it. A stream whose response has started runs past
+it, because the timer stops at the response headers, as in TypeScript's
+apiCall. Exits non-zero on any mismatch so ` + "`axir verify`" + ` fails if it regresses."""
+
+import socket
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from axllm import AxAIServiceTimeoutError, OpenAICompatibleClient
+
+# A server that accepts connections and never answers.
+silent = socket.socket()
+silent.bind(("127.0.0.1", 0))
+silent.listen(16)
+accepted = []
+
+
+def hold():
+    while True:
+        try:
+            connection, _ = silent.accept()
+        except OSError:
+            return
+        accepted.append(connection)
+
+
+threading.Thread(target=hold, daemon=True).start()
+request = {"chat_prompt": [{"role": "user", "content": "hi"}]}
+client = OpenAICompatibleClient(
+    api_key="test-key", base_url=f"http://127.0.0.1:{silent.getsockname()[1]}", model="gpt-5.4-mini"
+)
+
+
+def expect_timeout(label, run):
+    started = time.monotonic()
+    try:
+        run()
+    except AxAIServiceTimeoutError as error:
+        assert "Request timed out after 200ms" in str(error), f"{label}: {error}"
+        elapsed = time.monotonic() - started
+        assert elapsed < 5, f"{label}: timed out after {elapsed:.2f} s"
+        return
+    raise AssertionError(f"{label}: the request did not time out")
+
+
+expect_timeout("chat", lambda: client.chat(request, {"timeout": 200}))
+expect_timeout("stream", lambda: list(client.stream(request, {"timeout": 200})))
+assert len(accepted) == 2, f"a timed-out request was retried: {len(accepted)} connections"
+
+
+# A stream whose headers arrive at once and whose second event comes after more
+# than the timeout.
+def event(content, finish):
+    return (
+        '{"id":"chatcmpl_slow","model":"gpt-5.4-mini","choices":[{"index":0,"delta":{"content":"'
+        + content
+        + '"},"finish_reason":'
+        + finish
+        + "}]}"
+    )
+
+
+class Slow(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        self.wfile.write(("data: " + event("Hel", "null") + "\n\n").encode())
+        self.wfile.flush()
+        time.sleep(1.5)
+        self.wfile.write(("data: " + event("lo", '"stop"') + "\n\ndata: [DONE]\n\n").encode())
+        self.wfile.flush()
+
+
+server = ThreadingHTTPServer(("127.0.0.1", 0), Slow)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+try:
+    slow = OpenAICompatibleClient(
+        api_key="test-key", base_url=f"http://127.0.0.1:{server.server_address[1]}", model="gpt-5.4-mini"
+    )
+    events = list(slow.stream(request, {"timeout": 1000}))
+    text = "".join((event.get("results") or [{}])[0].get("content") or "" for event in events)
+    assert text == "Hello", f"a started stream was cut off: {text!r}"
+finally:
+    server.shutdown()
+    silent.close()
+
+print("timeout-http-roundtrip-ok")
+`
+
+const javaTimeoutHTTPRoundtripExample = `import com.sun.net.httpserver.HttpServer;
+import dev.axllm.ax.*;
+import java.io.OutputStream;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import java.util.concurrent.Callable;
+import java.util.concurrent.atomic.AtomicInteger;
+
+// Time requests out through the REAL HttpClient transport against in-process
+// loopback servers. A call's timeout (TypeScript's per-call timeout, in
+// milliseconds) ends a chat or a stream whose response has not started, and
+// the request layer does not retry it. A stream whose response has started
+// runs past it, because the timer stops at the response headers, as in
+// TypeScript's apiCall. Exits non-zero on any mismatch so ` + "`axir verify`" + `
+// fails if it regresses.
+public final class TimeoutHTTPRoundtripExample {
+  public static void main(String[] args) throws Exception {
+    // A server that accepts connections and never answers.
+    ServerSocket silent = new ServerSocket(0, 16, InetAddress.getByName("127.0.0.1"));
+    AtomicInteger accepted = new AtomicInteger();
+    List<Socket> held = Collections.synchronizedList(new ArrayList<>());
+    Thread acceptor = new Thread(() -> {
+      while (true) {
+        try {
+          held.add(silent.accept());
+          accepted.incrementAndGet();
+        } catch (Exception error) {
+          return;
+        }
+      }
+    });
+    acceptor.setDaemon(true);
+    acceptor.start();
+    Map<String, Object> request = Map.of("chat_prompt", List.of(Map.of("role", "user", "content", "hi")));
+    OpenAICompatibleClient client = new OpenAICompatibleClient(
+        Map.of("api_key", "test-key", "base_url", "http://127.0.0.1:" + silent.getLocalPort(), "model", "gpt-5.4-mini"));
+    expectTimeout("chat", () -> client.chat(request, new LinkedHashMap<>(Map.of("timeout", 200))));
+    expectTimeout("stream", () -> {
+      try (AxChatStream stream = client.openStream(request, new LinkedHashMap<>(Map.of("timeout", 200)), null)) {
+        for (Object ignored : stream) {}
+      }
+      return null;
+    });
+    if (accepted.get() != 2) throw new RuntimeException("a timed-out request was retried: " + accepted.get() + " connections");
+
+    // A stream whose headers arrive at once and whose second event comes after
+    // more than the timeout.
+    HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    server.createContext(
+        "/",
+        exchange -> {
+          exchange.getRequestBody().readAllBytes();
+          exchange.getResponseHeaders().set("Content-Type", "text/event-stream");
+          exchange.sendResponseHeaders(200, 0);
+          try (OutputStream os = exchange.getResponseBody()) {
+            os.write(("data: " + event("Hel", "null") + "\n\n").getBytes(StandardCharsets.UTF_8));
+            os.flush();
+            try {
+              Thread.sleep(1500);
+            } catch (InterruptedException error) {
+              Thread.currentThread().interrupt();
+            }
+            os.write(("data: " + event("lo", "\"stop\"") + "\n\ndata: [DONE]\n\n").getBytes(StandardCharsets.UTF_8));
+            os.flush();
+          }
+        });
+    server.start();
+    try {
+      OpenAICompatibleClient slow = new OpenAICompatibleClient(
+          Map.of("api_key", "test-key", "base_url", "http://127.0.0.1:" + server.getAddress().getPort(), "model", "gpt-5.4-mini"));
+      StringBuilder text = new StringBuilder();
+      try (AxChatStream stream = slow.openStream(request, new LinkedHashMap<>(Map.of("timeout", 1000)), null)) {
+        for (Map<String, Object> event : stream) {
+          Object results = event.get("results");
+          if (results instanceof List<?> list && !list.isEmpty() && list.get(0) instanceof Map<?, ?> first && first.get("content") instanceof String content) text.append(content);
+        }
+      }
+      if (!"Hello".equals(text.toString())) throw new RuntimeException("a started stream was cut off: " + text);
+    } finally {
+      server.stop(0);
+      silent.close();
+    }
+    System.out.println("timeout-http-roundtrip-ok");
+  }
+
+  static String event(String content, String finish) {
+    return "{\"id\":\"chatcmpl_slow\",\"model\":\"gpt-5.4-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" + content + "\"},\"finish_reason\":" + finish + "}]}";
+  }
+
+  static void expectTimeout(String label, Callable<Object> run) throws Exception {
+    long started = System.nanoTime();
+    try {
+      run.call();
+    } catch (AxAIServiceError error) {
+      if (!"AxAIServiceTimeoutError".equals(error.getClass().getSimpleName()) || !String.valueOf(error.getMessage()).contains("Request timed out after 200ms"))
+        throw new RuntimeException(label + ": " + error, error);
+      double elapsed = (System.nanoTime() - started) / 1e9;
+      if (elapsed >= 5) throw new RuntimeException(label + ": timed out after " + elapsed + " s");
+      return;
+    }
+    throw new RuntimeException(label + ": the request did not time out");
+  }
+}
+`
+
+const cppTimeoutHTTPRoundtripExample = `#include "axllm/axllm.hpp"
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <chrono>
+#include <csignal>
+#include <functional>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
+
+// Time requests out through the REAL libcurl HttpTransport against in-process
+// loopback servers. A call's timeout (TypeScript's per-call timeout, in
+// milliseconds) ends a chat or a stream whose response has not started, and
+// the request layer does not retry it. A stream whose response has started
+// runs past it, because the timer stops at the response headers, as in
+// TypeScript's apiCall. Returns non-zero on any mismatch so axir verify fails
+// if it regresses. Requires libcurl (AXLLM_ENABLE_CURL); axir verify skips it
+// when libcurl is unavailable.
+
+namespace {
+
+int listen_loopback() {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) throw std::runtime_error("socket failed");
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0 || listen(fd, 16) < 0)
+    throw std::runtime_error("listen failed");
+  return fd;
+}
+
+int port_of(int fd) {
+  sockaddr_in address{};
+  socklen_t size = sizeof(address);
+  getsockname(fd, reinterpret_cast<sockaddr*>(&address), &size);
+  return ntohs(address.sin_port);
+}
+
+// Read the request headers and its Content-Length body.
+void drain_request(int fd) {
+  std::string buf;
+  char tmp[4096];
+  size_t header_end = std::string::npos;
+  size_t content_length = 0;
+  while (true) {
+    if (header_end == std::string::npos) {
+      size_t pos = buf.find("\r\n\r\n");
+      if (pos != std::string::npos) {
+        header_end = pos + 4;
+        std::string lower = buf.substr(0, pos);
+        for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        size_t at = lower.find("content-length:");
+        if (at != std::string::npos) content_length = std::stoul(lower.substr(at + 15));
+      }
+    }
+    if (header_end != std::string::npos && buf.size() >= header_end + content_length) break;
+    ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+    if (n <= 0) break;
+    buf.append(tmp, static_cast<size_t>(n));
+  }
+}
+
+void send_all(int fd, const std::string& text) {
+  size_t offset = 0;
+  while (offset < text.size()) {
+    ssize_t n = send(fd, text.data() + offset, text.size() - offset, 0);
+    if (n <= 0) break;
+    offset += static_cast<size_t>(n);
+  }
+}
+
+std::string event(const std::string& content, const std::string& finish) {
+  return "{\"id\":\"chatcmpl_slow\",\"model\":\"gpt-5.4-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" + content + "\"},\"finish_reason\":" + finish + "}]}";
+}
+
+void expect_timeout(const std::string& label, const std::function<void()>& run) {
+  auto started = std::chrono::steady_clock::now();
+  try {
+    run();
+  } catch (const axllm::AxError& error) {
+    if (error.type != "AxAIServiceTimeoutError" || std::string(error.what()).find("Request timed out after 200ms") == std::string::npos)
+      throw std::runtime_error(label + ": " + error.type + ": " + error.what());
+    if (std::chrono::steady_clock::now() - started >= std::chrono::seconds(5)) throw std::runtime_error(label + ": timed out too late");
+    return;
+  }
+  throw std::runtime_error(label + ": the request did not time out");
+}
+
+}  // namespace
+
+int main() {
+  ::signal(SIGPIPE, SIG_IGN);
+  using namespace axllm;
+  // A server that accepts connections and never answers.
+  int silent = listen_loopback();
+  std::atomic<int> accepted{0};
+  std::thread([silent, &accepted] {
+    std::vector<int> held;
+    while (true) {
+      int fd = accept(silent, nullptr, nullptr);
+      if (fd < 0) return;
+      accepted.fetch_add(1);
+      held.push_back(fd);
+    }
+  }).detach();
+  Value request = object({{"chat_prompt", array({object({{"role", "user"}, {"content", "hi"}})})}});
+  OpenAICompatibleClient client(
+      object({{"api_key", "test-key"}, {"base_url", "http://127.0.0.1:" + std::to_string(port_of(silent))}, {"model", "gpt-5.4-mini"}}),
+      nullptr);
+  expect_timeout("chat", [&] { client.chat(request, object({{"timeout", 200}})); });
+  expect_timeout("stream", [&] { client.stream(request, object({{"timeout", 200}})); });
+  if (accepted.load() != 2) throw std::runtime_error("a timed-out request was retried: " + std::to_string(accepted.load()) + " connections");
+
+  // A stream whose headers arrive at once and whose second event comes after
+  // more than the timeout.
+  int slow = listen_loopback();
+  std::thread server([slow] {
+    int fd = accept(slow, nullptr, nullptr);
+    if (fd < 0) return;
+    drain_request(fd);
+    send_all(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n");
+    send_all(fd, "data: " + event("Hel", "null") + "\n\n");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    send_all(fd, "data: " + event("lo", "\"stop\"") + "\n\ndata: [DONE]\n\n");
+    close(fd);
+  });
+  OpenAICompatibleClient slow_client(
+      object({{"api_key", "test-key"}, {"base_url", "http://127.0.0.1:" + std::to_string(port_of(slow))}, {"model", "gpt-5.4-mini"}}),
+      nullptr);
+  std::string text;
+  for (const auto& event : slow_client.stream(request, object({{"timeout", 1000}}))) {
+    text += display(Core::get(Core::get(Core::get(event, "results"), 0), "content", ""));
+  }
+  server.join();
+  close(slow);
+  close(silent);
+  if (text != "Hello") {
+    std::cerr << "a started stream was cut off: " << text << "\n";
+    return 1;
+  }
+  std::cout << "timeout-http-roundtrip-ok\n";
+  return 0;
+}
+`
+
+const pyTransportErrorsHTTPRoundtripExample = `"""Send requests through the REAL urllib transport to in-process loopback
+servers that fail the way networks do, and check that the failures surface as
+TypeScript's apiCall reports fetch's: a refused or dropped connection is
+AxAIServiceNetworkError ("Network Error: ..."), which the request layer
+retries under the call's retry options; a timeout is AxAIServiceTimeoutError
+("Request timed out after <ms>ms", the client's timeout in milliseconds), which
+the request layer never retries; and AxGen retries both as infrastructure
+errors. A stream whose response began is not retried: TS reads its first event
+after apiCall returns. Exits non-zero on any mismatch so ` + "`" + `axir verify` + "`" + ` fails if
+it regresses."""
+
+import http.client
+import socket
+import threading
+import time
+
+from axllm import (
+    AxAIServiceError,
+    AxAIServiceNetworkError,
+    AxAIServiceTimeoutError,
+    OpenAICompatibleClient,
+    ax,
+    typesafe,
+)
+
+GATEWAY_BODY = b'{"error":{"message":"upstream timed out","type":"server_error"}}'
+GATEWAY_RESPONSE = (
+    b"HTTP/1.1 504 Gateway Timeout\r\nContent-Type: application/json\r\n"
+    + f"Content-Length: {len(GATEWAY_BODY)}\r\nConnection: close\r\n\r\n".encode()
+    + GATEWAY_BODY
+)
+DROP_EVENT = (
+    b'data: {"id":"chatcmpl_drop","object":"chat.completion.chunk","created":0,"model":"gpt-6-luna",'
+    b'"choices":[{"index":0,"delta":{"content":"Hel"},"finish_reason":null}]}\n\n'
+)
+
+
+def read_request(connection):
+    """Read the request headers and its Content-Length body."""
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = connection.recv(65536)
+        if not chunk:
+            return
+        data += chunk
+    head, _, body = data.partition(b"\r\n\r\n")
+    length = 0
+    for line in head.split(b"\r\n")[1:]:
+        name, _, value = line.partition(b":")
+        if name.strip().lower() == b"content-length":
+            length = int(value.strip())
+    while len(body) < length:
+        chunk = connection.recv(65536)
+        if not chunk:
+            return
+        body += chunk
+
+
+def serve(mode):
+    """Accept connections and count them: "close" closes each one without a
+    response, "drop" sends one stream event and drops it, "headers" sends the
+    response headers and drops it, "gateway" answers 504, "hold" never
+    answers."""
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(16)
+    state = {"connections": 0, "held": []}
+
+    def run():
+        while True:
+            try:
+                connection, _ = listener.accept()
+            except OSError:
+                return
+            state["connections"] += 1
+            if mode == "hold":
+                state["held"].append(connection)
+                continue
+            try:
+                read_request(connection)
+                if mode == "drop":
+                    head = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"
+                    connection.sendall(head + f"{len(DROP_EVENT):x}\r\n".encode() + DROP_EVENT + b"\r\n")
+                    time.sleep(0.05)
+                elif mode == "gateway":
+                    connection.sendall(GATEWAY_RESPONSE)
+                elif mode == "headers":
+                    connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
+                    time.sleep(0.05)
+            except OSError:
+                pass
+            connection.close()
+
+    threading.Thread(target=run, daemon=True).start()
+    return listener.getsockname()[1], state
+
+
+def closed_port():
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    return port
+
+
+def client(port, **options):
+    return OpenAICompatibleClient(api_key="test-key", base_url=f"http://127.0.0.1:{port}", model="gpt-6-luna", **options)
+
+
+def expect(label, error_type, prefix, run):
+    try:
+        run()
+    except Exception as error:  # noqa: BLE001
+        current = error
+        while current is not None and not isinstance(current, error_type):
+            current = current.__cause__
+        assert current is not None, f"{label}: want {error_type.__name__}, got {type(error).__name__}: {error}"
+        assert str(current).startswith(prefix), f"{label}: {str(current)!r} does not start with {prefix!r}"
+        return current
+    raise AssertionError(f"{label}: no error")
+
+
+request = {"chat_prompt": [{"role": "user", "content": "hi"}]}
+fast_retry = {"maxRetries": 2, "initialDelayMs": 10, "maxDelayMs": 20}
+
+# A refused connection.
+refused = client(closed_port())
+expect("refused chat", AxAIServiceNetworkError, "Network Error: ", lambda: refused.chat(request, {"stream": False, "retry": fast_retry}))
+expect("refused stream", AxAIServiceNetworkError, "Network Error: ", lambda: list(refused.stream(request, {"retry": fast_retry})))
+
+# A server that closes each connection without a response. The request layer
+# retries it: the first request and two retries.
+closing, closed = serve("close")
+before = closed["connections"]
+expect("closed chat", AxAIServiceNetworkError, "Network Error: ", lambda: client(closing).chat(request, {"stream": False, "retry": fast_retry}))
+assert closed["connections"] - before == 3, f"closed chat: {closed['connections'] - before} requests"
+before = closed["connections"]
+expect("closed stream", AxAIServiceNetworkError, "Network Error: ", lambda: list(client(closing).stream(request, {"retry": fast_retry})))
+assert closed["connections"] - before == 3, f"closed stream: {closed['connections'] - before} requests"
+
+# A stream whose response began and dropped before its first event is not
+# retried: TS reads the first event after apiCall returns.
+started, began = serve("headers")
+try:
+    list(client(started).stream(request, {"retry": fast_retry}))
+except AxAIServiceError:
+    pass
+else:
+    raise AssertionError("started stream: no error")
+assert began["connections"] == 1, f"started stream: {began['connections']} requests"
+
+# A 504 response is retried by its status, as TS apiCall retries it: it is not a
+# timeout the request ran out of.
+gateway, answered = serve("gateway")
+try:
+    list(client(gateway).stream(request, {"retry": fast_retry}))
+except AxAIServiceError:
+    pass
+else:
+    raise AssertionError("gateway stream: no error")
+assert answered["connections"] == 3, f"gateway stream: {answered['connections']} requests"
+
+# The client's own timeout (seconds) ends a chat or a stream whose response has
+# not started, in TS's words, and the request layer does not retry it.
+silent, held = serve("hold")
+before = held["connections"]
+timeout_error = expect("timed-out chat", AxAIServiceTimeoutError, "Request timed out after 300ms", lambda: client(silent, timeout=0.3).chat(request, {"stream": False}))
+assert not isinstance(timeout_error, AxAIServiceNetworkError)
+expect("timed-out stream", AxAIServiceTimeoutError, "Request timed out after 300ms", lambda: list(client(silent, timeout=0.3).stream(request, {"retry": fast_retry})))
+assert held["connections"] - before == 2, f"a timed-out request was retried: {held['connections'] - before} requests"
+
+# A server that sends one event and drops the connection: the stream ends in a
+# network error after the event, and is not retried.
+dropping, dropped = serve("drop")
+delivered = []
+
+
+def consume():
+    for event in client(dropping).stream(request, {"retry": fast_retry}):
+        delivered.append(event)
+
+
+dropped_error = expect("dropped stream", AxAIServiceNetworkError, "Network Error: ", consume)
+# Ax25 exposes the Ax error type and preserves the native exception as its cause.
+assert not isinstance(dropped_error, http.client.IncompleteRead), f"dropped stream: {type(dropped_error).__mro__}"
+assert isinstance(dropped_error.__cause__, http.client.IncompleteRead)
+assert len(delivered) == 1 and dropped["connections"] == 1, f"dropped stream: {len(delivered)} events, {dropped['connections']} requests"
+
+# The Typesafe client types the same failures, and does not retry a timeout.
+expect("Typesafe refused", AxAIServiceNetworkError, "Network Error: ", lambda: typesafe(api_key="test-key", base_url=f"http://127.0.0.1:{closed_port()}", retry=fast_retry).list_models())
+before = held["connections"]
+expect("Typesafe timeout", AxAIServiceTimeoutError, "Request timed out after 300ms", lambda: typesafe(api_key="test-key", base_url=f"http://127.0.0.1:{silent}", timeout=0.3, retry=fast_retry).list_models())
+assert held["connections"] - before == 1, f"a timed-out Typesafe request was retried: {held['connections'] - before} requests"
+
+# AxGen retries a network error and a timeout as infrastructure errors. The
+# client's own retries are off, so each request is one AxGen attempt:
+# maxRetries 1 is the first attempt and one retry.
+for stream in (False, True):
+    before = closed["connections"]
+    expect(
+        f"AxGen network (stream {stream})",
+        AxAIServiceNetworkError,
+        "Network Error: ",
+        lambda: ax("question:string -> answer:string").forward(client(closing, retry={"maxRetries": 0}), {"question": "hi"}, {"maxRetries": 1, "stream": stream}),
+    )
+    assert closed["connections"] - before == 2, f"AxGen network (stream {stream}): {closed['connections'] - before} requests"
+    before = held["connections"]
+    expect(
+        f"AxGen timeout (stream {stream})",
+        AxAIServiceTimeoutError,
+        "Request timed out after 200ms",
+        lambda: ax("question:string -> answer:string").forward(client(silent, retry={"maxRetries": 0}), {"question": "hi"}, {"maxRetries": 1, "stream": stream, "timeoutMs": 200}),
+    )
+    assert held["connections"] - before == 2, f"AxGen timeout (stream {stream}): {held['connections'] - before} requests"
+
+print("transport-errors-http-roundtrip-ok")
+`
+
+const javaTransportErrorsHTTPRoundtripExample = `import dev.axllm.ax.*;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import java.util.concurrent.Callable;
+import java.util.concurrent.atomic.AtomicInteger;
+
+// Send requests through the REAL HttpClient transport to in-process loopback
+// servers that fail the way networks do, and check that the failures surface
+// as TypeScript's apiCall reports fetch's: a refused or dropped connection is
+// AxAIServiceNetworkError ("Network Error: ..."), which the request layer
+// retries under the call's retry options; a timeout is
+// AxAIServiceTimeoutError ("Request timed out after <ms>ms", the client's
+// timeout in milliseconds), which the request layer never retries; and AxGen
+// retries both as infrastructure errors. Chat, embed and streams throw typed
+// errors by default and preserve their JDK causes. Exits non-zero on any
+// mismatch so ` + "`" + `axir verify` + "`" + ` fails if it regresses.
+public final class TransportErrorsHTTPRoundtripExample {
+  static final String GATEWAY_BODY = "{\"error\":{\"message\":\"upstream timed out\",\"type\":\"server_error\"}}";
+  static final String DROP_EVENT = "data: {\"id\":\"chatcmpl_drop\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"gpt-6-luna\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n";
+  static final Map<String, Object> REQUEST = Map.of("chat_prompt", List.of(Map.of("role", "user", "content", "hi")));
+  static final Map<String, Object> FAST_RETRY = Map.of("maxRetries", 2, "initialDelayMs", 10, "maxDelayMs", 20);
+  static final Map<String, Object> TYPED = Map.of();
+
+  public static void main(String[] args) throws Exception {
+    // A refused connection.
+    int refused = closedPort();
+    expect("refused chat", "AxAIServiceNetworkError", "Network Error: ", () -> client(refused, TYPED).chat(REQUEST, new LinkedHashMap<>(Map.of("stream", false, "retry", FAST_RETRY))));
+    expect("refused stream", "AxAIServiceNetworkError", "Network Error: ", () -> drain(client(refused, Map.of()), new LinkedHashMap<>(Map.of("retry", FAST_RETRY)), null));
+    // Explicit false preserves the legacy exception contract.
+    expect("refused chat, legacy", "ConnectException", "", () -> client(refused, Map.of("typedTransportErrors", false)).chat(REQUEST, new LinkedHashMap<>(Map.of("stream", false, "retry", FAST_RETRY))));
+
+    // A server that closes each connection without a response. The stream's
+    // request layer retries it under the call's retry options: the first
+    // request and two retries.
+    AtomicInteger closed = new AtomicInteger();
+    int closing = serve("close", closed);
+    int before = closed.get();
+    expect("closed chat", "AxAIServiceNetworkError", "Network Error: ", () -> client(closing, TYPED).chat(REQUEST, new LinkedHashMap<>(Map.of("stream", false, "retry", FAST_RETRY))));
+    expectCount("closed chat", closed.get() - before, 3);
+    before = closed.get();
+    expect("closed stream", "AxAIServiceNetworkError", "Network Error: ", () -> drain(client(closing, Map.of()), new LinkedHashMap<>(Map.of("retry", FAST_RETRY)), null));
+    expectCount("closed stream", closed.get() - before, 3);
+
+    // A stream whose response began and dropped before its first event is not
+    // retried: TS reads the first event after apiCall returns.
+    AtomicInteger began = new AtomicInteger();
+    int started = serve("headers", began);
+    try {
+      drain(client(started, Map.of()), new LinkedHashMap<>(Map.of("retry", FAST_RETRY)), null);
+      throw new RuntimeException("started stream: no error");
+    } catch (AxAIServiceError error) {
+      expectCount("started stream", began.get(), 1);
+    }
+
+    // A 504 response is retried by its status, as TS apiCall retries it: it is
+    // not a timeout the request ran out of.
+    AtomicInteger answered = new AtomicInteger();
+    int gateway = serve("gateway", answered);
+    try {
+      drain(client(gateway, Map.of()), new LinkedHashMap<>(Map.of("retry", FAST_RETRY)), null);
+      throw new RuntimeException("gateway stream: no error");
+    } catch (AxAIServiceError error) {
+      expectCount("gateway stream", answered.get(), 3);
+    }
+
+    // The client's own timeout (seconds) ends a chat or a stream whose
+    // response has not started, in TS's words, and the request layer does not
+    // retry it.
+    AtomicInteger held = new AtomicInteger();
+    int silent = serve("hold", held);
+    before = held.get();
+    expect("timed-out chat", "AxAIServiceTimeoutError", "Request timed out after 300ms", () -> client(silent, with(TYPED, Map.of("timeout", 0.3))).chat(REQUEST, new LinkedHashMap<>(Map.of("stream", false))));
+    expect("timed-out stream", "AxAIServiceTimeoutError", "Request timed out after 300ms", () -> drain(client(silent, Map.of("timeout", 0.3)), new LinkedHashMap<>(Map.of("retry", FAST_RETRY)), null));
+    expectCount("timed-out requests", held.get() - before, 2);
+
+    // A server that sends one event and drops the connection: the stream ends
+    // in an infrastructure error after the event, and is not retried.
+    AtomicInteger dropped = new AtomicInteger();
+    int dropping = serve("drop", dropped);
+    int[] delivered = {0};
+    expect("dropped stream", "AxAIServiceStreamTerminatedError", "", () -> drain(client(dropping, Map.of()), new LinkedHashMap<>(Map.of("retry", FAST_RETRY)), delivered));
+    expectCount("dropped stream events", delivered[0], 1);
+    expectCount("dropped stream", dropped.get(), 1);
+
+    // The Typesafe client types the same failures, and does not retry a
+    // timeout.
+    expect("Typesafe refused", "AxAIServiceNetworkError", "Network Error: ", () -> new AxAITypesafeClient(with(TYPED, Map.of("api_key", "test-key", "base_url", "http://127.0.0.1:" + closedPort(), "retry", FAST_RETRY))).listModels());
+    before = held.get();
+    expect("Typesafe timeout", "AxAIServiceTimeoutError", "Request timed out after 300ms", () -> new AxAITypesafeClient(with(TYPED, Map.of("api_key", "test-key", "base_url", "http://127.0.0.1:" + silent, "timeout", 0.3, "retry", FAST_RETRY))).listModels());
+    expectCount("Typesafe timeout", held.get() - before, 1);
+
+    // AxGen retries a network error and a timeout as infrastructure errors.
+    // The client's own retries are off, so each request is one AxGen attempt:
+    // maxRetries 1 is the first attempt and one retry.
+    Map<String, Object> noRequestRetry = Map.of("retry", Map.of("maxRetries", 0));
+    for (boolean stream : new boolean[] {false, true}) {
+      before = closed.get();
+      expect("AxGen network (stream " + stream + ")", "AxAIServiceNetworkError", "Network Error: ", () -> Ax.ax("question:string -> answer:string").forward(client(closing, with(TYPED, noRequestRetry)), Map.of("question", "hi"), new LinkedHashMap<>(Map.of("maxRetries", 1, "stream", stream))));
+      expectCount("AxGen network (stream " + stream + ")", closed.get() - before, 2);
+      before = held.get();
+      expect("AxGen timeout (stream " + stream + ")", "AxAIServiceTimeoutError", "Request timed out after 200ms", () -> Ax.ax("question:string -> answer:string").forward(client(silent, noRequestRetry), Map.of("question", "hi"), new LinkedHashMap<>(Map.of("maxRetries", 1, "stream", stream, "timeoutMs", 200))));
+      expectCount("AxGen timeout (stream " + stream + ")", held.get() - before, 2);
+    }
+    // AxGen retries the typed default as an infrastructure error.
+    before = closed.get();
+    expect("AxGen network, default", "AxAIServiceNetworkError", "Network Error: ", () -> Ax.ax("question:string -> answer:string").forward(client(closing, noRequestRetry), Map.of("question", "hi"), new LinkedHashMap<>(Map.of("maxRetries", 1))));
+    expectCount("AxGen network, default", closed.get() - before, 2);
+    System.out.println("transport-errors-http-roundtrip-ok");
+    System.exit(0);
+  }
+
+  static Map<String, Object> with(Map<String, Object> first, Map<String, Object> second) {
+    Map<String, Object> merged = new LinkedHashMap<>(first);
+    merged.putAll(second);
+    return merged;
+  }
+
+  static OpenAICompatibleClient client(int port, Map<String, Object> options) {
+    Map<String, Object> config = new LinkedHashMap<>(Map.of("api_key", "test-key", "base_url", "http://127.0.0.1:" + port, "model", "gpt-6-luna"));
+    config.putAll(options);
+    return new OpenAICompatibleClient(config);
+  }
+
+  static Object drain(OpenAICompatibleClient client, Map<String, Object> options, int[] delivered) throws Exception {
+    try (AxChatStream stream = client.openStream(REQUEST, options, null)) {
+      for (Object ignored : stream) if (delivered != null) delivered[0]++;
+    }
+    return null;
+  }
+
+  // The error, or an error it wraps, must be of the named type with
+  // a message that starts with prefix.
+  static void expect(String label, String type, String prefix, Callable<Object> run) {
+    try {
+      run.call();
+    } catch (Throwable error) {
+      for (Throwable current = error; current != null; current = current.getCause()) {
+        if (type.equals(current.getClass().getSimpleName())) {
+          if (!String.valueOf(current.getMessage()).startsWith(prefix)) throw new RuntimeException(label + ": " + current.getMessage() + " does not start with " + prefix, error);
+          return;
+        }
+      }
+      throw new RuntimeException(label + ": want " + type + ", got " + error, error);
+    }
+    throw new RuntimeException(label + ": no error");
+  }
+
+  static void expectCount(String label, int got, int want) {
+    if (got != want) throw new RuntimeException(label + ": " + got + " requests, want " + want);
+  }
+
+  // A loopback port nothing listens on.
+  static int closedPort() throws Exception {
+    try (ServerSocket probe = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))) {
+      return probe.getLocalPort();
+    }
+  }
+
+  // Read the request headers and its Content-Length body.
+  static void readRequest(Socket socket) throws Exception {
+    java.io.InputStream in = socket.getInputStream();
+    java.io.ByteArrayOutputStream head = new java.io.ByteArrayOutputStream();
+    int matched = 0;
+    while (matched < 4) {
+      int next = in.read();
+      if (next < 0) return;
+      head.write(next);
+      matched = next == "\r\n\r\n".charAt(matched) ? matched + 1 : next == '\r' ? 1 : 0;
+    }
+    int length = 0;
+    for (String line : head.toString(StandardCharsets.ISO_8859_1).split("\r\n")) {
+      int colon = line.indexOf(':');
+      if (colon > 0 && line.substring(0, colon).trim().equalsIgnoreCase("content-length")) length = Integer.parseInt(line.substring(colon + 1).trim());
+    }
+    in.readNBytes(length);
+  }
+
+  // Accept connections and count them: "close" closes each one without a
+  // response, "drop" sends one stream event and drops it, "headers" sends the
+  // response headers and drops it, "gateway" answers 504, "hold" never
+  // answers.
+  static int serve(String mode, AtomicInteger connections) throws Exception {
+    ServerSocket listener = new ServerSocket(0, 16, InetAddress.getByName("127.0.0.1"));
+    List<Socket> held = Collections.synchronizedList(new ArrayList<>());
+    Thread thread = new Thread(() -> {
+      while (true) {
+        try {
+          Socket socket = listener.accept();
+          connections.incrementAndGet();
+          if ("hold".equals(mode)) {
+            held.add(socket);
+            continue;
+          }
+          readRequest(socket);
+          if ("drop".equals(mode)) {
+            String response = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"
+                + Integer.toHexString(DROP_EVENT.length()) + "\r\n" + DROP_EVENT + "\r\n";
+            socket.getOutputStream().write(response.getBytes(StandardCharsets.UTF_8));
+            socket.getOutputStream().flush();
+            Thread.sleep(50);
+          } else if ("headers".equals(mode)) {
+            socket.getOutputStream().write("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n".getBytes(StandardCharsets.UTF_8));
+            socket.getOutputStream().flush();
+            Thread.sleep(50);
+          } else if ("gateway".equals(mode)) {
+            String response = "HTTP/1.1 504 Gateway Timeout\r\nContent-Type: application/json\r\nContent-Length: "
+                + GATEWAY_BODY.length() + "\r\nConnection: close\r\n\r\n" + GATEWAY_BODY;
+            socket.getOutputStream().write(response.getBytes(StandardCharsets.UTF_8));
+            socket.getOutputStream().flush();
+          }
+          socket.close();
+        } catch (Exception error) {
+          return;
+        }
+      }
+    });
+    thread.setDaemon(true);
+    thread.start();
+    return listener.getLocalPort();
+  }
+}
+`
+
+const cppTransportErrorsHTTPRoundtripExample = `#include "axllm/axllm.hpp"
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <cctype>
+#include <chrono>
+#include <csignal>
+#include <cstdio>
+#include <functional>
+#include <iostream>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
+
+// Send requests through the REAL libcurl HttpTransport to in-process loopback
+// servers that fail the way networks do, and check that the failures surface
+// as TypeScript's apiCall reports fetch's: a refused or dropped connection is
+// AxAIServiceNetworkError ("Network Error: ..."), which the request layer
+// retries under the call's retry options; a timeout is
+// AxAIServiceTimeoutError ("Request timed out after <ms>ms", the client's
+// timeout in milliseconds), which the request layer never retries; and AxGen
+// retries both as infrastructure errors. Returns non-zero on any mismatch so
+// axir verify fails if it regresses. Requires libcurl (AXLLM_ENABLE_CURL);
+// axir verify skips it when libcurl is unavailable.
+
+namespace {
+
+const std::string kGatewayBody = R"({"error":{"message":"upstream timed out","type":"server_error"}})";
+const std::string kDropEvent =
+    "data: {\"id\":\"chatcmpl_drop\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"gpt-5.4-mini\","
+    "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n";
+
+int listen_loopback(int* port) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) throw std::runtime_error("socket failed");
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0 || listen(fd, 16) < 0)
+    throw std::runtime_error("listen failed");
+  socklen_t size = sizeof(address);
+  getsockname(fd, reinterpret_cast<sockaddr*>(&address), &size);
+  *port = ntohs(address.sin_port);
+  return fd;
+}
+
+// A loopback port nothing listens on.
+int closed_port() {
+  int port = 0;
+  close(listen_loopback(&port));
+  return port;
+}
+
+// Read the request headers and its Content-Length body.
+void drain_request(int fd) {
+  std::string buf;
+  char tmp[4096];
+  size_t header_end = std::string::npos;
+  size_t content_length = 0;
+  while (true) {
+    if (header_end == std::string::npos) {
+      size_t pos = buf.find("\r\n\r\n");
+      if (pos != std::string::npos) {
+        header_end = pos + 4;
+        std::string lower = buf.substr(0, pos);
+        for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        size_t at = lower.find("content-length:");
+        if (at != std::string::npos) content_length = std::stoul(lower.substr(at + 15));
+      }
+    }
+    if (header_end != std::string::npos && buf.size() >= header_end + content_length) break;
+    ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+    if (n <= 0) break;
+    buf.append(tmp, static_cast<size_t>(n));
+  }
+}
+
+// Accept connections and count them: "close" closes each one without a
+// response, "drop" sends one stream event and drops it, "headers" sends the
+// response headers and drops it, "gateway" answers 504, "hold" never answers.
+std::shared_ptr<std::atomic<int>> serve(const std::string& mode, int* port) {
+  int listener = listen_loopback(port);
+  auto connections = std::make_shared<std::atomic<int>>(0);
+  std::thread([listener, mode, connections] {
+    std::vector<int> held;
+    while (true) {
+      int fd = accept(listener, nullptr, nullptr);
+      if (fd < 0) return;
+      connections->fetch_add(1);
+      if (mode == "hold") {
+        held.push_back(fd);
+        continue;
+      }
+      drain_request(fd);
+      if (mode == "drop") {
+        char size[16];
+        std::snprintf(size, sizeof(size), "%zx", kDropEvent.size());
+        std::string response = std::string("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n") + size + "\r\n" + kDropEvent + "\r\n";
+        (void)send(fd, response.data(), response.size(), 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      } else if (mode == "headers") {
+        std::string head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+        (void)send(fd, head.data(), head.size(), 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      } else if (mode == "gateway") {
+        std::string response = "HTTP/1.1 504 Gateway Timeout\r\nContent-Type: application/json\r\nContent-Length: " +
+                               std::to_string(kGatewayBody.size()) + "\r\nConnection: close\r\n\r\n" + kGatewayBody;
+        (void)send(fd, response.data(), response.size(), 0);
+      }
+      close(fd);
+    }
+  }).detach();
+  return connections;
+}
+
+std::unique_ptr<axllm::OpenAICompatibleClient> client(int port, axllm::Value options = axllm::Value::object()) {
+  axllm::Value config = axllm::object({{"api_key", "test-key"}, {"base_url", "http://127.0.0.1:" + std::to_string(port)}, {"model", "gpt-5.4-mini"}});
+  for (const char* key : {"timeout", "retry"}) {
+    if (!axllm::Core::get(options, key).is_null()) axllm::Core::set(config, key, axllm::Core::get(options, key));
+  }
+  return std::make_unique<axllm::OpenAICompatibleClient>(config, nullptr);
+}
+
+// The error, or an error it wraps, must be of the Ax error type with a
+// message that starts with prefix.
+void expect(const std::string& label, const std::string& type, const std::string& prefix, const std::function<void()>& run) {
+  try {
+    run();
+  } catch (const axllm::AxError& error) {
+    for (const axllm::AxError* current = &error; current != nullptr; current = current->cause()) {
+      if (current->type == type) {
+        if (std::string(current->what()).rfind(prefix, 0) != 0) throw std::runtime_error(label + ": " + current->what() + " does not start with " + prefix);
+        return;
+      }
+    }
+    throw std::runtime_error(label + ": want " + type + ", got " + error.type + ": " + error.what());
+  }
+  throw std::runtime_error(label + ": no error");
+}
+
+void expect_count(const std::string& label, int got, int want) {
+  if (got != want) throw std::runtime_error(label + ": " + std::to_string(got) + " requests, want " + std::to_string(want));
+}
+
+}  // namespace
+
+int main() {
+  ::signal(SIGPIPE, SIG_IGN);
+  using namespace axllm;
+  Value request = object({{"chat_prompt", array({object({{"role", "user"}, {"content", "hi"}})})}});
+  Value fast_retry = object({{"maxRetries", 2}, {"initialDelayMs", 10}, {"maxDelayMs", 20}});
+  auto ignore = [](const Value&) { return true; };
+
+  // A refused connection.
+  int refused = closed_port();
+  expect("refused chat", "AxAIServiceNetworkError", "Network Error: ", [&] { client(refused)->chat(request, object({{"stream", false}, {"retry", fast_retry}})); });
+  expect("refused stream", "AxAIServiceNetworkError", "Network Error: ", [&] { client(refused)->stream_each(request, ignore, object({{"retry", fast_retry}})); });
+
+  // A server that closes each connection without a response. The stream's
+  // request layer retries it under the call's retry options: the first
+  // request and two retries.
+  int closing = 0;
+  auto closed = serve("close", &closing);
+  int before = closed->load();
+  expect("closed chat", "AxAIServiceNetworkError", "Network Error: ", [&] { client(closing)->chat(request, object({{"stream", false}, {"retry", fast_retry}})); });
+  expect_count("closed chat", closed->load() - before, 3);
+  before = closed->load();
+  expect("closed stream", "AxAIServiceNetworkError", "Network Error: ", [&] { client(closing)->stream_each(request, ignore, object({{"retry", fast_retry}})); });
+  expect_count("closed stream", closed->load() - before, 3);
+
+  // A stream whose response began and dropped before its first event is not
+  // retried: TS reads the first event after apiCall returns.
+  int started = 0;
+  auto began = serve("headers", &started);
+  bool started_failed = false;
+  try {
+    client(started)->stream_each(request, ignore, object({{"retry", fast_retry}}));
+  } catch (const AxError&) {
+    started_failed = true;
+  }
+  if (!started_failed) throw std::runtime_error("started stream: no error");
+  expect_count("started stream", began->load(), 1);
+
+  // A 504 response is retried by its status, as TS apiCall retries it: it is
+  // not a timeout the request ran out of.
+  int gateway = 0;
+  auto answered = serve("gateway", &gateway);
+  bool gateway_failed = false;
+  try {
+    client(gateway)->stream_each(request, ignore, object({{"retry", fast_retry}}));
+  } catch (const AxError&) {
+    gateway_failed = true;
+  }
+  if (!gateway_failed) throw std::runtime_error("gateway stream: no error");
+  expect_count("gateway stream", answered->load(), 3);
+
+  // The client's own timeout (seconds) ends a chat or a stream whose response
+  // has not started, in TS's words, and the request layer does not retry it.
+  int silent = 0;
+  auto held = serve("hold", &silent);
+  before = held->load();
+  expect("timed-out chat", "AxAIServiceTimeoutError", "Request timed out after 300ms", [&] { client(silent, object({{"timeout", 0.3}}))->chat(request, object({{"stream", false}})); });
+  expect("timed-out stream", "AxAIServiceTimeoutError", "Request timed out after 300ms", [&] { client(silent, object({{"timeout", 0.3}}))->stream_each(request, ignore, object({{"retry", fast_retry}})); });
+  expect_count("timed-out requests", held->load() - before, 2);
+
+  // A server that sends one event and drops the connection: the stream ends
+  // in an infrastructure error after the event, and is not retried.
+  int dropping = 0;
+  auto dropped = serve("drop", &dropping);
+  int delivered = 0;
+  expect("dropped stream", "AxAIServiceStreamTerminatedError", "", [&] {
+    client(dropping)->stream_each(request, [&delivered](const Value&) { delivered++; return true; }, object({{"retry", fast_retry}}));
+  });
+  expect_count("dropped stream events", delivered, 1);
+  expect_count("dropped stream", dropped->load(), 1);
+
+  // The Typesafe client types the same failures, and does not retry a timeout.
+  expect("Typesafe refused", "AxAIServiceNetworkError", "Network Error: ", [&] {
+    typesafe(object({{"api_key", "test-key"}, {"base_url", "http://127.0.0.1:" + std::to_string(closed_port())}, {"retry", fast_retry}})).list_models();
+  });
+  before = held->load();
+  expect("Typesafe timeout", "AxAIServiceTimeoutError", "Request timed out after 300ms", [&] {
+    typesafe(object({{"api_key", "test-key"}, {"base_url", "http://127.0.0.1:" + std::to_string(silent)}, {"timeout", 0.3}, {"retry", fast_retry}})).list_models();
+  });
+  expect_count("Typesafe timeout", held->load() - before, 1);
+
+  // AxGen retries a network error and a timeout as infrastructure errors. The
+  // client's own retries are off, so each request is one AxGen attempt:
+  // maxRetries 1 is the first attempt and one retry.
+  Value no_request_retry = object({{"retry", object({{"maxRetries", 0}})}});
+  for (bool stream : {false, true}) {
+    std::string mode = stream ? " (stream)" : "";
+    before = closed->load();
+    expect("AxGen network" + mode, "AxAIServiceNetworkError", "Network Error: ", [&] {
+      ax("question:string -> answer:string").forward(*client(closing, no_request_retry), object({{"question", "hi"}}), object({{"maxRetries", 1}, {"stream", stream}}));
+    });
+    expect_count("AxGen network" + mode, closed->load() - before, 2);
+    before = held->load();
+    expect("AxGen timeout" + mode, "AxAIServiceTimeoutError", "Request timed out after 200ms", [&] {
+      ax("question:string -> answer:string").forward(*client(silent, no_request_retry), object({{"question", "hi"}}), object({{"maxRetries", 1}, {"stream", stream}, {"timeoutMs", 200}}));
+    });
+    expect_count("AxGen timeout" + mode, held->load() - before, 2);
+  }
+  std::cout << "transport-errors-http-roundtrip-ok" << std::endl;
+  std::_Exit(0);
 }
 `

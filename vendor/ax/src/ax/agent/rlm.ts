@@ -392,6 +392,19 @@ export type AxCodeSessionSnapshot = {
 };
 
 /**
+ * Result of {@link AxCodeSession.executeWithStatus}.
+ */
+export type AxCodeExecutionResult = {
+  /** The value `execute()` resolves with for the same code. */
+  value: unknown;
+  /**
+   * True when `value` is the runtime's report of an error in the code (for
+   * example `ReferenceError: x is not defined`) rather than a normal result.
+   */
+  isError: boolean;
+};
+
+/**
  * A persistent code execution session. Variables persist across `execute()` calls.
  */
 export interface AxCodeSession {
@@ -399,6 +412,18 @@ export interface AxCodeSession {
     code: string,
     options?: { signal?: AbortSignal; reservedNames?: readonly string[] }
   ): Promise<unknown>;
+  /**
+   * Optional variant of `execute()` that also reports whether the resolved
+   * value describes an error in the code. Implement it when the runtime
+   * returns errors as readable text instead of rejecting (as `AxJSRuntime`
+   * does for `ReferenceError`, `TypeError`, `SyntaxError`, …) so AxAgent tags
+   * those turns as errors while the actor still reads the same text. Without
+   * it, only rejected executions count as errors.
+   */
+  executeWithStatus?(
+    code: string,
+    options?: { signal?: AbortSignal; reservedNames?: readonly string[] }
+  ): Promise<AxCodeExecutionResult>;
   inspectGlobals?(options?: {
     signal?: AbortSignal;
     reservedNames?: readonly string[];
@@ -531,8 +556,19 @@ export function axBuildDistillerDefinition(
     hasCompressedActionReplay?: boolean;
     /** Enables tool discovery (`discover`) in the prompt. */
     discoveryMode?: boolean;
-    /** Enables `discover({ skills })` runtime overload in the prompt. */
+    /**
+     * Skills are in play for this stage (a skills search, skill usage
+     * tracking, or loaded skills): renders the skills sections, and the
+     * `discover({ skills })` overload unless `skillsDiscoveryMode` says
+     * otherwise.
+     */
     skillsMode?: boolean;
+    /**
+     * Whether the runtime's `discover` takes skills (a skills search callback
+     * or catalog). Gates the `discover({ skills })` overload; defaults to
+     * `skillsMode`.
+     */
+    skillsDiscoveryMode?: boolean;
     /** Static skill catalog rendered as an `### Available Skills` index. */
     skillsCatalog?: ReadonlyArray<{
       id: string;
@@ -628,7 +664,9 @@ export function axBuildDistillerDefinition(
         {
           hasInspectRuntime: Boolean(options.hasInspectRuntime),
           discoveryMode,
-          skillsMode: Boolean(options.skillsMode),
+          skillsMode: Boolean(
+            options.skillsDiscoveryMode ?? options.skillsMode
+          ),
           memoriesMode: Boolean(options.memoriesMode),
           usageTrackingMode: Boolean(options.usageTrackingMode),
           directRespondMode: Boolean(options.directRespondMode),
@@ -723,8 +761,19 @@ export function axBuildExecutorDefinition(
     discoveryMode?: boolean;
     /** Renders the advisory "Likely Relevant" instruction section. */
     relevanceHintsMode?: boolean;
-    /** Enables `discover({ skills })` runtime overload in the prompt. */
+    /**
+     * Skills are in play for this stage (a skills search, skill usage
+     * tracking, or loaded skills): renders the skills sections, and the
+     * `discover({ skills })` overload unless `skillsDiscoveryMode` says
+     * otherwise.
+     */
     skillsMode?: boolean;
+    /**
+     * Whether the runtime's `discover` takes skills (a skills search callback
+     * or catalog). Gates the `discover({ skills })` overload; defaults to
+     * `skillsMode`.
+     */
+    skillsDiscoveryMode?: boolean;
     /**
      * Static skill catalog rendered as an `### Available Skills` index so
      * skill discovery is targeted instead of blind. Construction-stable, so
@@ -824,7 +873,9 @@ export function axBuildExecutorDefinition(
           hasInspectRuntime: Boolean(options.hasInspectRuntime),
           hasAgentStatusCallback: Boolean(options.hasAgentStatusCallback),
           discoveryMode,
-          skillsMode: Boolean(options.skillsMode),
+          skillsMode: Boolean(
+            options.skillsDiscoveryMode ?? options.skillsMode
+          ),
           memoriesMode: Boolean(options.memoriesMode),
           usageTrackingMode: Boolean(options.usageTrackingMode),
         },

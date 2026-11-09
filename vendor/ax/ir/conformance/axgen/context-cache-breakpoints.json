@@ -10,7 +10,10 @@
       }
     }
   ],
-  "expected_chat_prompt_contains": ["cache", "Example Output"],
+  "expected_chat_prompt_contains": [
+    "cache",
+    "Example Output"
+  ],
   "expected_output": {
     "answer": "cached"
   },
@@ -28,7 +31,7 @@
   },
   "responses": [
     {
-      "content": "{\"answer\":\"cached\"}"
+      "content": "Answer: cached"
     }
   ],
   "signature": "document:string, question:string -> answer:string"

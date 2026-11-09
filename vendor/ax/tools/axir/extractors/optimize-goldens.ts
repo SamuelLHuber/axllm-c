@@ -1,6 +1,13 @@
 import { mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-
+import { clusterFailures } from '../../../src/ax/agent/agentInternal/playbookEvolve/failureClusters.js';
+import { mineWeakness } from '../../../src/ax/agent/agentInternal/playbookEvolve/weaknessMiner.js';
+import {
+  AX_HOST_SNIPPET_MARKER,
+  AX_INPUTS_PATCH_GLOBAL,
+} from '../../../src/ax/agent/agentInternal/sharedSession.js';
+import { buildActionLog } from '../../../src/ax/agent/contextManager.js';
+import { agent } from '../../../src/ax/agent/index.js';
 import {
   adjustEvalScoreForActions,
   buildAgentJudgeCriteria,
@@ -8,6 +15,9 @@ import {
   normalizeAgentEvalDataset,
   resolveAgentOptimizeTargetIds,
 } from '../../../src/ax/agent/optimize.js';
+import type { AxCodeRuntime } from '../../../src/ax/agent/rlm.js';
+import { AxMockAIService } from '../../../src/ax/ai/mock/api.js';
+import { optimize as optimizeProgram } from '../../../src/ax/dsp/optimize.js';
 import { AxACE } from '../../../src/ax/dsp/optimizers/ace.js';
 import {
   applyCuratorOperations,
@@ -21,6 +31,7 @@ import type {
   AxACEPlaybook,
   AxACEReflectionOutput,
 } from '../../../src/ax/dsp/optimizers/aceTypes.js';
+import { AxGEPA } from '../../../src/ax/dsp/optimizers/gepa.js';
 import { getGEPAUpdateGroup } from '../../../src/ax/dsp/optimizers/gepaDependencies.js';
 import { scalarizeGEPAScores } from '../../../src/ax/dsp/optimizers/gepaEvaluation.js';
 import { summarizeGEPATraces } from '../../../src/ax/dsp/optimizers/gepaReflection.js';
@@ -29,8 +40,10 @@ import {
   buildParetoFront,
   hypervolume2D,
 } from '../../../src/ax/dsp/optimizers/paretoUtils.js';
+import { playbook } from '../../../src/ax/dsp/playbook.js';
 import { AxSignature, f } from '../../../src/ax/dsp/sig.js';
 import { ax } from '../../../src/ax/dsp/template.js';
+import { legacyCompletionFixture } from './agent-fixture-mode.js';
 
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 type Fixture = Record<string, Json>;
@@ -60,9 +73,13 @@ function stable(value: unknown, parentKey = ''): unknown {
 }
 
 function writeFixture(name: string, fixture: Fixture): void {
+  const record =
+    fixture.kind === 'optimize' && (fixture.program ?? 'agent') === 'agent'
+      ? legacyCompletionFixture(fixture)
+      : fixture;
   writeFileSync(
     join(outDir, `${name}.json`),
-    `${JSON.stringify(stable({ name, ...fixture }), null, 2)}\n`
+    `${JSON.stringify(stable({ name, ...record }), null, 2)}\n`
   );
 }
 
@@ -293,7 +310,7 @@ writeFixture('gepa-max-metric-calls-error', {
   optimize_options: { maxMetricCalls: 1, numTrials: 0 },
   gepa_scores: { 'Base answer instruction': 0.5 },
   expected_error_contains:
-    'AxGEPA: options.maxMetricCalls=1 is too small to evaluate the initial Pareto set',
+    'AxGEPA: options.maxMetricCalls=1 is too small for baseline evaluation; need at least 2 metric calls',
 });
 
 writeFixture('gepa-selector-state-artifact', {
@@ -338,7 +355,7 @@ writeFixture('gepa-selector-state-artifact', {
         paretoMetricKey: 'faithfulness',
       } as any),
       count: 1,
-      phase: 'initial Pareto evaluation',
+      phase: 'baseline evaluation',
     },
   ],
 });
@@ -438,19 +455,8 @@ writeFixture('gepa-bootstrap-demos', {
         programId: 'root',
         traces: [
           {
-            actionLog: [],
-            completionType: 'final',
-            finalOutput: {
-              componentValue: 'Base answer instruction',
-            },
-            functionCalls: [],
-            output: {
-              componentValue: 'Base answer instruction',
-            },
-            trace: {
-              componentValue: 'Base answer instruction',
-            },
-            usage: {},
+            question: 'Keep?',
+            componentValue: 'Base answer instruction',
           },
         ],
       },
@@ -953,7 +959,7 @@ writeFixture('eval-prediction-final', {
       content:
         '{"completion":{"type":"final","args":["Answer the question",{"answer":"Paris"}]}}',
     },
-    { content: '{"answer":"Paris"}' },
+    { content: 'Answer: Paris' },
   ],
   expected_prediction_subset: {
     completionType: 'final',
@@ -1086,7 +1092,7 @@ writeFixture('candidate-evaluation-final-rollback', {
       content:
         '{"completion":{"type":"final","args":["Answer the question",{"answer":"Paris"}]}}',
     },
-    { content: '{"answer":"Paris"}' },
+    { content: 'Answer: Paris' },
   ],
   expected_evaluation_subset: {
     avg: 1,
@@ -1692,7 +1698,7 @@ writeFixture('flow-evaluate-rollback', {
       score: 1,
     },
   ],
-  responses: [{ content: '{"answer":"Paris"}' }],
+  responses: [{ content: 'Answer: Paris' }],
   expected_evaluation_subset: {
     avg: 1,
     count: 1,
@@ -2697,5 +2703,1885 @@ await (async () => {
       expected_artifact: out.artifact,
       expected_curator: out.curator,
     });
+  }
+})();
+
+// Baseline reports are derived from real TypeScript optimizer runs. The port
+// fixtures keep their native artifact shape while asserting the same original
+// scores, validation subset, metric budget, and demonstration boundary.
+const baselineTrain = [
+  { question: 'training-only-0', answer: 'ok', score: 1 },
+  { question: 'training-only-1', answer: 'ok', score: 1 },
+];
+const heldOut = (count: number) =>
+  Array.from({ length: count }, (_, i) => ({
+    question: `held-out-${i}`,
+    score: (i + 1) / 10,
+  }));
+const baselineCases = [
+  {
+    name: 'baseline-gepa-zero-reuses-seed',
+    helper: false,
+    train: [
+      { question: 'training-zero', score: 0 },
+      { question: 'training-zero-2', score: 0 },
+    ],
+    validation: [{ question: 'training-zero', score: 0 }],
+    options: { maxMetricCalls: 1, bootstrap: false },
+  },
+  {
+    name: 'baseline-gepa-objectives-held-out',
+    helper: false,
+    train: baselineTrain,
+    validation: [
+      { question: 'held-out-0', score: { quality: 0.2, brevity: 0.8 } },
+      { question: 'held-out-1', score: { quality: 0.8, brevity: 0.6 } },
+    ],
+    options: {
+      maxMetricCalls: 2,
+      paretoMetricKey: 'quality',
+      bootstrap: false,
+    },
+  },
+  {
+    name: 'baseline-gepa-bootstrap-validation-budget',
+    helper: false,
+    train: baselineTrain,
+    validation: heldOut(3),
+    options: {
+      maxMetricCalls: 6,
+      bootstrap: { maxBootstrapMetricCalls: 1, maxBootstrapDemos: 1 },
+    },
+  },
+  {
+    name: 'baseline-gepa-bootstrap-insufficient-budget',
+    helper: false,
+    train: baselineTrain,
+    validation: heldOut(3),
+    expectedError: 'need at least 6 metric calls',
+    options: {
+      maxMetricCalls: 5,
+      bootstrap: { maxBootstrapMetricCalls: 1, maxBootstrapDemos: 1 },
+    },
+  },
+  {
+    name: 'baseline-gepa-rejected-bootstrap-reuses-seed',
+    helper: false,
+    train: baselineTrain,
+    validation: heldOut(2),
+    options: {
+      maxMetricCalls: 2,
+      bootstrap: { maxBootstrapMetricCalls: 1, scoreThreshold: 1.1 },
+    },
+  },
+  {
+    name: 'baseline-gepa-default-bootstrap-budget',
+    helper: false,
+    train: Array.from({ length: 9 }, (_, i) => ({
+      question: `training-only-${i}`,
+      answer: 'ok',
+      score: 0,
+    })),
+    validation: heldOut(2),
+    options: { maxMetricCalls: 2, bootstrap: true },
+  },
+  {
+    name: 'baseline-helper-before-bootstrap',
+    helper: true,
+    train: baselineTrain,
+    validation: heldOut(2),
+    options: {
+      maxMetricCalls: 4,
+      bootstrap: { maxRounds: 1, maxExamples: 1, maxDemos: 1 },
+    },
+  },
+  {
+    name: 'baseline-helper-rejected-bootstrap-reuses-seed',
+    helper: true,
+    train: baselineTrain,
+    validation: heldOut(2),
+    options: {
+      maxMetricCalls: 2,
+      bootstrap: { maxRounds: 1, maxExamples: 1, qualityThreshold: 1.1 },
+    },
+  },
+  {
+    name: 'baseline-helper-implicit-validation-budget',
+    helper: true,
+    train: baselineTrain,
+    validation: heldOut(61),
+    options: { bootstrap: { maxRounds: 1, maxExamples: 1, maxDemos: 1 } },
+  },
+  {
+    name: 'baseline-gepa-capped-held-out',
+    helper: false,
+    train: baselineTrain,
+    validation: heldOut(8),
+    options: { maxMetricCalls: 5, paretoSetSize: 5, bootstrap: false },
+  },
+];
+for (const scenario of baselineCases) {
+  const program = ax('question:string -> answer:string');
+  const client = new AxMockAIService({
+    chatResponse: { results: [{ index: 0, content: 'Answer: ok' }] },
+  });
+  const calls: string[] = [];
+  const metric = ({ example }: any) => {
+    calls.push(example.question);
+    return example.score;
+  };
+  const options = { numTrials: 0, ...scenario.options };
+  const asTask = (example: any) => ({
+    input: { question: example.question },
+    output: { answer: 'ok' },
+    score: example.score,
+  });
+  const fixtureDataset = scenario.helper
+    ? scenario.train.map(asTask)
+    : {
+        train: scenario.train.map(asTask),
+        validation: scenario.validation.map(asTask),
+      };
+  const fixtureOptions = scenario.helper
+    ? { ...options, validationExamples: scenario.validation.map(asTask) }
+    : options;
+  let result: Awaited<ReturnType<typeof optimizeProgram>>;
+  try {
+    result = scenario.helper
+      ? await optimizeProgram(
+          program,
+          scenario.train as any,
+          metric as any,
+          {
+            studentAI: client,
+            teacherAI: client,
+            validationExamples: scenario.validation as any,
+            ...options,
+          } as any
+        )
+      : await new AxGEPA({
+          studentAI: client,
+          teacherAI: client,
+          ...options,
+        } as any).compile(
+          program,
+          scenario.train as any,
+          metric as any,
+          {
+            ...options,
+            maxMetricCalls: (options as any).maxMetricCalls,
+            validationExamples: scenario.validation as any,
+          } as any
+        );
+  } catch (error) {
+    if ('expectedError' in scenario) {
+      if (!(error as Error).message.includes(scenario.expectedError!))
+        throw error;
+      writeFixture(scenario.name, {
+        kind: 'optimize',
+        operation: 'gepa',
+        program: 'axgen',
+        components: [
+          {
+            id: 'root::instruction',
+            owner: 'root',
+            kind: 'instruction',
+            current: '',
+          },
+        ],
+        dataset: fixtureDataset as Json,
+        optimize_options: fixtureOptions as Json,
+        expected_error_contains: (error as Error).message,
+      });
+      continue;
+    }
+    if (scenario.name !== 'baseline-helper-rejected-bootstrap-reuses-seed')
+      throw error;
+    writeFixture('baseline-helper-rejected-bootstrap-error', {
+      kind: 'optimize',
+      operation: 'helper',
+      program: 'axgen',
+      signature: 'question:string -> answer:string',
+      dataset: fixtureDataset as Json,
+      optimize_options: fixtureOptions as Json,
+      responses: Array.from({ length: 16 }, () => ({ content: 'Answer: ok' })),
+      expected_error_contains: (error as Error).message,
+    });
+    continue;
+  }
+  if ('expectedError' in scenario)
+    throw new Error(`${scenario.name}: expected a budget error`);
+  const bootCalls =
+    options.bootstrap === false
+      ? 0
+      : calls.filter((question) => question.startsWith('training-only')).length;
+  const hasDemos = (result.demos?.length ?? 0) > 0;
+  const artifact = {
+    baselineScore: result.baselineScore!,
+    baselineScores: result.baselineScores!,
+    metadata: {
+      baselineScore: result.baselineScore!,
+      baselineScores: result.baselineScores!,
+      bestScore: result.bestScore,
+      totalMetricCalls: calls.length - bootCalls,
+      bootstrapMetricCalls: bootCalls,
+      totalCalls: calls.length,
+    },
+  };
+  writeFixture(scenario.name, {
+    kind: 'optimize',
+    operation: scenario.helper ? 'helper' : 'gepa',
+    program: 'axgen',
+    signature: 'question:string -> answer:string',
+    components: [
+      {
+        id: 'root::instruction',
+        owner: 'root',
+        kind: 'instruction',
+        current: '',
+      },
+    ],
+    dataset: fixtureDataset as Json,
+    responses: Array.from({ length: calls.length + 4 }, () => ({
+      content: 'Answer: ok',
+    })),
+    optimize_options: fixtureOptions as Json,
+    expected_artifact_subset: artifact as Json,
+    expected_demo_count: hasDemos ? 1 : 0,
+    ...(!scenario.helper
+      ? {
+          expected_gepa_phases: [
+            'baseline evaluation',
+            ...(bootCalls
+              ? Array.from({ length: bootCalls }, () => 'bootstrap')
+              : []),
+            ...(hasDemos ? ['bootstrapped Pareto evaluation'] : []),
+          ],
+        }
+      : {}),
+  } as Fixture);
+}
+
+await (async () => {
+  const program = ax('question:string -> answer:string');
+  program.setInstruction('answer original');
+  const client = new AxMockAIService({
+    chatResponse: async () => ({
+      results: [
+        {
+          index: 0,
+          content: `Answer: ${program.getInstruction() === 'answer better' ? 'better' : 'original'}`,
+        },
+      ],
+    }),
+  });
+  const optimizer = new AxGEPA({
+    studentAI: client,
+    numTrials: 1,
+    minibatchSize: 1,
+  });
+  (optimizer as any).reflectTargetInstruction = async () => 'answer better';
+  const examples = [{ question: 'q1' }, { question: 'q2' }];
+  const result = await optimizer.compile(
+    program,
+    examples,
+    ({ prediction }) => (prediction.answer === 'better' ? 1 : 0.25),
+    { maxMetricCalls: 10, bootstrap: false }
+  );
+  if (result.paretoFront.some((point) => point.configuration.candidate === 0))
+    throw new Error(
+      'baseline-gepa-dominated-seed: original candidate remains on frontier'
+    );
+  writeFixture('baseline-gepa-dominated-seed', {
+    kind: 'optimize',
+    operation: 'gepa',
+    program: 'axgen',
+    components: [
+      {
+        id: 'root::instruction',
+        owner: 'root',
+        kind: 'instruction',
+        current: 'answer original',
+      },
+    ],
+    dataset: examples.map((input) => ({ input, score: 0.25 })),
+    optimize_options: {
+      numTrials: 1,
+      minibatchSize: 1,
+      maxMetricCalls: 10,
+      bootstrap: false,
+    },
+    reflection_responses: [
+      { results: [{ index: 0, content: 'New Value: answer better' }] },
+    ],
+    gepa_scores: { 'answer original': 0.25, 'answer better': 1 },
+    expected_artifact_subset: {
+      baselineScore: result.baselineScore!,
+      baselineScores: result.baselineScores! as Json,
+      componentMap: { 'root::instruction': 'answer better' },
+      metadata: {
+        baselineScore: result.baselineScore!,
+        baselineScores: result.baselineScores! as Json,
+        bestScore: result.bestScore,
+        candidatesExplored: 2,
+      },
+    },
+  });
+})();
+
+// An actual student fails its original validation, then succeeds during
+// bootstrap and seeded validation. This distinguishes the original baseline
+// from the post-bootstrap score through the real helper evaluation path.
+await (async () => {
+  const program = ax('question:string -> answer:string');
+  const responses = [
+    { content: 'Answer: incomplete', finish_reason: 'length' },
+    { content: 'Answer: incomplete', finish_reason: 'length' },
+    ...Array.from({ length: 3 }, () => ({
+      content: 'Answer: ok',
+      finish_reason: 'stop',
+    })),
+  ];
+  let calls = 0;
+  const client = new AxMockAIService({
+    chatResponse: async () => {
+      const response = responses[calls++];
+      if (!response)
+        throw new Error(
+          'baseline-helper-improves-after-bootstrap: unexpected request'
+        );
+      return {
+        results: [
+          {
+            index: 0,
+            content: response.content,
+            finishReason: response.finish_reason as 'stop' | 'length',
+          },
+        ],
+      };
+    },
+  });
+  const train = [
+    { question: 'training-only-0', answer: 'ok' },
+    { question: 'training-only-1', answer: 'ok' },
+  ];
+  const validation = [
+    { question: 'held-out-0', answer: 'ok' },
+    { question: 'held-out-1', answer: 'ok' },
+  ];
+  const options = {
+    numTrials: 0,
+    maxMetricCalls: 4,
+    bootstrap: { maxRounds: 1, maxExamples: 1, maxDemos: 1 },
+  };
+  const result = await optimizeProgram(
+    program,
+    train,
+    ({ prediction }) => (prediction.answer === 'ok' ? 1 : 0),
+    {
+      ...options,
+      studentAI: client,
+      teacherAI: client,
+      validationExamples: validation,
+    }
+  );
+  if (calls !== 5 || result.baselineScore !== 0 || result.bestScore !== 1)
+    throw new Error(
+      'baseline-helper-improves-after-bootstrap: expected original 0, seeded 1, and five calls'
+    );
+  writeFixture('baseline-helper-improves-after-bootstrap', {
+    kind: 'optimize',
+    operation: 'helper',
+    program: 'axgen',
+    signature: 'question:string -> answer:string',
+    dataset: train.map(({ question }) => ({
+      input: { question },
+      expectedOutput: { answer: 'ok' },
+    })),
+    responses,
+    optimize_options: {
+      ...options,
+      validationExamples: validation.map(({ question }) => ({
+        input: { question },
+        expectedOutput: { answer: 'ok' },
+      })),
+    },
+    expected_demo_count: 1,
+    expected_artifact_subset: {
+      baselineScore: result.baselineScore!,
+      baselineScores: result.baselineScores! as Json,
+      metadata: {
+        baselineScore: result.baselineScore!,
+        baselineScores: result.baselineScores! as Json,
+        bestScore: result.bestScore,
+        totalMetricCalls: 4,
+        bootstrapMetricCalls: 1,
+        totalCalls: 5,
+      },
+    },
+  });
+})();
+
+// --- playbook() evolve through the real reflector and curator programs ------
+// ace-compile-* fixtures script the reflector and curator outputs; this one
+// runs TS playbook().evolve with scripted student and teacher clients, so the
+// real reflector and curator programs get their inputs: the playbook as
+// JSON.stringify({markdown, structured}), the question as the example's input
+// fields and the expected answer as its output fields. The teacher answers each
+// program in its own output format, recorded in call order for the ports.
+await (async () => {
+  const reflectorAnswer = [
+    'Reasoning: The answer ignored the source.',
+    'Error Identification: Missing citation',
+    'Root Cause Analysis: No citation guideline',
+    'Correct Approach: Cite the source',
+    'Key Insight: Citations build trust',
+    'Bullet Tags: []',
+  ].join('\n');
+  const resolvedAnswer = [
+    'Reasoning: Already correct.',
+    'Error Identification: no error',
+    'Root Cause Analysis: none',
+    'Correct Approach: keep going',
+    'Key Insight: stable behavior',
+    'Bullet Tags: []',
+  ].join('\n');
+  const curatorAnswer = [
+    'Reasoning: Add a citation guideline.',
+    'Operations: [{"type":"ADD","section":"Guidelines","bulletId":"guidelines-00001","content":"Always cite your sources."}]',
+  ].join('\n');
+  const noopCuratorAnswer = [
+    'Reasoning: Nothing to change.',
+    'Operations: []',
+  ].join('\n');
+  const examples = [
+    { question: 'What is the capital of France?', answer: 'Paris' },
+    { question: 'ping', answer: 'pong' },
+  ];
+  const studentAnswers = ['Answer: Paris', 'Answer: pong'];
+  const scores = [0.5, 1];
+
+  const wireKey = (prompt: string, key: string) =>
+    prompt.includes(`(wire key: \`${key}\`)`);
+  let reflections = 0;
+  let curations = 0;
+  const teacherResponses: string[] = [];
+  const teacherContents: string[] = [];
+  // Each teacher request's system prompt, in call order: the ports must build
+  // the reflector and curator signatures TS builds, descriptions included.
+  const teacherSystemPrompts: string[] = [];
+  const teacherAI = new AxMockAIService<string>({
+    name: 'mock',
+    features: { functions: false, streaming: false },
+    chatResponse: async (req) => {
+      const prompt = JSON.stringify(req.chatPrompt);
+      for (const message of req.chatPrompt) {
+        if (typeof message.content === 'string') {
+          teacherContents.push(message.content);
+        }
+        if (message.role === 'system') {
+          teacherSystemPrompts.push(message.content);
+        }
+      }
+      let content: string;
+      if (wireKey(prompt, 'errorIdentification')) {
+        content = reflections++ === 0 ? reflectorAnswer : resolvedAnswer;
+      } else {
+        content = curations++ === 0 ? curatorAnswer : noopCuratorAnswer;
+      }
+      teacherResponses.push(content);
+      return { results: [{ index: 0, content, finishReason: 'stop' }] };
+    },
+  });
+  let studentCall = 0;
+  const studentAI = new AxMockAIService<string>({
+    name: 'mock',
+    features: { functions: false, streaming: false },
+    chatResponse: async () => ({
+      results: [
+        {
+          index: 0,
+          content: studentAnswers[studentCall++] ?? '',
+          finishReason: 'stop',
+        },
+      ],
+    }),
+  });
+
+  const program = ax('question:string -> answer:string');
+  const book = playbook(program, {
+    studentAI,
+    teacherAI,
+    maxEpochs: 1,
+    maxReflectorRounds: 1,
+  });
+  // Record what the real reflector and curator programs are given.
+  const engine = (book as any).engine;
+  const reflectorInputs: Record<string, unknown>[] = [];
+  const curatorInputs: Record<string, unknown>[] = [];
+  const reflector = engine.getOrCreateReflectorProgram();
+  const reflectorForward = reflector.forward.bind(reflector);
+  reflector.forward = (
+    ai: unknown,
+    values: Record<string, unknown>,
+    o: unknown
+  ) => {
+    reflectorInputs.push(values);
+    return reflectorForward(ai, values, o);
+  };
+  const curator = engine.getOrCreateCuratorProgram();
+  const curatorForward = curator.forward.bind(curator);
+  curator.forward = (
+    ai: unknown,
+    values: Record<string, unknown>,
+    o: unknown
+  ) => {
+    curatorInputs.push(values);
+    return curatorForward(ai, values, o);
+  };
+  const scoreQueue = [...scores];
+  const metric = async () => (scoreQueue.length ? scoreQueue.shift()! : 0);
+  const result = await withFrozenClockAsync(ACE_NOW, () =>
+    book.evolve(examples as any, metric as any)
+  );
+  const first = reflectorInputs[0] ?? {};
+  const firstCurator = curatorInputs[0] ?? {};
+  writeFixture('playbook-evolve-teacher-inputs', {
+    kind: 'optimize',
+    operation: 'playbook-evolve',
+    now: ACE_NOW,
+    signature: 'question:string -> answer:string',
+    playbook_options: { maxEpochs: 1, maxReflectorRounds: 1 },
+    examples,
+    responses: studentAnswers,
+    teacher_responses: teacherResponses,
+    metric_scores: scores,
+    expected_playbook: result.playbook as unknown as Json,
+    expected_teacher_request_contains: [
+      String(first.question),
+      String(first.playbook),
+      String(first.expected_answer),
+      String(firstCurator.playbook),
+      String(firstCurator.question_context),
+    ],
+    expected_teacher_system_prompts: teacherSystemPrompts,
+  });
+  if (teacherContents.length === 0) {
+    throw new Error('playbook-evolve-teacher-inputs: teacher was never called');
+  }
+  if (teacherSystemPrompts.length !== teacherResponses.length) {
+    throw new Error(
+      'playbook-evolve-teacher-inputs: expected one system prompt per teacher request'
+    );
+  }
+})();
+
+// --- agent playbook evolve: the weakness miner's prompt -------------------
+// The expected system prompt and user message are what TS's mineWeakness
+// (weaknessMiner.ts) sends: its signature and MINER_DESCRIPTION, with the
+// inputs the scenario provides (a cluster signature, task summaries, the
+// executor's action log excerpt and the seeded playbook; no function calls or
+// tool errors). The scenario is the ports'
+// agent-playbook-evolve script: its expensive teacher takes only the miner
+// call, because the playbook's own reflector and curator lack teacherOptions.
+// The key-order variant gives the task input two keys out of sorted order:
+// the miner's user message holds JSON.stringify(input), so the ports must
+// keep the input's key order (the dataset goes in as dataset_json text, which
+// the canonical fixture sort cannot reorder).
+const writeMinerGolden = async (
+  name: string,
+  signature: string,
+  input: Record<string, string>,
+  datasetAsText: boolean
+) => {
+  const agentOutDir = join(outRoot, 'ir/conformance/axagent');
+  mkdirSync(agentOutDir, { recursive: true });
+  const finalCode =
+    "final('Answer', {'answer': 'Ax composes typed LLM programs.'})";
+  const codeResponse = {
+    content: JSON.stringify({ pythonCode: finalCode }),
+  };
+  const finalStep = {
+    expected_code: finalCode,
+    result: {
+      type: 'final',
+      args: ['Answer', { answer: 'Ax composes typed LLM programs.' }],
+    },
+  };
+  const seedPlaybook = {
+    version: 1,
+    sections: {
+      failures_to_avoid: [
+        {
+          id: 'failures-to-avoid-00001',
+          section: 'failures_to_avoid',
+          content: 'Check the evidence before answering.',
+          helpfulCount: 0,
+          harmfulCount: 0,
+          createdAt: '2026-07-15T00:00:00.000Z',
+          updatedAt: '2026-07-15T00:00:00.000Z',
+        },
+      ],
+    },
+    updatedAt: '2026-07-15T00:00:00.000Z',
+  };
+  const minerAnswer = [
+    'Weakness Description: The agent does not verify its final step.',
+    'Root Cause: The final step is accepted without a check.',
+    'Proposed Guidance: Verify the final step before completing the task.',
+    'Evidence Quotes: ["Answer"]',
+    'Config Recommendations: []',
+  ].join('\n');
+
+  const systemPrompts: string[] = [];
+  const userMessages: string[] = [];
+  const teacherAI = new AxMockAIService<string>({
+    name: 'mock',
+    features: { functions: false, streaming: false },
+    chatResponse: async (req) => {
+      for (const message of req.chatPrompt) {
+        if (message.role === 'system') systemPrompts.push(message.content);
+        if (message.role === 'user') userMessages.push(String(message.content));
+      }
+      return {
+        results: [{ index: 0, content: minerAnswer, finishReason: 'stop' }],
+      };
+    },
+  });
+  const weakness = await mineWeakness({
+    ai: teacherAI,
+    cluster: {
+      signature: 'behavioral:no_error',
+      records: [
+        {
+          task: { input },
+          // TS's prediction carries the executor's action log as text: the
+          // scenario's one executor step, whose final() prints nothing.
+          prediction: {
+            actionLog: buildActionLog([
+              { turn: 1, code: finalCode, output: '(no output)', tags: [] },
+            ]),
+          } as never,
+          score: 0,
+          passed: false,
+        },
+      ],
+      severity: 1,
+      taskIds: ['#1'],
+    },
+    currentPlaybook: renderPlaybook(seedPlaybook as unknown as AxACEPlaybook),
+    index: 0,
+  });
+  if (!weakness || systemPrompts.length !== 1 || userMessages.length !== 1) {
+    throw new Error(`${name}: the miner did not run`);
+  }
+
+  const dataset = { train: [{ input, score: 0 }] };
+  const fixture = legacyCompletionFixture({
+    name,
+    kind: 'agent_playbook_evolve',
+    signature,
+    runtime_language: 'Python',
+    options: {
+      name: 'qa',
+      description: 'Answer the question.',
+      contextFields: [],
+    },
+    responses: [
+      codeResponse,
+      codeResponse,
+      { content: 'Answer: Ax composes typed LLM programs.' },
+      codeResponse,
+    ],
+    runtime_script: [finalStep, finalStep],
+    seed: { playbook: seedPlaybook, artifact: { feedback: [], history: [] } },
+    ...(datasetAsText
+      ? { dataset_json: JSON.stringify(dataset) }
+      : { dataset }),
+    teacher_client: {
+      model: 'premium-model',
+      options: {
+        modelInfo: [
+          {
+            completionTokenCostPer1M: 600,
+            isExpensive: true,
+            name: 'premium-model',
+            promptTokenCostPer1M: 150,
+          },
+        ],
+      },
+    },
+    cases: [
+      {
+        name: 'miner-system-prompt',
+        options: {
+          teacherOptions: { useExpensiveModel: 'yes' },
+          verify: true,
+          minHeldInGain: 0,
+          maxProposals: 1,
+          maxMetricCalls: 2,
+        },
+        expected: { outcome_count: 1 },
+        expected_teacher_request_count: 1,
+        expected_teacher_system_prompts: systemPrompts,
+        expected_teacher_user_messages: userMessages,
+      },
+    ],
+    teacher_responses: [{ content: minerAnswer }],
+  });
+  writeFileSync(
+    join(agentOutDir, `${name}.json`),
+    `${JSON.stringify(stable(fixture), null, 2)}\n`
+  );
+};
+await writeMinerGolden(
+  'agent-playbook-evolve-miner-system-prompt',
+  'question:string -> answer:string',
+  { question: 'Answer briefly.' },
+  false
+);
+await writeMinerGolden(
+  'agent-playbook-evolve-miner-input-key-order',
+  'topic:string, question:string -> answer:string',
+  { topic: 'Ax', question: 'Answer briefly.' },
+  true
+);
+
+// --- agent playbook evolve: the runtime on the evolve call -----------------
+// TS's evolve replays run on the agent's own runtime; TS has no per-call
+// runtime. The ports' examples build the agent with a runtime descriptor
+// ({language}) and pass the runtime on forward and on evolve, so the ports'
+// replays must take the evolve call's runtime. The fixture's
+// runtime_on_evolve key has the runners do that; the expected outcome is
+// TS's, run here with the scripted runtime on the agent. The scenario is the
+// ports' agent-playbook-evolve script (accept at a flat held-in score).
+await (async () => {
+  const agentOutDir = join(outRoot, 'ir/conformance/axagent');
+  mkdirSync(agentOutDir, { recursive: true });
+  const finalCode =
+    "final('Answer', {'answer': 'Ax composes typed LLM programs.'})";
+  const codeResponse = {
+    content: JSON.stringify({ pythonCode: finalCode }),
+  };
+  const finalStep = {
+    expected_code: finalCode,
+    result: {
+      type: 'final',
+      args: ['Answer', { answer: 'Ax composes typed LLM programs.' }],
+    },
+  };
+  const reflection = [
+    'Reasoning: The playbook lacked a verification rule.',
+    'Error Identification: The final step was not checked.',
+    'Root Cause Analysis: No verification guidance.',
+    'Correct Approach: Add a verification guideline.',
+    'Key Insight: Verify before finishing.',
+    'Bullet Tags: []',
+  ].join('\n');
+  const responses = [
+    codeResponse,
+    codeResponse,
+    { content: 'Answer: Ax composes typed LLM programs.' },
+    {
+      content: [
+        'Weakness Description: The agent does not verify its final step.',
+        'Root Cause: The final step is accepted without a check.',
+        'Proposed Guidance: Verify the final step before completing the task.',
+        'Evidence Quotes: ["Answer"]',
+        'Config Recommendations: []',
+      ].join('\n'),
+    },
+    { content: reflection },
+    { content: reflection },
+    {
+      content: [
+        'Reasoning: The playbook lacked a verification rule.',
+        'Operations: [{"type":"ADD","section":"Guidelines","content":"Verify the final step before completing the task."}]',
+      ].join('\n'),
+    },
+    codeResponse,
+  ];
+  const seed = {
+    playbook: {
+      version: 1,
+      sections: {
+        failures_to_avoid: [
+          {
+            id: 'failures-to-avoid-00001',
+            section: 'failures_to_avoid',
+            content: 'Check the evidence before answering.',
+            helpfulCount: 0,
+            harmfulCount: 0,
+            createdAt: '2026-07-15T00:00:00.000Z',
+            updatedAt: '2026-07-15T00:00:00.000Z',
+          },
+        ],
+      },
+      updatedAt: '2026-07-15T00:00:00.000Z',
+    },
+    artifact: { feedback: [], history: [] },
+  };
+  const dataset = {
+    train: [{ input: { question: 'Answer briefly.' }, score: 0 }],
+  };
+  const agentOptions = {
+    name: 'qa',
+    description: 'Answer the question.',
+    contextFields: [],
+  };
+  const caseOptions = {
+    verify: true,
+    minHeldInGain: 0,
+    maxProposals: 1,
+    maxMetricCalls: 2,
+  };
+
+  // The ports' scripted client: responses in order, then an error.
+  let calls = 0;
+  const ai = new AxMockAIService<string>({
+    name: 'mock',
+    features: { functions: false, streaming: false },
+    chatResponse: async () => {
+      const next = responses[calls++];
+      if (!next) throw new Error('scripted AI exhausted');
+      return {
+        results: [{ index: 0, content: next.content, finishReason: 'stop' }],
+      };
+    },
+  });
+  // The ports' scripted runtime: each step checks the code and completes.
+  const steps = [finalStep, finalStep].map((step) => structuredClone(step));
+  let executed = 0;
+  const runtime = {
+    language: 'Python',
+    getUsageInstructions: () => '',
+    createSession(globals?: Record<string, unknown>) {
+      return {
+        async execute(code: string) {
+          if (code.startsWith('/* ax:host-snippet */')) return 'host-snippet';
+          const step = steps.shift();
+          if (!step) throw new Error('scripted runtime exhausted');
+          if (step.expected_code !== code) {
+            throw new Error(
+              `expected code ${JSON.stringify(step.expected_code)}, got ${JSON.stringify(code)}`
+            );
+          }
+          executed++;
+          const complete = globals?.[step.result.type] as (
+            ...args: unknown[]
+          ) => unknown;
+          await complete(...structuredClone(step.result.args));
+          return 'done';
+        },
+        async patchGlobals(patch: Record<string, unknown>) {
+          Object.assign(globals ?? {}, patch);
+        },
+        inspectGlobals() {
+          return JSON.stringify({ entries: [] });
+        },
+        snapshotGlobals() {
+          return { version: 1, entries: [], bindings: {} };
+        },
+        close() {},
+      };
+    },
+  };
+  const ag = agent('question:string -> answer:string', {
+    ...agentOptions,
+    runtime,
+  } as never);
+  const handle = ag.playbook({
+    target: 'responder',
+    studentAI: ai,
+    teacherAI: ai,
+    maxEpochs: 1,
+  } as never);
+  handle.load(seed as never);
+  // TS's evolve needs its student on the call (the ports also take the
+  // playbook's), and scores with the metric; the ports' default metric reads
+  // the task's score of 0.
+  const result = await handle.evolve(
+    dataset as never,
+    {
+      ...caseOptions,
+      studentAI: ai,
+      teacherAI: ai,
+      metric: () => 0,
+    } as never
+  );
+  const outcome = result.outcomes[0];
+  if (!outcome || executed !== 2) {
+    throw new Error(
+      `agent-playbook-evolve-runtime-on-evolve: TS did not run the scenario (outcomes ${result.outcomes.length}, runtime steps ${executed})`
+    );
+  }
+
+  const fixture = legacyCompletionFixture({
+    name: 'agent-playbook-evolve-runtime-on-evolve',
+    kind: 'agent_playbook_evolve',
+    description:
+      "The ports' examples build the agent with a runtime descriptor and pass the runtime on the evolve call (runtime_on_evolve); the replays must run on it. The expected outcome is TS's, with the runtime on the agent.",
+    signature: 'question:string -> answer:string',
+    runtime_language: 'Python',
+    runtime_on_evolve: true,
+    options: agentOptions,
+    responses,
+    runtime_script: [finalStep, finalStep],
+    seed,
+    dataset,
+    cases: [
+      {
+        name: 'replays-run-on-the-evolve-runtime',
+        options: caseOptions,
+        expected: {
+          outcome_count: result.outcomes.length,
+          accepted: outcome.accepted,
+          metricCallsUsed: result.metricCallsUsed,
+          heldIn: outcome.heldIn,
+          reason_contains: outcome.reason,
+        },
+      },
+    ],
+  });
+  writeFileSync(
+    join(agentOutDir, 'agent-playbook-evolve-runtime-on-evolve.json'),
+    `${JSON.stringify(stable(fixture), null, 2)}\n`
+  );
+})();
+
+// --- agent playbook config: TS's seed shapes -------------------------------
+// TS seeds a configured playbook from `playbook`: a snapshot ({playbook,
+// artifact}) is loaded, anything else is a bare playbook. The expected states
+// are TS's getState() right after construction; the forward responses are the
+// ports' agent script, and the seeded bullet must reach the actor prompt.
+await (async () => {
+  const agentOutDir = join(outRoot, 'ir/conformance/axagent');
+  mkdirSync(agentOutDir, { recursive: true });
+  const bullet = 'Check the live evidence before answering.';
+  const bare = {
+    version: 1,
+    sections: {
+      failures_to_avoid: [
+        {
+          id: 'failures-to-avoid-00001',
+          section: 'failures_to_avoid',
+          content: bullet,
+          helpfulCount: 0,
+          harmfulCount: 0,
+          createdAt: '2026-07-15T00:00:00.000Z',
+          updatedAt: '2026-07-15T00:00:00.000Z',
+        },
+      ],
+    },
+    stats: {
+      bulletCount: 1,
+      helpfulCount: 0,
+      harmfulCount: 0,
+      tokenEstimate: 10,
+    },
+    updatedAt: '2026-07-15T00:00:00.000Z',
+  };
+  const shapes = [
+    {
+      name: 'playbook-config-ts-snapshot-seed',
+      seed: { playbook: bare, artifact: { feedback: [], history: [] } },
+    },
+    { name: 'playbook-config-ts-bare-seed', seed: bare },
+  ];
+  for (const shape of shapes) {
+    const playbookConfig = { learn: false, playbook: shape.seed };
+    const tsAgent = agent('question:string -> answer:string', {
+      ai: new AxMockAIService({
+        features: { functions: false, streaming: false },
+      }),
+      contextFields: [],
+      playbook: playbookConfig,
+    } as never) as unknown as {
+      getPlaybook(): { getState(): unknown } | undefined;
+      executor: { executorDescription?: string };
+    };
+    const state = tsAgent.getPlaybook()?.getState();
+    if (!state || !tsAgent.executor.executorDescription?.includes(bullet)) {
+      throw new Error(`${shape.name}: TS did not seed the playbook`);
+    }
+    const fixture = legacyCompletionFixture({
+      name: shape.name,
+      kind: 'agent_forward',
+      signature: 'question:string -> answer:string',
+      options: { contextFields: [], playbook: playbookConfig },
+      input: { question: 'What should I check?' },
+      responses: [
+        { content: '{"completion":{"type":"final","args":["Answer",{}]}}' },
+        {
+          content:
+            '{"completion":{"type":"final","args":["Answer",{"answer":"the live evidence"}]}}',
+        },
+        { content: 'Answer: the live evidence' },
+      ],
+      expected_output: { answer: 'the live evidence' },
+      expected_request_contains: [bullet],
+      expected_playbook_state_before_forward: state,
+      expected_playbook_state: state,
+      expected_playbook_config_unchanged: true,
+    });
+    writeFileSync(
+      join(agentOutDir, `${shape.name}.json`),
+      `${JSON.stringify(stable(fixture), null, 2)}\n`
+    );
+  }
+})();
+
+// --- evaluated agent predictions: function calls, tool errors and turns ----
+// TS's forwardPipelineForEvaluation records the run's tool calls
+// (qualifiedName, name, arguments, then the result or the error message),
+// lists the failed ones as "<qualifiedName>: <error>" tool errors, counts the
+// turns of the stage whose action log it keeps (the executor's, else the
+// distiller's), and starts every evaluation from a fresh state. The expected
+// values below come from TS runs of each scenario through a scripted runtime
+// whose code steps call the agent's tools; the ports script the same steps
+// with runtime_script callable steps, and callable_results answer the tools.
+const evalFinalCode = "final('Answer', {'answer': 'Docs'})";
+const evalCode = (text: string) => ({
+  content: JSON.stringify({ javascriptCode: text }),
+});
+const evalToolSpecs = {
+  search: {
+    name: 'search',
+    description: 'Search the docs',
+    parameters: {
+      type: 'object',
+      properties: { query: { type: 'string', description: 'Query' } },
+      required: ['query'],
+    },
+  },
+  fetch: {
+    name: 'fetch',
+    description: 'Fetch a page',
+    parameters: {
+      type: 'object',
+      properties: { url: { type: 'string', description: 'Page URL' } },
+      required: ['url'],
+    },
+  },
+  download: {
+    name: 'download',
+    description: 'Download a file',
+    parameters: {
+      type: 'object',
+      properties: { url: { type: 'string', description: 'File URL' } },
+      required: ['url'],
+    },
+  },
+} as const;
+// A long, multi-line tool error: TS's failure signal collapses it to one line
+// and cuts it to 120 characters with an ellipsis.
+const evalLongToolError = `Download failed:\n  upstream   returned 503 Service Unavailable  \n${'please retry later, '.repeat(8)}`;
+const evalToolResults = {
+  search: { value: { title: 'Docs' } },
+  fetch: { error: 'fetch failed' },
+  download: { error: evalLongToolError },
+} as const;
+const evalSteps = {
+  final: {
+    expected_code: evalFinalCode,
+    result: { type: 'final', args: ['Answer', { answer: 'Docs' }] },
+  },
+  search: {
+    expected_code: 'search',
+    result: {
+      callable: { qualified_name: 'tools.search', args: { query: 'ax' } },
+      output: '{"title":"Docs"}',
+    },
+  },
+  fetch: {
+    expected_code: 'fetch',
+    result: {
+      callable: {
+        qualified_name: 'tools.fetch',
+        args: { url: 'https://example.com' },
+      },
+      is_error: true,
+      error: 'Error: fetch failed',
+      error_category: 'runtime_error',
+    },
+  },
+  clarify: {
+    expected_code: "askClarification('Which docs do you mean?')",
+    result: { type: 'askClarification', args: ['Which docs do you mean?'] },
+  },
+  clarifyObject: {
+    expected_code:
+      "askClarification({question: 'Which docs do you mean?', choices: ['API', 'Guides']})",
+    result: {
+      type: 'askClarification',
+      args: [
+        { question: 'Which docs do you mean?', choices: ['API', 'Guides'] },
+      ],
+    },
+  },
+  respond: {
+    expected_code: "respond('Ready', {})",
+    result: { type: 'respond', args: ['Ready', {}] },
+  },
+  // The step's code catches the tool's error and goes on.
+  downloadCaught: {
+    expected_code: 'downloadCaught',
+    result: {
+      callable: {
+        qualified_name: 'tools.download',
+        args: { url: 'https://example.com/a' },
+      },
+      output: 'download failed; skipping',
+    },
+  },
+} as const;
+
+// The ports' tool module for the named tools, and TS's with the same tools
+// answering as callable_results does.
+function evalPortTools(names: readonly (keyof typeof evalToolSpecs)[]) {
+  return [
+    {
+      namespace: 'tools',
+      title: 'Tools',
+      functions: names.map((name) => evalToolSpecs[name]),
+    },
+  ];
+}
+function evalTsTools(names: readonly (keyof typeof evalToolSpecs)[]) {
+  return [
+    {
+      namespace: 'tools',
+      title: 'Tools',
+      functions: names.map((name) => ({
+        ...evalToolSpecs[name],
+        func: async () => {
+          const scripted = evalToolResults[name] as {
+            value?: unknown;
+            error?: string;
+          };
+          if (scripted.error) throw new Error(scripted.error);
+          return scripted.value;
+        },
+      })),
+    },
+  ];
+}
+function evalCallableResults(names: readonly (keyof typeof evalToolSpecs)[]) {
+  return Object.fromEntries(
+    names.map((name) => [`tools.${name}`, evalToolResults[name]])
+  );
+}
+
+// Runs each scripted code step as the ports' runtime_script does: a tool step
+// calls the tool global and prints its JSON result (a thrown tool error fails
+// the step), and a completion step calls its primitive.
+function evalToolRuntime(): AxCodeRuntime {
+  return {
+    getUsageInstructions: () => '',
+    createSession(globals) {
+      const g = (globals ?? {}) as Record<string, any>;
+      return {
+        async execute(code: string) {
+          if (code.startsWith(AX_HOST_SNIPPET_MARKER)) return 'host-snippet';
+          if (code === 'search') {
+            return JSON.stringify(await g.tools.search({ query: 'ax' }));
+          }
+          if (code === 'fetch') {
+            return JSON.stringify(
+              await g.tools.fetch({ url: 'https://example.com' })
+            );
+          }
+          if (code === 'downloadCaught') {
+            try {
+              await g.tools.download({ url: 'https://example.com/a' });
+            } catch {
+              return 'download failed; skipping';
+            }
+            return '';
+          }
+          if (code === evalFinalCode) {
+            g.final('Answer', { answer: 'Docs' });
+            return '';
+          }
+          if (code === evalSteps.clarify.expected_code) {
+            g.askClarification('Which docs do you mean?');
+            return '';
+          }
+          if (code === evalSteps.clarifyObject.expected_code) {
+            g.askClarification({
+              question: 'Which docs do you mean?',
+              choices: ['API', 'Guides'],
+            });
+            return '';
+          }
+          if (code === evalSteps.respond.expected_code) {
+            g.respond('Ready', {});
+            return '';
+          }
+          throw new Error(`unscripted code: ${code}`);
+        },
+        async patchGlobals(patch: Record<string, unknown>) {
+          const { [AX_INPUTS_PATCH_GLOBAL]: staged, ...rest } = patch;
+          Object.assign(g, rest);
+          if (staged && typeof staged === 'object') {
+            g.inputs = Object.assign(
+              (g.inputs as Record<string, unknown>) ?? {},
+              staged
+            );
+          }
+        },
+        inspectGlobals() {
+          return JSON.stringify({ entries: [] });
+        },
+        snapshotGlobals() {
+          return { version: 1, entries: [], bindings: {} };
+        },
+        close() {},
+      };
+    },
+  };
+}
+
+// A scripted student that answers the scenario's model requests in order;
+// requests() counts them.
+function evalStudent(responses: readonly { content: string }[]) {
+  let turn = 0;
+  const student = new AxMockAIService<string>({
+    name: 'mock',
+    features: { functions: false, streaming: false },
+    chatResponse: async () => {
+      const next = responses[turn++];
+      if (!next) throw new Error('eval scenario: responses exhausted');
+      return {
+        results: [{ index: 0, content: next.content, finishReason: 'stop' }],
+      };
+    },
+  });
+  return Object.assign(student, { requests: () => turn });
+}
+
+function evalAgent(
+  student: AxMockAIService<string>,
+  names: readonly (keyof typeof evalToolSpecs)[],
+  extraOptions: Record<string, unknown> = {}
+) {
+  return agent('question:string -> answer:string', {
+    ai: student,
+    contextFields: [],
+    runtime: evalToolRuntime(),
+    ...(names.length > 0 ? { functions: evalTsTools(names) } : {}),
+    ...extraOptions,
+  } as never) as unknown as {
+    _forwardForEvaluation: (
+      ai: unknown,
+      task: unknown
+    ) => Promise<Record<string, unknown>>;
+  };
+}
+
+await (async () => {
+  const scenarios = [
+    {
+      name: 'eval-prediction-function-calls',
+      tools: ['search', 'fetch'] as const,
+      responses: [
+        evalCode(evalFinalCode),
+        evalCode('search'),
+        evalCode('fetch'),
+        evalCode(evalFinalCode),
+        { content: 'Answer: Docs' },
+      ],
+      runtime_script: [
+        evalSteps.final,
+        evalSteps.search,
+        evalSteps.fetch,
+        evalSteps.final,
+      ],
+      completionType: 'final',
+    },
+    {
+      name: 'eval-prediction-clarification-function-calls',
+      tools: ['search'] as const,
+      responses: [
+        evalCode(evalFinalCode),
+        evalCode('search'),
+        evalCode(evalSteps.clarify.expected_code),
+      ],
+      runtime_script: [evalSteps.final, evalSteps.search, evalSteps.clarify],
+      completionType: 'askClarification',
+      // The ports carry TS's structured clarification with this option.
+    },
+    {
+      name: 'eval-prediction-clarification-object',
+      tools: ['search'] as const,
+      responses: [
+        evalCode(evalFinalCode),
+        evalCode('search'),
+        evalCode(evalSteps.clarifyObject.expected_code),
+      ],
+      runtime_script: [
+        evalSteps.final,
+        evalSteps.search,
+        evalSteps.clarifyObject,
+      ],
+      completionType: 'askClarification',
+    },
+    // An agent with a playbook (run-end learning on by default) evaluates a
+    // run with a tool error: TS's evaluation path never updates the
+    // playbook, so no reflector or curator request goes out. The teacher
+    // answers at the end would only be used by a port that learns.
+    {
+      name: 'eval-prediction-playbook-no-learning',
+      tools: ['search', 'fetch'] as const,
+      agentOptions: { playbook: {} },
+      responses: [
+        evalCode(evalFinalCode),
+        evalCode('search'),
+        evalCode('fetch'),
+        evalCode(evalFinalCode),
+        { content: 'Answer: Docs' },
+        {
+          content: [
+            'Reasoning: The fetch tool failed.',
+            'Error Identification: fetch failed.',
+            'Root Cause Analysis: The page was unavailable.',
+            'Correct Approach: Check tool results.',
+            'Key Insight: Check tool results before using them.',
+            'Bullet Tags: []',
+          ].join('\n'),
+        },
+        {
+          content: [
+            'Reasoning: One avoidance rule covers the failure.',
+            'Operations: [{"type":"ADD","section":"failures_to_avoid","content":"Check tool results before using them."}]',
+          ].join('\n'),
+        },
+      ],
+      runtime_script: [
+        evalSteps.final,
+        evalSteps.search,
+        evalSteps.fetch,
+        evalSteps.final,
+      ],
+      completionType: 'final',
+    },
+    {
+      // Only tool errors (the code catches them): TS's failure signals are
+      // one merged tool_error signal, pinned below.
+      name: 'eval-prediction-tool-error-signals',
+      tools: ['download'] as const,
+      responses: [
+        evalCode(evalFinalCode),
+        evalCode('downloadCaught'),
+        evalCode('downloadCaught'),
+        evalCode(evalFinalCode),
+        { content: 'Answer: Docs' },
+      ],
+      runtime_script: [
+        evalSteps.final,
+        evalSteps.downloadCaught,
+        evalSteps.downloadCaught,
+        evalSteps.final,
+      ],
+      completionType: 'final',
+      pinSignals: true,
+    },
+  ];
+  for (const scenario of scenarios) {
+    const student = evalStudent(scenario.responses);
+    const task = { input: { question: 'Find the docs.' } };
+    const agentOptions =
+      'agentOptions' in scenario ? scenario.agentOptions : {};
+    const prediction = await evalAgent(
+      student,
+      scenario.tools,
+      agentOptions
+    )._forwardForEvaluation(student, task);
+    if (prediction.completionType !== scenario.completionType) {
+      throw new Error(
+        `${scenario.name}: TS completed with ${String(prediction.completionType)}`
+      );
+    }
+    writeFixture(scenario.name, {
+      kind: 'optimize',
+      operation: 'eval',
+      program: 'agent',
+      signature: 'question:string -> answer:string',
+      options: {
+        contextFields: [],
+        functions: evalPortTools(scenario.tools),
+        callable_results: evalCallableResults(scenario.tools),
+        ...agentOptions,
+        ...('portOptions' in scenario ? scenario.portOptions : {}),
+      },
+      runtime_language: 'JavaScript',
+      runtime_script: scenario.runtime_script,
+      task,
+      responses: scenario.responses,
+      expected_request_count: student.requests(),
+      expected_prediction_subset: {
+        completionType: prediction.completionType,
+        ...(prediction.completionType === 'final'
+          ? { output: prediction.output }
+          : {}),
+      },
+      // Compared exactly, so a list must match in full.
+      expected_prediction_fields: {
+        functionCalls: prediction.functionCalls,
+        toolErrors: prediction.toolErrors,
+        turnCount: prediction.turnCount,
+        // TS's structured clarification (normalizeClarificationForError).
+        ...(prediction.completionType === 'askClarification'
+          ? { clarification: prediction.clarification }
+          : {}),
+        ...('pinSignals' in scenario
+          ? { failureSignals: prediction.failureSignals ?? [] }
+          : {}),
+      },
+    } as never);
+  }
+})();
+
+// Port-only: without clarificationShape the ports' evaluated clarification is
+// the askClarification payload as given, as this release carries it (a
+// one-time warning names the option); TS's is always structured (above).
+for (const [name, step] of [
+  ['eval-prediction-clarification-raw', evalSteps.clarify],
+  ['eval-prediction-clarification-object-raw', evalSteps.clarifyObject],
+] as const) {
+  writeFixture(name, {
+    kind: 'optimize',
+    operation: 'eval',
+    program: 'agent',
+    description:
+      "Port-only: with explicit clarificationShape: 'raw', the evaluated clarification is the askClarification payload as given, as this release carries it.",
+    signature: 'question:string -> answer:string',
+    options: {
+      clarificationShape: 'raw',
+      contextFields: [],
+      functions: evalPortTools(['search']),
+      callable_results: evalCallableResults(['search']),
+    },
+    runtime_language: 'JavaScript',
+    runtime_script: [evalSteps.final, evalSteps.search, step],
+    task: { input: { question: 'Find the docs.' } },
+    responses: [
+      evalCode(evalFinalCode),
+      evalCode('search'),
+      evalCode(step.expected_code),
+    ],
+    expected_request_count: 3,
+    expected_prediction_subset: { completionType: 'askClarification' },
+    expected_prediction_fields: { clarification: step.result.args[0] },
+  } as never);
+}
+
+// --- agent playbook evolve: the miner sees each run's calls and log -------
+// Two failing tasks run the executor's search tool before the final answer,
+// and a third scenario answers from the distiller (a direct respond, so the
+// executor never runs). The expected miner messages are TS's mineWeakness
+// over TS's evaluated predictions of the same runs, clustered by TS: each
+// record carries only its own run's action log and function calls, and a
+// direct respond's record carries the distiller's log. In a fourth
+// scenario every run throws (a task without its required input): TS's
+// evaluation harness records the message as record.error, with no
+// prediction, so the miner shows "Run threw: <message>".
+await (async () => {
+  const agentOutDir = join(outRoot, 'ir/conformance/axagent');
+  mkdirSync(agentOutDir, { recursive: true });
+  const seedPlaybook = {
+    version: 1,
+    sections: {
+      failures_to_avoid: [
+        {
+          id: 'failures-to-avoid-00001',
+          section: 'failures_to_avoid',
+          content: 'Check the evidence before answering.',
+          helpfulCount: 0,
+          harmfulCount: 0,
+          createdAt: '2026-07-15T00:00:00.000Z',
+          updatedAt: '2026-07-15T00:00:00.000Z',
+        },
+      ],
+    },
+    updatedAt: '2026-07-15T00:00:00.000Z',
+  };
+  // The miner's evidence quote must appear in the run's action log excerpt.
+  const minerAnswerQuoting = (quote: string) =>
+    [
+      'Weakness Description: The agent does not verify its final step.',
+      'Root Cause: The final step is accepted without a check.',
+      'Proposed Guidance: Verify the final step before completing the task.',
+      `Evidence Quotes: ["${quote}"]`,
+      'Config Recommendations: []',
+    ].join('\n');
+  const answer = { content: 'Answer: Docs' };
+  const scenarios = [
+    {
+      name: 'agent-playbook-evolve-miner-function-calls',
+      quote: 'Answer',
+      tools: ['search'] as const,
+      tasks: [
+        { input: { question: 'Find the docs.' } },
+        { input: { question: 'Find the API docs.' } },
+      ],
+      run: {
+        responses: [
+          evalCode(evalFinalCode),
+          evalCode('search'),
+          evalCode(evalFinalCode),
+          answer,
+        ],
+        runtime_script: [evalSteps.final, evalSteps.search, evalSteps.final],
+      },
+    },
+    {
+      name: 'agent-playbook-evolve-miner-direct-respond',
+      quote: 'Ready',
+      tools: [] as const,
+      tasks: [{ input: { question: 'Find the docs.' } }],
+      run: {
+        responses: [evalCode(evalSteps.respond.expected_code), answer],
+        runtime_script: [evalSteps.respond],
+      },
+    },
+    {
+      name: 'agent-playbook-evolve-miner-run-threw',
+      quote: 'is required',
+      tools: [] as const,
+      tasks: [{ input: {} }, { input: {} }],
+      run: { responses: [], runtime_script: [] },
+    },
+  ];
+  for (const scenario of scenarios) {
+    const minerAnswer = minerAnswerQuoting(scenario.quote);
+    const responses = scenario.tasks.flatMap(() => scenario.run.responses);
+    const student = evalStudent(responses);
+    const tsAgent = evalAgent(student, scenario.tools);
+    const records = [];
+    for (const task of scenario.tasks) {
+      // As TS's evaluation harness (runAgentEvalBatch) records a run: a
+      // thrown run keeps its message as error, with no prediction.
+      try {
+        const prediction = await tsAgent._forwardForEvaluation(student, task);
+        records.push({ task, prediction, score: 0, passed: false });
+      } catch (err) {
+        records.push({
+          task,
+          score: 0,
+          passed: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    const clusters = clusterFailures(records as never, 0.7, 1);
+    const systemPrompts: string[] = [];
+    const userMessages: string[] = [];
+    const teacherAI = new AxMockAIService<string>({
+      name: 'mock',
+      features: { functions: false, streaming: false },
+      chatResponse: async (req) => {
+        for (const message of req.chatPrompt) {
+          if (message.role === 'system') systemPrompts.push(message.content);
+          if (message.role === 'user') {
+            userMessages.push(String(message.content));
+          }
+        }
+        return {
+          results: [{ index: 0, content: minerAnswer, finishReason: 'stop' }],
+        };
+      },
+    });
+    const weakness = clusters[0]
+      ? await mineWeakness({
+          ai: teacherAI,
+          cluster: clusters[0],
+          currentPlaybook: renderPlaybook(
+            seedPlaybook as unknown as AxACEPlaybook
+          ),
+          index: 0,
+        })
+      : undefined;
+    if (!weakness || systemPrompts.length !== 1 || userMessages.length !== 1) {
+      throw new Error(`${scenario.name}: the miner did not run`);
+    }
+    const fixture = legacyCompletionFixture({
+      name: scenario.name,
+      kind: 'agent_playbook_evolve',
+      signature: 'question:string -> answer:string',
+      runtime_language: 'JavaScript',
+      options: {
+        name: 'qa',
+        description: 'Answer the question.',
+        contextFields: [],
+        ...(scenario.tools.length > 0
+          ? {
+              functions: evalPortTools(scenario.tools),
+              callable_results: evalCallableResults(scenario.tools),
+            }
+          : {}),
+      },
+      responses,
+      runtime_script: scenario.tasks.flatMap(() => scenario.run.runtime_script),
+      seed: { playbook: seedPlaybook, artifact: { feedback: [], history: [] } },
+      dataset: {
+        train: scenario.tasks.map((task) => ({ ...task, score: 0 })),
+      },
+      teacher_client: {
+        model: 'premium-model',
+        options: {
+          modelInfo: [
+            {
+              completionTokenCostPer1M: 600,
+              isExpensive: true,
+              name: 'premium-model',
+              promptTokenCostPer1M: 150,
+            },
+          ],
+        },
+      },
+      cases: [
+        {
+          name: 'miner-messages',
+          options: {
+            teacherOptions: { useExpensiveModel: 'yes' },
+            verify: true,
+            minHeldInGain: 0,
+            maxProposals: 1,
+            maxMetricCalls: 2 * scenario.tasks.length,
+          },
+          expected: { outcome_count: 1 },
+          expected_teacher_request_count: 1,
+          expected_teacher_system_prompts: systemPrompts,
+          expected_teacher_user_messages: userMessages,
+        },
+      ],
+      teacher_responses: [{ content: minerAnswer }],
+    });
+    writeFileSync(
+      join(agentOutDir, `${scenario.name}.json`),
+      `${JSON.stringify(stable(fixture), null, 2)}\n`
+    );
+  }
+})();
+
+// --- run-end learning over two runs ----------------------------------------
+// TS carries a stage's action log into the agent's next run through its
+// state (each entry's turn, code, output and tags), so an earlier run's error
+// turn still counts in a later run's failure report, but its tool calls do
+// not: a later run has no tool_error signal from an earlier run. In each
+// scenario run 1 learns from its failure and run 2 is clean. Dedupe is off, so
+// a signal that carries into run 2 learns again (two more playbook requests).
+// - earlier-error-turn-carried: run 1's executor turn fails at runtime; TS's
+//   run 2 learns again from the carried error turn.
+// - earlier-tool-error-not-carried: run 1's executor catches a failing tool
+//   call (a tool_error signal, no error turn); TS's run 2 learns nothing.
+await (async () => {
+  const agentOutDir = join(outRoot, 'ir/conformance/axagent');
+  mkdirSync(agentOutDir, { recursive: true });
+  const caughtFetchCode = 'fetchCaught';
+  const caughtOutput = 'fetch failed; using the cached page';
+  const lookupCode = 'lookupPolicy()';
+  const lookupError = 'lookupPolicy is not defined';
+  const stageOf = (system: string) =>
+    system.includes('You (`distiller`)')
+      ? 'distiller'
+      : system.includes('You (`executor`)')
+        ? 'executor'
+        : system.includes('`Generator answer`') ||
+            system.includes('`Question context`')
+          ? 'playbook'
+          : 'responder';
+  const teacher = [
+    {
+      content: [
+        'Reasoning: The executor step failed.',
+        'Error Identification: The step raised an error.',
+        'Root Cause Analysis: The executor did not check its step.',
+        'Correct Approach: Check each step before relying on it.',
+        'Key Insight: Check tool results before using them.',
+        'Bullet Tags: []',
+      ].join('\n'),
+    },
+    {
+      content: [
+        'Reasoning: One avoidance rule covers the failure.',
+        'Operations: [{"type":"ADD","section":"failures_to_avoid","content":"Check tool results before using them."}]',
+      ].join('\n'),
+    },
+  ];
+  const answer = { content: 'Answer: Docs' };
+  const scenarios = [
+    {
+      name: 'agent-forward-runs-earlier-error-turn-carried',
+      description:
+        "Run 1's executor turn fails at runtime and run 1 learns; run 2 is clean. TS carries the stage's action log into the next run through the agent's state, so run 2's failure report still has run 1's error turn and, with dedupe off, learns again.",
+      failingCode: lookupCode,
+      failingStep: {
+        expected_code: lookupCode,
+        result: {
+          is_error: true,
+          kind: 'error',
+          error_category: 'runtime_error',
+          error: lookupError,
+        },
+      },
+    },
+    {
+      name: 'agent-forward-runs-earlier-tool-error-not-carried',
+      description:
+        "Run 1's executor catches a failing tool call (a tool_error signal and no error turn) and learns; run 2 is clean. An earlier run's tool calls do not carry into a later run's failure report in TS, so run 2 has no failure signals and sends no playbook request.",
+      failingCode: caughtFetchCode,
+      failingStep: {
+        expected_code: caughtFetchCode,
+        result: {
+          callable: {
+            qualified_name: 'tools.fetch',
+            args: { url: 'https://example.com' },
+          },
+          output: caughtOutput,
+        },
+      },
+    },
+  ];
+  for (const scenario of scenarios) {
+    const responses = [
+      evalCode(evalFinalCode),
+      evalCode(scenario.failingCode),
+      evalCode(evalFinalCode),
+      answer,
+      ...teacher,
+      evalCode(evalFinalCode),
+      evalCode(evalFinalCode),
+      answer,
+      // Answers a learning update in run 2, when a signal carries.
+      ...teacher,
+    ];
+    const transcript: string[] = [];
+    let turn = 0;
+    const student = new AxMockAIService<string>({
+      name: 'mock',
+      features: { functions: false, streaming: false },
+      chatResponse: async (req) => {
+        const first = req.chatPrompt[0];
+        const system =
+          first?.role === 'system' && typeof first.content === 'string'
+            ? first.content
+            : '';
+        transcript.push(`request:${stageOf(system)}`);
+        const next = responses[turn++];
+        if (!next) throw new Error('runs scenario: responses exhausted');
+        return {
+          results: [{ index: 0, content: next.content, finishReason: 'stop' }],
+        };
+      },
+    });
+    const runtime: AxCodeRuntime = {
+      getUsageInstructions: () => '',
+      createSession(globals) {
+        const g = (globals ?? {}) as Record<string, any>;
+        return {
+          async execute(code: string) {
+            if (code.startsWith(AX_HOST_SNIPPET_MARKER)) return 'host-snippet';
+            if (code === caughtFetchCode) {
+              try {
+                await g.tools.fetch({ url: 'https://example.com' });
+              } catch {
+                return caughtOutput;
+              }
+              throw new Error('fetch was expected to fail');
+            }
+            if (code === lookupCode) throw new Error(lookupError);
+            if (code === evalFinalCode) {
+              g.final('Answer', { answer: 'Docs' });
+              return '';
+            }
+            throw new Error(`unscripted code: ${code}`);
+          },
+          async patchGlobals(patch: Record<string, unknown>) {
+            const { [AX_INPUTS_PATCH_GLOBAL]: staged, ...rest } = patch;
+            Object.assign(g, rest);
+            if (staged && typeof staged === 'object') {
+              g.inputs = Object.assign(
+                (g.inputs as Record<string, unknown>) ?? {},
+                staged
+              );
+            }
+          },
+          inspectGlobals() {
+            return JSON.stringify({ entries: [] });
+          },
+          snapshotGlobals() {
+            return { version: 1, entries: [], bindings: {} };
+          },
+          close() {},
+        };
+      },
+    };
+    const observerCalls: Record<string, unknown>[] = [];
+    const ag = agent('question:string -> answer:string', {
+      ai: student,
+      contextFields: [],
+      runtime,
+      functions: evalTsTools(['fetch']),
+      playbook: {
+        learn: { dedupe: false },
+        onUpdate: (result: { status: string }) => {
+          transcript.push('playbook_update');
+          observerCalls.push({
+            callback: 'playbook_update',
+            payload: { status: result.status },
+          });
+        },
+      },
+    } as never) as unknown as {
+      forward: (
+        ai: unknown,
+        input: unknown
+      ) => Promise<Record<string, unknown>>;
+    };
+    const input = { question: 'Find the docs.' };
+    const outputs: Record<string, unknown>[] = [];
+    for (let run = 0; run < 2; run++) {
+      outputs.push(await ag.forward(student, input));
+      // Fire-and-forget observers settle before the next run.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    const fixture = legacyCompletionFixture({
+      name: scenario.name,
+      kind: 'agent_forward',
+      description: scenario.description,
+      signature: 'question:string -> answer:string',
+      options: {
+        contextFields: [],
+        functions: evalPortTools(['fetch']),
+        callable_results: evalCallableResults(['fetch']),
+        playbook: { learn: { dedupe: false } },
+        runtime: { language: 'JavaScript' },
+      },
+      observers: ['playbook_update'],
+      features: {
+        functions: false,
+        streaming: false,
+        structured_outputs: false,
+      },
+      runtime_script: [
+        evalSteps.final,
+        scenario.failingStep,
+        evalSteps.final,
+        evalSteps.final,
+        evalSteps.final,
+      ],
+      responses,
+      forward_runs: [{ input }, { input }],
+      expected_output: outputs,
+      expected_request_count: turn,
+      expected_transcript: transcript,
+      expected_observer_calls: observerCalls,
+    });
+    writeFileSync(
+      join(agentOutDir, `${scenario.name}.json`),
+      `${JSON.stringify(stable(fixture), null, 2)}\n`
+    );
   }
 })();

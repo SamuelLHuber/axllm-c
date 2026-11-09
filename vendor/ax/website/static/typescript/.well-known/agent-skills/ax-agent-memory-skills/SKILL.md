@@ -1,7 +1,7 @@
 ---
 name: ax-agent-memory-skills
 description: This skill helps an LLM generate correct AxAgent memory retrieval, context-map, and dynamic skill-loading code using @ax-llm/ax. Use when the user asks about contextMap, AxAgentContextMap, onMemoriesSearch, memoriesCatalog, recall(...), inputs.memories, onLoadedMemories, onUsedMemories, onSkillsSearch, skillsCatalog, AxAgentCatalogSkill, discover({ skills }), onLoadedSkills, onUsedSkills, preloaded skills, preloading memories at forward time, relevanceRanking hints, loaded memory/skill IDs, or carrying memories across forward() calls.
-version: "24.0.14"
+version: "25.4.9"
 ---
 
 # AxAgent Memory And Skills Rules (@ax-llm/ax)
@@ -337,7 +337,7 @@ await releaseAgent.forward(
 );
 ```
 
-You can use `skills` without setting `onSkillsSearch` at all. That is useful for static guides where the actor never needs to fetch more.
+You can use `skills` without setting `onSkillsSearch` at all. That is useful for static guides where the actor never needs to fetch more. Without `onSkillsSearch` or a `skillsCatalog` the executor prompt shows the loaded guides but doesn't advertise `discover({ skills })`, because the runtime has no skills search to back it.
 
 ## Advisory Relevance Hints (`relevanceRanking`)
 

@@ -2,7 +2,7 @@
   "expected_output": {
     "model_usage": {
       "ai": "google-gemini",
-      "model": "gemini-3.5-flash",
+      "model": "gemini-3.6-flash",
       "tokens": {
         "completion_tokens": 1,
         "prompt_tokens": 1,
@@ -20,7 +20,9 @@
       }
     ]
   },
-  "expected_transport_json_absent": ["service_tier"],
+  "expected_transport_json_absent": [
+    "service_tier"
+  ],
   "kind": "ai_chat",
   "name": "gemini-service-tier-unspecified-normalizes-standard",
   "provider": "google-gemini",

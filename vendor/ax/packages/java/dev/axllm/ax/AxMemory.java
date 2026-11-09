@@ -6,6 +6,11 @@ import java.util.List;
 import java.util.Map;
 
 public final class AxMemory {
+  AxMemory ownedCopy() {
+    AxMemory copy=new AxMemory();
+    for(var item:items)copy.items.add(Core.asMap(Core.ownedCopy(item)));
+    return copy;
+  }
   private final List<Map<String, Object>> items = new ArrayList<>();
 
   public AxMemory addRequest(Object messages) {
@@ -30,7 +35,7 @@ public final class AxMemory {
   public AxMemory updateResult(Object response) {
     for (int i = items.size() - 1; i >= 0; i--) {
       if ("assistant".equals(items.get(i).get("role"))) {
-        items.get(i).put("response", response);
+        items.get(i).put("response", Core.ai_merge_replay_metadata(items.get(i).get("response"), response));
         return this;
       }
     }
@@ -105,7 +110,7 @@ public final class AxMemory {
     if (!(response instanceof Map<?, ?> map)) return response != null;
     Object content = map.get("content");
     if (content instanceof String text && !text.trim().isEmpty()) return true;
-    for (String key : List.of("function_calls", "functionCalls", "tool_calls", "toolCalls", "thought_blocks", "thoughtBlocks")) {
+    for (String key : List.of("function_calls", "functionCalls", "tool_calls", "toolCalls", "thought_blocks", "thoughtBlocks", "images")) {
       Object value = map.get(key);
       if (value instanceof List<?> list && !list.isEmpty()) return true;
     }

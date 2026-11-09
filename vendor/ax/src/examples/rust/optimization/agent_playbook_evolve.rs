@@ -20,8 +20,8 @@ fn openai_client() -> AxResult<OpenAICompatibleClient> {
         .map_err(|_| {
             axllm::AxError::runtime("Set OPENAI_API_KEY or OPENAI_APIKEY to run this example.")
         })?;
-    let model = env::var("AX_OPENAI_MODEL").unwrap_or_else(|_| "gpt-5.4-mini".to_string());
-    Ok(OpenAICompatibleClient::new(api_key, model))
+    let model = env::var("AX_OPENAI_MODEL").unwrap_or_else(|_| "gpt-6-luna".to_string());
+    axllm::ai("openai", json!({"api_key": api_key, "model": model}))
 }
 
 fn main() -> AxResult<()> {
@@ -51,7 +51,7 @@ fn main() -> AxResult<()> {
         json!({
             "contextFields": [],
             "runtime": {"language": "JavaScript"},
-            "playbook": {"seed": seed},
+            "playbook": {"playbook": seed, "seed": 7},
             "citations": {"surface": "hidden"}
         }),
     )?
@@ -87,17 +87,34 @@ fn main() -> AxResult<()> {
             "score": 0
         }]
     });
+    // The playbook borrows `student` to reflect while the agent runs, so the
+    // agent runs on its own client for the same model.
     let evolution = {
-        let mut client = student.borrow_mut();
+        let mut runner = openai_client()?;
         playbook.evolve_agent(
             &mut assistant,
-            &mut *client,
+            &mut runner,
             &dataset,
             &json!({"verify": true, "maxProposals": 1}),
         )?
     };
 
+    // Each train task replays on the runtime. A replay that fails scores 0 and
+    // would be mined as the weakness, so stop instead.
+    let mut replays = Vec::new();
+    for record in evolution["records"].as_array().cloned().unwrap_or_default() {
+        let completion = record["prediction"]["completionType"].clone();
+        if !record["error"].is_null() || completion == "error" {
+            return Err(axllm::AxError::runtime(format!(
+                "evolve replay failed: {} {}",
+                record["error"], record["prediction"]["error"]
+            )));
+        }
+        replays.push(completion);
+    }
+
     println!("{}", serde_json::to_string_pretty(&answer)?);
+    println!("replays: {}", serde_json::Value::Array(replays));
     println!("citations: {}", observed_citations.borrow());
     println!("run-end updates: {}", playbook_updates.borrow().len());
     println!("outcomes: {}", evolution["outcomes"]);

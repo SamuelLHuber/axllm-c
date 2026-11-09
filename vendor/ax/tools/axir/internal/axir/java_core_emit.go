@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 func BuildJavaCore(model AxRuntimeModel) (string, error) {
@@ -134,7 +135,7 @@ func emitJavaCoreStmt(names map[string]string, stmt CoreStmt, declared map[strin
 		if _, ok := Attr(stmt.Op, "error"); ok {
 			return []string{fmt.Sprintf("throw Core.asRuntime(%s);", javaAttrValue(stmt.Op, "error"))}, nil
 		}
-		return []string{fmt.Sprintf("throw new RuntimeException(%s);", strconv.Quote(stmt.Message))}, nil
+		return []string{fmt.Sprintf("throw new RuntimeException(%s);", javaStringLiteral(stmt.Message))}, nil
 	case "try":
 		return emitJavaTry(names, stmt, declared)
 	default:
@@ -292,133 +293,176 @@ func javaCallee(names map[string]string, callee string) string {
 }
 
 var coreIntrinsicJava = map[CoreIntrinsic]string{
-	IntrinsicNot:                    "Core.not",
-	IntrinsicAnd:                    "Core.and",
-	IntrinsicOr:                     "Core.or",
-	IntrinsicEq:                     "Core.eq",
-	IntrinsicNe:                     "Core.ne",
-	IntrinsicLT:                     "Core.lt",
-	IntrinsicLTE:                    "Core.lte",
-	IntrinsicGT:                     "Core.gt",
-	IntrinsicGTE:                    "Core.gte",
-	IntrinsicAdd:                    "Core.add",
-	IntrinsicMul:                    "Core.mul",
-	IntrinsicDiv:                    "Core.div",
-	IntrinsicMathAbs:                "Core.mathAbs",
-	IntrinsicMathLog:                "Core.mathLog",
-	IntrinsicMathExp:                "Core.mathExp",
-	IntrinsicMathSqrt:               "Core.mathSqrt",
-	IntrinsicMathCos:                "Core.mathCos",
-	IntrinsicMathPow:                "Core.mathPow",
-	IntrinsicMathRandom:             "Core.mathRandom",
-	IntrinsicContains:               "Core.contains",
-	IntrinsicLen:                    "Core.len",
-	IntrinsicTruthy:                 "Core.truthyValue",
-	IntrinsicIsNone:                 "Core.isNone",
-	IntrinsicIsNotNone:              "Core.isNotNone",
-	IntrinsicNone:                   "Core.none",
-	IntrinsicCoalesce:               "Core.coalesce",
-	IntrinsicMapMerge:               "Core.mapMerge",
-	IntrinsicMapContains:            "Core.mapContains",
-	IntrinsicMapGet:                 "Core.mapGet",
-	IntrinsicMapDelete:              "Core.mapDelete",
-	IntrinsicMapUpdate:              "Core.mapUpdate",
-	IntrinsicMapKeys:                "Core.mapKeys",
-	IntrinsicMapValues:              "Core.mapValues",
-	IntrinsicRecordNew:              "Core.recordNew",
-	IntrinsicObjectCallMethod:       "Core.objectCallMethod",
-	IntrinsicProgramComponents:      "Core.programComponents",
-	IntrinsicProgramApplyComponents: "Core.programApplyComponents",
-	IntrinsicAICompleteOnce:         "Core.aiCompleteOnce",
-	IntrinsicAIClientFeatures:       "Core.aiClientFeatures",
-	IntrinsicRetrySleep:             "Core.retrySleep",
-	IntrinsicExceptionMessage:       "Core.exceptionMessage",
-	IntrinsicRuntimeError:           "Core.runtimeError",
-	IntrinsicJSONParse:              "Core.jsonParse",
-	IntrinsicJSONParseStrict:        "Core.jsonParseStrict",
-	IntrinsicJSONStringify:          "Core.jsonStringify",
-	IntrinsicJSONStableStringify:    "Core.jsonStableStringify",
-	IntrinsicToolInvoke:             "Core.toolInvoke",
-	IntrinsicAIErrorResponse:        "Core.aiErrorResponse",
-	IntrinsicAIErrorRefusal:         "Core.aiErrorRefusal",
-	IntrinsicAIErrorStream:          "Core.aiErrorStream",
-	IntrinsicAIErrorUnsupported:     "Core.aiErrorUnsupported",
-	IntrinsicAIErrorAuth:            "Core.aiErrorAuth",
-	IntrinsicAIErrorTimeout:         "Core.aiErrorTimeout",
-	IntrinsicAIErrorStatus:          "Core.aiErrorStatus",
-	IntrinsicStringEndsWith:         "Core.stringEndsWith",
-	IntrinsicStringJoin:             "Core.stringJoin",
-	IntrinsicStringLower:            "Core.stringLower",
-	IntrinsicStringLowerCamel:       "Core.stringLowerCamel",
-	IntrinsicStringTitleFromCamel:   "Core.stringTitleFromCamel",
-	IntrinsicStringFormat:           "Core.stringFormat",
-	IntrinsicStringSlice:            "Core.stringSlice",
-	IntrinsicStringReplace:          "Core.stringReplace",
-	IntrinsicStringRemoveSuf:        "Core.stringRemoveSuffix",
-	IntrinsicStringWords:            "Core.stringWords",
-	IntrinsicStringDefault:          "Core.stringDefaultIfEmpty",
-	IntrinsicStringSplitOnce:        "Core.stringSplitOnce",
-	IntrinsicStringSplitTrim:        "Core.stringSplitTrimNonEmpty",
-	IntrinsicStringFindQuoted:       "Core.stringFindOutsideQuotes",
-	IntrinsicStringSplitQuoted:      "Core.stringSplitOutsideQuotes",
-	IntrinsicStringSplitTopLevel:    "Core.stringSplitTopLevel",
-	IntrinsicStringExtractGroup:     "Core.stringExtractLeadingGroup",
-	IntrinsicStringConsumeOpt:       "Core.stringConsumeOptionalQuotedPrefix",
-	IntrinsicStringExtractSuf:       "Core.stringExtractQuotedSuffix",
-	IntrinsicStringSplit:            "Core.stringSplit",
-	IntrinsicStringStartsWith:       "Core.stringStartsWith",
-	IntrinsicStringStr:              "Core.stringStr",
-	IntrinsicRegexReplace:           "Core.regexReplace",
-	IntrinsicSortedStrings:          "Core.sortedStrings",
-	IntrinsicJSONPretty:             "Core.jsonPretty",
-	IntrinsicTemplateParse:          "Core.templateParse",
-	IntrinsicTemplateRender:         "Core.templateRenderTree",
-	IntrinsicTemplateCollect:        "Core.templateCollectVars",
-	IntrinsicTemplateValidate:       "Core.templateValidate",
-	IntrinsicPromptStructured:       "Core.promptStructured",
-	IntrinsicPromptUserContent:      "Core.promptUserContent",
-	IntrinsicAxGenRenderExamples:    "Core.axgenRenderExamples",
-	IntrinsicAxGenRenderDemos:       "Core.axgenRenderDemos",
-	IntrinsicAxGenApplyProcessors:   "Core.axgenApplyFieldProcessors",
-	IntrinsicAxGenRunAssertions:     "Core.axgenRunAssertions",
-	IntrinsicAxGenRecordTrace:       "Core.axgenRecordTrace",
-	IntrinsicAxGenShouldContinue:    "Core.axgenShouldContinueSteps",
-	IntrinsicAxGenApplyCache:        "Core.axgenApplyContextCache",
-	IntrinsicAxGenMemoryRequest:     "Core.axgenMemoryAddRequest",
-	IntrinsicAxGenMemoryResponse:    "Core.axgenMemoryAddResponse",
-	IntrinsicAxGenMemoryFunction:    "Core.axgenMemoryAddFunctionResult",
-	IntrinsicAxGenMemoryCorrection:  "Core.axgenMemoryAddCorrection",
-	IntrinsicAxGenCleanupCorrection: "Core.axgenMemoryCleanupCorrections",
-	IntrinsicAxGenRecordChatLog:     "Core.axgenRecordChatLog",
-	IntrinsicAxGenRecordFunction:    "Core.axgenRecordFunctionCall",
-	IntrinsicAgentStageForward:      "Core.agentStageForward",
-	IntrinsicAgentStageChatLog:      "Core.agentStageChatLog",
-	IntrinsicAgentStageUsage:        "Core.agentStageUsage",
-	IntrinsicAgentStageTraces:       "Core.agentStageTraces",
-	IntrinsicAgentClarificationErr:  "Core.agentClarificationError",
-	IntrinsicAgentRuntimeCreate:     "Core.agentRuntimeCreateSession",
-	IntrinsicAgentRuntimeExecute:    "Core.agentRuntimeExecute",
-	IntrinsicAgentRuntimeInspect:    "Core.agentRuntimeInspect",
-	IntrinsicAgentRuntimeExport:     "Core.agentRuntimeExportState",
-	IntrinsicAgentRuntimeRestore:    "Core.agentRuntimeRestoreState",
-	IntrinsicAgentRuntimeClose:      "Core.agentRuntimeClose",
-	IntrinsicAgentMemorySearch:      "Core.agentMemorySearch",
-	IntrinsicAgentSkillSearch:       "Core.agentSkillSearch",
-	IntrinsicAgentObserverNotify:    "Core.agentObserverNotify",
-	IntrinsicAgentTranscribe:        "Core.agentTranscribe",
-	IntrinsicAgentCallableInvoke:    "Core.agentCallableInvoke",
-	IntrinsicStreamEventParts:       "Core.streamEventContentParts",
-	IntrinsicDescriptionAppend:      "Core.descriptionAppend",
-	IntrinsicURLValid:               "Core.urlValid",
-	IntrinsicSignatureError:         "Core.signatureError",
-	IntrinsicValidationError:        "Core.validationError",
-	IntrinsicListGet:                "Core.listGet",
-	IntrinsicFieldItem:              "Core.fieldItem",
-	IntrinsicNestedFields:           "Core.fieldsFromMap",
-	IntrinsicValidImage:             "Core.validImage",
-	IntrinsicValidAudio:             "Core.validAudio",
-	IntrinsicValidFile:              "Core.validFile",
-	IntrinsicValidURLShape:          "Core.validUrlShape",
+	IntrinsicNot:                       "Core.not",
+	IntrinsicAnd:                       "Core.and",
+	IntrinsicOr:                        "Core.or",
+	IntrinsicEq:                        "Core.eq",
+	IntrinsicNe:                        "Core.ne",
+	IntrinsicLT:                        "Core.lt",
+	IntrinsicLTE:                       "Core.lte",
+	IntrinsicGT:                        "Core.gt",
+	IntrinsicGTE:                       "Core.gte",
+	IntrinsicAdd:                       "Core.add",
+	IntrinsicMul:                       "Core.mul",
+	IntrinsicDiv:                       "Core.div",
+	IntrinsicMathAbs:                   "Core.mathAbs",
+	IntrinsicStringCodepointLength:     "Core.stringCodepointLength",
+	IntrinsicStringUTF16Units:          "Core.stringUTF16Units",
+	IntrinsicStringUTF8Length:          "Core.stringUTF8Length",
+	IntrinsicMathIsFinite:              "Core.mathIsFinite",
+	IntrinsicMathFloor:                 "Core.mathFloor",
+	IntrinsicMathLog:                   "Core.mathLog",
+	IntrinsicMathExp:                   "Core.mathExp",
+	IntrinsicMathSqrt:                  "Core.mathSqrt",
+	IntrinsicMathCos:                   "Core.mathCos",
+	IntrinsicMathPow:                   "Core.mathPow",
+	IntrinsicMathRandom:                "Core.mathRandom",
+	IntrinsicContains:                  "Core.contains",
+	IntrinsicLen:                       "Core.len",
+	IntrinsicTruthy:                    "Core.truthyValue",
+	IntrinsicIsNone:                    "Core.isNone",
+	IntrinsicIsNotNone:                 "Core.isNotNone",
+	IntrinsicNone:                      "Core.none",
+	IntrinsicCoalesce:                  "Core.coalesce",
+	IntrinsicMapMerge:                  "Core.mapMerge",
+	IntrinsicMapContains:               "Core.mapContains",
+	IntrinsicMapGet:                    "Core.mapGet",
+	IntrinsicMapDelete:                 "Core.mapDelete",
+	IntrinsicMapUpdate:                 "Core.mapUpdate",
+	IntrinsicMapKeys:                   "Core.mapKeys",
+	IntrinsicMapValues:                 "Core.mapValues",
+	IntrinsicRecordNew:                 "Core.recordNew",
+	IntrinsicObjectCallMethod:          "Core.objectCallMethod",
+	IntrinsicProgramComponents:         "Core.programComponents",
+	IntrinsicProgramApplyComponents:    "Core.programApplyComponents",
+	IntrinsicProgramSignature:          "Core.programSignature",
+	IntrinsicAICompleteOnce:            "Core.aiCompleteOnce",
+	IntrinsicAIControlTakePending:      "Core.aiControlTakePending",
+	IntrinsicAIControlPendingCount:     "Core.aiControlPendingCount",
+	IntrinsicAIClientFeatures:          "Core.aiClientFeatures",
+	IntrinsicRetrySleep:                "Core.retrySleep",
+	IntrinsicExceptionMessage:          "Core.exceptionMessage",
+	IntrinsicExceptionRewrap:           "Core.exceptionRewrap",
+	IntrinsicExceptionGenerate:         "Core.exceptionGenerate",
+	IntrinsicCryptoSha256Hex:           "Core.cryptoSha256Hex",
+	IntrinsicRuntimeError:              "Core.runtimeError",
+	IntrinsicJSONParse:                 "Core.jsonParse",
+	IntrinsicJSONParseStrict:           "Core.jsonParseStrict",
+	IntrinsicJSONStringify:             "Core.jsonStringify",
+	IntrinsicJSONStableStringify:       "Core.jsonStableStringify",
+	IntrinsicToolInvoke:                "Core.toolInvoke",
+	IntrinsicAIErrorResponse:           "Core.aiErrorResponse",
+	IntrinsicAIErrorRefusal:            "Core.aiErrorRefusal",
+	IntrinsicAIErrorStream:             "Core.aiErrorStream",
+	IntrinsicAIErrorUnsupported:        "Core.aiErrorUnsupported",
+	IntrinsicAIErrorAuth:               "Core.aiErrorAuth",
+	IntrinsicAIErrorTimeout:            "Core.aiErrorTimeout",
+	IntrinsicAIErrorStatus:             "Core.aiErrorStatus",
+	IntrinsicAIWarnOnce:                "Core.aiWarnOnce",
+	IntrinsicStringEndsWith:            "Core.stringEndsWith",
+	IntrinsicStringJoin:                "Core.stringJoin",
+	IntrinsicStringLower:               "Core.stringLower",
+	IntrinsicStringLowerCamel:          "Core.stringLowerCamel",
+	IntrinsicStringTitleFromCamel:      "Core.stringTitleFromCamel",
+	IntrinsicStringFormat:              "Core.stringFormat",
+	IntrinsicStringSlice:               "Core.stringSlice",
+	IntrinsicStringReplace:             "Core.stringReplace",
+	IntrinsicStringRemoveSuf:           "Core.stringRemoveSuffix",
+	IntrinsicStringWords:               "Core.stringWords",
+	IntrinsicStringDefault:             "Core.stringDefaultIfEmpty",
+	IntrinsicStringSplitOnce:           "Core.stringSplitOnce",
+	IntrinsicStringIndexOf:             "Core.stringIndexOf",
+	IntrinsicAIStreamOpen:              "Core.aiStreamOpen",
+	IntrinsicAIStreamNext:              "Core.aiStreamNext",
+	IntrinsicAIStreamClose:             "Core.aiStreamClose",
+	IntrinsicAxGenEmitDelta:            "Core.axgenEmitDelta",
+	IntrinsicAxGenCallProcessor:        "Core.axgenCallProcessor",
+	IntrinsicAxGenCheckStreamAssert:    "Core.axgenCheckStreamingAssertion",
+	IntrinsicAxGenDeprecation:          "Core.axgenDeprecation",
+	IntrinsicAxGenSpeak:                "Core.axgenSpeak",
+	IntrinsicDateZoneOffset:            "Core.dateZoneOffset",
+	IntrinsicAxGenCachingFunction:      "Core.axgenCachingFunction",
+	IntrinsicAxGenCacheRead:            "Core.axgenCacheRead",
+	IntrinsicAxGenCacheWrite:           "Core.axgenCacheWrite",
+	IntrinsicAxGenResultFormatter:      "Core.axgenFunctionResultFormatter",
+	IntrinsicStringSplitTrim:           "Core.stringSplitTrimNonEmpty",
+	IntrinsicStringFindQuoted:          "Core.stringFindOutsideQuotes",
+	IntrinsicStringSplitQuoted:         "Core.stringSplitOutsideQuotes",
+	IntrinsicStringSplitTopLevel:       "Core.stringSplitTopLevel",
+	IntrinsicStringExtractGroup:        "Core.stringExtractLeadingGroup",
+	IntrinsicStringConsumeOpt:          "Core.stringConsumeOptionalQuotedPrefix",
+	IntrinsicStringExtractSuf:          "Core.stringExtractQuotedSuffix",
+	IntrinsicStringSplit:               "Core.stringSplit",
+	IntrinsicStringStartsWith:          "Core.stringStartsWith",
+	IntrinsicStringDropHighSurrogate:   "Core.stringDropTrailingHighSurrogate",
+	IntrinsicStringConcatStreamText:    "Core.stringConcatStreamText",
+	IntrinsicStringStr:                 "Core.stringStr",
+	IntrinsicRegexReplace:              "Core.regexReplace",
+	IntrinsicSortedStrings:             "Core.sortedStrings",
+	IntrinsicJSONPretty:                "Core.jsonPretty",
+	IntrinsicTemplateParse:             "Core.templateParse",
+	IntrinsicTemplateRender:            "Core.templateRenderTree",
+	IntrinsicTemplateCollect:           "Core.templateCollectVars",
+	IntrinsicTemplateValidate:          "Core.templateValidate",
+	IntrinsicPromptStructured:          "Core.promptStructured",
+	IntrinsicPromptUserContent:         "Core.promptUserContent",
+	IntrinsicAxGenRenderExamples:       "Core.axgenRenderExamples",
+	IntrinsicAxGenRenderDemos:          "Core.axgenRenderDemos",
+	IntrinsicAxGenApplyProcessors:      "Core.axgenApplyFieldProcessors",
+	IntrinsicAxGenRunAssertions:        "Core.axgenRunAssertions",
+	IntrinsicAxGenRecordTrace:          "Core.axgenRecordTrace",
+	IntrinsicAxGenShouldContinue:       "Core.axgenShouldContinueSteps",
+	IntrinsicAxGenApplyCache:           "Core.axgenApplyContextCache",
+	IntrinsicAxGenMemoryRequest:        "Core.axgenMemoryAddRequest",
+	IntrinsicAxGenMemoryResponse:       "Core.axgenMemoryAddResponse",
+	IntrinsicAxGenMemoryFunction:       "Core.axgenMemoryAddFunctionResult",
+	IntrinsicAxGenMemoryCorrection:     "Core.axgenMemoryAddCorrection",
+	IntrinsicAxGenCleanupCorrection:    "Core.axgenMemoryCleanupCorrections",
+	IntrinsicAxGenRecordChatLog:        "Core.axgenRecordChatLog",
+	IntrinsicAxGenRecordFunction:       "Core.axgenRecordFunctionCall",
+	IntrinsicRunControlAborted:         "Core.runControlAborted",
+	IntrinsicFlowDispatchGroup:         "Core.flowDispatchGroup",
+	IntrinsicFlowCachingFunction:       "Core.flowCachingFunction",
+	IntrinsicAgentStageForward:         "Core.agentStageForward",
+	IntrinsicAgentNativeStageForward:   "Core.agentNativeStageForward",
+	IntrinsicAgentStageStreamForward:   "Core.agentStageStreamingForward",
+	IntrinsicAgentStageChatLog:         "Core.agentStageChatLog",
+	IntrinsicAgentStageUsage:           "Core.agentStageUsage",
+	IntrinsicAgentStageTraces:          "Core.agentStageTraces",
+	IntrinsicAgentClarificationErr:     "Core.agentClarificationError",
+	IntrinsicAgentRuntimeCreate:        "Core.agentRuntimeCreateSession",
+	IntrinsicAgentRuntimeExecutable:    "Core.agentRuntimeIsExecutable",
+	IntrinsicAgentRuntimeExecute:       "Core.agentRuntimeExecute",
+	IntrinsicAgentRuntimeInspect:       "Core.agentRuntimeInspect",
+	IntrinsicAgentRuntimeExport:        "Core.agentRuntimeExportState",
+	IntrinsicAgentRuntimeRestore:       "Core.agentRuntimeRestoreState",
+	IntrinsicAgentRuntimeClose:         "Core.agentRuntimeClose",
+	IntrinsicAgentRuntimeLanguage:      "Core.agentRuntimeLanguage",
+	IntrinsicAgentRuntimeUsage:         "Core.agentRuntimeUsageInstructions",
+	IntrinsicAgentProgramForward:       "Core.agentProgramForward",
+	IntrinsicAgentMemorySearch:         "Core.agentMemorySearch",
+	IntrinsicAgentSkillSearch:          "Core.agentSkillSearch",
+	IntrinsicAgentObserverNotify:       "Core.agentObserverNotify",
+	IntrinsicAgentTranscribe:           "Core.agentTranscribe",
+	IntrinsicAgentCallableInvoke:       "Core.agentCallableInvoke",
+	IntrinsicStreamEventParts:          "Core.streamEventContentParts",
+	IntrinsicDescriptionAppend:         "Core.descriptionAppend",
+	IntrinsicURLValid:                  "Core.urlValid",
+	IntrinsicURLEncodeComponent:        "Core.urlEncodeComponent",
+	IntrinsicSignatureError:            "Core.signatureError",
+	IntrinsicValidationError:           "Core.validationError",
+	IntrinsicDecisionRefusalError:      "Core.decisionRefusalError",
+	IntrinsicListGet:                   "Core.listGet",
+	IntrinsicFieldItem:                 "Core.fieldItem",
+	IntrinsicNestedFields:              "Core.fieldsFromMap",
+	IntrinsicValidImage:                "Core.validImage",
+	IntrinsicValidAudio:                "Core.validAudio",
+	IntrinsicValidFile:                 "Core.validFile",
+	IntrinsicValidURLShape:             "Core.validUrlShape",
+	IntrinsicExceptionIsAborted:        "Core.exceptionIsAborted",
+	IntrinsicExceptionIsInfrastructure: "Core.exceptionIsInfrastructure",
+	IntrinsicExceptionIsRefusal:        "Core.exceptionIsRefusal",
+	IntrinsicExceptionIsValidation:     "Core.exceptionIsValidation",
 }
 
 func javaAttrValue(op Operation, name string) string {
@@ -438,32 +482,46 @@ func javaLiteral(value interface{}) string {
 			return javaName(v)
 		}
 		return javaStringLiteral(v)
+	case QuotedString:
+		return javaStringLiteral(string(v))
 	case bool:
 		if v {
 			return "Boolean.TRUE"
 		}
 		return "Boolean.FALSE"
 	case int:
+		if v > 2147483647 || v < -2147483648 {
+			return strconv.Itoa(v) + "L"
+		}
 		return strconv.Itoa(v)
 	case float64:
-		return strconv.FormatFloat(v, 'f', -1, 64)
+		text := strconv.FormatFloat(v, 'f', -1, 64)
+		if (v > 2147483647 || v < -2147483648) && !strings.Contains(text, ".") {
+			text += ".0"
+		}
+		return text
 	default:
-		return strconv.Quote(fmt.Sprint(v))
+		return javaStringLiteral(fmt.Sprint(v))
 	}
 }
 
 func javaStringLiteral(value string) string {
 	const maxChunk = 12000
 	if len(value) <= maxChunk {
-		return strconv.Quote(value)
+		return javaQuoteString(value)
 	}
 	parts := make([]string, 0, (len(value)/maxChunk)+1)
-	for start := 0; start < len(value); start += maxChunk {
+	for start := 0; start < len(value); {
 		end := start + maxChunk
-		if end > len(value) {
+		if end >= len(value) {
 			end = len(value)
+		} else {
+			for end > start && !utf8.RuneStart(value[end]) {
+				end--
+			}
 		}
-		parts = append(parts, strconv.Quote(value[start:end]))
+		parts = append(parts, javaQuoteString(value[start:end]))
+		start = end
 	}
 	return "String.join(\"\", new String[] {\n        " + strings.Join(parts, ",\n        ") + "\n      })"
 }

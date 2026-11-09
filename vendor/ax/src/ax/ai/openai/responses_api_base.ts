@@ -16,8 +16,10 @@ import type {
 } from './chat_types.js';
 import { AxAIOpenAIEmbedModel } from './chat_types.js';
 import { axModelInfoOpenAIResponses } from './info.js';
+import { axIsGPT6Family } from './model_family.js';
 import { AxAIOpenAIResponsesImpl } from './responses_api.js';
 import type {
+  AxAIOpenAIResponsesRealtimeAdapter,
   AxAIOpenAIResponsesRequest,
   AxAIOpenAIResponsesResponse,
   OpenAIResponsesResponseDelta,
@@ -73,9 +75,11 @@ interface AxAIOpenAIResponsesBaseArgs<
   modelInfo?: ReadonlyArray<AxModelInfo>;
   models?: AxAIInputModelList<TModel, TEmbedModel, TModelKey>;
   responsesReqUpdater?: (
-    req: Readonly<TResponsesReq>
+    req: Readonly<TResponsesReq>,
+    options: Readonly<AxAIServiceOptions>
   ) => Readonly<TResponsesReq>;
   supportFor?: AxAIFeatures | ((model: TModel) => AxAIFeatures);
+  realtime?: AxAIOpenAIResponsesRealtimeAdapter<TModel>;
 }
 
 /**
@@ -136,6 +140,7 @@ export class AxAIOpenAIResponsesBase<
       thinking: false,
       multiTurn: true,
     },
+    realtime,
   }: Readonly<
     AxAIOpenAIResponsesBaseArgs<TModel, TEmbedModel, TModelKey, TResponsesReq>
   >) {
@@ -152,7 +157,9 @@ export class AxAIOpenAIResponsesBase<
       options?.streamingUsage ?? true,
       options,
       responsesReqUpdater,
-      supportFor
+      supportFor,
+      realtime,
+      apiKey
     );
 
     // Normalize per-model presets: allow provider-specific config on each model list item
@@ -284,6 +291,7 @@ export class AxAIOpenAIResponses<
   constructor({
     apiKey,
     credentialProvider,
+    apiURL,
     config,
     options,
     models,
@@ -331,8 +339,10 @@ export class AxAIOpenAIResponses<
         structuredOutputModes,
         media: {
           images: {
-            supported: false,
-            formats: [],
+            supported: axIsGPT6Family(model),
+            formats: axIsGPT6Family(model)
+              ? ['image/jpeg', 'image/png', 'image/gif', 'image/webp']
+              : [],
           },
           audio: {
             supported: false,
@@ -350,10 +360,10 @@ export class AxAIOpenAIResponses<
           },
         },
         caching: {
-          supported: false,
-          types: [],
+          supported: axIsGPT6Family(model),
+          types: axIsGPT6Family(model) ? ['ephemeral' as const] : [],
         },
-        thinking: false,
+        thinking: axIsGPT6Family(model),
         multiTurn: true,
         serviceTiers:
           mi?.supported?.serviceTiers ??
@@ -365,6 +375,7 @@ export class AxAIOpenAIResponses<
       apiKey,
       credentialProvider,
       credentialProfile: 'openai-responses',
+      apiURL,
       config: {
         ...axAIOpenAIResponsesDefaultConfig(),
         ...config,
@@ -374,5 +385,6 @@ export class AxAIOpenAIResponses<
       models,
       supportFor,
     });
+    this.setExplicitModelConfigKeys(config);
   }
 }

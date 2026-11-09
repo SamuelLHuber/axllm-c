@@ -1,7 +1,7 @@
 ---
 name: "ax-go-agent-rlm"
 description: "Use when writing Go code with `github.com/ax-llm/ax/packages/go` for RLM executor loops, AxCodeRuntime sessions, runtime envelopes, process runtimes, and optional runtime profiles."
-version: "24.0.15"
+version: "25.4.9"
 ---
 # AxAgent RLM Runtime For Go
 
@@ -33,7 +33,7 @@ out := helper.Forward(llm, map[string]ax.Value{"question": "How should I proceed
 
 ## Relevant API Surface
 
-- Agents And RLM: `axllm.NewAgent`, `axllm.AxAgent`
+- Agents And RLM: `axllm.NewAgent`, `axllm.AxAgent`, `AxAgent.AddChildAgent`, `AxAgent.StreamingForward`
 - Runtime Profiles: `axllm.ProcessCodeRuntime`, `axllm.RuntimeCapabilities`, `axllm.RuntimeEnvelope`, `javascript-goja`
 
 ## Guardrails

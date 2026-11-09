@@ -3,9 +3,16 @@ from .schema import AxValidationError
 from .tool import Tool, fn
 from .ai import (
     AIClient,
+    AxAITypesafeClient,
+    AxAIOpenAIDecisionsClient,
+    openai_decisions,
+    AxBox, TypesafeBox, TypesafeImageAsset, TypesafeEntry, TypesafeQuestion, TypesafeRequest, TypesafeAnswer, TypesafeNoul, TypesafeChoice, TypesafeScore, TypesafeUsage, TypesafeResponse, TypesafeModelCard,
+    typesafe,
+    AxCancellationToken,
     AxAIRefusalError,
     AxAIService,
     AxAIServiceAuthenticationError,
+    AxAIServiceAbortedError,
     AxAIServiceError,
     AxAIServiceNetworkError,
     AxAIServiceResponseError,
@@ -47,25 +54,35 @@ from .ai import (
     create_balancer_route_stats,
     get_supported_ai_models,
     sample_balancer_route_health,
+    set_caching_function,
+    set_function_result_formatter,
     set_meter,
     set_rate_limiter,
     set_tracer,
     set_usage_observer,
     update_balancer_route_stats,
 )
-from .gen import AxGen, AxMemory, ax
+from .gen import AxDecisionRefusalError, AxGenerateError, AxGen, AxMemory, ax
+from .session import AxChatSession, AxRunControl, run_control
 from .agent import AxAgent, AxAgentClarificationError, AxBootstrapFewShot, AxCodeRuntime, AxCodeSession, AxGEPA, AxPlaybook, OptimizerEngine, OptimizerEvaluator, agent, optimize, playbook
 from .flow import AxFlow, AxProgram, flow
-from .mcp import AxEventCancellationToken, AxEventClock, AxEventCommand, AxEventContinuation, AxEventDeadLetter, AxEventEnvelope, AxEventInputBuilder, AxEventInputError, AxEventInputPlan, AxEventPath, AxEventPublishReceipt, AxEventRoute, AxEventRouteBuilder, AxEventRun, AxEventRuntime, AxEventSink, AxEventSource, AxEventStore, AxEventTarget, AxEventTargetBuilder, AxExecutionContext, AxInMemoryEventStore, AxManualEventClock, AxMCPClient, AxMCPContinuationState, AxMCPEventSource, AxMCPOAuthOptions, AxMCPScriptedTransport, AxMCPStdioTransport, AxMCPStreamableHTTPTransport, AxMCPTokenSet, AxMCPTransport, AxPushEventSource, AxSystemEventClock, AxUCPBinding, AxUCPClient, event_input, event_path, event_route, event_target
+from .mcp import AxEventCancellationToken, AxEventClock, AxEventCommand, AxEventContinuation, AxEventDeadLetter, AxEventEnvelope, AxEventInputBuilder, AxEventInputError, AxEventInputPlan, AxEventPath, AxEventPublishReceipt, AxEventRoute, AxEventRouteBuilder, AxEventRun, AxEventRuntime, AxEventSink, AxEventSource, AxEventStore, AxEventTarget, AxEventTargetBuilder, AxExecutionContext, AxInMemoryEventStore, AxManualEventClock, AxMCPClient, AxMCPContinuationState, AxMCPEventSource, AxMCPOAuthOptions, AxMCPScriptedTransport, AxMCPStdioTransport, AxMCPWebSocketTransport, AxMCPStreamableHTTPTransport, AxMCPTokenSet, AxMCPTransport, AxPushEventSource, AxSystemEventClock, AxUCPBinding, AxUCPClient, event_input, event_path, event_route, event_target
 from .prompt import AxPromptTemplate, TemplateError, render_template_content, validate_prompt_template_syntax
 from .runtime import ProcessCodeRuntime, ProcessCodeSession, RuntimeCapabilities, RuntimeEnvelope
 from .runtime_quickjs import AxQuickJsCodeRuntime, AxQuickJsCodeSession
 
+from .gen import novel_f1_score
+
 __all__ = [
+    "novel_f1_score",
+    "AxAIOpenAIDecisionsClient",
+    "openai_decisions",
     "AIClient",
+    "AxCancellationToken",
     "AxAIRefusalError",
     "AxAIService",
     "AxAIServiceAuthenticationError",
+    "AxAIServiceAbortedError",
     "AxAIServiceError",
     "AxAIServiceNetworkError",
     "AxAIServiceResponseError",
@@ -85,6 +102,11 @@ __all__ = [
     "AxBalancerStatsStore",
     "AxInMemoryBalancerStatsStore",
     "AxGen",
+    "AxDecisionRefusalError",
+    "AxGenerateError",
+    "AxRunControl",
+    "AxChatSession",
+    "run_control",
     "AxFlow",
     "AxAgent",
     "AxAgentClarificationError",
@@ -125,6 +147,23 @@ __all__ = [
     "AxMCPOAuthOptions",
     "AxMCPScriptedTransport",
     "AxMCPStdioTransport",
+    "AxMCPWebSocketTransport",
+    "AxAITypesafeClient",
+    "typesafe",
+    "AxBox",
+    "TypesafeBox",
+    "TypesafeImageAsset",
+    "TypesafeEntry",
+    "TypesafeQuestion",
+    "TypesafeRequest",
+    "TypesafeAnswer",
+    "TypesafeNoul",
+    "TypesafeChoice",
+    "TypesafeScore",
+    "TypesafeUsage",
+    "TypesafeResponse",
+    "TypesafeModelCard",
+
     "AxMCPStreamableHTTPTransport",
     "AxMCPTokenSet",
     "AxMCPTransport",
@@ -180,6 +219,8 @@ __all__ = [
     "event_target",
     "get_supported_ai_models",
     "sample_balancer_route_health",
+    "set_caching_function",
+    "set_function_result_formatter",
     "set_meter",
     "set_rate_limiter",
     "set_tracer",

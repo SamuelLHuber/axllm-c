@@ -1,6 +1,8 @@
-use crate::{tool, AxError, AxResult, Tool};
+use crate::{
+    js_json_string, tool, AxCancellationToken, AxError, AxResult, AxToolContext, JsJsonBody, Tool,
+};
 use serde_json::{json, Map, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -68,6 +70,8 @@ impl AxMCPTokenStore for AxMCPFixtureTokenStore {
     }
 }
 
+pub type AxMCPToolAuthorizer =
+    Arc<dyn Fn(&AxMCPClient, Value) -> AxResult<Option<bool>> + Send + Sync>;
 pub type AxMCPElicitationHandler = Arc<dyn Fn(Value, Value) -> AxResult<Value> + Send + Sync>;
 pub type AxMCPRequestHandler = Arc<dyn Fn(Value) -> Value + Send + Sync>;
 
@@ -79,6 +83,17 @@ pub trait AxMCPTransport: Send {
         _headers: Map<String, Value>,
     ) -> AxResult<Value> {
         self.send(message)
+    }
+    fn send_with_context(
+        &mut self,
+        message: Value,
+        headers: Map<String, Value>,
+        context: &AxToolContext,
+    ) -> AxResult<Value> {
+        mcp_check_cancelled(context)?;
+        let result = self.send_with_headers(message, headers)?;
+        mcp_check_cancelled(context)?;
+        Ok(result)
     }
     fn send_notification(&mut self, message: Value) -> AxResult<()>;
     fn send_response(&mut self, message: Value) -> AxResult<()> {
@@ -127,6 +142,13 @@ pub trait AxMCPTransport: Send {
     }
 }
 
+fn mcp_check_cancelled(context: &AxToolContext) -> AxResult<()> {
+    if context.is_cancelled() {
+        return Err(AxError::new("aborted", "MCP invocation cancelled"));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AxMCPCatalogSnapshot {
     pub namespace: String,
@@ -141,8 +163,29 @@ pub struct AxMCPCatalogSnapshot {
     pub subscriptions: Vec<String>,
 }
 
+/// How `call_tool_with_task_handling` treats a modern server's task, as
+/// TypeScript's callTool `taskHandling`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AxMCPTaskHandling {
+    /// Wait for the task and return its result (the default).
+    #[default]
+    Await,
+    /// Return the task as its flattened CreateTaskResult, with its top-level taskId.
+    Expose,
+}
+
+/// What `call_tool_outcome` returns, as TypeScript's AxMCPToolCallOutcome.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AxMCPToolCallOutcome {
+    /// The tool's result. A legacy server's task-shaped result is a complete result.
+    Complete(Value),
+    /// A modern server's CreateTaskResult, with its top-level taskId.
+    Task(Value),
+}
+
 #[derive(Clone)]
 pub struct AxMCPClient {
+    invocation_context: AxToolContext,
     transport: Arc<Mutex<Box<dyn AxMCPTransport>>>,
     options: Value,
     server_capabilities: Value,
@@ -168,13 +211,24 @@ pub struct AxMCPClient {
     subscription_ready: bool,
     catalog_revision: u64,
     elicitation_handler: Option<AxMCPElicitationHandler>,
+    tool_authorizer: Option<AxMCPToolAuthorizer>,
     initialized: bool,
+    // Latest snapshot of each task this client has seen, by task id.
+    tasks: Arc<Mutex<BTreeMap<String, Value>>>,
 }
 
 impl AxMCPClient {
     pub fn new(transport: Box<dyn AxMCPTransport>, options: Value) -> Self {
+        Self::from_shared_transport(Arc::new(Mutex::new(transport)), options)
+    }
+
+    pub(crate) fn from_shared_transport(
+        transport: Arc<Mutex<Box<dyn AxMCPTransport>>>,
+        options: Value,
+    ) -> Self {
         Self {
-            transport: Arc::new(Mutex::new(transport)),
+            invocation_context: AxToolContext::default(),
+            transport,
             options,
             server_capabilities: json!({}),
             server_info: Arc::new(Mutex::new(json!({}))),
@@ -199,10 +253,18 @@ impl AxMCPClient {
             subscription_ready: false,
             catalog_revision: 0,
             elicitation_handler: None,
+            tool_authorizer: None,
             initialized: false,
+            tasks: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
+    pub fn set_tool_authorizer(
+        &mut self,
+        handler: impl Fn(&AxMCPClient, Value) -> AxResult<Option<bool>> + Send + Sync + 'static,
+    ) {
+        self.tool_authorizer = Some(Arc::new(handler));
+    }
     pub fn set_elicitation_handler(
         &mut self,
         handler: impl Fn(Value, Value) -> AxResult<Value> + Send + Sync + 'static,
@@ -641,7 +703,65 @@ impl AxMCPClient {
     pub fn list_tools(&mut self, cursor: Option<&str>) -> AxResult<Value> {
         self.request("tools/list", cursor_params(cursor))
     }
+    pub fn call_tool_with_context(
+        &mut self,
+        name: &str,
+        arguments: Value,
+        context: AxToolContext,
+    ) -> AxResult<Value> {
+        mcp_check_cancelled(&context)?;
+        let previous = std::mem::replace(&mut self.invocation_context, context);
+        let result = self.call_tool(name, arguments);
+        self.invocation_context = previous;
+        result
+    }
     pub fn call_tool(&mut self, name: &str, arguments: Value) -> AxResult<Value> {
+        self.call_tool_with_task_handling(name, arguments, AxMCPTaskHandling::Await)
+    }
+    /// Calls a tool, as TypeScript's callTool with `taskHandling`: a modern
+    /// server's task is awaited, or returned as its flattened CreateTaskResult
+    /// (with its top-level taskId) with `AxMCPTaskHandling::Expose`.
+    pub fn call_tool_with_task_handling(
+        &mut self,
+        name: &str,
+        arguments: Value,
+        task_handling: AxMCPTaskHandling,
+    ) -> AxResult<Value> {
+        match self.call_tool_outcome(name, arguments)? {
+            AxMCPToolCallOutcome::Complete(result) => Ok(result),
+            AxMCPToolCallOutcome::Task(task) => match task_handling {
+                AxMCPTaskHandling::Expose => Ok(task),
+                AxMCPTaskHandling::Await => self.await_modern_task(
+                    task.get("taskId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                ),
+            },
+        }
+    }
+    /// Calls a tool without waiting on a task, as TypeScript's callToolOutcome.
+    /// A legacy server's task-shaped result is a complete result.
+    pub fn call_tool_outcome(
+        &mut self,
+        name: &str,
+        arguments: Value,
+    ) -> AxResult<AxMCPToolCallOutcome> {
+        if let Some(authorize) = &self.tool_authorizer {
+            let context = core_mcp(
+                &crate::_mcp_tool_authorization_context,
+                &[
+                    json!(self.tools),
+                    json!(self.namespace()),
+                    json!(name),
+                    arguments.clone(),
+                ],
+            )?;
+            let decision = authorize(self, context)?;
+            core_mcp(
+                &crate::_mcp_tool_authorization_result,
+                &[json!(name), json!(decision)],
+            )?;
+        }
         let args = if arguments.is_null() {
             json!({})
         } else {
@@ -677,24 +797,58 @@ impl AxMCPClient {
             }
             Err(error) => return Err(error),
         };
-        if result.get("resultType").and_then(Value::as_str) != Some("task") {
-            return Ok(result);
-        }
-        if !self.has_tasks_capability() {
-            return Err(AxError::new("mcp","MCP protocol violation: server returned a task without negotiating io.modelcontextprotocol/tasks"));
-        }
-        if core_mcp(&crate::mcp_validate_modern_task, &[result.clone()])?.as_bool() != Some(true) {
-            return Err(AxError::new(
+        let outcome = core_mcp(
+            &crate::mcp_tool_call_outcome,
+            &[result.clone(), json!(self.has_tasks_capability())],
+        )?;
+        match outcome
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+        {
+            "violation" => Err(AxError::new(
                 "mcp",
-                "MCP protocol violation: invalid CreateTaskResult",
-            ));
+                outcome
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )),
+            "task" => {
+                self.record_task(&result);
+                Ok(AxMCPToolCallOutcome::Task(result))
+            }
+            _ => Ok(AxMCPToolCallOutcome::Complete(result)),
         }
-        self.await_modern_task(
-            result
-                .get("taskId")
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
-        )
+    }
+    // As TypeScript's recordTask: keeps a task's latest snapshot and asks a
+    // running modern listener for a new task's updates.
+    fn record_task(&mut self, task: &Value) {
+        if self.store_task(task)
+            && self.era.as_deref() == Some("modern")
+            && self.active_subscription_id.is_some()
+        {
+            let _ = self.restart_modern_listener();
+        }
+    }
+    // Stores a task snapshot; true when the task is new to this client.
+    fn store_task(&self, task: &Value) -> bool {
+        match task.get("taskId").and_then(Value::as_str) {
+            Some(id) if !id.is_empty() => self
+                .tasks
+                .lock()
+                .unwrap()
+                .insert(id.to_string(), task.clone())
+                .is_none(),
+            _ => false,
+        }
+    }
+    // The recorded tasks a modern listener asks updates for, as TypeScript's
+    // listener does when something listens for them.
+    fn listen_task_ids(&self) -> Vec<String> {
+        if self.notification_listeners.lock().unwrap().is_empty() || !self.has_tasks_capability() {
+            return Vec::new();
+        }
+        self.tasks.lock().unwrap().keys().cloned().collect()
     }
     fn await_modern_task(&mut self, task_id: &str) -> AxResult<Value> {
         let max = self
@@ -1024,6 +1178,7 @@ impl AxMCPClient {
                     .get("subscriptionFilters")
                     .cloned()
                     .unwrap_or_else(|| json!({})),
+                json!(self.listen_task_ids()),
             ],
         )?;
         let version = self
@@ -1112,6 +1267,7 @@ impl AxMCPClient {
                 "MCP protocol violation: invalid tasks/get result",
             ));
         }
+        self.record_task(&result);
         Ok(result)
     }
     pub fn cancel_task(&mut self, task_id: &str) -> AxResult<Value> {
@@ -1260,6 +1416,7 @@ impl AxMCPClient {
         for state in states {
             self.emit_lifecycle(&state)
         }
+        let mut new_task = false;
         for message in messages {
             let message = if self.era.as_deref() == Some("modern") {
                 let filtered = core_mcp(
@@ -1278,9 +1435,25 @@ impl AxMCPClient {
                 message
             };
             self.apply_cache_notification(&message);
+            if matches!(
+                message.get("method").and_then(Value::as_str),
+                Some("notifications/tasks" | "notifications/tasks/status")
+            ) {
+                let params = message.get("params").cloned().unwrap_or(Value::Null);
+                let task = params
+                    .get("task")
+                    .filter(|value| value.is_object())
+                    .cloned()
+                    .unwrap_or(params);
+                new_task |= self.store_task(&task);
+            }
             self.emit_notification(message)
         }
-        if restart {
+        if restart
+            || (new_task
+                && self.era.as_deref() == Some("modern")
+                && self.active_subscription_id.is_some())
+        {
             let _ = self.restart_modern_listener();
         }
         count
@@ -1303,6 +1476,62 @@ impl AxMCPClient {
         out
     }
 
+    // Invocation views retain transport ownership and negotiated protocol state.
+    // Non-Send listener callbacks remain on the owning client; workers leave
+    // inbound notifications queued for that client to dispatch.
+    fn invocation_factory(&self) -> impl Fn() -> AxMCPClient + Send + Sync + 'static {
+        let transport = self.transport.clone();
+        let options = self.options.clone();
+        let server_capabilities = self.server_capabilities.clone();
+        let server_info = self.server_info.clone();
+        let negotiated_protocol_version = self.negotiated_protocol_version.clone();
+        let era = self.era.clone();
+        let discover_result = self.discover_result.clone();
+        let negotiated_extensions = self.negotiated_extensions.clone();
+        let tools = self.tools.clone();
+        let prompts = self.prompts.clone();
+        let resources = self.resources.clone();
+        let resource_templates = self.resource_templates.clone();
+        let catalog_cache = self.catalog_cache.clone();
+        let resource_read_cache = self.resource_read_cache.clone();
+        let next_id = self.next_id.clone();
+        let inbound_messages = self.inbound_messages.clone();
+        let inbound_lifecycle = self.inbound_lifecycle.clone();
+        let subscription_owners = self.subscription_owners.clone();
+        let active_subscription_id = self.active_subscription_id.clone();
+        let elicitation_handler = self.elicitation_handler.clone();
+        let tool_authorizer = self.tool_authorizer.clone();
+        let initialized = self.initialized;
+        let subscription_ready = self.subscription_ready;
+        let catalog_revision = self.catalog_revision;
+        move || {
+            let mut client = AxMCPClient::from_shared_transport(transport.clone(), options.clone());
+            client.server_capabilities = server_capabilities.clone();
+            client.server_info = server_info.clone();
+            client.negotiated_protocol_version = negotiated_protocol_version.clone();
+            client.era = era.clone();
+            client.discover_result = discover_result.clone();
+            client.negotiated_extensions = negotiated_extensions.clone();
+            client.tools = tools.clone();
+            client.prompts = prompts.clone();
+            client.resources = resources.clone();
+            client.resource_templates = resource_templates.clone();
+            client.catalog_cache = catalog_cache.clone();
+            client.resource_read_cache = resource_read_cache.clone();
+            client.next_id = next_id.clone();
+            client.inbound_messages = inbound_messages.clone();
+            client.inbound_lifecycle = inbound_lifecycle.clone();
+            client.subscription_owners = subscription_owners.clone();
+            client.active_subscription_id = active_subscription_id.clone();
+            client.elicitation_handler = elicitation_handler.clone();
+            client.tool_authorizer = tool_authorizer.clone();
+            client.initialized = initialized;
+            client.subscription_ready = subscription_ready;
+            client.catalog_revision = catalog_revision;
+            client
+        }
+    }
+
     pub fn native_tools(&self) -> Vec<Tool> {
         let mut out = Vec::new();
         for spec in &self.tools {
@@ -1313,16 +1542,19 @@ impl AxMCPClient {
                 .to_string();
             let name = override_name(&self.options, &original);
             let description = override_description(&self.options, spec);
-            let transport = self.transport.clone();
-            let next_id = self.next_id.clone();
-            out.push(tool(&name).description(description).handler(move |args| {
-                mcp_transport_request(
-                    &transport,
-                    &next_id,
-                    "tools/call",
-                    json!({"name": original, "arguments": args}),
-                )
-            }));
+            let invoke = self.invocation_factory();
+            let schema = spec
+                .get("inputSchema")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            out.push(
+                tool(&name)
+                    .description(description)
+                    .parameters(schema)
+                    .context_handler(move |args, context| {
+                        invoke().call_tool_with_context(&original, args, context)
+                    }),
+            );
         }
         out
     }
@@ -1500,10 +1732,23 @@ impl AxMCPClient {
             }
             request_params["_meta"] = meta
         }
-        let response = self.transport.lock().unwrap().send_with_headers(
+        mcp_check_cancelled(&self.invocation_context)?;
+        let mut transport = loop {
+            match self.transport.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    mcp_check_cancelled(&self.invocation_context)?;
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return Err(AxError::new("mcp", "MCP transport lock poisoned")),
+            }
+        };
+        let response = transport.send_with_context(
             json!({"jsonrpc":"2.0","id":id,"method":method,"params":request_params}),
             headers.clone(),
+            &self.invocation_context,
         )?;
+        drop(transport);
         if let Some(raw) = response.get("error") {
             let code = raw.get("code").and_then(Value::as_i64).unwrap_or_default();
             if self.era.as_deref() == Some("modern") && allow_version_retry && code == -32022 {
@@ -1602,10 +1847,13 @@ impl AxMCPClient {
             .to_string();
         let name = override_name(&self.options, &original);
         let description = override_description(&self.options, &spec);
-        let transport = self.transport.clone();
-        let next_id = self.next_id.clone();
-        tool(&name).description(description).handler(move |args| {
-            let result = mcp_transport_request(&transport, &next_id, "tools/call", json!({"name": original, "arguments": args}))?;
+        let invoke = self.invocation_factory();
+        let schema = spec
+            .get("inputSchema")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        tool(&name).description(description).parameters(schema).context_handler(move |args, context| {
+            let result = invoke().call_tool_with_context(&original, args, context)?;
             if let Some(value) = result.get("structuredContent") { return Ok(value.clone()); }
             Ok(json!({"content": content_text(result.get("content").and_then(Value::as_array).cloned().unwrap_or_default())}))
         })
@@ -2036,18 +2284,7 @@ pub struct AxEventContinuation {
     pub completed: bool,
     pub expires_at: Option<i64>,
 }
-#[derive(Debug, Clone, Default)]
-pub struct AxEventCancellationToken {
-    state: Arc<Mutex<(bool, String)>>,
-}
-impl AxEventCancellationToken {
-    pub fn cancel(&self, reason: &str) {
-        *self.state.lock().unwrap() = (true, reason.into())
-    }
-    pub fn is_cancelled(&self) -> bool {
-        self.state.lock().unwrap().0
-    }
-}
+pub type AxEventCancellationToken = AxCancellationToken;
 #[derive(Debug, Clone)]
 pub struct AxEventInvocationContext {
     pub run_id: String,
@@ -2369,23 +2606,26 @@ impl AxEventClock for AxSystemEventClock {
             .as_millis() as i64
     }
     fn sleep(&self, milliseconds: i64, cancellation: Option<&AxEventCancellationToken>) -> bool {
-        if cancellation.is_some_and(AxEventCancellationToken::is_cancelled) {
-            return false;
+        let duration = Duration::from_millis(milliseconds.max(0) as u64);
+        match cancellation {
+            Some(token) => !token.wait_timeout(duration),
+            None => {
+                std::thread::sleep(duration);
+                true
+            }
         }
-        std::thread::sleep(Duration::from_millis(milliseconds.max(0) as u64));
-        !cancellation.is_some_and(AxEventCancellationToken::is_cancelled)
     }
 }
 #[derive(Default)]
 pub struct AxManualEventClock {
-    state: Mutex<i64>,
-    changed: Condvar,
+    state: Arc<Mutex<i64>>,
+    changed: Arc<Condvar>,
 }
 impl AxManualEventClock {
     pub fn new(now: i64) -> Self {
         Self {
-            state: Mutex::new(now),
-            changed: Condvar::new(),
+            state: Arc::new(Mutex::new(now)),
+            changed: Arc::new(Condvar::new()),
         }
     }
     pub fn advance(&self, milliseconds: i64) {
@@ -2400,6 +2640,14 @@ impl AxEventClock for AxManualEventClock {
     }
     fn sleep(&self, milliseconds: i64, cancellation: Option<&AxEventCancellationToken>) -> bool {
         let target = self.now() + milliseconds.max(0);
+        let changed = Arc::clone(&self.changed);
+        let state = Arc::clone(&self.state);
+        let _subscription = cancellation.map(|token| {
+            token.subscribe(move || {
+                let _guard = state.lock().unwrap();
+                changed.notify_all();
+            })
+        });
         let mut value = self.state.lock().unwrap();
         while *value < target {
             if cancellation.is_some_and(AxEventCancellationToken::is_cancelled) {
@@ -3603,6 +3851,24 @@ pub struct AxExecutionContext {
     initialized: Arc<Mutex<Vec<usize>>>,
 }
 
+thread_local! { static MCP_RUN_CONTEXT: std::cell::RefCell<Option<AxExecutionContext>> = const { std::cell::RefCell::new(None) }; }
+pub(crate) struct MCPRunScope(Option<AxExecutionContext>);
+impl MCPRunScope {
+    pub(crate) fn current() -> Option<AxExecutionContext> {
+        MCP_RUN_CONTEXT.with(|context| context.borrow().clone())
+    }
+    pub(crate) fn enter(context: Option<AxExecutionContext>) -> Self {
+        Self(MCP_RUN_CONTEXT.with(|active| active.replace(context)))
+    }
+}
+impl Drop for MCPRunScope {
+    fn drop(&mut self) {
+        MCP_RUN_CONTEXT.with(|active| {
+            active.replace(self.0.take());
+        });
+    }
+}
+
 impl AxExecutionContext {
     pub fn new(mcp: Vec<Arc<Mutex<AxMCPClient>>>, ucp: Vec<AxUCPClient>) -> AxResult<Self> {
         let out = Self {
@@ -3621,10 +3887,11 @@ impl AxExecutionContext {
     }
     pub fn initialize(&self) -> AxResult<()> {
         let mut initialized = self.initialized.lock().unwrap();
-        for (index, client) in self.mcp.iter().enumerate() {
-            if !initialized.contains(&index) {
+        for client in &self.mcp {
+            let identity = Arc::as_ptr(client) as usize;
+            if !initialized.contains(&identity) {
                 client.lock().unwrap().init()?;
-                initialized.push(index)
+                initialized.push(identity)
             }
         }
         Ok(())
@@ -3657,30 +3924,48 @@ impl AxExecutionContext {
             .chain(self.ucp.iter().map(AxUCPClient::namespace))
             .collect()
     }
-    pub fn derive(&self, inheritance: &Value) -> Self {
-        if inheritance.as_str() == Some("none") {
-            return Self::default();
+    pub fn try_derive(&self, inheritance: &Value) -> AxResult<Self> {
+        let mcp_names = self
+            .mcp
+            .iter()
+            .map(|client| client.lock().unwrap().namespace())
+            .collect::<Vec<_>>();
+        let ucp_names = self
+            .ucp
+            .iter()
+            .map(AxUCPClient::namespace)
+            .collect::<Vec<_>>();
+        let plan = core_mcp(
+            &crate::_mcp_inheritance_plan,
+            &[json!(mcp_names), json!(ucp_names), inheritance.clone()],
+        )?;
+        let mut mcp = Vec::new();
+        let mut ucp = Vec::new();
+        for name in plan["mcp"].as_array().unwrap() {
+            let index = mcp_names
+                .iter()
+                .position(|candidate| Some(candidate.as_str()) == name.as_str())
+                .unwrap();
+            mcp.push(self.mcp[index].clone());
         }
-        let Some(allowed) = inheritance.as_array() else {
-            return self.clone();
-        };
-        let allowed = allowed.iter().filter_map(Value::as_str).collect::<Vec<_>>();
-        Self {
-            mcp: self
-                .mcp
+        for name in plan["ucp"].as_array().unwrap() {
+            let index = ucp_names
                 .iter()
-                .filter(|c| allowed.contains(&c.lock().unwrap().namespace().as_str()))
-                .cloned()
-                .collect(),
-            ucp: self
-                .ucp
-                .iter()
-                .filter(|c| allowed.contains(&c.namespace().as_str()))
-                .cloned()
-                .collect(),
+                .position(|candidate| Some(candidate.as_str()) == name.as_str())
+                .unwrap();
+            ucp.push(self.ucp[index].clone());
+        }
+        Ok(Self {
+            mcp,
+            ucp,
             initialized: self.initialized.clone(),
-        }
+        })
     }
+    pub fn derive(&self, inheritance: &Value) -> Self {
+        self.try_derive(inheritance)
+            .expect("Invalid MCP inheritance")
+    }
+
     pub fn continuation_state(&self) -> AxMCPContinuationState {
         let namespaces = self.namespaces();
         let digest = ax_mcp_sha256(namespaces.join("\n").as_bytes());
@@ -3857,8 +4142,12 @@ impl AxMCPStreamableHTTPTransport {
             .unwrap_or_default();
         Ok(Self {
             endpoint,
+            headers: options
+                .get("headers")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default(),
             options,
-            headers: Map::new(),
             session_id: None,
             protocol_version: None,
             era: None,
@@ -4414,11 +4703,27 @@ impl AxMCPTransport for AxMCPStreamableHTTPTransport {
         message: Value,
         extra_headers: Map<String, Value>,
     ) -> AxResult<Value> {
-        let mut request = self
-            .client
+        self.send_with_context(message, extra_headers, &AxToolContext::default())
+    }
+    fn send_with_context(
+        &mut self,
+        message: Value,
+        extra_headers: Map<String, Value>,
+        context: &AxToolContext,
+    ) -> AxResult<Value> {
+        mcp_check_cancelled(context)?;
+        // The public call stays synchronous. Dropping the request future on cancellation
+        // closes the in-flight transport instead of leaving a detached blocking request.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()?;
+        let mut request = client
             .post(&self.endpoint)
             .header("Accept", "application/json, text/event-stream")
-            .json(&message);
+            .js_json(&message);
         let method = message
             .get("method")
             .and_then(Value::as_str)
@@ -4434,45 +4739,54 @@ impl AxMCPTransport for AxMCPStreamableHTTPTransport {
                 request = request.header(key, text);
             }
         }
-        let response = request.send()?;
-        if response.status().as_u16() == 401 {
-            let challenge = response
-                .headers()
+        let (status, headers, body) = runtime.block_on(async {
+            let mut pending = Box::pin(async {
+                let response = request.send().await?;
+                let status = response.status();
+                let headers = response.headers().clone();
+                let body = response.text().await?;
+                Ok::<_, AxError>((status, headers, body))
+            });
+            loop {
+                mcp_check_cancelled(context)?;
+                if let Ok(result) =
+                    tokio::time::timeout(Duration::from_millis(10), &mut pending).await
+                {
+                    mcp_check_cancelled(context)?;
+                    return result;
+                }
+            }
+        })?;
+        if status.as_u16() == 401 {
+            let challenge = headers
                 .get("www-authenticate")
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or_default()
                 .to_string();
             if self.apply_oauth_with_challenge(&challenge)? {
-                return self.send_with_headers(message, extra_headers);
+                return self.send_with_context(message, extra_headers, context);
             }
         }
-        if !response.status().is_success() {
+        if !status.is_success() {
             return Err(AxError::new(
                 "mcp",
-                format!("HTTP error {}", response.status().as_u16()),
+                format!("HTTP error {}", status.as_u16()),
             ));
         }
         if self.era.as_deref() != Some("modern") {
-            if let Some(session) = response
-                .headers()
+            if let Some(session) = headers
                 .get("mcp-session-id")
                 .and_then(|value| value.to_str().ok())
             {
                 self.session_id = Some(session.to_string());
             }
         }
-        // A spec-compliant MCP server may answer a JSON-RPC POST with an SSE stream
-        // (Content-Type: text/event-stream) carrying the response — and any
-        // interleaved notifications/keepalives — in `data:` frames; parse those
-        // rather than JSON-decoding the raw stream. Otherwise keep the JSON path.
-        let content_type = response
-            .headers()
+        let content_type = headers
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .unwrap_or("")
             .to_ascii_lowercase();
         let request_id = message.get("id").cloned().unwrap_or(Value::Null);
-        let body = response.text()?;
         if body.trim().is_empty() {
             return Ok(json!({"jsonrpc": "2.0", "id": request_id, "result": {}}));
         }
@@ -4611,7 +4925,7 @@ impl AxMCPTransport for AxMCPStreamableHTTPTransport {
                                                 let mut post = client
                                                     .post(&endpoint)
                                                     .header("Content-Type", "application/json")
-                                                    .json(&response);
+                                                    .js_json(&response);
                                                 for (key, value) in &headers {
                                                     if let Some(text) = value.as_str() {
                                                         post = post.header(key, text)
@@ -4640,7 +4954,7 @@ impl AxMCPTransport for AxMCPStreamableHTTPTransport {
                     _ => {}
                 }
                 if !stop.load(Ordering::SeqCst) {
-                    thread::sleep(Duration::from_millis(delay))
+                    thread::park_timeout(Duration::from_millis(delay))
                 }
             }
         }));
@@ -4674,7 +4988,7 @@ impl AxMCPTransport for AxMCPStreamableHTTPTransport {
         let request_handler = self.request_handler.clone();
         let lifecycle = self.lifecycle_handler.clone();
         self.listen_thread = Some(thread::spawn(move || {
-            let mut request = client.post(&endpoint).json(&message);
+            let mut request = client.post(&endpoint).js_json(&message);
             for (key, value) in &headers {
                 if let Some(text) = value.as_str() {
                     request = request.header(key, text)
@@ -4701,7 +5015,7 @@ impl AxMCPTransport for AxMCPStreamableHTTPTransport {
                                             let mut post = client
                                                 .post(&endpoint)
                                                 .header("Content-Type", "application/json")
-                                                .json(&response);
+                                                .js_json(&response);
                                             for (key, value) in &headers {
                                                 if let Some(text) = value.as_str() {
                                                     post = post.header(key, text)
@@ -4731,15 +5045,18 @@ impl AxMCPTransport for AxMCPStreamableHTTPTransport {
     }
     fn close_request_stream(&mut self) -> AxResult<()> {
         self.listen_stop.store(true, Ordering::SeqCst);
-        let _ = self.listen_thread.take();
+        if let Some(thread) = self.listen_thread.take() {
+            thread.thread().unpark();
+        }
         Ok(())
     }
     fn close(&mut self) -> AxResult<()> {
         self.listen_stop.store(true, Ordering::SeqCst);
-        if self.era.as_deref() == Some("modern") {
-            let _ = self.listen_thread.take();
-        } else if let Some(thread) = self.listen_thread.take() {
-            let _ = thread.join();
+        if let Some(thread) = self.listen_thread.take() {
+            thread.thread().unpark();
+            if self.era.as_deref() != Some("modern") {
+                let _ = thread.join();
+            }
         }
         Ok(())
     }
@@ -4981,7 +5298,7 @@ impl AxMCPTransport for AxMCPScriptedTransport {
 }
 
 pub fn ax_mcp_stdio_encode(message: &Value) -> AxResult<String> {
-    Ok(format!("{}\n", serde_json::to_string(message)?))
+    Ok(format!("{}\n", js_json_string(message)))
 }
 pub fn ax_mcp_stdio_decode(line: &str) -> AxResult<Value> {
     Ok(serde_json::from_str(line.trim())?)
@@ -5046,7 +5363,8 @@ fn ax_mcp_base64_url_no_pad(bytes: &[u8]) -> String {
     }
     out
 }
-fn ax_mcp_sha256(input: &[u8]) -> [u8; 32] {
+// Also backs intrinsic.crypto.sha256_hex (AxGen cache keys) in lib.rs.
+pub(crate) fn ax_mcp_sha256(input: &[u8]) -> [u8; 32] {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
         0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
@@ -5181,6 +5499,259 @@ pub fn run_mcp_conformance_fixture(fixture: &Value) -> AxResult<()> {
         .get("operation")
         .and_then(Value::as_str)
         .unwrap_or("initialize");
+    if operation == "inheritance_context" || operation == "inheritance_agent_context" {
+        for test in fixture["cases"].as_array().unwrap() {
+            let mut clients = Vec::new();
+            let mut transports = Vec::new();
+            for spec in fixture["clients"].as_array().unwrap() {
+                let name = spec["namespace"].as_str().unwrap().to_string();
+                let transport = Arc::new(Mutex::new(Box::new(AxMCPScriptedTransport::new(
+                    spec["responses"].as_array().unwrap().clone(),
+                )) as Box<dyn AxMCPTransport>));
+                clients.push(Arc::new(Mutex::new(AxMCPClient::from_shared_transport(
+                    transport.clone(),
+                    json!({"namespace":name,"era":"modern"}),
+                ))));
+                transports.push((name, transport));
+            }
+            let context = AxExecutionContext::new(clients, vec![])?;
+            let mut results = Vec::new();
+            let mut selected = Vec::new();
+            let outcome = context.try_derive(&test["inheritance"]).and_then(|child| {
+                selected = child.namespaces();
+                if operation == "inheritance_agent_context" {
+                    let mut program = crate::agent_with_execution_context(
+                        "question:string -> answer:string",
+                        fixture["agent_options"].clone(),
+                        child.clone(),
+                    )?;
+                    assert_eq!(
+                        program.invoke_callable("tools.local_echo", json!({}), json!({}))?,
+                        fixture["expected_local_result"]
+                    );
+                    for client in &child.mcp {
+                        let (name, tools) = {
+                            let client = client.lock().unwrap();
+                            (client.namespace(), client.native_tools())
+                        };
+                        for tool in tools {
+                            let result = program.invoke_callable(
+                                &format!("mcp.{name}.tools.{}", tool.name),
+                                json!({"query":"scope-probe"}),
+                                json!({}),
+                            )?;
+                            assert_eq!(result["status"], "ok");
+                            results.push(result["value"].clone());
+                        }
+                    }
+                } else {
+                    for tool in child.native_tools()? {
+                        results.push(tool.call(json!({"query":"scope-probe"}))?);
+                    }
+                }
+                Ok(())
+            });
+            if let Some(expected) = test.get("expected_error").and_then(Value::as_str) {
+                assert_eq!(
+                    outcome.expect_err("Expected inheritance rejection").message,
+                    expected
+                );
+            } else {
+                outcome?;
+                assert_eq!(json!(selected), test["expected_namespaces"]);
+            }
+            assert_eq!(json!(results), test["expected_results"]);
+            for (name, transport) in &transports {
+                let requests = transport.lock().unwrap().sent_requests();
+                let methods = requests
+                    .iter()
+                    .map(|request| request["method"].clone())
+                    .collect::<Vec<_>>();
+                assert_eq!(json!(methods), test["expected_methods"][name]);
+                for request in requests {
+                    if request["method"] == "tools/call" {
+                        assert_eq!(
+                            request["params"]["arguments"],
+                            json!({"query":"scope-probe"})
+                        );
+                    }
+                }
+            }
+            let mut parent_results = Vec::new();
+            for tool in context.native_tools()? {
+                parent_results.push(tool.call(json!({"query":"parent-probe"}))?);
+            }
+            assert_eq!(json!(parent_results), test["expected_parent_results"]);
+            for (name, transport) in &transports {
+                let requests = transport.lock().unwrap().sent_requests();
+                let methods = requests
+                    .iter()
+                    .map(|request| request["method"].clone())
+                    .collect::<Vec<_>>();
+                let calls=requests.iter().filter(|request|request["method"]=="tools/call").map(|request|json!({"name":request["params"]["name"],"arguments":request["params"]["arguments"]})).collect::<Vec<_>>();
+                assert_eq!(json!(methods), test["expected_parent_methods"][name]);
+                assert_eq!(json!(calls), test["expected_calls"][name]);
+            }
+        }
+        return Ok(());
+    }
+    if operation == "inheritance_plan" {
+        for test in fixture["cases"].as_array().unwrap() {
+            let result = core_mcp(
+                &crate::_mcp_inheritance_plan,
+                &[
+                    fixture["mcp"].clone(),
+                    fixture["ucp"].clone(),
+                    test["inheritance"].clone(),
+                ],
+            );
+            if let Some(expected) = test.get("expected_error").and_then(Value::as_str) {
+                assert_eq!(
+                    result.expect_err("Expected inheritance rejection").message,
+                    expected
+                );
+            } else {
+                assert_eq!(result?, test["expected"]);
+            }
+        }
+        return Ok(());
+    }
+    if operation == "tool_task_handling" {
+        let tool = fixture["tool"].as_str().unwrap_or_default();
+        let args = fixture
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        for case in fixture["cases"].as_array().unwrap() {
+            let label = case["name"].as_str().unwrap_or_default();
+            let transport = Arc::new(Mutex::new(Box::new(AxMCPScriptedTransport::new(
+                case["responses"].as_array().unwrap().clone(),
+            )) as Box<dyn AxMCPTransport>));
+            let mut options = fixture["client_options"].clone();
+            options["era"] = case["era"].clone();
+            let mut client = AxMCPClient::from_shared_transport(transport.clone(), options);
+            client.init()?;
+            let before = transport.lock().unwrap().sent_requests().len();
+            let result = match case["api"].as_str().unwrap_or_default() {
+                "call_tool" => client.call_tool(tool, args.clone()),
+                "call_tool_expose" => client.call_tool_with_task_handling(
+                    tool,
+                    args.clone(),
+                    AxMCPTaskHandling::Expose,
+                ),
+                "call_tool_outcome" => {
+                    client
+                        .call_tool_outcome(tool, args.clone())
+                        .map(|outcome| match outcome {
+                            AxMCPToolCallOutcome::Complete(result) => {
+                                json!({"kind":"complete","result":result})
+                            }
+                            AxMCPToolCallOutcome::Task(task) => json!({"kind":"task","task":task}),
+                        })
+                }
+                other => {
+                    return Err(AxError::new(
+                        "fixture",
+                        format!("unknown task-handling api {other}"),
+                    ))
+                }
+            };
+            match (result, case.get("expected_error").and_then(Value::as_str)) {
+                (Err(error), Some(expected)) => {
+                    if error.message != expected {
+                        return Err(AxError::new(
+                            "fixture",
+                            format!("{label}: task-handling error mismatch: {}", error.message),
+                        ));
+                    }
+                }
+                (Ok(value), None) => {
+                    if value != case["expected"] {
+                        return Err(AxError::new(
+                            "fixture",
+                            format!("{label}: task-handling result mismatch: {value}"),
+                        ));
+                    }
+                }
+                (Err(error), None) => {
+                    return Err(AxError::new(
+                        "fixture",
+                        format!("{label}: unexpected task-handling error: {}", error.message),
+                    ))
+                }
+                (Ok(value), Some(expected)) => {
+                    return Err(AxError::new(
+                        "fixture",
+                        format!("{label}: expected error {expected}, got {value}"),
+                    ))
+                }
+            }
+            let methods = transport.lock().unwrap().sent_requests()[before..]
+                .iter()
+                .map(|request| request["method"].clone())
+                .collect::<Vec<_>>();
+            if json!(methods) != case["expected_methods"] {
+                return Err(AxError::new(
+                    "fixture",
+                    format!(
+                        "{label}: task-handling methods mismatch: {}",
+                        json!(methods)
+                    ),
+                ));
+            }
+        }
+        return Ok(());
+    }
+    if operation == "tool_authorization" {
+        for case in fixture["cases"].as_array().unwrap() {
+            let transport = Arc::new(Mutex::new(Box::new(AxMCPScriptedTransport::new(
+                fixture["responses"].as_array().unwrap().clone(),
+            )) as Box<dyn AxMCPTransport>));
+            let mut client = AxMCPClient::from_shared_transport(
+                transport.clone(),
+                fixture["client_options"].clone(),
+            );
+            client.init()?;
+            let observed = Arc::new(Mutex::new(Vec::<Value>::new()));
+            let captured = observed.clone();
+            let decision = case["decision"].as_bool();
+            client.set_tool_authorizer(move |caller, call| {
+                assert_eq!(caller.namespace(), call["namespace"].as_str().unwrap());
+                captured.lock().unwrap().push(call);
+                Ok(decision)
+            });
+            let result =
+                client.call_tool(case["name"].as_str().unwrap(), json!({"query":"REF-42"}));
+            if let Some(expected) = case.get("expected_error").and_then(Value::as_str) {
+                assert_eq!(result.unwrap_err().message, expected);
+            } else {
+                assert_eq!(result?, case["expected_result"]);
+            }
+            let observed = observed.lock().unwrap();
+            assert_eq!(
+                observed.len(),
+                case["expected_authorization_calls"].as_u64().unwrap() as usize
+            );
+            if !observed.is_empty() {
+                assert_eq!(observed[0], case["expected_context"]);
+            }
+            let sent = transport.lock().unwrap().sent_requests();
+            let sent = sent
+                .iter()
+                .filter(|request| request["method"] == "tools/call")
+                .collect::<Vec<_>>();
+            assert_eq!(
+                sent.len(),
+                case["expected_tool_requests"].as_u64().unwrap() as usize
+            );
+            for request in sent {
+                assert_eq!(request["params"]["name"], case["name"]);
+                assert_eq!(request["params"]["arguments"], json!({"query":"REF-42"}));
+            }
+        }
+        return Ok(());
+    }
+
     let result = run_mcp_conformance_fixture_inner(fixture, operation);
     if let Some(expected) = fixture
         .get("expected_error_contains")
@@ -6855,6 +7426,7 @@ fn run_mcp_conformance_fixture_inner(fixture: &Value, operation: &str) -> AxResu
                                     .cloned()
                                     .unwrap_or_else(|| json!([])),
                                 item.get("filters").cloned().unwrap_or_else(|| json!({})),
+                                item.get("task_ids").cloned().unwrap_or(Value::Null),
                             ],
                         )?;
                         if actual != item.get("expected").cloned().unwrap_or_else(|| json!({})) {
@@ -6993,10 +7565,117 @@ fn run_mcp_conformance_fixture_inner(fixture: &Value, operation: &str) -> AxResu
                     }
                     Ok(())
                 }
+                "task_listen_restart" => {
+                    let delivered = Arc::new(Mutex::new(Vec::<Value>::new()));
+                    let captured = delivered.clone();
+                    client.add_notification_listener(move |message| {
+                        captured.lock().unwrap().push(message)
+                    });
+                    client.start_listening()?;
+                    let streams = client.transport.lock().unwrap().sent_request_streams();
+                    if streams.len() != 1 {
+                        return Err(AxError::new(
+                            "fixture",
+                            "initial subscriptions/listen stream missing",
+                        ));
+                    }
+                    if streams[0]
+                        .get("params")
+                        .and_then(|params| params.get("notifications"))
+                        .and_then(|value| value.get("taskIds"))
+                        .is_some()
+                    {
+                        return Err(AxError::new(
+                            "fixture",
+                            "listener asked for tasks before any were recorded",
+                        ));
+                    }
+                    let outcome = client.call_tool_outcome(
+                        fixture
+                            .get("tool")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                        fixture
+                            .get("arguments")
+                            .cloned()
+                            .unwrap_or_else(|| json!({})),
+                    )?;
+                    if !matches!(outcome, AxMCPToolCallOutcome::Task(_)) {
+                        return Err(AxError::new("fixture", "expected a task outcome"));
+                    }
+                    let streams = client.transport.lock().unwrap().sent_request_streams();
+                    if streams.len() != 2 {
+                        return Err(AxError::new(
+                            "fixture",
+                            "a recorded task did not restart the listener",
+                        ));
+                    }
+                    let second = streams.last().cloned().unwrap_or(Value::Null);
+                    expect_subset(
+                        "task listen interests",
+                        second
+                            .get("params")
+                            .and_then(|params| params.get("notifications"))
+                            .unwrap_or(&Value::Null),
+                        fixture
+                            .get("expected_second_notifications")
+                            .unwrap_or(&Value::Null),
+                    )?;
+                    let mut notification = fixture
+                        .get("task_notification")
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
+                    notification["params"]["_meta"] = json!({"io.modelcontextprotocol/subscriptionId":second.get("id").cloned().unwrap_or(Value::Null)});
+                    client.inbound_messages.lock().unwrap().push(notification);
+                    client.drain_inbound();
+                    if delivered
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|item| {
+                            item.get("method").and_then(Value::as_str)
+                                == Some("notifications/tasks")
+                        })
+                        .count()
+                        != 1
+                    {
+                        return Err(AxError::new(
+                            "fixture",
+                            "task notification was not delivered",
+                        ));
+                    }
+                    if client
+                        .transport
+                        .lock()
+                        .unwrap()
+                        .sent_request_streams()
+                        .len()
+                        != 2
+                    {
+                        return Err(AxError::new(
+                            "fixture",
+                            "a known task restarted the listener",
+                        ));
+                    }
+                    Ok(())
+                }
                 "initialize" | "protocol_negotiation" => Ok(()),
                 "ping" => client.ping().map(|_| ()),
                 "tools" => {
                     let functions = client.native_tools();
+                    for function in &functions {
+                        if let Some(expected) = fixture
+                            .get("expected_schemas")
+                            .and_then(|schemas| schemas.get(&function.name))
+                        {
+                            if &function.schema()? != expected {
+                                return Err(AxError::new(
+                                    "fixture",
+                                    "Native tool schema was altered",
+                                ));
+                            }
+                        }
+                    }
                     if let Some(expected) = fixture.get("expected_function_names") {
                         let names =
                             Value::Array(functions.iter().map(|tool| json!(tool.name)).collect());
@@ -7015,6 +7694,20 @@ fn run_mcp_conformance_fixture_inner(fixture: &Value, operation: &str) -> AxResu
                             &result,
                             fixture.get("expected_call_result").unwrap_or(&Value::Null),
                         )?;
+                    }
+                    let requests = client.transport.lock().unwrap().sent_requests();
+                    if let Some(expected) =
+                        fixture.get("expected_requests").and_then(Value::as_array)
+                    {
+                        if requests.len() != expected.len() {
+                            return Err(AxError::new(
+                                "fixture",
+                                "Native MCP request count mismatch",
+                            ));
+                        }
+                        for (request, expected) in requests.iter().zip(expected) {
+                            expect_subset("native MCP request", request, expected)?;
+                        }
                     }
                     Ok(())
                 }
@@ -7181,5 +7874,705 @@ fn is_private_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(ip) => ip.is_private() || ip.is_link_local(),
         std::net::IpAddr::V6(ip) => ip.is_unique_local() || ip.is_unicast_link_local(),
+    }
+}
+
+#[cfg(test)]
+mod invocation_cancellation_tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
+    #[test]
+    fn native_tool_cancellation_closes_http_and_does_not_replay() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut headers = String::new();
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+                headers.push_str(&line);
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(request["params"]["arguments"], json!({"query":"probe"}));
+            assert!(headers.to_ascii_lowercase().contains("x-tenant: fixture"));
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n").unwrap();
+            started_tx.send(()).unwrap();
+            let mut byte = [0];
+            // A client that closes with these headers unread makes its kernel send RST instead of FIN.
+            let read = reader.read(&mut byte);
+            let closed = match &read {
+                Ok(0) => true,
+                Err(error) => matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ),
+                Ok(_) => false,
+            };
+            assert!(closed, "cancelled HTTP request stayed open: {read:?}");
+        });
+        let transport = AxMCPStreamableHTTPTransport::new(format!("http://{address}"),json!({"headers":{"X-Tenant":"fixture"},"ssrfProtection":{"requireHttps":false,"allowLocalhost":true,"allowPrivateNetworks":true}})).unwrap();
+        let mut client = AxMCPClient::new(Box::new(transport), json!({"namespace":"inventory"}));
+        client.tools = vec![json!({"name":"lookup","inputSchema":{"type":"object"}})];
+        let tool = client.native_tools().remove(0);
+        let context = AxToolContext::default();
+        let worker_context = context.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = tool.call_with_context(json!({"query":"probe"}), worker_context.clone());
+            assert!(result.is_err());
+            assert!(tool
+                .call_with_context(json!({"query":"never"}), worker_context)
+                .is_err());
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        context.cancelled.store(true, Ordering::SeqCst);
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("MCP cancellation blocked");
+        worker.join().unwrap();
+        server.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod actor_cancellation_tests {
+    use super::*;
+    #[test]
+    fn actor_invocation_preserves_mcp_cancellation() -> AxResult<()> {
+        struct Transport {
+            control: crate::AxRunControl,
+            calls: Arc<AtomicUsize>,
+        }
+        impl AxMCPTransport for Transport {
+            fn send(&mut self, _: Value) -> AxResult<Value> {
+                Err(AxError::new("mcp", "actor lost context"))
+            }
+            fn send_notification(&mut self, _: Value) -> AxResult<()> {
+                Ok(())
+            }
+            fn send_with_context(
+                &mut self,
+                message: Value,
+                _: Map<String, Value>,
+                context: &AxToolContext,
+            ) -> AxResult<Value> {
+                assert_eq!(message["method"], "tools/call");
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.control.abort();
+                assert!(context.is_cancelled(), "actor lost run control");
+                mcp_check_cancelled(context)?;
+                unreachable!()
+            }
+        }
+        let control = crate::run_control();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut client = AxMCPClient::new(
+            Box::new(Transport {
+                control: control.clone(),
+                calls: calls.clone(),
+            }),
+            json!({"namespace":"inventory"}),
+        );
+        client.tools = vec![json!({"name":"lookup","inputSchema":{"type":"object"}})];
+        let mut program =
+            crate::agent_with_options("question -> answer", json!({"functionDiscovery":false}))?
+                .with_tool_module("tools", client.native_tools())?;
+        let result = crate::session::with_control(
+            crate::AxForwardOptions::default().with_control(control),
+            |_| program.invoke_callable("tools.lookup", json!({"query":"probe"}), json!({})),
+        );
+        match result {
+            Ok(value) => assert_eq!(value["status"], "error"),
+            Err(error) => assert!(error.to_string().contains("cancel"), "{error}"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod configured_context_tests {
+    use super::*;
+    #[test]
+    fn inheritance_none_retains_generators_own_clients() -> AxResult<()> {
+        struct Model {
+            calls: usize,
+        }
+        impl crate::AxAIClient for Model {
+            fn get_features(&self, _: Option<&str>) -> Value {
+                json!({"functions":true,"streaming":false})
+            }
+            fn chat(&mut self, request: Value) -> AxResult<Value> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    assert!(
+                        request.to_string().contains("lookup"),
+                        "configured MCP tool disappeared"
+                    );
+                    return Ok(
+                        json!({"results":[{"function_calls":[{"id":"own-call","type":"function","function":{"name":"lookup","params":{}}}]}]}),
+                    );
+                }
+                assert_eq!(self.calls, 2);
+                assert!(
+                    request.to_string().contains("OWN-REFERENCE"),
+                    "MCP result absent from continuation"
+                );
+                assert!(
+                    request.to_string().contains("own-call"),
+                    "MCP result lost its call ID"
+                );
+                Ok(json!({"results":[{"content":"Answer: OWN-REFERENCE"}]}))
+            }
+        }
+        let mut mcp = AxMCPClient::new(
+            Box::new(AxMCPScriptedTransport::new(vec![
+                json!({"result":{"structuredContent":{"reference":"OWN-REFERENCE"}}}),
+            ])),
+            json!({"namespace":"inventory"}),
+        );
+        mcp.initialized = true;
+        mcp.tools = vec![json!({"name":"lookup","inputSchema":{"type":"object"}})];
+        let context = AxExecutionContext::new(vec![Arc::new(Mutex::new(mcp))], vec![])?;
+        let mut program = crate::ax("question -> answer")?.with_execution_context(context)?;
+        let mut model = Model { calls: 0 };
+        let result = program.forward_with_options(
+            &mut model,
+            json!({"question":"Find reference"}),
+            json!({"mcpInheritance":"none"}),
+        )?;
+        assert_eq!(result, json!({"answer":"OWN-REFERENCE"}));
+        assert_eq!(model.calls, 2);
+        assert!(serde_json::to_string(program.get_chat_log())?.contains("OWN-REFERENCE"));
+        Ok(())
+    }
+}
+
+/// Legacy MCP WebSocket transport. The built-in socket uses the `realtime` feature.
+/// Custom factories share the same cancellation and request settlement behavior.
+pub struct AxMCPWebSocketTransport {
+    url: String,
+    headers: Value,
+    factory: Option<crate::AxSessionWebSocketFactory>,
+    state: Arc<Mutex<MCPWebSocketState>>,
+    connection: Mutex<Option<JoinHandle<()>>>,
+}
+struct MCPWebSocketState {
+    socket: Option<Arc<dyn crate::AxSessionSocket>>,
+    pending: HashMap<String, Arc<MCPWebSocketPending>>,
+    protocol: String,
+    handler: Option<Arc<dyn Fn(Value) + Send + Sync>>,
+    request_handler: Option<AxMCPRequestHandler>,
+    lifecycle: Option<Arc<dyn Fn(String) + Send + Sync>>,
+}
+struct MCPWebSocketPending {
+    result: Mutex<Option<AxResult<Value>>>,
+    changed: Condvar,
+}
+struct MCPWebSocketRequestGuard {
+    state: Arc<Mutex<MCPWebSocketState>>,
+    slots: Vec<(String, Arc<MCPWebSocketPending>)>,
+}
+impl Drop for MCPWebSocketRequestGuard {
+    fn drop(&mut self) {
+        let mut state = self.state.lock().unwrap();
+        for (key, slot) in &self.slots {
+            if state
+                .pending
+                .get(key)
+                .is_some_and(|current| Arc::ptr_eq(current, slot))
+            {
+                state.pending.remove(key);
+            }
+        }
+    }
+}
+impl AxMCPWebSocketTransport {
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            headers: json!({}),
+            factory: None,
+            connection: Mutex::new(None),
+            state: Arc::new(Mutex::new(MCPWebSocketState {
+                socket: None,
+                pending: HashMap::new(),
+                protocol: String::new(),
+                handler: None,
+                request_handler: None,
+                lifecycle: None,
+            })),
+        }
+    }
+    pub fn with_socket_factory(mut self, factory: crate::AxSessionWebSocketFactory) -> Self {
+        self.factory = Some(factory);
+        self
+    }
+    pub fn with_headers(mut self, headers: Value) -> Self {
+        self.headers = headers;
+        self
+    }
+    pub fn connect_socket(&self) -> AxResult<()> {
+        let mut reader = self.connection.lock().unwrap();
+        if self.state.lock().unwrap().socket.is_some() {
+            return Ok(());
+        }
+        if let Some(old) = reader.take() {
+            let _ = old.join();
+        }
+        let socket = match &self.factory {
+            Some(factory) => factory(&self.url, &self.headers)?,
+            None => {
+                #[cfg(feature = "realtime")]
+                {
+                    crate::session::native_session_socket(&self.url, &self.headers)?
+                }
+                #[cfg(not(feature = "realtime"))]
+                {
+                    return Err(AxError::new(
+                        "mcp",
+                        "Enable the realtime feature or provide a WebSocket factory",
+                    ));
+                }
+            }
+        };
+        self.state.lock().unwrap().socket = Some(socket.clone());
+        let state = self.state.clone();
+        *reader = Some(thread::spawn(move || Self::receive(state, socket)));
+        Ok(())
+    }
+    fn terminate(
+        state: &Arc<Mutex<MCPWebSocketState>>,
+        socket: &Arc<dyn crate::AxSessionSocket>,
+        error: AxError,
+    ) {
+        let (pending, lifecycle) = {
+            let mut state = state.lock().unwrap();
+            if !state
+                .socket
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, socket))
+            {
+                return;
+            }
+            state.socket = None;
+            (std::mem::take(&mut state.pending), state.lifecycle.clone())
+        };
+        for slot in pending.into_values() {
+            *slot.result.lock().unwrap() = Some(Err(error.clone()));
+            slot.changed.notify_all();
+        }
+        socket.close();
+        if let Some(handler) = lifecycle {
+            thread::spawn(move || handler("disconnected".into()));
+        }
+    }
+    fn receive(state: Arc<Mutex<MCPWebSocketState>>, socket: Arc<dyn crate::AxSessionSocket>) {
+        let outcome = (|| -> AxResult<()> {
+            loop {
+                {
+                    let state = state.lock().unwrap();
+                    if !state
+                        .socket
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &socket))
+                    {
+                        return Ok(());
+                    }
+                }
+                let Some(parsed) = socket.recv(Duration::from_millis(20))? else {
+                    continue;
+                };
+                if parsed.is_array() && state.lock().unwrap().protocol != "2025-03-26" {
+                    return Err(AxError::new(
+                        "mcp",
+                        "JSON-RPC batching is only allowed for MCP 2025-03-26",
+                    ));
+                }
+                let messages = match parsed {
+                    Value::Array(messages) => messages,
+                    message => vec![message],
+                };
+                for message in messages {
+                    let (slot, handler, request_handler) = {
+                        let mut state = state.lock().unwrap();
+                        if !state
+                            .socket
+                            .as_ref()
+                            .is_some_and(|current| Arc::ptr_eq(current, &socket))
+                        {
+                            return Ok(());
+                        }
+                        let slot = if message.get("id").is_some() && message.get("method").is_none()
+                        {
+                            state.pending.remove(&message["id"].to_string())
+                        } else {
+                            None
+                        };
+                        (slot, state.handler.clone(), state.request_handler.clone())
+                    };
+                    if let Some(slot) = slot {
+                        *slot.result.lock().unwrap() = Some(Ok(message));
+                        slot.changed.notify_all();
+                    } else if handler.is_some() || request_handler.is_some() {
+                        let socket = socket.clone();
+                        thread::spawn(move || {
+                            if message.get("id").is_some() && message.get("method").is_some() {
+                                if let Some(handler) = request_handler {
+                                    let _ = socket.send(handler(message));
+                                    return;
+                                }
+                            }
+                            if let Some(handler) = handler {
+                                handler(message);
+                            }
+                        });
+                    }
+                }
+            }
+        })();
+        if let Err(error) = outcome {
+            Self::terminate(&state, &socket, error);
+        }
+    }
+    fn requests(
+        &self,
+        messages: Vec<Value>,
+        context: &AxToolContext,
+        batch: bool,
+    ) -> AxResult<Vec<Value>> {
+        let protocol = self.state.lock().unwrap().protocol.clone();
+        let ids = crate::core_value_to_json(&crate::mcp_websocket_request_ids(&[
+            crate::core_value_from_json(&json!(messages)),
+            crate::CoreValue::from(protocol.as_str()),
+            crate::CoreValue::Bool(batch),
+        ])?);
+        mcp_check_cancelled(context)?;
+        self.connect_socket()?;
+        let (socket, guard) = {
+            let mut state = self.state.lock().unwrap();
+            let ids = ids.as_array().unwrap();
+            if ids
+                .iter()
+                .any(|id| state.pending.contains_key(id.as_str().unwrap()))
+            {
+                return Err(AxError::new("mcp", "MCP request ID is already pending"));
+            }
+            let socket = state
+                .socket
+                .clone()
+                .ok_or_else(|| AxError::new("mcp", "MCP WebSocket closed"))?;
+            let mut slots = Vec::new();
+            for id in ids {
+                let key = id.as_str().unwrap().to_string();
+                let slot = Arc::new(MCPWebSocketPending {
+                    result: Mutex::new(None),
+                    changed: Condvar::new(),
+                });
+                state.pending.insert(key.clone(), slot.clone());
+                slots.push((key, slot));
+            }
+            (
+                socket,
+                MCPWebSocketRequestGuard {
+                    state: self.state.clone(),
+                    slots,
+                },
+            )
+        };
+        mcp_check_cancelled(context)?;
+        socket.send(if batch {
+            json!(messages)
+        } else {
+            messages[0].clone()
+        })?;
+        let mut results = Vec::new();
+        for (_, slot) in &guard.slots {
+            let mut result = slot.result.lock().unwrap();
+            loop {
+                mcp_check_cancelled(context)?;
+                if let Some(value) = result.take() {
+                    results.push(value?);
+                    break;
+                }
+                result = slot
+                    .changed
+                    .wait_timeout(result, Duration::from_millis(10))
+                    .unwrap()
+                    .0;
+            }
+        }
+        Ok(results)
+    }
+    pub fn send_request(&self, message: Value, context: &AxToolContext) -> AxResult<Value> {
+        Ok(self.requests(vec![message], context, false)?.remove(0))
+    }
+    pub fn send_batch(
+        &self,
+        messages: Vec<Value>,
+        context: &AxToolContext,
+    ) -> AxResult<Vec<Value>> {
+        self.requests(messages, context, true)
+    }
+    pub fn close_socket(&self) {
+        let socket = self.state.lock().unwrap().socket.clone();
+        if let Some(socket) = socket {
+            Self::terminate(
+                &self.state,
+                &socket,
+                AxError::new("mcp", "MCP WebSocket closed"),
+            );
+        }
+        if let Some(reader) = self.connection.lock().unwrap().take() {
+            if reader.thread().id() != thread::current().id() {
+                let _ = reader.join();
+            }
+        }
+    }
+}
+impl Drop for AxMCPWebSocketTransport {
+    fn drop(&mut self) {
+        self.close_socket();
+    }
+}
+impl AxMCPTransport for AxMCPWebSocketTransport {
+    fn send(&mut self, message: Value) -> AxResult<Value> {
+        self.send_request(message, &AxToolContext::default())
+    }
+    fn send_with_context(
+        &mut self,
+        message: Value,
+        _headers: Map<String, Value>,
+        context: &AxToolContext,
+    ) -> AxResult<Value> {
+        self.send_request(message, context)
+    }
+    fn send_notification(&mut self, message: Value) -> AxResult<()> {
+        self.connect_socket()?;
+        let socket = self
+            .state
+            .lock()
+            .unwrap()
+            .socket
+            .clone()
+            .ok_or_else(|| AxError::new("mcp", "MCP WebSocket closed"))?;
+        socket.send(message)
+    }
+    fn set_protocol_version(&mut self, version: &str) {
+        self.state.lock().unwrap().protocol = version.into();
+    }
+    fn set_message_handler(&mut self, handler: Arc<dyn Fn(Value) + Send + Sync>) {
+        self.state.lock().unwrap().handler = Some(handler);
+    }
+    fn set_request_handler(&mut self, handler: AxMCPRequestHandler) {
+        self.state.lock().unwrap().request_handler = Some(handler);
+    }
+    fn set_lifecycle_handler(&mut self, handler: Arc<dyn Fn(String) + Send + Sync>) {
+        self.state.lock().unwrap().lifecycle = Some(handler);
+    }
+    fn era_hint(&self) -> Option<String> {
+        Some("legacy".into())
+    }
+    fn connect(&mut self) -> AxResult<()> {
+        self.connect_socket()
+    }
+    fn start_listening(&mut self) -> AxResult<()> {
+        self.connect_socket()
+    }
+    fn close(&mut self) -> AxResult<()> {
+        self.close_socket();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod websocket_cleanup_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    struct Socket {
+        inbound: Mutex<VecDeque<Value>>,
+        sent: AtomicUsize,
+        fail: AtomicBool,
+        closed: AtomicBool,
+    }
+    impl crate::AxSessionSocket for Socket {
+        fn send(&self, _: Value) -> AxResult<()> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(AxError::runtime("send failed"));
+            }
+            self.sent.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn recv(&self, timeout: Duration) -> AxResult<Option<Value>> {
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(AxError::runtime("socket closed"));
+            }
+            if let Some(value) = self.inbound.lock().unwrap().pop_front() {
+                return Ok(Some(value));
+            }
+            thread::sleep(timeout);
+            Ok(None)
+        }
+        fn close(&self) {
+            self.closed.store(true, Ordering::SeqCst);
+        }
+    }
+    fn wait_sent(socket: &Socket, count: usize) {
+        let until = std::time::Instant::now() + Duration::from_secs(2);
+        while socket.sent.load(Ordering::SeqCst) < count {
+            assert!(std::time::Instant::now() < until, "request did not start");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    #[test]
+    fn websocket_pending_cleanup_and_reused_ids() -> AxResult<()> {
+        let socket = Arc::new(Socket {
+            inbound: Mutex::new(VecDeque::new()),
+            sent: AtomicUsize::new(0),
+            fail: AtomicBool::new(true),
+            closed: AtomicBool::new(false),
+        });
+        let factory_socket = socket.clone();
+        let mut transport = AxMCPWebSocketTransport::new("ws://example.test")
+            .with_socket_factory(Arc::new(move |_, _| Ok(factory_socket.clone())));
+        transport.set_protocol_version("2025-03-26");
+        let transport = Arc::new(transport);
+        let request = json!({"id":1,"method":"ping"});
+        let batch = vec![request.clone(), json!({"id":2,"method":"ping"})];
+        assert!(transport
+            .send_request(request.clone(), &AxToolContext::default())
+            .unwrap_err()
+            .message
+            .contains("send failed"));
+        assert!(transport
+            .send_batch(batch.clone(), &AxToolContext::default())
+            .unwrap_err()
+            .message
+            .contains("send failed"));
+        assert!(transport.state.lock().unwrap().pending.is_empty());
+        socket.fail.store(false, Ordering::SeqCst);
+        let old = AxCancellationToken::default();
+        let context = AxToolContext {
+            cancellation: Some(old.clone()),
+            ..Default::default()
+        };
+        let run = transport.clone();
+        let first_request = request.clone();
+        let first = thread::spawn(move || run.send_request(first_request, &context));
+        wait_sent(&socket, 1);
+        socket
+            .inbound
+            .lock()
+            .unwrap()
+            .push_back(json!({"id":1,"result":"first"}));
+        assert_eq!(first.join().unwrap()?["result"], "first");
+        let run = transport.clone();
+        let next_request = request.clone();
+        let second =
+            thread::spawn(move || run.send_request(next_request, &AxToolContext::default()));
+        wait_sent(&socket, 2);
+        old.cancel("obsolete");
+        assert!(transport
+            .send_request(request, &AxToolContext::default())
+            .unwrap_err()
+            .message
+            .contains("already pending"));
+        socket
+            .inbound
+            .lock()
+            .unwrap()
+            .push_back(json!({"id":1,"result":"second"}));
+        assert_eq!(second.join().unwrap()?["result"], "second");
+        let abort = AxCancellationToken::default();
+        let context = AxToolContext {
+            cancellation: Some(abort.clone()),
+            ..Default::default()
+        };
+        let run = transport.clone();
+        let requests = batch.clone();
+        let cancelled = thread::spawn(move || run.send_batch(requests, &context));
+        wait_sent(&socket, 3);
+        abort.cancel("stop");
+        assert!(cancelled
+            .join()
+            .unwrap()
+            .unwrap_err()
+            .message
+            .contains("cancelled"));
+        assert!(transport.state.lock().unwrap().pending.is_empty());
+        let run = transport.clone();
+        let closed = thread::spawn(move || run.send_batch(batch, &AxToolContext::default()));
+        wait_sent(&socket, 4);
+        transport.close_socket();
+        assert!(closed
+            .join()
+            .unwrap()
+            .unwrap_err()
+            .message
+            .contains("closed"));
+        assert!(transport.state.lock().unwrap().pending.is_empty());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod listen_delay_cleanup_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    #[test]
+    fn close_wakes_reconnect_delay() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let count = socket.read(&mut chunk).unwrap();
+                assert!(count > 0, "missing listener request headers");
+                request.extend_from_slice(&chunk[..count]);
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        let (ended, receiver) = std::sync::mpsc::channel();
+        let mut transport = AxMCPStreamableHTTPTransport::new(format!("http://127.0.0.1:{port}"), json!({"reconnectDelayMs":5000,"ssrfProtection":{"requireHttps":false,"allowLocalhost":true,"allowPrivateNetworks":true}})).unwrap();
+        transport.set_lifecycle_handler(Arc::new(move |event| {
+            if event == "disconnected" {
+                let _ = ended.send(());
+            }
+        }));
+        transport.start_listening().unwrap();
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("listener did not finish the first request");
+        let started = std::time::Instant::now();
+        transport.close().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "close retained reconnect sleep"
+        );
+        assert!(transport.listen_thread.is_none());
+        server.join().unwrap();
     }
 }

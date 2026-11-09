@@ -12,25 +12,40 @@ import (
 // emitter where raising helpers return Result and pure helpers are total;
 // in Go the split keeps the hot pure path free of error plumbing.
 var coreIntrinsicGoRaising = map[CoreIntrinsic]bool{
-	IntrinsicToolInvoke:          true,
-	IntrinsicAICompleteOnce:      true,
-	IntrinsicObjectCallMethod:    true,
-	IntrinsicJSONParse:           true,
-	IntrinsicJSONParseStrict:     true,
-	IntrinsicAxGenRunAssertions:  true,
-	IntrinsicAgentStageForward:   true,
-	IntrinsicAgentRuntimeCreate:  true,
-	IntrinsicAgentRuntimeExecute: true,
-	IntrinsicAgentRuntimeInspect: true,
-	IntrinsicAgentRuntimeExport:  true,
-	IntrinsicAgentRuntimeRestore: true,
-	IntrinsicPromptStructured:    true,
-	IntrinsicStringFindQuoted:    true,
-	IntrinsicStringSplitQuoted:   true,
-	IntrinsicStringSplitTopLevel: true,
-	IntrinsicStringExtractGroup:  true,
-	IntrinsicStringConsumeOpt:    true,
-	IntrinsicStringExtractSuf:    true,
+	IntrinsicToolInvoke:              true,
+	IntrinsicAICompleteOnce:          true,
+	IntrinsicObjectCallMethod:        true,
+	IntrinsicJSONParse:               true,
+	IntrinsicJSONParseStrict:         true,
+	IntrinsicAxGenRunAssertions:      true,
+	IntrinsicFlowDispatchGroup:       true,
+	IntrinsicAgentStageForward:       true,
+	IntrinsicAgentProgramForward:     true,
+	IntrinsicAgentNativeStageForward: true,
+	IntrinsicAgentStageStreamForward: true,
+	IntrinsicAgentRuntimeCreate:      true,
+	IntrinsicAgentRuntimeExecute:     true,
+	IntrinsicAgentRuntimeInspect:     true,
+	IntrinsicAgentRuntimeExport:      true,
+	IntrinsicAgentRuntimeRestore:     true,
+	IntrinsicPromptStructured:        true,
+	IntrinsicPromptUserContent:       true,
+	IntrinsicStringFindQuoted:        true,
+	IntrinsicStringSplitQuoted:       true,
+	IntrinsicStringSplitTopLevel:     true,
+	IntrinsicStringExtractGroup:      true,
+	IntrinsicStringConsumeOpt:        true,
+	IntrinsicStringExtractSuf:        true,
+	IntrinsicRetrySleep:              true,
+	IntrinsicAIStreamOpen:            true,
+	IntrinsicAIStreamNext:            true,
+	IntrinsicAxGenEmitDelta:          true,
+	IntrinsicAxGenSpeak:              true,
+	IntrinsicAxGenCallProcessor:      true,
+	IntrinsicAxGenCheckStreamAssert:  true,
+	IntrinsicDateZoneOffset:          true,
+	IntrinsicAxGenCacheRead:          true,
+	IntrinsicAxGenCacheWrite:         true,
 }
 
 func BuildGoCore(model AxRuntimeModel) (string, error) {
@@ -235,7 +250,7 @@ func emitGoCoreStmt(ctx *goEmitCtx, stmt CoreStmt) ([]string, error) {
 	case "raise":
 		errExpr := fmt.Sprintf("AxError{Category: \"runtime\", Message: %s}", strconv.Quote(stmt.Message))
 		if _, ok := Attr(stmt.Op, "error"); ok {
-			errExpr = fmt.Sprintf("asAxError(%s)", goAttrValue(stmt.Op, "error"))
+			errExpr = fmt.Sprintf("asError(%s)", goAttrValue(stmt.Op, "error"))
 		}
 		if ctx.inClosure() {
 			return []string{fmt.Sprintf("return coreFlow{}, %s", errExpr)}, nil
@@ -498,6 +513,8 @@ func goLiteral(value interface{}) string {
 			return goName(v)
 		}
 		return strconv.Quote(v)
+	case QuotedString:
+		return strconv.Quote(string(v))
 	case bool:
 		if v {
 			return "true"

@@ -1,7 +1,9 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { AxMockAIService } from '../../../src/ax/ai/mock/api.js';
 import type { AxAIService } from '../../../src/ax/ai/types.js';
-import { axGlobals } from '../../../src/ax/dsp/globals.js';
+import { AxGen } from '../../../src/ax/dsp/generate.js';
+import { runControl } from '../../../src/ax/dsp/runControl.js';
 import { AxSignature, f } from '../../../src/ax/dsp/sig.js';
 import type {
   AxChatLogEntry,
@@ -11,6 +13,7 @@ import { AxFlowExecutionPlanner } from '../../../src/ax/flow/executionPlanner.js
 import { executeFlowSteps } from '../../../src/ax/flow/executor.js';
 import { flow } from '../../../src/ax/flow/flow.js';
 import { createFlowStep, toPlanStep } from '../../../src/ax/flow/steps.js';
+import { AxAIServiceResponseError } from '../../../src/ax/util/apicall.js';
 
 type Fixture = Record<string, unknown>;
 
@@ -197,7 +200,7 @@ const runSimpleForward = async () => {
     returns: { answer: 'answer' },
     responses: [
       {
-        content: '{"answer":"Paris"}',
+        content: 'Answer: Paris',
         usage: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 },
       },
     ],
@@ -257,104 +260,10 @@ const writeExecutionRuntimeFixtures = async () => {
     ],
     returns: { answer: 'answer' },
     forward_options: { model: 'gpt-flow-fixture', traceLabel: 'outer' },
-    responses: [{ content: '{"answer":"dynamic"}' }],
+    responses: [{ content: 'Answer: dynamic' }],
     expected_output: { answer: 'dynamic' },
     expected_request_count: 1,
     expected_request_contains: ['gpt-flow-fixture'],
-  });
-
-  const cacheProgram = new ScriptedProgram('question:string -> answer:string', {
-    answer: 'miss',
-  });
-  const cacheFlow = flow<{ question: string }, { answer: string }>()
-    .node('qa', cacheProgram)
-    .execute('qa', (state) => ({ question: state.question }))
-    .returns((state) => ({ answer: String((state as any).qaResult.answer) }));
-  const cacheEvents: Array<Record<string, unknown>> = [];
-  const cache = new Map<string, unknown>();
-  cache.set('fixture-hit', { answer: 'Cached' });
-  const cacheHit = await cacheFlow.forward(
-    { name: 'mock' } as unknown as AxAIService,
-    { question: 'Cached?' },
-    {
-      cachingFunction: async (_key: string, value?: unknown) => {
-        cacheEvents.push({ value });
-        return cache.get('fixture-hit');
-      },
-    } as any
-  );
-
-  writeFixture(flowDir, 'cache-hit-skips-execution.json', {
-    kind: 'flow',
-    name: 'cache-hit-skips-execution',
-    source: source('cache-hit-skips-execution', {
-      output: cacheHit,
-      calls: cacheProgram.calls.length,
-      cacheEvents,
-    }),
-    input: { question: 'Cached?' },
-    steps: [
-      {
-        kind: 'execute',
-        name: 'qa',
-        signature: 'question:string -> answer:string',
-      },
-    ],
-    returns: { answer: 'answer' },
-    cache_seed_value: { answer: 'Cached' },
-    forward_options: { cache_store: {} },
-    expected_output: { answer: 'Cached' },
-    expected_request_count: 0,
-    expected_trace_kinds: [],
-  });
-
-  writeFixture(flowDir, 'cache-miss-writes-output.json', {
-    kind: 'flow',
-    name: 'cache-miss-writes-output',
-    source: source('cache-miss-writes-output', {
-      rule: 'TS writes final returned state after a cache miss.',
-    }),
-    input: { question: 'Cache miss?' },
-    steps: [
-      {
-        kind: 'execute',
-        name: 'qa',
-        signature: 'question:string -> answer:string',
-      },
-    ],
-    returns: { answer: 'answer' },
-    forward_options: { cache_store: {} },
-    responses: [{ content: '{"answer":"Stored"}' }],
-    expected_output: { answer: 'Stored' },
-    expected_request_count: 1,
-    expected_cache_value_for_input: { answer: 'Stored' },
-  });
-
-  writeFixture(flowDir, 'cache-errors-are-swallowed.json', {
-    kind: 'flow',
-    name: 'cache-errors-are-swallowed',
-    source: source('cache-errors-are-swallowed', {
-      rule: 'TS ignores cache read/write callback failures.',
-    }),
-    input: { question: 'Cache error?' },
-    steps: [
-      {
-        kind: 'execute',
-        name: 'qa',
-        signature: 'question:string -> answer:string',
-      },
-    ],
-    returns: { answer: 'answer' },
-    cache_seed_value: { answer: 'Ignored' },
-    forward_options: {
-      cache_store: {},
-      cache_read_error: true,
-      cache_write_error: true,
-    },
-    responses: [{ content: '{"answer":"Recovered"}' }],
-    expected_output: { answer: 'Recovered' },
-    expected_request_count: 1,
-    expected_cache_value_for_input: { answer: 'Ignored' },
   });
 
   writeFixture(flowDir, 'explicit-parallel-merge-execution.json', {
@@ -443,7 +352,7 @@ const writeExecutionRuntimeFixtures = async () => {
       },
     ],
     returns: { answer: 'answer' },
-    responses: [{ content: '{"answer":"Nested Paris"}' }],
+    responses: [{ content: 'Answer: Nested Paris' }],
     expected_output: { answer: 'Nested Paris' },
     expected_request_count: 1,
     expected_chat_log_subset: [{ name: 'nested.inner' }],
@@ -719,20 +628,6 @@ const writeMapAndCacheFixtures = async () => {
       },
     ],
     expected_plan: normalizePlan(directPlan),
-  });
-
-  writeFixture(flowDir, 'cache-key-stable-input-order.json', {
-    kind: 'flow',
-    name: 'cache-key-stable-input-order',
-    operation: 'cache_key',
-    source: source('cache-key-stable-input-order', {
-      rule: 'TS Flow hashes sorted object keys from actual input values.',
-    }),
-    cache_key_inputs: [
-      { lastName: 'Lovelace', firstName: 'Ada' },
-      { firstName: 'Ada', lastName: 'Lovelace' },
-    ],
-    expected_cache_keys_equal: true,
   });
 };
 
@@ -1017,7 +912,7 @@ const writeControlFlowRuntimeFixtures = async () => {
     ],
     returns: { left: 'leftResult.left', right: 'rightResult.right' },
     forward_options: { autoParallel: true, record_flow_groups: true },
-    responses: [{ content: '{"left":"l"}' }, { content: '{"right":"r"}' }],
+    responses: [{ content: 'Left: l' }, { content: 'Right: r' }],
     expected_output: { left: 'l', right: 'r' },
     expected_trace_kinds: [
       'flow_start',
@@ -1064,7 +959,7 @@ const writeControlFlowRuntimeFixtures = async () => {
     ],
     returns: { left: 'leftResult.left', right: 'rightResult.right' },
     forward_options: { autoParallel: false, record_flow_groups: true },
-    responses: [{ content: '{"left":"l"}' }, { content: '{"right":"r"}' }],
+    responses: [{ content: 'Left: l' }, { content: 'Right: r' }],
     expected_output: { left: 'l', right: 'r' },
     expected_trace_kinds: [
       'flow_start',
@@ -1079,41 +974,6 @@ const writeControlFlowRuntimeFixtures = async () => {
     ],
     expected_request_count: 2,
   });
-
-  const originalCaching = axGlobals.cachingFunction;
-  try {
-    const streamFlow = flow<{ userQuery: string }, { final: string }>()
-      .map((state) => ({ final: state.userQuery.toUpperCase() }))
-      .returns((state) => ({ final: String((state as any).final) }));
-    axGlobals.cachingFunction = async () => ({ final: 'cached-stream' }) as any;
-    const iterator = streamFlow.streamingForward(ai, { userQuery: 'zzz' });
-    const first = await iterator.next();
-    writeFixture(flowDir, 'control-streaming-cache-short-circuit.json', {
-      kind: 'flow',
-      name: 'control-streaming-cache-short-circuit',
-      operation: 'streaming',
-      source: source('control-streaming-cache-short-circuit', {
-        first,
-      }),
-      input: { userQuery: 'zzz' },
-      steps: [
-        {
-          kind: 'map',
-          name: 'final',
-          mapper: { op: 'set', values: { final: 'ZZZ' } },
-        },
-      ],
-      returns: { final: 'final' },
-      cache_seed_value: { final: 'cached-stream' },
-      forward_options: { cache_store: {} },
-      expected_streaming_output: [
-        { version: 1, index: 0, delta: { final: 'cached-stream' } },
-      ],
-      expected_request_count: 0,
-    });
-  } finally {
-    axGlobals.cachingFunction = originalCaching;
-  }
 
   const extendedFlow = flow().nx(
     'reasoner',
@@ -1140,7 +1000,7 @@ const writeControlFlowRuntimeFixtures = async () => {
       },
     ],
     returns: { answer: 'reasonerResult.answer' },
-    responses: [{ content: '{"reasoning":"because","answer":"ok"}' }],
+    responses: [{ content: 'Reasoning: because\nAnswer: ok' }],
     expected_output: { answer: 'ok' },
     expected_request_count: 1,
   });
@@ -1408,13 +1268,551 @@ const writeMermaidFixtures = () => {
   }
 };
 
+// Observe TS dependency semantics and results; the traced serial fallback is
+// the explicit owned-worker compatibility policy of the generated targets.
+const writeOwnedWorkerFallbackFixture = async () => {
+  const left = new ScriptedProgram('question:string -> left:string', {
+    left: 'l',
+  });
+  const right = new ScriptedProgram('question:string -> right:string', {
+    right: 'r',
+  });
+  const program = flow<{ question: string }, { left: string; right: string }>()
+    .node('left', left)
+    .node('right', right)
+    .execute('left', (state) => ({ question: state.question }))
+    .execute('right', (state) => ({ question: state.question }))
+    .returns((state) => ({
+      left: String((state as any).leftResult.left),
+      right: String((state as any).rightResult.right),
+    }));
+  const output = await program.forward(
+    { name: 'mock' } as unknown as AxAIService,
+    { question: 'override?' },
+    { autoParallel: false }
+  );
+  const fixture = {
+    kind: 'flow',
+    name: 'owned-workers-custom-client-serial-fallback',
+    input: {
+      question: 'override?',
+    },
+    steps: [
+      {
+        kind: 'execute',
+        name: 'left',
+        signature: 'question:string -> left:string',
+        options: {
+          reads: ['question'],
+          writes: ['leftResult'],
+          isBarrier: false,
+        },
+      },
+      {
+        kind: 'execute',
+        name: 'right',
+        signature: 'question:string -> right:string',
+        options: {
+          reads: ['question'],
+          writes: ['rightResult'],
+          isBarrier: false,
+        },
+      },
+    ],
+    returns: {
+      left: 'leftResult.left',
+      right: 'rightResult.right',
+    },
+    forward_options: {},
+    responses: [
+      {
+        content: 'Left: l',
+      },
+      {
+        content: 'Right: r',
+      },
+    ],
+    expected_trace_subset: [
+      {
+        kind: 'flow_parallel_fallback',
+        payload: {
+          reason: 'owned-worker-unavailable',
+        },
+      },
+      {
+        kind: 'flow_step',
+        payload: {
+          name: 'left',
+        },
+      },
+      {
+        kind: 'flow_step',
+        payload: {
+          name: 'right',
+        },
+      },
+    ],
+    expected_chat_log_subset: [
+      {
+        name: 'left',
+        response: {
+          content: 'Left: l',
+        },
+      },
+      {
+        name: 'right',
+        response: {
+          content: 'Right: r',
+        },
+      },
+    ],
+  };
+  writeFixture(flowDir, 'owned-workers-custom-client-serial-fallback.json', {
+    ...fixture,
+    source: source(fixture.name, {
+      output,
+      nodeCalls: left.calls.length + right.calls.length,
+      generatedCompatibilityPolicy:
+        'Clients without owned workers preserve the TS plan and result, execute the group serially, and report flow_parallel_fallback.',
+    }),
+    expected_output: output,
+    expected_request_count: left.calls.length + right.calls.length,
+  });
+};
+
+// A ScriptedProgram that returns its scripted outputs in call order.
+class QueuedProgram extends ScriptedProgram {
+  private next = 0;
+
+  constructor(
+    signature: string,
+    private readonly outputs: Record<string, unknown>[]
+  ) {
+    super(signature, outputs[0] ?? {});
+  }
+
+  override async forward(
+    ai: Readonly<AxAIService>,
+    values: Record<string, unknown>,
+    options?: Record<string, unknown>
+  ) {
+    await super.forward(ai, values, options);
+    const output = this.outputs[Math.min(this.next, this.outputs.length - 1)];
+    this.next++;
+    return output;
+  }
+}
+
+// The reads, writes and barrier TS's planner gives each step of a step list,
+// by node name (derive steps by their output field).
+const planOptions = (steps: readonly unknown[]) => {
+  const plan = new AxFlowExecutionPlanner(steps as any).getExecutionPlan();
+  const byName = new Map<string, Record<string, unknown>>();
+  for (const step of plan.steps ?? []) {
+    byName.set(step.nodeName ?? step.produces[0] ?? step.type, {
+      reads: [...step.dependencies],
+      writes: [...step.produces],
+      isBarrier: step.isBarrier,
+    });
+  }
+  const groups = plan.groups.map((group) =>
+    group.steps.map((step) => step.nodeName ?? step.produces[0] ?? step.type)
+  );
+  return { byName, groups };
+};
+
+const expectGroups = (label: string, actual: unknown, expected: unknown) => {
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error(
+      `${label}: TS planned ${JSON.stringify(actual)}, expected ${JSON.stringify(expected)}`
+    );
+  }
+};
+
+// A parallel group merges each step's changes: a later step in the group must
+// not undo an earlier step's update to a key the state already held.
+const writeParallelMergeFixtures = async () => {
+  const ai = { name: 'mock' } as unknown as AxAIService;
+
+  {
+    const name = 'parallel-group-keeps-earlier-step-update';
+    const a = new ScriptedProgram('topic:string -> summary:string', {
+      summary: 'new',
+    });
+    const b = new ScriptedProgram('topic:string -> title:string', {
+      title: 'title',
+    });
+    const wf = flow<{ topic: string; aResult?: unknown }>({
+      autoParallel: true,
+    })
+      .node('a', a)
+      .node('b', b)
+      .execute('a', (state) => ({ topic: state.topic }))
+      .execute('b', (state) => ({ topic: state.topic }))
+      .returns((state) => ({
+        aResult: (state as any).aResult,
+        bResult: (state as any).bResult,
+      }));
+    const { byName, groups } = planOptions((wf as any).steps);
+    expectGroups(name, groups, [['a', 'b'], ['returns']]);
+    const input = { topic: 'x', aResult: { summary: 'old' } };
+    const output = await wf.forward(ai, input);
+    writeFixture(flowDir, `${name}.json`, {
+      kind: 'flow',
+      name,
+      source: source(name, {
+        output,
+        plan: normalizePlan(wf.getExecutionPlan()),
+        rule: 'A later step in a parallel group keeps an earlier step update to a key the state already held.',
+      }),
+      input,
+      steps: [
+        {
+          kind: 'execute',
+          name: 'a',
+          signature: 'topic:string -> summary:string',
+          options: byName.get('a'),
+        },
+        {
+          kind: 'execute',
+          name: 'b',
+          signature: 'topic:string -> title:string',
+          options: byName.get('b'),
+        },
+      ],
+      returns: { aResult: 'aResult', bResult: 'bResult' },
+      responses: [{ content: 'Summary: new' }, { content: 'Title: title' }],
+      expected_output: output,
+      expected_request_count: 2,
+    });
+  }
+
+  {
+    const name = 'parallel-group-loop-keeps-each-iteration';
+    const a = new QueuedProgram('topic:string -> summary:string', [
+      { summary: 's1' },
+      { summary: 's2' },
+    ]);
+    const b = new QueuedProgram('topic:string -> title:string', [
+      { title: 't1' },
+      { title: 't2' },
+    ]);
+    const wf = flow<{ topic: string; round: number }>({ autoParallel: true })
+      .node('a', a)
+      .node('b', b)
+      .while((state) => state.round < 2)
+      .execute('a', (state) => ({ topic: state.topic }))
+      .execute('b', (state) => ({ topic: state.topic }))
+      .map((state) => ({ ...state, round: state.round + 1 }))
+      .endWhile()
+      .returns((state) => ({
+        aResult: (state as any).aResult,
+        bResult: (state as any).bResult,
+        round: state.round,
+      }));
+    const whileStep = (wf as any).steps[0];
+    const { byName, groups } = planOptions(whileStep.meta.bodySteps);
+    expectGroups(name, groups, [['a', 'b'], ['map']]);
+    const input = { topic: 'x', round: 0 };
+    const output = await wf.forward(ai, input);
+    writeFixture(flowDir, `${name}.json`, {
+      kind: 'flow',
+      name,
+      source: source(name, {
+        output,
+        rule: 'Each iteration of a while loop whose body runs a parallel group keeps its updates.',
+      }),
+      input,
+      steps: [
+        {
+          kind: 'while',
+          name: 'rounds',
+          condition: { op: 'lt', field: 'round', value: 2 },
+          options: { maxIterations: 5 },
+          steps: [
+            {
+              kind: 'execute',
+              name: 'a',
+              signature: 'topic:string -> summary:string',
+              options: byName.get('a'),
+            },
+            {
+              kind: 'execute',
+              name: 'b',
+              signature: 'topic:string -> title:string',
+              options: byName.get('b'),
+            },
+            {
+              kind: 'map',
+              name: 'nextRound',
+              mapper: { op: 'increment', field: 'round' },
+            },
+          ],
+        },
+      ],
+      returns: { aResult: 'aResult', bResult: 'bResult', round: 'round' },
+      responses: [
+        { content: 'Summary: s1' },
+        { content: 'Title: t1' },
+        { content: 'Summary: s2' },
+        { content: 'Title: t2' },
+      ],
+      expected_output: output,
+      expected_request_count: 4,
+    });
+  }
+
+  {
+    const name = 'parallel-group-loop-keeps-derive-update';
+    const b = new QueuedProgram('topic:string -> title:string', [
+      { title: 't1' },
+      { title: 't2' },
+    ]);
+    const wf = flow<{ topic: string; round: number }>({ autoParallel: true })
+      .node('b', b)
+      .while((state) => state.round < 2)
+      .derive('label', 'round', (value: number) => value)
+      .execute('b', (state) => ({ topic: state.topic }))
+      .map((state) => ({ ...state, round: state.round + 1 }))
+      .endWhile()
+      .returns((state) => ({
+        label: (state as any).label,
+        bResult: (state as any).bResult,
+        round: state.round,
+      }));
+    const whileStep = (wf as any).steps[0];
+    const { byName, groups } = planOptions(whileStep.meta.bodySteps);
+    expectGroups(name, groups, [['label', 'b'], ['map']]);
+    const input = { topic: 'x', round: 0 };
+    const output = await wf.forward(ai, input);
+    writeFixture(flowDir, `${name}.json`, {
+      kind: 'flow',
+      name,
+      source: source(name, {
+        output,
+        rule: 'A derive step in a loop body parallel group keeps each iteration update.',
+      }),
+      input,
+      steps: [
+        {
+          kind: 'while',
+          name: 'rounds',
+          condition: { op: 'lt', field: 'round', value: 2 },
+          options: { maxIterations: 5 },
+          steps: [
+            {
+              kind: 'derive',
+              name: 'label',
+              mapper: { op: 'copy', from: '__item', to: '__derived' },
+              options: byName.get('label'),
+            },
+            {
+              kind: 'execute',
+              name: 'b',
+              signature: 'topic:string -> title:string',
+              options: byName.get('b'),
+            },
+            {
+              kind: 'map',
+              name: 'nextRound',
+              mapper: { op: 'increment', field: 'round' },
+            },
+          ],
+        },
+      ],
+      returns: { label: 'label', bResult: 'bResult', round: 'round' },
+      responses: [{ content: 'Title: t1' }, { content: 'Title: t2' }],
+      expected_output: output,
+      expected_request_count: 2,
+    });
+  }
+};
+
+// A node's own run control (an AxGen constructor control) sees the node's
+// path: TS's executor always runs a node at <parent>/<node>, so the events
+// are at root/<node>, and at root/<outer>/<inner> inside a nested flow. A
+// flow control takes the node's events over. Each fixture's step flag
+// constructor_control gives that step's AxGen the recorded control.
+const writeNodeControlPathFixtures = async () => {
+  const lifecycle = ['started', 'completed', 'failed', 'aborted'];
+  type ControlEvent = { type: string; path: string };
+  const recorded = () => {
+    const control = runControl();
+    const events: ControlEvent[] = [];
+    control.onEvent(({ type, path }) => {
+      if (lifecycle.includes(type)) events.push({ type, path });
+    });
+    return { control, events };
+  };
+  const mockAI = () => {
+    let requests = 0;
+    const ai = new AxMockAIService({
+      features: { functions: false, streaming: false },
+      chatResponse: async () => {
+        requests++;
+        return { results: [{ index: 0, content: 'Answer: ok' }] } as never;
+      },
+    });
+    return { ai, requests: () => requests };
+  };
+  const signature = 'question:string -> answer:string';
+  const step = {
+    kind: 'execute',
+    name: 'first',
+    signature,
+    constructor_control: true,
+  };
+  for (const flowControl of [false, true]) {
+    const name = flowControl
+      ? 'node-constructor-control-under-flow-control'
+      : 'node-constructor-control-path';
+    const { ai, requests } = mockAI();
+    const node = recorded();
+    const wf = flow<{ question: string }, { answer: string }>()
+      .node('first', new AxGen(signature, { control: node.control }))
+      .execute('first', (state) => ({ question: state.question }))
+      .returns((state) => ({
+        answer: String((state as any).firstResult.answer),
+      }));
+    const run = recorded();
+    const output = await wf.forward(
+      ai,
+      { question: 'Status?' },
+      flowControl ? { control: run.control } : {}
+    );
+    writeFixture(flowDir, `${name}.json`, {
+      kind: 'flow',
+      name,
+      source: source(name, { output }),
+      input: { question: 'Status?' },
+      steps: [step],
+      returns: { answer: 'answer' },
+      responses: [{ content: 'Answer: ok' }],
+      ...(flowControl
+        ? { control: true, expected_control_events: run.events }
+        : {}),
+      expected_output: output,
+      expected_node_control_events: node.events,
+      expected_request_count: requests(),
+    });
+  }
+  // A nested flow's node runs at root/<outer>/<inner>. Under a flow control
+  // the control hears the outer flow, the nested flow and the node, each at
+  // its path.
+  for (const flowControl of [false, true]) {
+    const { ai, requests } = mockAI();
+    const node = recorded();
+    const inner = flow<{ question: string }, { answer: string }>()
+      .node('inner', new AxGen(signature, { control: node.control }))
+      .execute('inner', (state) => ({ question: state.question }))
+      .returns((state) => ({
+        answer: String((state as any).innerResult.answer),
+      }));
+    const outer = flow<{ question: string }, { answer: string }>()
+      .node('outer', inner)
+      .execute('outer', (state) => ({ question: state.question }))
+      .returns((state) => ({
+        answer: String((state as any).outerResult.answer),
+      }));
+    const run = recorded();
+    const output = await outer.forward(
+      ai,
+      { question: 'Status?' },
+      flowControl ? { control: run.control } : {}
+    );
+    const name = flowControl
+      ? 'node-constructor-control-nested-under-flow-control'
+      : 'node-constructor-control-nested-path';
+    writeFixture(flowDir, `${name}.json`, {
+      kind: 'flow',
+      name,
+      source: source(name, { output }),
+      input: { question: 'Status?' },
+      steps: [
+        {
+          kind: 'execute',
+          name: 'outer',
+          program: 'flow',
+          signature,
+          steps: [{ ...step, name: 'inner' }],
+          returns: { answer: 'answer' },
+        },
+      ],
+      returns: { answer: 'answer' },
+      responses: [{ content: 'Answer: ok' }],
+      ...(flowControl
+        ? { control: true, expected_control_events: run.events }
+        : {}),
+      expected_output: output,
+      expected_node_control_events: node.events,
+      expected_request_count: requests(),
+    });
+  }
+  // A node that fails fails the flow: the flow control hears the node's
+  // failure at root/<node>, then the flow's own at root. The service error
+  // is one TS does not retry.
+  {
+    let requests = 0;
+    const ai = new AxMockAIService({
+      features: { functions: false, streaming: false },
+      chatResponse: async () => {
+        requests++;
+        throw new AxAIServiceResponseError(
+          'Service fixture failure',
+          'mock://chat'
+        );
+      },
+    });
+    const node = recorded();
+    const wf = flow<{ question: string }, { answer: string }>()
+      .node('first', new AxGen(signature, { control: node.control }))
+      .execute('first', (state) => ({ question: state.question }))
+      .returns((state) => ({
+        answer: String((state as any).firstResult.answer),
+      }));
+    const run = recorded();
+    let error = '';
+    try {
+      await wf.forward(ai, { question: 'Status?' }, { control: run.control });
+    } catch (caught) {
+      error = caught instanceof Error ? caught.message : String(caught);
+    }
+    if (!error.includes('Service fixture failure')) {
+      throw new Error(`expected the flow to fail, got: ${error}`);
+    }
+    const name = 'node-constructor-control-failed-under-flow-control';
+    writeFixture(flowDir, `${name}.json`, {
+      kind: 'flow',
+      name,
+      source: source(name, { error }),
+      input: { question: 'Status?' },
+      steps: [step],
+      returns: { answer: 'answer' },
+      // One scripted response: a retry would find none and fail otherwise.
+      responses: [
+        { error: { type: 'response', message: 'Service fixture failure' } },
+      ],
+      control: true,
+      expected_error_contains: 'Service fixture failure',
+      expected_control_events: run.events,
+      expected_node_control_events: node.events,
+    });
+    if (requests !== 1) {
+      throw new Error(`expected TS to send one request, sent ${requests}`);
+    }
+  }
+};
+
 writeProgramFixtures();
 writePlanFixtures();
 await runSimpleForward();
+await writeParallelMergeFixtures();
+await writeOwnedWorkerFallbackFixture();
 await writeExecutionRuntimeFixtures();
 await writeMapAndCacheFixtures();
 await writeControlFlowRuntimeFixtures();
 writeDemoFixture();
 writeMermaidFixtures();
+await writeNodeControlPathFixtures();
 
 console.log('wrote TS-derived AxFlow AxIR conformance fixtures');

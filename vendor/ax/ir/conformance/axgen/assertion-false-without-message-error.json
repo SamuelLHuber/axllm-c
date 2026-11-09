@@ -5,7 +5,8 @@
       "return": false
     }
   ],
-  "expected_error_contains": "assertion failed without message",
+  "expected_error_contains": "Assertion failed without message",
+  "expected_request_count": 1,
   "input": {
     "question": "Assert"
   },
@@ -20,6 +21,9 @@
     },
     {
       "content": "{\"answer\":\"again\"}"
+    },
+    {
+      "content": "{\"answer\":\"once more\"}"
     }
   ],
   "signature": "question:string -> answer:string"

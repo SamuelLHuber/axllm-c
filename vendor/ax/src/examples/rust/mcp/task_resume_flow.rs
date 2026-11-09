@@ -10,7 +10,7 @@
 // ax-example:end
 use axllm::{
     ax, AxEventEnvelope, AxEventRoute, AxEventRuntime, AxEventTarget, AxMCPClient,
-    AxMCPEventSource, AxMCPStreamableHTTPTransport, AxResult, OpenAICompatibleClient,
+    AxMCPEventSource, AxMCPStreamableHTTPTransport, AxMCPToolCallOutcome, AxResult,
 };
 use serde_json::{json, Map};
 use std::{
@@ -28,7 +28,7 @@ fn main() -> AxResult<()> {
     })?;
     let local = endpoint.starts_with("http://127.0.0.1");
     let transport = AxMCPStreamableHTTPTransport::new(
-        endpoint,
+        endpoint.clone(),
         json!({"ssrfProtection":{"requireHttps":!local,"allowLocalhost":local,"allowPrivateNetworks":local}}),
     )?;
     let client = Arc::new(Mutex::new(AxMCPClient::new(
@@ -36,12 +36,19 @@ fn main() -> AxResult<()> {
         json!({"namespace":"inventory"}),
     )));
     client.lock().unwrap().init()?;
-    let task = client
+    // A modern server answers with a task; a legacy server returns it inside a
+    // complete result.
+    let outcome = client
         .lock()
         .unwrap()
-        .call_tool("start_reindex", json!({"scope":"all"}))?;
-    let task_id = task["task"]["taskId"].as_str().unwrap().to_string();
-    let mut llm = OpenAICompatibleClient::new(key, "gpt-5.4-mini");
+        .call_tool_outcome("start_reindex", json!({"scope":"all"}))?;
+    let task = match outcome {
+        AxMCPToolCallOutcome::Task(task) => Some(task),
+        AxMCPToolCallOutcome::Complete(result) => result.get("task").cloned(),
+    }
+    .expect("start_reindex did not start an MCP task");
+    let task_id = task["taskId"].as_str().unwrap().to_string();
+    let mut llm = axllm::ai("openai", json!({"api_key": key, "model": "gpt-5.4-mini"}))?;
     let mut flow = axllm::flow("reindex-flow")
         .execute("status", ax("taskId:string -> status:string")?)
         .returns(json!({"status":"status"}));
@@ -49,6 +56,10 @@ fn main() -> AxResult<()> {
     let completed_target = completed.clone();
     let mut target = AxEventTarget::new("reindex-flow", move |input, _| {
         let output = flow.forward(&mut llm, input)?;
+        for key in ["status"] {
+            let value = &output[key];
+            assert!(!value.is_null() && value != "" && *value != json!([]), "flow output field {key} is empty: {output}");
+        }
         println!("{output}");
         let (lock, changed) = &*completed_target;
         *lock.lock().unwrap() += 1;
@@ -123,6 +134,9 @@ fn main() -> AxResult<()> {
     );
     source.start()?;
     println!("Waiting for terminal MCP task notification {task_id}");
+    if env::var("AX_MCP_DEMO_AUTO").as_deref() == Ok("1") {
+        complete_demo_task(&endpoint)?;
+    }
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         source.poll();
@@ -139,5 +153,26 @@ fn main() -> AxResult<()> {
     source.close()?;
     client.lock().unwrap().close()?;
     runtime.lock().unwrap().close()?;
+    Ok(())
+}
+
+// AX_MCP_DEMO_AUTO=1: the repo's demo server (plain HTTP on 127.0.0.1)
+// completes the task on request.
+fn complete_demo_task(endpoint: &str) -> AxResult<()> {
+    use std::io::{Read, Write};
+    let authority = endpoint
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    let failed = |error: std::io::Error| axllm::AxError::runtime(error.to_string());
+    let mut stream = std::net::TcpStream::connect(authority).map_err(failed)?;
+    write!(
+        stream,
+        "POST /control/task/complete HTTP/1.1\r\nHost: {authority}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .map_err(failed)?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).map_err(failed)?;
     Ok(())
 }

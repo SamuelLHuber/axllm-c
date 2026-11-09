@@ -2,27 +2,46 @@ from __future__ import annotations
 import os
 
 from abc import ABC, abstractmethod
+import contextvars
 import copy
+from datetime import datetime, timezone
 import json
 import math
+import queue
 import re
+import threading
 from typing import Any
 
 from .ai import (
+    _cancellation_token,
+    AxAIServiceAbortedError,
     AxMeter,
     AxRateLimiter,
     AxRuntimeHooks,
     AxTracer,
     _coerce_runtime_hooks,
+    _core_math_abs,
+    _core_math_floor,
     _merge_runtime_hooks,
     _runtime_hook_scope,
     _runtime_hooks_from_options,
     _strip_runtime_hooks,
 )
 
+from .session import _core_run_control_aborted
 from .gen import (
     AxGen,
+    _StreamingConsumerStopped,
     _core_ai_complete_once,
+    _core_ai_client_features,
+    _core_axgen_deprecation,
+    _core_fields_from_map,
+    _core_exception_message,
+    _core_string_index_of,
+    _core_string_str,
+    _core_string_utf16_units,
+    _core_tool_invoke,
+    _core_validation_error,
     _ace_apply_curator_operations,
     _ace_dedupe_playbook,
     _ace_empty_playbook,
@@ -35,17 +54,21 @@ from .gen import (
     _build_optimization_eval_result,
     _build_optimization_eval_row,
     _deserialize_optimized_artifact,
+    _gepa_baseline_report,
+    _gepa_helper_metric_budget,
+    _gepa_pareto_set_size,
     _normalize_optimization_dataset,
     _normalize_optimization_metric_scores,
     _normalize_optimizer_engine_response,
     _optimization_component_current_map,
+    _optimization_bootstrap_demo,
     _prepare_optimizer_run,
     _scalarize_optimization_scores,
     _validate_optimization_component_map,
     _validate_optimized_artifact,
 )
 from .mcp import resolve_execution_context
-from .signature import AxSignature, parse_signature
+from .signature import _core_record_new, AxSignature, _js_json_dumps, _js_number_text, parse_signature, f as _signature_builder, _js_format
 # AXIR_CORE_IMPORTS
 
 
@@ -278,6 +301,10 @@ class AxBootstrapFewShot(OptimizerEngine):
         max_examples = _gepa_int(_gepa_option(options, "maxExamples", "max_examples", default=16), 16, 1)
         max_demos = _gepa_int(_gepa_option(options, "maxDemos", "max_demos", default=4), 4, 1)
         batch_size = _gepa_int(_gepa_option(options, "batchSize", "batch_size", default=1), 1, 1)
+        teacher_options = _gepa_option(options, "teacherOptions", "teacher_options", default=None) or {}
+        evaluate_extra = {}
+        if teacher_options:
+            evaluate_extra["forward_options"] = {**teacher_options, **(options.get("forward_options") or {})}
         base_cfg = _gepa_current_map(components)
         demos = []
         accepted = set()
@@ -295,7 +322,7 @@ class AxBootstrapFewShot(OptimizerEngine):
                     example_key = json.dumps(example, sort_keys=True, default=str)
                     if example_key in accepted:
                         continue
-                    result = evaluator.evaluate(dict(base_cfg), {"dataset": {"train": [example], "validation": []}, "phase": "bootstrap", "round": round_index})
+                    result = evaluator.evaluate(dict(base_cfg), {"dataset": {"train": [example], "validation": []}, "phase": "bootstrap", "round": round_index, **evaluate_extra})
                     rows = list((result or {}).get("rows") or [])
                     total_calls += int((result or {}).get("count", len(rows) or 1))
                     if not rows:
@@ -303,7 +330,7 @@ class AxBootstrapFewShot(OptimizerEngine):
                     row = rows[0]
                     if _gepa_num(row.get("scalar"), 0) >= threshold:
                         accepted.add(example_key)
-                        demos.append({"programId": "root", "traces": [copy.deepcopy(row.get("prediction", row.get("input", {})))]})
+                        demos.append(_optimization_bootstrap_demo(row))
         return {
             "artifactVersion": "axir-optimized-artifact-v1",
             "optimizerName": self.name,
@@ -331,6 +358,8 @@ class AxGEPA(OptimizerEngine):
         self.rng_state = _gepa_int(self.options.get("seed"), 123456789) or 123456789
         self.selector_state = {}
         self.feedback_memory = []
+        self._baseline_evaluation = None
+        self._active_demos = []
 
     def _rand(self):
         self.rng_state ^= (self.rng_state << 13) & 0xFFFFFFFF
@@ -413,9 +442,12 @@ class AxGEPA(OptimizerEngine):
         needed = len(examples or [])
         if total_calls + needed > max_calls:
             if throw:
-                raise RuntimeError(f"AxGEPA: options.maxMetricCalls={max_calls} is too small to evaluate the initial Pareto set; need at least {needed} metric calls")
+                raise RuntimeError(f"AxGEPA: options.maxMetricCalls={max_calls} is too small for {phase}; need at least {total_calls + needed} metric calls")
             return None, total_calls
-        result = evaluator.evaluate(dict(cfg), {"dataset": self._dataset_for(examples), "phase": phase, "captureTraces": capture_traces})
+        eval_options = {"dataset": self._dataset_for(examples), "phase": phase, "captureTraces": capture_traces}
+        if self._active_demos:
+            eval_options["demos"] = copy.deepcopy(self._active_demos)
+        result = evaluator.evaluate(dict(cfg), eval_options)
         rows = list((result or {}).get("rows") or [])
         scalars = [_gepa_num(row.get("scalar"), 0) for row in rows]
         out = {
@@ -429,17 +461,35 @@ class AxGEPA(OptimizerEngine):
         }
         return out, total_calls + out["count"]
 
+    def _teacher_logger(self, options):
+        if _gepa_option(options, "verbose", default=None) is False:
+            return None
+        logger = _gepa_option(options, "logger", default=None)
+        if logger is not None:
+            return logger
+        student = _gepa_option(options, "studentAI", "student_ai", "student", "client", "ai", default=None)
+        get_logger = getattr(student, "get_logger", None)
+        return get_logger() if callable(get_logger) else None
+
+    def _log_teacher_failure(self, action, error, options):
+        logger = self._teacher_logger(options)
+        if logger is not None:
+            logger({"name": "Notification", "id": "gepa_teacher", "value": f"GEPA teacher call failed while {action}: {error}"})
+
     def _reflect(self, component, current, tuples, trace_dataset, options):
         if self.reflection_client is None:
             raise RuntimeError("AxGEPA requires a reflection_client for reflective trials")
         attempts = max(1, _gepa_int(_gepa_option(options, "maxReflectionAttempts", "max_reflection_attempts", default=2), 2))
+        chat_options = {**(_gepa_option(options, "teacherOptions", "teacher_options", default=None) or {}), "stream": False}
         previous_error = None
+        last_error = None
         for _ in range(attempts):
+            last_error = None
             prompt = {
                 "chatPrompt": [
                     {
                         "role": "user",
-                        "content": json.dumps(
+                        "content": _js_json_dumps(
                             {
                                 "componentKey": component.get("id"),
                                 "componentKind": component.get("kind"),
@@ -449,17 +499,26 @@ class AxGEPA(OptimizerEngine):
                                 "traceDataset": trace_dataset,
                             },
                             sort_keys=True,
+                            separators=(", ", ": "),
                         ),
                     }
                 ],
                 "model": _gepa_option(options, "reflectionModel", "reflection_model"),
             }
-            response = self.reflection_client.chat(prompt, {"stream": False})
+            try:
+                response = self.reflection_client.chat(prompt, chat_options)
+            except AxAIServiceAbortedError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                continue
             candidate = _gepa_extract_text(response).strip()
             validation = _gepa_validate_component_value(component, candidate)
             if validation is True:
                 return candidate
             previous_error = validation
+        if last_error is not None:
+            self._log_teacher_failure(f"proposing a new value for {component.get('id')}; keeping the current value", last_error, options)
         return current
 
     def _next_minibatch(self, train, iteration, size):
@@ -492,7 +551,7 @@ class AxGEPA(OptimizerEngine):
                 continue
             row = result["rows"][0]
             if _gepa_num(row.get("scalar"), 0) >= threshold:
-                demos.append({"programId": "root", "traces": [copy.deepcopy(row.get("prediction", row.get("input", {})))]})
+                demos.append(_optimization_bootstrap_demo(row))
         return demos, total_calls
 
     def optimize(self, request: dict[str, Any], evaluator: OptimizerEvaluator | None = None) -> dict[str, Any]:
@@ -513,14 +572,31 @@ class AxGEPA(OptimizerEngine):
         minibatch_size = _gepa_int(_gepa_option(options, "minibatchSize", "minibatch_size", default=20), 20, 1)
         early_stop = _gepa_int(_gepa_option(options, "earlyStoppingTrials", "early_stopping_trials", default=5), 5, 1)
         min_improvement = _gepa_num(_gepa_option(options, "minImprovementThreshold", "min_improvement_threshold", default=0), 0)
-        pareto_size = _gepa_int(_gepa_option(options, "paretoSetSize", "pareto_set_size", default=max(10, min(200, minibatch_size * 3))), max(10, min(200, minibatch_size * 3)), 1, 1000)
+        pareto_size = int(_gepa_pareto_set_size(options))
         tie_eps = _gepa_num(_gepa_option(options, "tieEpsilon", "tie_epsilon", default=0), 0)
         base_cfg = _gepa_current_map(components)
         pareto_set = validation[:pareto_size]
         self._selector_init(components, _gepa_option(options, "selectorState", "selector_state"))
         total_calls = 0
-        demos, total_calls = self._bootstrap(evaluator, base_cfg, train, options, total_calls, max_calls)
-        base_eval, total_calls = self._evaluate(evaluator, base_cfg, pareto_set, "initial Pareto evaluation", max_calls, total_calls, True)
+        self._active_demos = []
+        baseline_eval = copy.deepcopy(options.get("_baselineEvaluation"))
+        if baseline_eval is None:
+            baseline_eval, total_calls = self._evaluate(evaluator, base_cfg, pareto_set, "baseline evaluation", max_calls, total_calls, True)
+        else:
+            total_calls = int(baseline_eval.get("count", len(pareto_set)))
+        self._baseline_evaluation = copy.deepcopy(baseline_eval)
+        baseline_report = _gepa_baseline_report(baseline_eval, options)
+        bootstrap_calls = int(options.get("_bootstrapMetricCalls", 0))
+        demos = copy.deepcopy(options.get("_bootstrapDemos") or [])
+        if options.get("bootstrap"):
+            raw_bootstrap = options["bootstrap"]
+            boot_options = raw_bootstrap if isinstance(raw_bootstrap, dict) else {}
+            boot_limit = _gepa_int(_gepa_option(boot_options, "maxBootstrapMetricCalls", "max_bootstrap_metric_calls", default=min(len(train), 8) or 1), min(len(train), 8) or 1, 1)
+            demos, bootstrap_calls = self._bootstrap(evaluator, base_cfg, train, options, 0, boot_limit)
+        self._active_demos = demos
+        base_eval = baseline_eval
+        if demos:
+            base_eval, total_calls = self._evaluate(evaluator, base_cfg, pareto_set, "bootstrapped Pareto evaluation", max_calls, total_calls, True)
         candidates = [{"cfg": dict(base_cfg), "scores": base_eval["avgScores"] or {"score": base_eval["avg"]}, "parent": None}]
         per_instance = [base_eval["scalars"]]
         stagnation = 0
@@ -581,6 +657,7 @@ class AxGEPA(OptimizerEngine):
             "artifactVersion": "axir-optimized-artifact-v1",
             "optimizerName": "GEPA",
             "optimizerVersion": self.version,
+            **baseline_report,
             "componentMap": best_cfg,
             "demos": demos,
             "metadata": {
@@ -588,7 +665,10 @@ class AxGEPA(OptimizerEngine):
                 "selectorState": copy.deepcopy(self.selector_state),
                 "paretoFront": pareto_meta,
                 "bestScore": 0 if best_score == -1e100 else best_score,
+                **baseline_report,
                 "totalMetricCalls": total_calls,
+                "bootstrapMetricCalls": bootstrap_calls,
+                "totalCalls": total_calls + bootstrap_calls,
                 "candidatesExplored": len(candidates),
                 "report": {
                     "summary": "GEPA Multi-Objective Optimization Complete",
@@ -620,6 +700,12 @@ def _ace_option(options, *keys, default=None):
         if isinstance(options, dict) and key in options and options.get(key) is not None:
             return options.get(key)
     return default
+
+
+def _ace_wall_clock():
+    """The current UTC time as JavaScript's toISOString writes it."""
+    now = datetime.now(timezone.utc)
+    return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
 
 
 class AxACE:
@@ -657,8 +743,10 @@ class AxACE:
             else _ace_empty_playbook(None, self._now())
         )
 
+    # The injected clock (`now`), else the wall clock at each call, as TS's
+    # new Date().toISOString() stamps each playbook change.
     def _now(self):
-        return self.options.get("now") or "1970-01-01T00:00:00.000Z"
+        return self.options.get("now") or _ace_wall_clock()
 
     def reset(self):
         self.playbook = (
@@ -967,44 +1055,91 @@ class AxACE:
         return curator_result
 
 
-_ACE_REFLECTOR_SIGNATURE = (
-    'question:string "Original task input serialized as JSON", '
-    'generator_answer:string "Generator output serialized as JSON", '
-    'generator_reasoning?:string "Generator reasoning trace", '
-    'playbook:string "Current context playbook rendered as markdown", '
-    'expected_answer?:string "Expected output when ground truth is available", '
-    'feedback?:string "External feedback or reward signal", '
-    'previous_reflection?:string "Most recent reflection JSON when running multi-round refinement" '
-    '-> reasoning:string "Step-by-step analysis of generator performance", '
-    'errorIdentification:string "Specific mistakes detected", '
-    'rootCauseAnalysis:string "Underlying cause of the error", '
-    'correctApproach:string "What the generator should do differently", '
-    'keyInsight:string "Reusable insight to remember", '
-    'bulletTags:json "Array of {id, tag} entries referencing playbook bullets"'
+# The reflector and curator signatures TS builds (src/ax/dsp/optimizers/ace.ts),
+# built with the field builder: a signature string cannot carry a description
+# with double quotes, as the curator's operations description has.
+def _ace_reflector_signature():
+    return (
+        _signature_builder()
+        .input("question", _signature_builder.string("Original task input serialized as JSON"))
+        .input("generator_answer", _signature_builder.string("Generator output serialized as JSON"))
+        .input("generator_reasoning", _signature_builder.string("Generator reasoning trace").optional())
+        .input("playbook", _signature_builder.string("Current context playbook rendered as markdown"))
+        .input("expected_answer", _signature_builder.string("Expected output when ground truth is available").optional())
+        .input("feedback", _signature_builder.string("External feedback or reward signal").optional())
+        .input("previous_reflection", _signature_builder.string("Most recent reflection JSON when running multi-round refinement").optional())
+        .output("reasoning", _signature_builder.string("Step-by-step analysis of generator performance"))
+        .output("errorIdentification", _signature_builder.string("Specific mistakes detected"))
+        .output("rootCauseAnalysis", _signature_builder.string("Underlying cause of the error"))
+        .output("correctApproach", _signature_builder.string("What the generator should do differently"))
+        .output("keyInsight", _signature_builder.string("Reusable insight to remember"))
+        .output("bulletTags", _signature_builder.json("Array of {id, tag} entries referencing playbook bullets"))
+        .build()
+    )
+
+
+_ACE_CURATOR_OPERATIONS_DESCRIPTION = (
+    'List of operations, each {type: "ADD"|"UPDATE"|"REMOVE", section, content}. '
+    "Emit an operation ONLY when the playbook should actually change. "
+    "If nothing should change, return an empty array — never emit an ADD whose content "
+    'just acknowledges that no change is needed (e.g. "No update required", '
+    '"Keep the existing rule unchanged"). '
+    "Each ADD content must be a standalone, reusable rule."
 )
 
-_ACE_CURATOR_SIGNATURE = (
-    'playbook:string "Current playbook serialized as JSON", '
-    'reflection:string "Latest reflection output serialized as JSON", '
-    'question_context:string "Original task input serialized as JSON", '
-    'token_budget?:number "Approximate token budget for curator response" '
-    '-> reasoning:string "Justification for the proposed updates", '
-    'operations:json "List of operations with type/section/content fields"'
+
+def _ace_curator_signature():
+    return (
+        _signature_builder()
+        .input("playbook", _signature_builder.string("Current playbook serialized as JSON"))
+        .input("reflection", _signature_builder.string("Latest reflection output serialized as JSON"))
+        .input("question_context", _signature_builder.string("Original task input serialized as JSON"))
+        .input("token_budget", _signature_builder.number("Approximate token budget for curator response").optional())
+        .output("reasoning", _signature_builder.string("Justification for the proposed updates"))
+        .output("operations", _signature_builder.json(_ACE_CURATOR_OPERATIONS_DESCRIPTION))
+        .build()
+    )
+
+# The weakness miner's description and signature, as TS builds them
+# (src/ax/agent/agentInternal/playbookEvolve/weaknessMiner.ts).
+_AGENT_PLAYBOOK_WEAKNESS_MINER_DESCRIPTION = (
+    "You are a failure analyst for an LLM agent harness. You receive one "
+    "cluster of failed agent runs sharing an error signature, with excerpts "
+    "of what the agent actually did. Identify the single recurring weakness, "
+    "its root cause, and one narrow, durable avoidance rule the agent should "
+    "recall while acting. Ground every claim: evidenceQuotes must be verbatim "
+    "substrings copied from the excerpts. Keep proposedGuidance concise, "
+    "imperative, and general to the failure mode (not one task). Use "
+    "configRecommendations only for setup problems no prompt text can fix "
+    "(missing tools, timeouts, model choice)."
 )
 
-_AGENT_PLAYBOOK_WEAKNESS_MINER_SIGNATURE = (
-    'clusterSignature:string "Shared error signature of the cluster", '
-    'taskSummaries:string "One line per failing task", '
-    'actionLogExcerpts:string "Excerpts of the failing runs, centered on the failure", '
-    'functionCallSummary?:string "Digest of runtime/tool calls in the failing runs", '
-    'toolErrors?:string "Tool errors observed", '
-    'currentPlaybook?:string "The failure-avoidance playbook currently applied" '
-    '-> weaknessDescription:string "The recurring weakness, one sentence", '
-    'rootCause:string "Why the runs fail, mechanically", '
-    'proposedGuidance:string "One concise imperative avoidance rule", '
-    'evidenceQuotes:json "Verbatim substrings copied from actionLogExcerpts", '
-    'configRecommendations?:json "Setup suggestions no prompt text can fix"'
-)
+
+def _agent_playbook_weakness_miner_signature():
+    return (
+        _signature_builder()
+        .input("clusterSignature", _signature_builder.string("Shared error signature of the cluster."))
+        .input("taskSummaries", _signature_builder.string("One line per failing task."))
+        .input("actionLogExcerpts", _signature_builder.string("Excerpts of the failing runs, centered on the failure."))
+        .input("functionCallSummary", _signature_builder.string("Digest of runtime/tool calls in the failing runs.").optional())
+        .input("toolErrors", _signature_builder.string("Tool errors observed.").optional())
+        .input("currentPlaybook", _signature_builder.string("The failure-avoidance playbook currently applied.").optional())
+        .output("weaknessDescription", _signature_builder.string("The recurring weakness, one sentence."))
+        .output("rootCause", _signature_builder.string("Why the runs fail, mechanically."))
+        .output("proposedGuidance", _signature_builder.string("The avoidance rule to add to the playbook — concise, imperative."))
+        .output("evidenceQuotes", _signature_builder.string("Verbatim substrings from actionLogExcerpts proving the weakness.").array())
+        .output("configRecommendations", _signature_builder.string("Setup/config suggestions no prompt text can fix.").array().optional())
+        .description(_AGENT_PLAYBOOK_WEAKNESS_MINER_DESCRIPTION)
+        .build()
+    )
+
+
+def _agent_evolve_prediction_error(prediction):
+    # The message of the ports' error prediction (TS's thrown run).
+    error = (prediction or {}).get("error")
+    if isinstance(error, dict):
+        return str(error.get("message") or "")
+    return str(error or "")
 
 
 def _playbook_option(options, *keys, default=None):
@@ -1019,6 +1154,57 @@ def _playbook_stringify(value):
         return _core_json_stringify(value)
     except Exception:
         return json.dumps(str(value))
+
+
+# JSON.stringify: compact, in insertion order (the Core stringify sorts keys).
+def _playbook_js_json(value):
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+
+
+# TS stringifyBounded: JSON of the value with every string cut to the ACE
+# config's maxSerializedFieldChars. As in TS, lengths count UTF-16 code units;
+# a cut inside a surrogate pair leaves U+FFFD, as the other ports do.
+def _playbook_truncate(value, max_chars):
+    max_chars = max(0, int(max_chars))
+    units = value.encode("utf-16-le")
+    if len(units) // 2 <= max_chars:
+        return value
+    suffix = "...[truncated]"
+    if max_chars <= len(suffix):
+        return units[: 2 * max_chars].decode("utf-16-le", "replace")
+    return units[: 2 * (max_chars - len(suffix))].decode("utf-16-le", "replace") + suffix
+
+
+def _playbook_bound(value, max_chars, seen=None):
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return _playbook_truncate(value, max_chars)
+    if not isinstance(value, (list, dict)):
+        return _playbook_truncate(str(value), max_chars)
+    seen = set() if seen is None else seen
+    if id(value) in seen:
+        return "[Circular]"
+    seen.add(id(value))
+    if isinstance(value, list):
+        bounded = [_playbook_bound(entry, max_chars, seen) for entry in value]
+    else:
+        bounded = {key: _playbook_bound(entry, max_chars, seen) for key, entry in value.items()}
+    seen.discard(id(value))
+    return bounded
+
+
+def _playbook_stringify_bounded(value, max_chars):
+    try:
+        return _playbook_js_json(_playbook_bound(value, max_chars))
+    except Exception:
+        return _playbook_js_json("[Unserializable]")
+
+
+# TS extractFieldValues: the example's values for the given signature fields.
+def _playbook_field_values(example, fields):
+    example = example if isinstance(example, dict) else {}
+    return {field.name: example[field.name] for field in fields if field.name in example}
 
 
 def _playbook_compose_instruction(base, rendered):
@@ -1040,6 +1226,7 @@ class AxPlaybook:
         self.program = program
         self.student_ai = _playbook_option(opts, "studentAI", "student_ai", "student", "client", "ai")
         self.teacher_ai = _playbook_option(opts, "teacherAI", "teacher_ai", "teacher", default=self.student_ai)
+        self.teacher_options = dict(_playbook_option(opts, "teacherOptions", "teacher_options", default=None) or {})
         if self.student_ai is None:
             raise ValueError("playbook() requires studentAI or client")
         self.verbose = bool(opts.get("verbose"))
@@ -1078,34 +1265,57 @@ class AxPlaybook:
 
     def _get_reflector_program(self):
         if self._reflector_program is None:
-            self._reflector_program = AxGen(_ACE_REFLECTOR_SIGNATURE, {"validation_retries": 1, "id": "ace.reflector"})
+            self._reflector_program = AxGen(_ace_reflector_signature(), {"validation_retries": 1, "id": "ace.reflector"})
         return self._reflector_program
 
     def _get_curator_program(self):
         if self._curator_program is None:
-            self._curator_program = AxGen(_ACE_CURATOR_SIGNATURE, {"validation_retries": 1, "id": "ace.curator"})
+            self._curator_program = AxGen(_ace_curator_signature(), {"validation_retries": 1, "id": "ace.curator"})
         return self._curator_program
 
+    def _program_fields(self):
+        signature = getattr(self.program, "signature", None)
+        if signature is None or not hasattr(signature, "get_input_fields"):
+            return [], []
+        return signature.get_input_fields(), signature.get_output_fields()
+
+    def _max_serialized_chars(self):
+        return self.engine.config.get("maxSerializedFieldChars", 2000)
+
+    # As in TS, the reflector and curator get the playbook as
+    # JSON.stringify({markdown, structured}): the rendered markdown and the
+    # playbook itself.
+    def _playbook_input(self, rendered):
+        return _playbook_js_json({"markdown": rendered, "structured": self.engine.get_playbook()})
+
     # The real LLM reflector: a focused AxGen sub-program driven by the teacher.
+    # As in TS, the question holds the example's input fields and the expected
+    # answer its output fields.
     def _run_reflector(self, payload):
         payload = dict(payload or {})
         reflector = self._get_reflector_program()
         reflector_ai = self.teacher_ai or self.student_ai
+        inputs, outputs = self._program_fields()
+        max_chars = self._max_serialized_chars()
+        expected_answer = _playbook_field_values(payload.get("question"), outputs)
         request = {
-            "question": _playbook_stringify(payload.get("question")),
-            "generator_answer": _playbook_stringify(payload.get("generator_answer")),
+            "question": _playbook_stringify_bounded(_playbook_field_values(payload.get("question"), inputs), max_chars),
+            "generator_answer": _playbook_stringify_bounded(payload.get("generator_answer"), max_chars),
             "generator_reasoning": payload.get("generator_reasoning"),
-            "playbook": payload.get("playbook"),
+            "playbook": self._playbook_input(payload.get("playbook")),
+            "expected_answer": (
+                _playbook_stringify_bounded(expected_answer, max_chars) if expected_answer else None
+            ),
             "feedback": payload.get("feedback"),
             "previous_reflection": (
-                _playbook_stringify(payload.get("previous_reflection"))
+                _playbook_js_json(payload.get("previous_reflection"))
                 if payload.get("previous_reflection") is not None
                 else None
             ),
         }
         request = {key: value for key, value in request.items() if value is not None}
         try:
-            return reflector.forward(reflector_ai, request)
+            return reflector.forward(reflector_ai, request, dict(self.teacher_options))
         except Exception as exc:
             if self.verbose:
                 print("[AxPlaybook] reflector error:", exc)
@@ -1116,15 +1326,18 @@ class AxPlaybook:
         payload = dict(payload or {})
         curator = self._get_curator_program()
         curator_ai = self.teacher_ai or self.student_ai
+        inputs, _ = self._program_fields()
         request = {
-            "playbook": payload.get("playbook"),
-            "reflection": _playbook_stringify(payload.get("reflection")),
-            "question_context": _playbook_stringify(payload.get("question_context")),
+            "playbook": self._playbook_input(payload.get("playbook")),
+            "reflection": _playbook_js_json(payload.get("reflection")),
+            "question_context": _playbook_stringify_bounded(
+                _playbook_field_values(payload.get("question_context"), inputs), self._max_serialized_chars()
+            ),
             "token_budget": payload.get("token_budget", 1024),
         }
         request = {key: value for key, value in request.items() if value is not None}
         try:
-            return curator.forward(curator_ai, request)
+            return curator.forward(curator_ai, request, dict(self.teacher_options))
         except Exception as exc:
             if self.verbose:
                 print("[AxPlaybook] curator error:", exc)
@@ -1224,27 +1437,38 @@ def optimize(program, examples, options: dict[str, Any] | None = None):
     if student is None:
         raise ValueError("optimize() requires studentAI or client")
     teacher = _optimize_option(opts, "teacherAI", "teacher_ai", "teacher", "reflectionAI", "reflection_ai", "reflection_client", default=student)
-    max_metric_calls = _gepa_int(_optimize_option(opts, "maxMetricCalls", "max_metric_calls", default=100), 100, 1)
-    bootstrap_setting = opts.get("bootstrap") if "bootstrap" in opts else (len(examples or []) <= 8)
+    dataset = _normalize_optimization_dataset(examples or [])
+    validation_examples = _optimize_option(opts, "validationExamples", "validation_examples")
+    if validation_examples is not None:
+        dataset["validation"] = list(validation_examples)
+    validation = dataset.get("validation") or dataset.get("train") or []
+    bootstrap_setting = opts.get("bootstrap") if "bootstrap" in opts else (len(dataset.get("train") or []) <= 8)
+    max_metric_calls = int(_gepa_helper_metric_budget(opts, len(validation), bootstrap_setting is not False))
+    gepa_options = {**opts, "bootstrap": False, "maxMetricCalls": max_metric_calls, "client": student, "apply": False}
     demos = []
+    bootstrap_calls = 0
     if bootstrap_setting is not False:
+        baseline_options = {**gepa_options, "numTrials": 0}
+        baseline_engine = AxGEPA(teacher, **baseline_options)
+        program.optimize_with(baseline_engine, dataset, baseline_options)
+        gepa_options["_baselineEvaluation"] = baseline_engine._baseline_evaluation
         bootstrap_options = dict(opts)
         if isinstance(bootstrap_setting, dict):
             bootstrap_options.update(bootstrap_setting)
         bootstrap_options["client"] = teacher or student
         bootstrap_options["apply"] = False
         bootstrap = AxBootstrapFewShot(**bootstrap_options)
-        bootstrap_artifact = program.optimize_with(bootstrap, examples or [], bootstrap_options)
+        bootstrap_artifact = program.optimize_with(bootstrap, dataset, bootstrap_options)
         demos = list((bootstrap_artifact or {}).get("demos") or [])
+        if not demos:
+            raise RuntimeError("No demonstrations found. Either provide more examples or improve the existing ones.")
+        bootstrap_calls = int((bootstrap_artifact.get("metadata") or {}).get("totalMetricCalls", 0))
         if demos and hasattr(program, "set_demos"):
             program.set_demos(demos)
-    gepa_options = dict(opts)
-    gepa_options["bootstrap"] = False
-    gepa_options["maxMetricCalls"] = max_metric_calls
-    gepa_options["client"] = student
-    gepa_options["apply"] = False
+    gepa_options["_bootstrapDemos"] = demos
+    gepa_options["_bootstrapMetricCalls"] = bootstrap_calls
     engine = AxGEPA(teacher, **gepa_options)
-    artifact = program.optimize_with(engine, examples or [], gepa_options)
+    artifact = program.optimize_with(engine, dataset, gepa_options)
     if demos:
         artifact["demos"] = demos
     return artifact
@@ -1309,7 +1533,14 @@ class AxAgentPlaybook:
         if not train:
             raise ValueError("AxAgent.playbook().evolve(): at least one training task is required.")
         client = _playbook_option(opts, "studentAI", "student_ai", "client", "ai") or self.inner.student_ai
-        teacher = _playbook_option(opts, "teacherAI", "teacher_ai", "teacher") or self.inner.teacher_ai or client
+        evolve_teacher = _playbook_option(opts, "teacherAI", "teacher_ai", "teacher")
+        teacher = evolve_teacher or self.inner.teacher_ai or client
+        # The miner's options go with its model: explicit evolve teacherOptions,
+        # else the playbook's own when the miner runs on the playbook's teacher.
+        teacher_options = _playbook_option(opts, "teacherOptions", "teacher_options", default=None)
+        if teacher_options is None:
+            teacher_options = self.inner.teacher_options if evolve_teacher is None and teacher is self.inner.teacher_ai else {}
+        teacher_options = dict(teacher_options or {})
         metric = opts.get("metric")
         score_threshold = float(opts.get("scoreThreshold", opts.get("score_threshold", 0.7)))
         min_gain = float(opts.get("minHeldInGain", opts.get("min_held_in_gain", 0.05)))
@@ -1346,11 +1577,18 @@ class AxAgentPlaybook:
                         break
                     remaining[0] -= 1
                     try:
-                        prediction = self.agent.evaluate_optimization_task(client, task, opts)
-                        if callable(metric):
-                            score = float(metric({"example": task, "task": task, "prediction": prediction}))
+                        candidate = self.agent.evaluate_optimization_task(client, task, opts)
+                        if (candidate or {}).get("completionType") == "error":
+                            # TS's harness sees a thrown run: a zero score with
+                            # no metric call, and its message as the error.
+                            score = 0.0
+                            error = _agent_evolve_prediction_error(candidate)
                         else:
-                            _, score = _score_optimization_prediction(task, prediction, opts)
+                            prediction = candidate
+                            if callable(metric):
+                                score = float(metric({"example": task, "task": task, "prediction": prediction}))
+                            else:
+                                _, score = _score_optimization_prediction(task, prediction, opts)
                     except Exception as exc:
                         score = 0.0
                         error = str(exc)
@@ -1378,6 +1616,9 @@ class AxAgentPlaybook:
             return match.group(1) if match else text[:80]
 
         def record_signature(record):
+            # TS's record of a thrown run has only its error.
+            if record.get("error"):
+                return error_signature(record.get("error"))
             prediction = record.get("prediction") or {}
             counts = {}
             for signal in prediction.get("failureSignals") or []:
@@ -1390,69 +1631,24 @@ class AxAgentPlaybook:
                 return str(tool_errors[0]).split("\n", 1)[0][:100]
             if record.get("error"):
                 return error_signature(record.get("error"))
-            action_log = str(prediction.get("actionLog") or "")
+            # The action log as TS's prediction carries it: the executor's code
+            # steps as text.
+            action_log = _agent_playbook_action_log_text(prediction.get("actionLog"))
             match = re.search(r"^\s*(\w+Error:\s*.{0,60})", action_log, re.MULTILINE)
             return error_signature(match.group(1)) if match else "behavioral:no_error"
-
-        def failure_excerpt(record, signature):
-            if record.get("error"):
-                return f"Run threw: {record['error']}"
-            action_log = str((record.get("prediction") or {}).get("actionLog") or "")
-            if len(action_log) <= 2000:
-                return action_log
-            hit = action_log.find(signature[:40])
-            if hit < 0:
-                return action_log[-2000:]
-            start = max(0, hit - 1000)
-            return action_log[start : start + 2000]
 
         def collapse(value):
             return re.sub(r"\s+", " ", str(value or "")).strip()
 
         def mine_weakness(signature, records, proposal_index):
-            selected = records[:4]
-            bodies = [failure_excerpt(record, signature) for record in selected]
-            excerpts = "\n\n".join(
-                f"--- run {index + 1} ---\n{body}" for index, body in enumerate(bodies)
-            )
-            if not any(collapse(body) for body in bodies):
+            # TS's miner inputs: task summaries, action-log excerpts, function
+            # calls and tool errors of up to four records.
+            request = _agent_playbook_miner_inputs(signature, list(records), self.inner.render() or "")
+            if request is None:
                 return None
-            task_summaries = "\n".join(
-                f"- {record.get('task', {}).get('id') or f'#{index + 1}'} "
-                f"(score {float(record.get('score', 0)):.2f}): "
-                f"{json.dumps(record.get('task', {}).get('input'), sort_keys=True, default=str)[:240]}"
-                for index, record in enumerate(selected)
-            )
-            function_calls = [
-                call
-                for record in selected
-                for call in ((record.get("prediction") or {}).get("functionCalls") or [])
-            ][:20]
-            tool_errors = [
-                str(error)
-                for record in selected
-                for error in ((record.get("prediction") or {}).get("toolErrors") or [])
-            ][:10]
-            request = {
-                "clusterSignature": signature,
-                "taskSummaries": task_summaries,
-                "actionLogExcerpts": excerpts,
-                "functionCallSummary": "\n".join(json.dumps(call, sort_keys=True, default=str) for call in function_calls) or None,
-                "toolErrors": "\n".join(tool_errors) or None,
-                "currentPlaybook": self.inner.render() or None,
-            }
-            request = {key: value for key, value in request.items() if value is not None}
-            miner = AxGen(
-                _AGENT_PLAYBOOK_WEAKNESS_MINER_SIGNATURE,
-                {
-                    "id": "agent.playbook.weakness-miner",
-                    "instruction": (
-                        "Identify one recurring weakness and one narrow durable avoidance rule. "
-                        "Every evidence quote must be copied verbatim from actionLogExcerpts."
-                    ),
-                },
-            )
-            mined = miner.forward(teacher, request)
+            excerpts = request["actionLogExcerpts"]
+            miner = AxGen(_agent_playbook_weakness_miner_signature(), {"id": "agent.playbook.weakness-miner"})
+            mined = miner.forward(teacher, request, dict(teacher_options))
             raw_quotes = mined.get("evidenceQuotes")
             candidates = raw_quotes if isinstance(raw_quotes, list) else ([] if raw_quotes is None else [raw_quotes])
             haystack = collapse(excerpts)
@@ -1590,11 +1786,15 @@ class AxAgent:
         self.options = _strip_runtime_hooks(options)
         self.execution_context = resolve_execution_context(self.options)
         if self.execution_context:
-            existing = list(self.options.get("functions") or [])
-            self.options["functions"] = existing + self.execution_context.runtime_modules()
+            self.execution_context.initialize()
+            self.options = _agent_append_runtime_modules(self.options, self.execution_context.runtime_modules())
             self.options["executionContext"] = self.execution_context
         self._playbook_handle = None
         self._agent_playbook = None
+        # The stage the playbook targets and whether it writes into that
+        # stage's prompt, kept to rebind the playbook when the stages rebuild.
+        self._playbook_target = "actor"
+        self._playbook_apply = True
         self._playbook_config = self.options.get("playbook")
         self._rebuild_from_signature(signature)
         if self._playbook_config not in (None, False):
@@ -1615,11 +1815,68 @@ class AxAgent:
     def _rebuild_from_signature(self, signature):
         self.state = _agent_factory(signature, self.options)
         self.signature = _core_get(self.state, "signature")
-        actor_validation_retries = self.options.get("validation_retries", self.options.get("validationRetries", 1))
-        self.distiller = AxGen(_core_get(self.state, "distiller_signature"), {"validation_retries": actor_validation_retries, "id": "ctx.root.actor", "instruction": _core_get(self.state, "distiller_description", "")})
-        self.executor = AxGen(_core_get(self.state, "executor_signature"), {"validation_retries": actor_validation_retries, "id": "task.root.actor", "instruction": _core_get(self.state, "executor_description", "")})
-        self.responder = AxGen(_core_get(self.state, "responder_signature", self.signature), {"validation_retries": self.options.get("validation_retries", 2), "id": "task.root.responder", "instruction": _core_get(self.state, "responder_description", "")})
+        self.distiller, self.executor, self.responder = self._build_stage_set({
+            "distiller_signature": _core_get(self.state, "distiller_signature"),
+            "executor_signature": _core_get(self.state, "executor_signature"),
+            "distiller_description": _core_get(self.state, "distiller_description", ""),
+            "executor_description": _core_get(self.state, "executor_description", ""),
+            "responder_description": _core_get(self.state, "responder_description", ""),
+        })
+        # Each run uses the stage set of its mode (see _use_stage_mode): this
+        # one, or the other, built on first use and kept.
+        self._stage_mode = "runtime" if _core_get(self.state, "runtime_enabled", False) else "plain"
+        self._stage_sets = {self._stage_mode: (self.distiller, self.executor, self.responder)}
+        self._optimized_components = {}
         self.llm_query = AxGen(_core_get(self.state, "llm_query_signature", "task:string, context:json -> answer:string"), {"validation_retries": 1, "id": "rlm.llmquery", "instruction": _core_get(self.state, "llm_query_description", "")})
+        self._rebind_playbook()
+
+    # The actor stages list every input field in their system prompt, as TS's
+    # actor AxGen does (includeOptionalInputFieldsInSystemPrompt).
+    def _build_stage_set(self, record):
+        actor_validation_retries = self.options.get("validation_retries", self.options.get("validationRetries", 1))
+        distiller = AxGen(record["distiller_signature"], {"validation_retries": actor_validation_retries, "id": "ctx.root.actor", "instruction": record.get("distiller_description") or "", "includeOptionalInputFieldsInSystemPrompt": True})
+        executor = AxGen(record["executor_signature"], {"validation_retries": actor_validation_retries, "id": "task.root.actor", "instruction": record.get("executor_description") or "", "includeOptionalInputFieldsInSystemPrompt": True})
+        responder_options = {"id": "task.root.responder", "instruction": record.get("responder_description") or ""}
+        # As in TS, the responder's validation budget is maxRetries (3 by
+        # default) unless validation_retries is set.
+        if "validation_retries" in self.options:
+            responder_options["validation_retries"] = self.options["validation_retries"]
+        responder = AxGen(_core_get(self.state, "responder_signature", self.signature), responder_options)
+        if (_core_get(self.state, "citations", {}) or {}).get("enabled"):
+            state = self.state
+            responder.add_assert(lambda output: _agent_citation_assert(state, output))
+        return distiller, executor, responder
+
+    def _use_stage_mode(self, options):
+        # A run's stages follow its runtime: the constructor's, else the
+        # forward call's; without one, the runtime-less stages run. The other
+        # mode's set is built on first use and kept, with the optimized
+        # components applied so far.
+        record = _agent_use_stage_mode(self.state, options)
+        mode = record.get("mode")
+        if mode == self._stage_mode:
+            return
+        stages = self._stage_sets.get(mode)
+        if stages is None:
+            stages = self._build_stage_set(record)
+            self._stage_sets[mode] = stages
+        else:
+            # The instructions follow the agent's state (a standing instruction
+            # set since), and the optimized components apply again below.
+            stages[0].set_instruction(record.get("distiller_description") or "")
+            stages[1].set_instruction(record.get("executor_description") or "")
+            stages[2].set_instruction(record.get("responder_description") or "")
+        if self._optimized_components:
+            for stage in stages:
+                stage.apply_optimized_components(self._optimized_components)
+        self.distiller, self.executor, self.responder = stages
+        self._stage_mode = mode
+        self._rebind_playbook()
+
+    def add_child_agent(self, namespace: str, name: str, child: "AxAgent"):
+        self.options = _agent_register_child(self.options, namespace, name, child, child.signature)
+        self._rebuild_from_signature(self.signature)
+        return self
 
     def set_signature(self, signature):
         self._rebuild_from_signature(signature)
@@ -1647,39 +1904,183 @@ class AxAgent:
         options: dict[str, Any] | None = None,
         hooks: AxRuntimeHooks | None = None,
     ):
+        return self._run(client, values, options, hooks)
+
+    def streaming_forward(
+        self,
+        client,
+        values: dict[str, Any],
+        options: dict[str, Any] | None = None,
+        hooks: AxRuntimeHooks | None = None,
+    ):
+        """Run the agent and yield the responder's output as it streams.
+
+        As TypeScript's streamingForward does, the distiller and the executor
+        (or the direct-respond skip) run first without streaming; then this
+        yields the responder's ``{"version", "index", "delta"}`` deltas: merge
+        each index's deltas (strings and lists append, other values replace)
+        and start over when the version changes. With citations
+        ``surface: "hidden"`` the deltas leave out the citation field, and
+        ``onCitations`` gets the streamed citations after the stream. The run
+        works on a worker thread that waits while you handle each delta;
+        closing the generator stops the run, and with a run ``control`` the run
+        then ends with an ``aborted`` event. On a client that opens native chat
+        sessions, each stage request opens its own session, and the responder
+        streams its session's output as AxGen deltas do.
+        """
+        return self._streaming_deltas(client, values, dict(options or {}), hooks)
+
+    def _streaming_deltas(self, client, values, options, hooks):
+        # The run works in a worker thread and hands each delta to this
+        # generator, then waits until the consumer asks for the next one, as
+        # TypeScript's async generator does.
+        deliveries = queue.Queue()
+        resume = threading.Semaphore(0)
+        stopped = threading.Event()
+
+        def sink(envelope):
+            if stopped.is_set():
+                raise _StreamingConsumerStopped("streaming consumer closed")
+            deliveries.put(("delta", copy.deepcopy(envelope)))
+            resume.acquire()
+            if stopped.is_set():
+                raise _StreamingConsumerStopped("streaming consumer closed")
+
+        def run():
+            try:
+                self._run(client, values, options, hooks, sink)
+                deliveries.put(("done", None))
+            except BaseException as error:  # noqa: BLE001 - re-raised in the consumer
+                deliveries.put(("error", error))
+
+        context = contextvars.copy_context()
+        worker = threading.Thread(target=context.run, args=(run,), daemon=True)
+        worker.start()
+        try:
+            while True:
+                kind, item = deliveries.get()
+                if kind == "error":
+                    raise item
+                if kind == "done":
+                    return
+                yield item
+                resume.release()
+        finally:
+            stopped.set()
+            resume.release()
+            worker.join()
+
+    def _run(self, client, values, options, hooks, sink=None):
         call_hooks = _merge_runtime_hooks(_coerce_runtime_hooks(hooks), _runtime_hooks_from_options(options))
+        attributes = {"ax.program.id": "root.agent", "ax.program.type": "AxAgent"}
+        if sink is not None:
+            attributes["ax.streaming"] = True
         with _runtime_hook_scope(
             call_hooks,
             self.runtime_hooks,
             span_name="ax_gen_agent_forward",
-            attributes={"ax.program.id": "root.agent", "ax.program.type": "AxAgent"},
+            attributes=attributes,
             metric_prefix="ax_gen_agent",
         ):
-            return self._forward_unscoped(client, values, _strip_runtime_hooks(options))
+            return self._forward_unscoped(client, values, _strip_runtime_hooks(options), sink)
 
-    def _forward_unscoped(self, client, values: dict[str, Any], options: dict[str, Any] | None = None):
+    def _forward_unscoped(self, client, values: dict[str, Any], options: dict[str, Any] | None = None, sink=None):
         options = dict(options or {})
+        self._use_stage_mode(options)
         call_context = resolve_execution_context(options, self.execution_context)
-        if call_context:
+        if call_context is not None or self.state.get("mcp_run_context_active"):
+            modules = []
+            if call_context is not None:
+                call_context.initialize()
+                modules = call_context.runtime_modules()
             options["executionContext"] = call_context
-            options["functions"] = list(options.get("functions") or []) + call_context.runtime_modules()
+            options = _agent_apply_run_context(self.state, self.options, options, modules)
+            if self.state.get("runtime_enabled"):
+                self.distiller.set_instruction(self.state["distiller_description"])
+                self.executor.set_instruction(self.state["executor_description"])
+                self.responder.set_instruction(self.state["responder_description"])
         runtime = options.get("runtime")
         if runtime is None:
             runtime = self.options.get("runtime")
+        invocation_binding = None
+        if runtime is not None and hasattr(runtime, "register_callable"):
+            import threading
+            import weakref
+            class InvocationBinding:
+                def __init__(self, state, sub_gen, client, options):
+                    self.state = state
+                    self.sub_gen = sub_gen
+                    self.client = client
+                    self.options = options
+                    self.owner = threading.get_ident()
+                    self.active = True
+            invocation_binding = InvocationBinding(self.state, self.llm_query, client, options)
+            binding_ref = weakref.ref(invocation_binding)
+            for qualified in _agent_runtime_callable_names(self.state):
+                def invoke(arguments, qualified=qualified):
+                    binding = binding_ref()
+                    if binding is None or not binding.active:
+                        raise RuntimeError("Agent invocation belongs to a closed run")
+                    if threading.get_ident() != binding.owner:
+                        raise RuntimeError("Agent runtime callbacks must execute on the owning run thread")
+                    return _agent_runtime_invoke_callable(binding.state, qualified, arguments)
+                runtime.register_callable(qualified, invoke)
         # Wire the built-in llmQuery primitive: a focused sub-query the model can
         # await inside the runtime. The logic lives in the AxIR-generated helper;
         # this wrapper only registers the host callable that closes over this client.
         if runtime is not None and hasattr(runtime, "register_callable"):
-            runtime.register_callable("llmQuery", lambda params: _agent_run_llm_query(self.llm_query, client, params))
-        output = _agent_forward(
-            self.state,
-            self.distiller,
-            self.executor,
-            self.responder,
-            client,
-            values or {},
-            options,
-        )
+            def llm_query(params):
+                binding = binding_ref()
+                if binding is None or not binding.active:
+                    raise RuntimeError("Agent invocation belongs to a closed run")
+                if threading.get_ident() != binding.owner:
+                    raise RuntimeError("Agent runtime callbacks must execute on the owning run thread")
+                return _agent_run_llm_query(binding.sub_gen, binding.client, params, binding.options)
+            runtime.register_callable("llmQuery", llm_query)
+        # As TypeScript's forward and streamingForward do, a run control hears
+        # the run's own lifecycle at its path; each stage reports at
+        # <path>/<stage>.
+        control = options.get("control")
+        run_path = options.get("execution_path", options.get("executionPath", "root"))
+        if control is not None:
+            control._emit({"type": "started", "path": run_path})
+        try:
+            if sink is None:
+                output = _agent_forward(
+                    self.state,
+                    self.distiller,
+                    self.executor,
+                    self.responder,
+                    client,
+                    values or {},
+                    options,
+                )
+            else:
+                output = _agent_streaming_forward(
+                    self.state,
+                    self.distiller,
+                    self.executor,
+                    self.responder,
+                    client,
+                    values or {},
+                    options,
+                    sink,
+                )
+        except BaseException as error:
+            if control is not None:
+                if isinstance(error, _StreamingConsumerStopped):
+                    # The consumer stopped the stream early: the run ended on
+                    # purpose, as with control.abort().
+                    control._emit({"type": "aborted", "path": run_path})
+                else:
+                    control._emit({"type": "failed", "path": run_path, "error": str(error)})
+            raise
+        finally:
+            if invocation_binding is not None:
+                invocation_binding.active = False
+                invocation_binding.client = None
+                invocation_binding.sub_gen = None
+                invocation_binding.options = None
         citations = self.options.get("citations")
         citation_callback = citations.get("onCitations") or citations.get("on_citations") if isinstance(citations, dict) else None
         if callable(citation_callback):
@@ -1687,7 +2088,11 @@ class AxAgent:
                 citation_callback(list(_core_get(self.state, "last_citations", []) or []))
             except Exception:
                 pass
-        self._learn_playbook_failures(output)
+        # TS learns from the responder's answer after forward; a stream has
+        # no single answer to hand the playbook.
+        self._learn_playbook_failures(output if sink is None else {})
+        if control is not None:
+            control._emit({"type": "completed", "path": run_path})
         return output
 
     def test(self, runtime: AxCodeRuntime, code: str, context_field_values: dict[str, Any] | None = None, options: dict[str, Any] | None = None):
@@ -1794,6 +2199,9 @@ class AxAgent:
     def apply_optimized_components(self, component_map: dict[str, Any]):
         updates = dict(component_map or {})
         _validate_optimization_component_map(self.get_optimizable_components(), updates)
+        # Kept for the other stage set, which gets them when a run switches to
+        # it (see _use_stage_mode).
+        self._optimized_components.update(updates)
         self.distiller.apply_optimized_components(updates)
         self.executor.apply_optimized_components(updates)
         self.responder.apply_optimized_components(updates)
@@ -1814,31 +2222,27 @@ class AxAgent:
 
     def evaluate_optimization_task(self, client, task: dict[str, Any], options: dict[str, Any] | None = None):
         opts = options or {}
+        # A runtime on the evolve or optimize call runs each task, as it runs a
+        # forward call (the agent may hold only a runtime descriptor), unless
+        # forward_options names one.
+        forward_options = dict(opts.get("forward_options") or {})
+        if opts.get("runtime") is not None and forward_options.get("runtime") is None:
+            forward_options["runtime"] = opts["runtime"]
+        # As TS evaluates each task from a fresh state, the prediction carries
+        # only this run's share of the agent's logs.
+        marks = _agent_eval_marks(self.state)
+        # TS's evaluation path runs no playbook run-end learning.
+        self.state["playbook_learning_paused"] = True
         try:
-            output = self.forward(client, task.get("input") or task, opts.get("forward_options") or {})
-            return _build_agent_eval_prediction(output, self.get_action_log(), self.get_usage(), self.export_trace())
+            output = self.forward(client, task.get("input") or task, forward_options)
+            completion = {"type": "final", "output": output}
         except AxAgentClarificationError as exc:
-            return {
-                "completionType": "askClarification",
-                "clarification": exc.clarification,
-                "actionLog": self.get_action_log(),
-                "functionCalls": _core_get(self.state, "function_call_traces", []) or [],
-                "toolErrors": [],
-                "turnCount": 0,
-                "usage": self.get_usage(),
-                "trace": self.export_trace(),
-            }
+            completion = {"type": "askClarification", "clarification": exc.clarification}
         except Exception as exc:
-            return {
-                "completionType": "error",
-                "error": {"message": str(exc)},
-                "actionLog": self.get_action_log(),
-                "functionCalls": _core_get(self.state, "function_call_traces", []) or [],
-                "toolErrors": [str(exc)],
-                "turnCount": 0,
-                "usage": self.get_usage(),
-                "trace": self.export_trace(),
-            }
+            completion = {"type": "error", "message": str(exc)}
+        finally:
+            self.state.pop("playbook_learning_paused", None)
+        return _build_agent_run_prediction(self.state, marks, completion, self.get_usage(), self.export_trace())
 
     def evaluate_optimization(self, client, dataset, candidate_map: dict[str, Any] | None = None, options: dict[str, Any] | None = None):
         opts = options or {}
@@ -1903,18 +2307,17 @@ class AxAgent:
         raw = self._playbook_config
         config = dict(raw) if isinstance(raw, dict) else {}
         config.setdefault("maxReflectorRounds", 1)
-        seed = config.get("seed")
-        if seed is None and ("playbook" in config or "artifact" in config):
-            seed = config
+        # TS's `playbook` seed (a snapshot or a bare playbook). Numeric `seed` is reserved for the optimizer.
+        seed = _agent_playbook_config_seed(config)
         self.playbook(config)
         if seed is not None:
-            if isinstance(seed, dict) and "playbook" in seed:
-                self._playbook_handle.load(seed)
-            elif isinstance(seed, dict):
-                self._playbook_handle.load({"playbook": seed})
+            self._playbook_handle.load(seed)
 
     def _learn_playbook_failures(self, output):
         if self._playbook_handle is None or self._playbook_config in (None, False):
+            return
+        # An evaluated run learns nothing, as TS's evaluation path.
+        if _core_get(self.state, "playbook_learning_paused", False):
             return
         config = dict(self._playbook_config) if isinstance(self._playbook_config, dict) else {}
         learn = config.get("learn", True)
@@ -1964,22 +2367,47 @@ class AxAgent:
             student = self.options.get("ai") or self.options.get("client")
         if student is None:
             raise ValueError("AxAgent.playbook(): studentAI is required when the agent has no default ai.")
-        stage = self.responder if target == "responder" else self.executor
+        self._playbook_target = target
+        self._playbook_apply = opts.get("apply") is not False
+        stage = self._playbook_stage()
         handle_options = dict(opts)
         handle_options["studentAI"] = student
         handle = AxPlaybook(stage, handle_options)
-        if opts.get("apply") is False:
+        self._bind_playbook_stage(handle, stage)
+        self._playbook_handle = handle
+        self._agent_playbook = AxAgentPlaybook(self, handle)
+        return self._agent_playbook
+
+    # The stage the playbook targets: the actor, or the responder.
+    def _playbook_stage(self):
+        return self.responder if self._playbook_target == "responder" else self.executor
+
+    # Point the playbook at an agent stage: the program it runs and the hook
+    # that writes the rendered playbook into the stage prompt.
+    def _bind_playbook_stage(self, handle, stage):
+        handle.program = stage
+        if not self._playbook_apply:
             handle._set_apply_hook(lambda _rendered: None)
-        base = stage.signature.get_description() if hasattr(stage.signature, "get_description") else None
+            return
+        # A stage keeps the description it had when first bound, so binding a
+        # stage again (a kept stage set coming back into use) doesn't compose
+        # the playbook twice.
+        if not hasattr(stage, "_playbook_base"):
+            stage._playbook_base = stage.signature.get_description() if hasattr(stage.signature, "get_description") else None
+        base = stage._playbook_base
 
         def _apply(rendered):
             stage.signature.description = _playbook_compose_instruction(base, rendered)
 
-        if opts.get("apply") is not False:
-            handle._set_apply_hook(_apply)
-        self._playbook_handle = handle
-        self._agent_playbook = AxAgentPlaybook(self, handle)
-        return self._agent_playbook
+        handle._set_apply_hook(_apply)
+
+    # set_signature and add_child_agent rebuild the stages: point the playbook
+    # at the new stage and write it into that stage's prompt.
+    def _rebind_playbook(self):
+        if self._playbook_handle is None:
+            return
+        self._bind_playbook_stage(self._playbook_handle, self._playbook_stage())
+        self._playbook_handle.apply_to()
 
     def get_playbook(self):
         return self._agent_playbook
@@ -2090,13 +2518,12 @@ def _core_list_get(values, index, default=None):
 
 
 def _core_json_stringify(value):
-    import json
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    # TS JSON.stringify(value): keys in insertion order, null as null.
+    return _js_json_dumps(value)
 
 
 def _core_json_stable_stringify(value):
-    import json
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return _js_json_dumps(value, sort_keys=True)
 
 
 def _core_json_parse(value):
@@ -2104,7 +2531,7 @@ def _core_json_parse(value):
 
 
 def _core_string_format(template, *args):
-    return str(template).format(*args)
+    return _js_format(template, args)
 
 
 def _core_string_slice(value, start, end=None):
@@ -2191,11 +2618,58 @@ def _core_runtime_error(message):
 
 
 def _core_json_pretty(value):
-    return json.dumps(value, indent=2)
+    return _js_json_dumps(value, indent=2)
+
+
+def _core_agent_native_stage_forward(stage, state, client, values, options, selected):
+    from .tool import Tool
+    from dataclasses import replace
+    tools=[]
+    for descriptor in selected:
+        source=_agent_callable_implementation(state,descriptor["qualified_name"])
+        if not isinstance(source,Tool):
+            raise ValueError("Background agent callables must have a typed fn() implementation")
+        tools.append(replace(source,name=descriptor["native_name"],description=descriptor["description"],execution="background"))
+    original=stage.functions
+    original_base=stage._base_functions
+    previous=stage.function_call_traces
+    stage.functions=[*original,*tools]
+    stage._base_functions=[*original_base,*tools]
+    stage.function_call_traces=[]
+    try:
+        return stage.forward(client,values or {},options or {})
+    finally:
+        records=stage.function_call_traces
+        stage.functions=original
+        stage._base_functions=original_base
+        stage.function_call_traces=[*previous,*records]
+        _agent_record_native_calls(state,selected,records,options or {})
+
+
+def _core_agent_stage_streaming_forward(stage, state, client, values, options, sink):
+    # Streams the stage's AxGen deltas to sink, each through the agent's
+    # citation handling (hidden citations leave the delta).
+    def emit(envelope):
+        sink(_agent_stream_citation_delta(state, envelope))
+
+    return stage._streaming_forward_with(client, values or {}, options or {}, emit)
 
 
 def _core_agent_stage_forward(stage, client, values, options):
-    return stage.forward(client, values or {}, options or {})
+    options = dict(options or {})
+    if isinstance(stage, AxAgent) and "mcpInheritanceFromParent" in options:
+        context = options.pop("executionContext", None)
+        policy = options.pop("mcpInheritanceFromParent")
+        if context is not None:
+            options["inheritedExecutionContext"] = context.derive(policy)
+    return stage.forward(client, values or {}, options)
+
+
+def _core_agent_program_forward(signature, program_options, client, values, options):
+    # A one-off AxGen (the context map's distiller and cartographer),
+    # forwarded like an agent stage.
+    program = AxGen(signature, dict(program_options or {}))
+    return program.forward(client, dict(values or {}), dict(options or {}))
 
 
 def _core_agent_stage_chat_log(stage):
@@ -2233,6 +2707,10 @@ def _core_agent_clarification_error(payload, state):
         state=_core_get(state, "runtime_state", {}),
         payload=payload,
     )
+
+
+def _core_agent_runtime_is_executable(runtime):
+    return callable(getattr(runtime, "create_session", None))
 
 
 def _core_agent_runtime_create_session(runtime, globals_, options):
@@ -2279,6 +2757,33 @@ def _core_agent_runtime_close(session):
         result = session.close()
         return {"closed": True} if result is None else result
     return {"closed": True}
+
+
+def _core_agent_runtime_language(runtime):
+    # A runtime's language: a runtime config's "language", else the code
+    # runtime's own, else JavaScript, TS's default runtime.
+    if isinstance(runtime, dict):
+        language = runtime.get("language")
+    else:
+        language = getattr(runtime, "language", None)
+        if callable(language):
+            language = language()
+    language = str(language or "").strip()
+    return language or "JavaScript"
+
+
+def _core_agent_runtime_usage_instructions(runtime):
+    # A runtime's own usage instructions, as TS's getUsageInstructions(): a
+    # runtime config's "usageInstructions", else the code runtime's own, else
+    # none.
+    if isinstance(runtime, dict):
+        text = runtime.get("usageInstructions", runtime.get("usage_instructions"))
+    else:
+        method = getattr(runtime, "get_usage_instructions", None)
+        text = method() if callable(method) else getattr(runtime, "usage_instructions", None)
+        if callable(text):
+            text = text()
+    return str(text or "")
 
 
 def _core_agent_memory_search(state, searches, already_loaded):
@@ -2358,6 +2863,20 @@ def _core_agent_callable_invoke(state, request, options):
     agent_options = _core_get(state, "options", {}) or {}
     qualified = _core_get(request, "qualified_name", _core_get(request, "name", ""))
     args = _core_get(request, "args", {})
+    implementation=_agent_callable_implementation(state,qualified)
+    from .tool import Tool
+    if isinstance(implementation,Tool):
+        from .gen import _core_tool_invoke
+        context = (options or {}).get("tool_context")
+        if context is None:
+            import threading
+            token = _cancellation_token(options)
+            control = (options or {}).get("control")
+            signal = control.signal if control is not None else token._event if token is not None else threading.Event()
+            context = {"signal": signal, "cancellation": token, "call_id": _core_get(request,"call_id")}
+        return {"status":"ok","value":_core_tool_invoke(implementation,args,context)}
+    handler=_core_get(implementation,"handler")
+    if callable(handler):return {"status":"ok","value":handler(args)}
     for group in _core_get(state, "callable_inventory", []) or []:
         for callable_meta in _core_get(group, "callables", []) or []:
             if _core_get(callable_meta, "qualified_name") == qualified:
