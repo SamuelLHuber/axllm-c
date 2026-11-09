@@ -11,7 +11,7 @@ cargo add axllm
 Or add to your `Cargo.toml`:
 
 ```toml
-axllm = "24.0.15"
+axllm = "25.4.9"
 ```
 
 Enable realtime audio over WebSocket with the `realtime` feature (pulls `tungstenite`):
@@ -37,9 +37,13 @@ fn main() -> AxResult<()> {
 - AxGen: run structured generation with retries, tool calls, field processors, assertions, traces, usage, and provider-backed output parsing.
 - AxAI: select named deployment profiles independently from model IDs, resolve model-aware structured-output modes, and attach renewable request credentials through one provider boundary.
 - Audio and realtime: `.chat()` accepts `input_audio` content parts, `transcribe()`/`speak()` do batch speech-to-text and text-to-speech, and realtime-capable models stream audio over a WebSocket — transparently through `chat()` or via the productized `realtime_chat()` driver (Go: `RealtimeChat`).
+- Meta Muse: `meta` (Responses), `meta-chat` (Chat Completions), and `meta-messages` (Messages) default to `muse-spark-1.3` with `MODEL_API_KEY`. Muse Image uses chat and `results[].images`; Muse Voice uses batch transcription or realtime streaming chat. Contributor models expose provider-training data-use metadata and are never defaults. Glimmer uses the existing self-hosted profiles; Ax does not manage weights.
+- Jev and OpenAI Decisions: use required boolean/class/rubric score signatures with (evidence) to retain probabilities, native values, optional confidence, and trusted provenance through AxGen. Generative models use the same contract with elicited evidence. Rerank query/document pairs by the continuous rubric score while preserving candidate IDs.
+- Native decision clients: use explicit provider request shapes for advanced criteria, structured state, ordered questions, and provider-specific media. Normal evidence-bearing signatures support scores and answered/refused outcomes without calling these clients directly.
 - AxAgent and RLM: let an agent plan and execute actor-code steps while Ax keeps envelopes, state, logs, traces, context, discovery, recall, and final typed responses aligned.
 - AxFlow: compose AxGen, AxAgent, and nested flows into a portable program graph.
 - Optimizers: save, load, apply, and evaluate optimizer artifacts, including the generated GEPA engine.
+- Evaluation: novel_f1_score scores multiset word overlap after excluding history and stopwords, with matching Unicode normalization and finite empty-input scores.
 
 ## Package Shape
 
@@ -57,12 +61,15 @@ Shared Ax behavior is Core-owned. The generated target code stays focused on idi
 `no-key` examples are deterministic local smokes. They are the fastest way to see the package work without any provider account:
 
 - `cargo run --example signature_schema`: signature parsing and JSON schema generation
+- `cargo run --example model_catalog`: model catalog, named profiles, thinking levels, and service tiers
 - `cargo run --example provider_mapping_no_key`: provider mapping through a scripted transport
 - `cargo run --example runtime_hooks_no_key`: runtime-hook globals and typed program surfaces through a scripted transport
 - `cargo run --example adaptive_balancer_no_key`: adaptive balancer state, scoring, and stable route keys without a provider key
 - `cargo run --example provider_stream_no_key`: provider streaming through a scripted SSE transport
+- `cargo run --example cancellation_no_key`: one-shot provider cancellation with no transport attempt
 - `cargo run --example axgen_scripted_client_tool`: AxGen with a scripted client and tool
-- `cargo run --example axflow_program_graph`: AxFlow program graph
+- `cargo run --example axgen_streaming_no_key`: `streaming_forward` field deltas, streaming assertions, field processor feedback, field transforms, and `AxFlow::streaming_forward` through a scripted streaming client
+- `cargo run --example axflow_program_graph`: AxFlow program graph and a caching function, whose hits run no node and record no span
 - `cargo run --example flow_mermaid`: portable Mermaid flow parsing and canonical round-trip
 - `cargo run --example audio_responses_mapping`: OpenAI Responses speak/transcribe mapping through a scripted transport
 - `cargo run --example realtime_audio_events`: Grok/Gemini realtime audio setup, input, and event folding

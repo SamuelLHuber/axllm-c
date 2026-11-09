@@ -13,6 +13,8 @@ option(AXLLM_ENABLE_REALTIME "Build the built-in IXWebSocket realtime audio tran
 
 add_library(axllm axllm/axllm.cpp axllm/axllm_c.cpp axllm/mcp.cpp)
 add_library(axllm::axllm ALIAS axllm)
+find_package(Threads REQUIRED)
+target_link_libraries(axllm PUBLIC Threads::Threads)
 target_compile_features(axllm PUBLIC cxx_std_17)
 target_include_directories(axllm PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
@@ -70,12 +72,15 @@ if(AX_BUILD_EXAMPLES)
   foreach(example
     signature_schema
     c_signature_schema
+    model_catalog
     axgen_scripted_client_tool
+    axgen_streaming_no_key
     axgen_openai_api
     vertex_gemini_api
     provider_mapping_no_key
     adaptive_balancer_no_key
     provider_stream_no_key
+    cancellation_no_key
     runtime_adapter
     runtime_protocol
     axflow_program_graph

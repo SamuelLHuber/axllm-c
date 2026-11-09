@@ -1,7 +1,7 @@
 ---
 name: "ax-rust-agent-rlm"
 description: "Use when writing Rust code with `axllm` for RLM executor loops, AxCodeRuntime sessions, runtime envelopes, process runtimes, and optional runtime profiles."
-version: "24.0.15"
+version: "25.4.9"
 ---
 # AxAgent RLM Runtime For Rust
 
@@ -33,7 +33,7 @@ let out = helper.forward(&llm, inputs, None)?;
 
 ## Relevant API Surface
 
-- Agents And RLM: `agent`, `AxAgent`
+- Agents And RLM: `agent`, `AxAgent`, `AxAgent::with_child_agent`, `AxAgent::streaming_forward`
 - Runtime Profiles: `ProcessCodeRuntime`, `RuntimeCapabilities`, `RuntimeEnvelope`, `javascript-quickjs`
 
 ## Guardrails

@@ -20,6 +20,12 @@ Your job is to choose the smallest correct `AxAgent` shape for the user's needs:
 
 ## Use These Defaults
 
+For Typesafe/Jev decisions inside an agent, keep a generative model for the
+actor's tools/code/prose and call Typesafe in a separate decision step. See the
+[ax-typesafe skill](https://github.com/ax-llm/ax/blob/main/src/ax/skills/ax-typesafe.md)
+for supported signatures and native questions; Jev cannot supply a general
+tool-using actor's output contract.
+
 - Use `agent(...)`, not `new AxAgent(...)`.
 - Prefer string signatures or `f()` signatures over hand-written signature objects.
 - Put `ai`, `judgeAI`, and `agentIdentity` on the `agent(...)` config when you want instance defaults or child-agent metadata.
@@ -45,7 +51,7 @@ Map user intent to agent shape before writing code:
 ## Critical Rules
 
 - Use `agent(...)` factory syntax for new code.
-- If an actor response contains multiple fenced code blocks, the runtime rejects the whole turn without executing any block and asks for one executable program.
+- If an actor response contains multiple fenced code blocks, the runtime rejects the whole turn without executing any block and asks for one executable program. This applies to text and structured JSON responses, with LF or CRLF line endings.
 - Add child agents to the parent's `functions: [...]` list. Each child's `agentIdentity.namespace` (or `utils`, the default) determines the runtime call site, e.g. `await team.writer({...})`.
 - If discovery is enabled, call `discover(...)` before using callables whose docs are not already in the prompt.
 - `autoUpgrade` is ON by default: large tool catalogs auto-enable discovery, and oversized undeclared input values are auto-kept runtime-only with a truncated prompt preview. Explicit `functionDiscovery` and declared `contextFields` always win; set `autoUpgrade: false` to opt out.
@@ -256,9 +262,14 @@ const parent = agent('query:string -> answer:string', {
   contextFields: [],
 });
 
-// A child can restrict inheritance to selected namespaces or `none`.
+// Restrict what this agent passes to its children.
 await parent.forward(llm, { query }, { mcpInheritance: ['memory'] });
 ```
+
+The agent's own distiller and executor retain its attached clients. Apply
+`mcpInheritance` when delegating to a child, not between stages of the same
+agent. A child's explicitly configured clients take precedence over inherited
+clients. `none` and an empty namespace list pass no parent clients.
 
 Rules:
 
@@ -601,7 +612,7 @@ Rules:
 These construction-time options are portable across TypeScript and the generated
 Python, Java, C++, Go, and Rust packages (both default off):
 
-- `playbook`: attach an ACE playbook at construction. `learn` is on by default — after each run that produced failure signals (error turns, dead-ends, failing tool calls) one bounded update curates durable avoidance rules that ride the next run's actor prompt; zero LLM cost on clean runs. TypeScript seeds a prior session with `playbook: { playbook: snapshot }`; generated packages accept their full `{ playbook, artifact }` snapshot under `seed`. Persist via `onUpdate`, read the live handle with `getPlaybook()` (or the language-shaped equivalent), gate with `learn: { minSignals, dedupe }`, or disable with `learn: false`. To grow the same playbook from a task set with a held-out verify gate, use the agent-bound playbook evolve method — see `ax-playbook`.
+- `playbook`: attach an ACE playbook at construction. `learn` is on by default — after each run that produced failure signals (error turns, dead-ends, failing tool calls) one bounded update curates durable avoidance rules that ride the next run's actor prompt; zero LLM cost on clean runs. Seed a prior session with `playbook: { playbook: snapshot }` (a `{ playbook, artifact }` snapshot or a bare playbook); the generated packages accept the same shape, and their older `seed` snapshot key still works with a deprecation warning (in the next major version `seed` is TypeScript's numeric random seed). Persist via `onUpdate`, read the live handle with `getPlaybook()` (or the language-shaped equivalent), gate with `learn: { minSignals, dedupe }`, or disable with `learn: false`. Reflection and curation run on `teacherAI`, which defaults to the agent's `judgeAI` and then its `ai`; a teacher marked `isExpensive` also needs `teacherOptions: { useExpensiveModel: 'yes' }`, or its updates curate nothing. To grow the same playbook from a task set with a held-out verify gate, use the agent-bound playbook evolve method — see `ax-playbook`.
 - `citations`: add an optional `evidenceCitations: string[]` responder output listing which evidence entries (top-level keys of the curated evidence, plus memory ids) the answer relied on. Validated in-pipeline — the model cannot cite evidence it never collected (existence, not entailment). Pass `true`, or `{ field?, surface?: 'output' | 'hidden', includeMemoryIds?, onCitations? }`.
 
 Stage guidance is portable too. `setInstruction` replaces the stage-owned actor
@@ -693,3 +704,7 @@ its own authorization, instance serialization, retry policy, and run record.
 - Do not call `discover()` from the distiller or responder stages.
 - Do not assign or inspect the return value of `await discover(...)`; read the next prompt instead.
 - Do not loop `discover()` calls or wrap them in `Promise.all`.
+
+## Automatic sessions (TypeScript)
+
+Declared-background tools become native actor tools on supporting providers after discovery. Their invocation uses the existing runtime bindings. Stateful code stays serialized; do not call a native background tool again in generated code. Agent pipeline scopes are `root/distiller`, `root/executor`, and `root/responder`. Pass the shared controller through forward options. `forward()` and `streamingForward()` report the same run-control events: `started` at `root`, each stage's pair at its scope, then `completed` or `failed` at `root`; when a `streamingForward()` consumer stops early, the in-flight stage and `root` end with `aborted`. A steer targeted at a stage scope applies to that stage in both.

@@ -6,14 +6,26 @@
   "packageName": "dev.axllm:ax",
   "install": [
     "// Gradle (build.gradle):",
-    "implementation 'dev.axllm:ax:22.0.4'",
+    "implementation 'dev.axllm:ax:24.0.15'",
     "// Maven (pom.xml):",
     "<dependency>",
     "  <groupId>dev.axllm</groupId>",
     "  <artifactId>ax</artifactId>",
-    "  <version>22.0.4</version>",
+    "  <version>24.0.15</version>",
     "</dependency>"
   ],
+  "quickStartRun": {
+    "file": "QuickStart.java",
+    "setup": [
+      "export OPENAI_API_KEY=\"sk-...\"",
+      "mvn dependency:copy -Dartifact=dev.axllm:ax:24.0.15 -DoutputDirectory=."
+    ],
+    "run": [
+      "javac -cp ax-24.0.15.jar QuickStart.java",
+      "java -cp \".:ax-24.0.15.jar\" QuickStart"
+    ],
+    "output": ["sentiment: positive"]
+  },
   "exampleRoot": "packages/java/examples",
   "academy": {
     "unitExamples": {
@@ -88,6 +100,20 @@
           "}"
         ]
       },
+      "cancellation": {
+        "sourcePath": "src/examples/java/generation/CancellationExample.java",
+        "verified": true,
+        "requiresCredentials": false,
+        "code": [
+          "AxCancellationToken token = new AxCancellationToken();",
+          "token.cancel(\"user stopped\");",
+          "try {",
+          "  client.chatWithCancellation(request, Map.of(), token);",
+          "} catch (AxAIServiceAbortedError error) {",
+          "  assert error.reason().equals(\"user stopped\") && !error.retryable;",
+          "}"
+        ]
+      },
       "balancer": {
         "sourcePath": "src/examples/java/generation/AdaptiveBalancerExample.java",
         "verified": true,
@@ -103,18 +129,56 @@
         ]
       },
       "audio": [
-        "// Realtime audio over WebSocket — uses the JDK's built-in WebSocket (no extra dependency)",
+        "// Realtime audio over WebSocket \u2014 uses the JDK's built-in WebSocket (no extra dependency)",
         "OpenAIResponsesClient client = new OpenAIResponsesClient(Map.of(\"model\", \"gpt-realtime-2\", \"api_key\", System.getenv(\"OPENAI_APIKEY\")));",
         "Map<String, Object> request = Map.of(\"model\", \"gpt-realtime-2\", \"chat_prompt\", List.of(Map.of(\"role\", \"user\", \"content\", \"Say hello.\")), \"audio\", Map.of(\"output\", Map.of(\"voice\", \"alloy\")));",
         "Map<String, Object> result = client.realtimeChat(request, null);  // one merged turn: transcript + base64 PCM audio",
         "// Realtime models also route transparently through chat(); chat() accepts input_audio parts; transcribe()/speak() do batch STT/TTS."
-      ]
+      ],
+      "typesafe": {
+        "sourcePath": "src/examples/java/generation/TypesafeExample.java",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "// ax-example:start",
+          "// title: Java Jev Signature Decisions",
+          "// group: generation",
+          "// description: Converts Jev probabilities into boolean and class outputs with a provider threshold.",
+          "// provider: typesafe",
+          "// env: TYPESAFE_APIKEY",
+          "// level: beginner",
+          "// order: 35",
+          "// ax-example:end",
+          "import dev.axllm.ax.*;",
+          "import java.util.*;",
+          "",
+          "public final class TypesafeExample {",
+          "  public static void main(String[] args) throws Exception {",
+          "    var model = Ax.ai(\"typesafe\", Map.of(\"apiKey\", System.getenv(\"TYPESAFE_APIKEY\"), \"trueThreshold\", 0.9));",
+          "    var triage = Ax.ax(\"ticket:string -> urgent:boolean(true \\\"Customers cannot complete a core task\\\", false \\\"Routine request\\\") \\\"Needs immediate attention?\\\", team:class \\\"support, billing, engineering\\\"\");",
+          "    var decision = triage.forward(model, Map.of(\"ticket\", \"Checkout is unavailable for all customers after the latest deployment.\"));",
+          "    if (!(decision.get(\"urgent\") instanceof Boolean) || !Set.of(\"support\", \"billing\", \"engineering\").contains(decision.get(\"team\"))) throw new AssertionError(\"Invalid decision\");",
+          "    System.out.println(Json.stringify(decision));",
+          "  }",
+          "}"
+        ]
+      }
     },
     "quickStart": [
       "import dev.axllm.ax.Ax;",
+      "import java.util.Map;",
       "",
-      "var llm = Ax.ai(\"openai\", Map.of(\"apiKey\", System.getenv(\"OPENAI_API_KEY\")));",
-      "var classify = Ax.ax(\"review:string -> sentiment:class \\\"positive, negative, neutral\\\"\");"
+      "public class QuickStart {",
+      "  public static void main(String[] args) throws Exception {",
+      "    var llm = Ax.ai(\"openai\", Map.of(\"apiKey\", System.getenv(\"OPENAI_API_KEY\")));",
+      "    var classify = Ax.ax(\"review:string -> sentiment:class \\\"positive, negative, neutral\\\"\");",
+      "    var result = classify.forward(llm, Map.of(",
+      "      \"review\", \"Useful and boring in the best way.\"",
+      "    ));",
+      "",
+      "    System.out.println(\"sentiment: \" + result.get(\"sentiment\"));",
+      "  }",
+      "}"
     ],
     "dspy": [
       "var qa = Ax.ax(\"question:string -> answer:string, confidence:number\");"
@@ -157,10 +221,46 @@
       "pb.evolve(examples, metric, Map.of());   // grow a playbook offline from examples",
       "pb.update(Map.of(\"example\", ex, \"prediction\", pred, \"feedback\", \"...\"));",
       "pb.applyTo(program);"
-    ]
+    ],
+    "decisionEvidenceExample": {
+      "sourcePath": "src/examples/java/generation/DecisionEvidenceExample.java",
+      "code": [
+        "import dev.axllm.ax.*;",
+        "import java.util.*;",
+        "",
+        "public final class DecisionEvidenceExample {",
+        "  public static void main(String[] args) throws Exception {",
+        "    var model = Ax.ai(\"openai-decisions\", Map.of(\"apiKey\", Optional.ofNullable(System.getenv(\"OPENAI_API_KEY\")).orElse(System.getenv(\"OPENAI_APIKEY\"))));",
+        "    var judge = Ax.ax(\"query:string, document:string -> relevant:boolean(evidence, threshold 0.7), relevance:score \\\"Irrelevant, Related, Partial answer, Direct answer\\\"(evidence)\");",
+        "    var candidates = List.of(Map.of(\"id\", \"refund\", \"text\", \"Request a refund within 30 days through your account billing page.\"), Map.of(\"id\", \"password\", \"text\", \"Reset your password using the sign-in page.\"));",
+        "    var ranked = new ArrayList<Map<String,Object>>();",
+        "    for (var item : candidates) {",
+        "      var result = new LinkedHashMap<String,Object>(judge.forward(model, Map.of(\"query\", \"How do I request a refund?\", \"document\", item.get(\"text\"))));",
+        "      result.put(\"id\", item.get(\"id\")); ranked.add(result);",
+        "    }",
+        "    ranked.sort(Comparator.comparingDouble((Map<String,Object> item) -> ((Number)((Map<?,?>)item.get(\"relevance\")).get(\"value\")).doubleValue()).reversed());",
+        "    System.out.println(Json.stringify(ranked));",
+        "  }",
+        "}"
+      ],
+      "fence": "java",
+      "requiresCredentials": true
+    }
   },
   "snippetGroups": {
     "ai": {
+      "catalog": {
+        "sourcePath": "src/examples/java/generation/ModelCatalogExample.java",
+        "verified": true,
+        "requiresCredentials": false,
+        "code": [
+          "List<Object> catalog = Ax.getSupportedAIModels();",
+          "Map<?, ?> azure = provider(catalog, \"azure-openai\");",
+          "Map<?, ?> capabilities = (Map<?, ?>) azure.get(\"capabilities\");",
+          "System.out.println(capabilities.get(\"thinkingLevels\"));",
+          "System.out.println(capabilities.get(\"serviceTiers\"));"
+        ]
+      },
       "serviceTier": {
         "sourcePath": "src/examples/java/generation/GeminiServiceTierExample.java",
         "verified": true,
@@ -168,7 +268,7 @@
         "code": [
           "GoogleGeminiClient client = new GoogleGeminiClient(Map.of(",
           "    \"api_key\", apiKey(),",
-          "    \"model\", System.getenv().getOrDefault(\"AX_GEMINI_MODEL\", \"gemini-3.7-flash\")));",
+          "    \"model\", System.getenv().getOrDefault(\"AX_GEMINI_MODEL\", \"gemini-3.8-flash\")));",
           "Map<String, Object> out = client.chat(request, Map.of(\"service_tier\", \"flex\"));"
         ]
       },
@@ -182,6 +282,40 @@
           "    \"project_id\", required(\"GOOGLE_PROJECT_ID\"),",
           "    \"region\", required(\"GOOGLE_REGION\"),",
           "    \"model\", System.getenv().getOrDefault(\"AX_VERTEX_MODEL\", \"gemini-3.5-flash\")));"
+        ]
+      }
+    },
+    "ax": {
+      "streaming": {
+        "sourcePath": "src/examples/java/generation/StreamingForwardExample.java",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "AxGen story = Ax.ax(\"topic:string -> title:string, story:string \\\"Three short sentences\\\"\");",
+          "",
+          "Map<String, Object> merged = new LinkedHashMap<>();",
+          "int version = 0;",
+          "try (AxGenDeltaStream stream = story.streamingForward(client, Map.of(\"topic\", topic), Map.of())) {",
+          "  for (AxGenDelta delta : stream) {",
+          "    if (delta.version() != version) { merged.clear(); version = delta.version(); } // a retry starts over",
+          "    delta.delta().forEach((field, value) -> merged.put(field,",
+          "        merged.get(field) instanceof String previous && value instanceof String text ? previous + text : value));",
+          "  }",
+          "}"
+        ]
+      },
+      "dates": {
+        "sourcePath": "src/examples/java/generation/DateFieldsExample.java",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "AxGen planner = new AxGen(",
+          "    AxSignature.create(\"emailText:string, sentAt:datetime -> meetingStartsAt:datetime, travelWindow:dateRange\"),",
+          "    Map.of(\"parseDates\", true));",
+          "Map<String, Object> out = planner.forward(client, Map.of(",
+          "    \"emailText\", emailText,",
+          "    \"sentAt\", Instant.parse(\"2024-05-02T16:30:00Z\")));",
+          "System.out.println(out.get(\"meetingStartsAt\")); // 2024-05-07T19:00:00.000Z"
         ]
       }
     },
@@ -279,6 +413,42 @@
           "Map<String, Object> evolution = assistant.playbook(null).evolve(",
           "    dataset,",
           "    Map.of(\"verify\", true, \"maxProposals\", 1, \"runtime\", runtime));"
+        ]
+      },
+      "streaming": {
+        "sourcePath": "src/examples/java/short-agents/StreamingAgentExample.java",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "// The handbook stays in the agent's runtime, out of the prompt. With",
+          "// citations on, the answer cites the evidence it used, and ids the run",
+          "// never gathered are sent back to the model for a correction.",
+          "Consumer<List<Object>> onCitations = ids -> System.out.println(\"\\ncited: \" + ids);",
+          "AxAgent assistant = Ax.agent(",
+          "    \"question:string, handbook:string -> answer:string\",",
+          "    Map.of(",
+          "        \"contextFields\", List.of(\"handbook\"),",
+          "        \"runtime\", Map.of(\"language\", \"JavaScript\"),",
+          "        \"citations\", Map.of(\"onCitations\", onCitations)));",
+          "",
+          "// The distiller and the executor run first; then the responder's answer",
+          "// streams. Merge each delta and start over when the version changes (a retry).",
+          "try (AxQuickJsCodeRuntime runtime = new AxQuickJsCodeRuntime();",
+          "    AxGenDeltaStream stream = assistant.streamingForward(",
+          "        client(),",
+          "        Map.of(",
+          "            \"question\", \"I downgraded today. When does it take effect, and is my data safe if I delete the workspace?\",",
+          "            \"handbook\", HANDBOOK),",
+          "        Map.of(\"runtime\", runtime, \"max_actor_steps\", 12))) {",
+          "  long version = 0;",
+          "  for (AxGenDelta delta : stream) {",
+          "    if (delta.version() != version) {",
+          "      version = delta.version();",
+          "      System.out.println(\"\\n[retry: starting over]\");",
+          "    }",
+          "    if (delta.delta().get(\"answer\") instanceof String text) System.out.print(text);",
+          "  }",
+          "  System.out.println();"
         ]
       }
     },

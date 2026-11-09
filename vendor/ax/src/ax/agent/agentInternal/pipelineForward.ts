@@ -256,6 +256,9 @@ function applyDirectRespondState(p: any): void {
   p.executor.stateError = p.distiller.stateError;
 }
 
+// Actor stages belong to this agent; only delegated programs inherit a filtered context.
+const actorMCPContext = Symbol('actorMCPContext');
+
 class ActorStageProgram {
   private id = '';
 
@@ -274,6 +277,13 @@ class ActorStageProgram {
     const directRespondRun = values?.[AX_DIRECT_RESPOND_RUN_KEY];
     if (directRespondRun) {
       return directRespondRun;
+    }
+    if (values && actorMCPContext in values) {
+      const { [actorMCPContext]: context, ...inputs } = values;
+      return this.actor.run(ai, inputs, {
+        ...options,
+        _mcpExecutionContext: context,
+      });
     }
     return this.actor.run(ai, values, options);
   }
@@ -819,13 +829,20 @@ export function buildPipelineFlow<IN extends AxGenIn, OUT extends AxGenOut>(
     )
     .execute(
       'distiller',
-      (state) => state.agentValues as any,
+      (state) =>
+        ({
+          ...state.agentValues,
+          [actorMCPContext]: state.forwardOptions?._mcpExecutionContext,
+        }) as any,
       p.distillerAi ? { ai: p.distillerAi } : undefined
     )
     .map((state) => buildExecutorInputsFromDistiller(p, state))
     .execute(
       'executor',
-      (state) => (state as any).executorInputs,
+      (state) => ({
+        ...(state as any).executorInputs,
+        [actorMCPContext]: state.forwardOptions?._mcpExecutionContext,
+      }),
       p.executorAi ? { ai: p.executorAi } : undefined
     )
     .map((state) => buildResponderInputFromExecutor(p, state))
@@ -957,11 +974,24 @@ export async function* streamingForwardPipeline<
     }
 
     const sharedSession = beginPipelineSharedSession(p);
+    // As forward's flow does, the run reports its lifecycle to a run control
+    // at its own path and runs each stage at `<path>/<stage>`, so a steer
+    // targeted at a stage reaches it.
+    const control = runOptions.control;
+    const runPath = runOptions.executionPath ?? 'root';
+    const stageOptions = (stage: 'distiller' | 'executor' | 'responder') => ({
+      ...runOptions,
+      executionPath: `${runPath}/${stage}`,
+    });
+    let runSucceeded = false;
+    let runFailed = false;
+    let runFailure: unknown;
+    control?.emit({ type: 'started', path: runPath });
     try {
       const distillerRun = await p.distiller.run(
         distillerAi,
         valuesForStages,
-        runOptions
+        stageOptions('distiller')
       );
       throwOnClarification(distillerRun.executorResult, p.distiller);
 
@@ -989,7 +1019,7 @@ export async function* streamingForwardPipeline<
         executorRun = await p.executor.run(
           executorAi,
           executorInputs,
-          runOptions
+          stageOptions('executor')
         );
         throwOnClarification(executorRun.executorResult, p.executor);
       }
@@ -1018,7 +1048,7 @@ export async function* streamingForwardPipeline<
       yield* p.responder.streamingForward(responderAi, {
         nonContextValues: nonCtxForResponder,
         executorResult: executorRun.executorResult,
-        options: runOptions,
+        options: stageOptions('responder'),
       });
       if (typeof p._updateContextMapFromPipelineState === 'function') {
         await p._updateContextMapFromPipelineState(ai, {
@@ -1037,7 +1067,23 @@ export async function* streamingForwardPipeline<
           executorResult: executorRun,
         });
       }
+      runSucceeded = true;
+    } catch (error) {
+      runFailed = true;
+      runFailure = error;
+      throw error;
     } finally {
+      if (runSucceeded || runFailed) {
+        control?.emit({
+          type: runSucceeded ? 'completed' : 'failed',
+          path: runPath,
+          ...(runFailed ? { error: runFailure } : {}),
+        });
+      } else {
+        // The consumer stopped the stream early: the run ended on purpose,
+        // as a streaming AxGen reports it.
+        control?.emit({ type: 'aborted', path: runPath });
+      }
       endPipelineSharedSession(p, sharedSession);
     }
   } catch (error) {

@@ -10,14 +10,14 @@ Add the dependency from Maven Central:
 <dependency>
   <groupId>dev.axllm</groupId>
   <artifactId>ax</artifactId>
-  <version>24.0.15</version>
+  <version>25.4.9</version>
 </dependency>
 ```
 
 Or with Gradle:
 
 ```groovy
-implementation 'dev.axllm:ax:24.0.15'
+implementation 'dev.axllm:ax:25.4.9'
 ```
 
 Realtime audio over WebSocket uses the JDK's built-in `java.net.http` WebSocket — no extra dependency.
@@ -37,9 +37,13 @@ System.out.println(schema.get("properties"));
 - AxGen: run structured generation with retries, tool calls, field processors, assertions, traces, usage, and provider-backed output parsing.
 - AxAI: select named deployment profiles independently from model IDs, resolve model-aware structured-output modes, and attach renewable request credentials through one provider boundary.
 - Audio and realtime: `.chat()` accepts `input_audio` content parts, `transcribe()`/`speak()` do batch speech-to-text and text-to-speech, and realtime-capable models stream audio over a WebSocket — transparently through `chat()` or via the productized `realtime_chat()` driver (Go: `RealtimeChat`).
+- Meta Muse: `meta` (Responses), `meta-chat` (Chat Completions), and `meta-messages` (Messages) default to `muse-spark-1.3` with `MODEL_API_KEY`. Muse Image uses chat and `results[].images`; Muse Voice uses batch transcription or realtime streaming chat. Contributor models expose provider-training data-use metadata and are never defaults. Glimmer uses the existing self-hosted profiles; Ax does not manage weights.
+- Jev and OpenAI Decisions: use required boolean/class/rubric score signatures with (evidence) to retain probabilities, native values, optional confidence, and trusted provenance through AxGen. Generative models use the same contract with elicited evidence. Rerank query/document pairs by the continuous rubric score while preserving candidate IDs.
+- Native decision clients: use explicit provider request shapes for advanced criteria, structured state, ordered questions, and provider-specific media. Normal evidence-bearing signatures support scores and answered/refused outcomes without calling these clients directly.
 - AxAgent and RLM: let an agent plan and execute actor-code steps while Ax keeps envelopes, state, logs, traces, context, discovery, recall, and final typed responses aligned.
 - AxFlow: compose AxGen, AxAgent, and nested flows into a portable program graph.
 - Optimizers: save, load, apply, and evaluate optimizer artifacts, including the generated GEPA engine.
+- Evaluation: Ax.novelF1Score scores multiset word overlap after excluding history and stopwords, with matching Unicode normalization and finite empty-input scores.
 
 ## Package Shape
 
@@ -56,12 +60,15 @@ Shared Ax behavior is Core-owned. The generated target code stays focused on idi
 `no-key` examples are deterministic local smokes. They are the fastest way to see the package work without any provider account:
 
 - `examples/SignatureSchemaExample.java`: signature parsing and JSON schema generation
+- `examples/ModelCatalogExample.java`: model catalog, named profiles, thinking levels, and service tiers
 - `examples/AxGenScriptedClientToolExample.java`: AxGen with a scripted client and tool
+- `examples/AxGenStreamingNoKeyExample.java`: `streamingForward` deltas with streaming assertions, streaming and feedback field processors, transforms, early close, and cancellation through a scripted streaming client and a scripted OpenAI SSE transport, and `AxCachingFunction` hits, which send no request and record no span or metric, from the constructor, the forward call and `AxGlobals.setCachingFunction`
 - `examples/ProviderMappingNoKeyExample.java`: provider mapping through a scripted transport
 - `examples/RuntimeHooksNoKeyExample.java`: runtime-hook globals and typed program surfaces through a scripted transport
 - `examples/AdaptiveBalancerNoKeyExample.java`: adaptive balancer state, scoring, and stable route keys without a provider key
 - `examples/ProviderStreamNoKeyExample.java`: provider streaming through a scripted SSE transport
-- `examples/AxFlowProgramGraphExample.java`: AxFlow program graph
+- `examples/CancellationNoKeyExample.java`: one-shot provider cancellation with no transport attempt
+- `examples/AxFlowProgramGraphExample.java`: AxFlow program graph and a caching function, whose hits run no node and record no span
 - `examples/FlowMermaidExample.java`: portable Mermaid flow parsing and canonical round-trip
 - `examples/AudioResponsesMappingExample.java`: OpenAI Responses speak/transcribe mapping through a scripted transport
 - `examples/RealtimeAudioEventsExample.java`: Grok/Gemini realtime audio setup, input, and event folding

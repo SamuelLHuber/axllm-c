@@ -1,13 +1,21 @@
 import { describe, expect, it, vi } from 'vitest';
 
+import { f, fn } from '../../dsp/sig.js';
+import { axAIProviderProfiles } from '../provider_profiles.generated.js';
 import { ai as createAI } from '../wrap.js';
 import {
   AxAIGoogleGemini,
   axAIGoogleGeminiDefaultConfig,
+  axAIGoogleGeminiDefaultCreativeConfig,
   axAIGoogleGeminiLiveAudioDefaultConfig,
 } from './api.js';
+import { axModelInfoGoogleGemini } from './info.js';
 import { axIsGeminiLiveAudioModel } from './live_audio.js';
-import { AxAIGoogleGeminiEmbedModel, AxAIGoogleGeminiModel } from './types.js';
+import {
+  AxAIGoogleGeminiEmbedModel,
+  AxAIGoogleGeminiEmbedTypes,
+  AxAIGoogleGeminiModel,
+} from './types.js';
 
 // Utility to create a fake fetch that returns a minimal valid response and captures request body
 function createMockFetch(body: unknown, capture: { lastBody?: any }) {
@@ -57,10 +65,19 @@ function createSequencedMockFetch(
     });
 }
 
+// How the fake server frames its JSON. The real Live endpoint uses binary
+// frames, which a WebSocket delivers as a Blob unless binaryType is
+// 'arraybuffer'. 'bytes' ignores binaryType and hands over a view into a
+// larger buffer, like a pooled Node Buffer from `ws`.
+type FakeGeminiLiveFrames = 'binary' | 'text' | 'bytes';
+
 class FakeGeminiLiveWebSocket {
   static serverMessages: unknown[] = [];
   static instances: FakeGeminiLiveWebSocket[] = [];
+  static frames: FakeGeminiLiveFrames = 'binary';
+  static closeOnSetup?: { code: number; reason: string };
 
+  binaryType = 'blob';
   readonly sent: string[] = [];
   readonly url: string;
   private readonly listeners = new Map<string, ((event: any) => void)[]>();
@@ -88,7 +105,12 @@ class FakeGeminiLiveWebSocket {
 
     if (message.setup) {
       queueMicrotask(() => {
-        this.emit('message', { data: JSON.stringify({ setupComplete: {} }) });
+        const rejection = FakeGeminiLiveWebSocket.closeOnSetup;
+        if (rejection) {
+          this.emit('close', rejection);
+          return;
+        }
+        this.emit('message', { data: this.frame({ setupComplete: {} }) });
       });
       return;
     }
@@ -99,7 +121,7 @@ class FakeGeminiLiveWebSocket {
     ) {
       queueMicrotask(() => {
         for (const serverMessage of FakeGeminiLiveWebSocket.serverMessages) {
-          this.emit('message', { data: JSON.stringify(serverMessage) });
+          this.emit('message', { data: this.frame(serverMessage) });
         }
       });
     }
@@ -107,6 +129,20 @@ class FakeGeminiLiveWebSocket {
 
   close() {
     this.emit('close', {});
+  }
+
+  private frame(message: unknown): unknown {
+    const json = JSON.stringify(message);
+    if (FakeGeminiLiveWebSocket.frames === 'text') {
+      return json;
+    }
+    const bytes = new TextEncoder().encode(json);
+    if (FakeGeminiLiveWebSocket.frames === 'bytes') {
+      const pooled = new Uint8Array(bytes.length + 8);
+      pooled.set(bytes, 4);
+      return pooled.subarray(4, 4 + bytes.length);
+    }
+    return this.binaryType === 'arraybuffer' ? bytes.buffer : new Blob([bytes]);
   }
 
   private emit(type: string, event: any) {
@@ -120,10 +156,18 @@ class FakeGeminiLiveWebSocket {
   }
 }
 
-function installFakeGeminiLiveWebSocket(messages: unknown[]) {
+function installFakeGeminiLiveWebSocket(
+  messages: unknown[],
+  options: {
+    frames?: FakeGeminiLiveFrames;
+    closeOnSetup?: { code: number; reason: string };
+  } = {}
+) {
   const original = globalThis.WebSocket;
   FakeGeminiLiveWebSocket.serverMessages = messages;
   FakeGeminiLiveWebSocket.instances = [];
+  FakeGeminiLiveWebSocket.frames = options.frames ?? 'binary';
+  FakeGeminiLiveWebSocket.closeOnSetup = options.closeOnSetup;
   (globalThis as any).WebSocket = FakeGeminiLiveWebSocket;
 
   return () => {
@@ -264,6 +308,140 @@ describe('AxAIGoogleGemini schema validation', () => {
     expect(responseSchema?.properties?.profile?.properties?.age?.maximum).toBe(
       120
     );
+  });
+
+  it('sends fn() tool schemas as parametersJsonSchema, never the OpenAPI-subset parameters field', async () => {
+    // Gemini's `parameters` field rejects `additionalProperties` with HTTP 400
+    // ("Unknown name additionalProperties ... Cannot find field"), and fn()
+    // emits it on every object schema.
+    const getWeather = fn('getWeather')
+      .description('Get the current weather for a city')
+      .arg('city', f.string('City'))
+      .arg(
+        'options',
+        f.object({ units: f.string('Units').optional() }).optional()
+      )
+      .returns(f.string('Weather'))
+      .handler(async () => 'sunny')
+      .build();
+    expect(getWeather.parameters.additionalProperties).toBe(false);
+
+    const ai = new AxAIGoogleGemini({
+      apiKey: 'key',
+      config: { model: AxAIGoogleGeminiModel.Gemini36Flash },
+      models: [],
+    });
+
+    const capture: { lastBody?: any } = {};
+    ai.setOptions({
+      fetch: createMockFetch(
+        {
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    functionCall: {
+                      name: 'getWeather',
+                      args: { city: 'Paris' },
+                    },
+                  },
+                ],
+              },
+              finishReason: 'STOP',
+            },
+          ],
+        },
+        capture
+      ),
+    });
+
+    const res = await ai.chat(
+      {
+        chatPrompt: [{ role: 'user', content: 'Weather in Paris?' }],
+        functions: [getWeather],
+      },
+      { stream: false }
+    );
+
+    const declarations = capture.lastBody?.tools?.[0]?.function_declarations;
+    expect(declarations).toHaveLength(1);
+    const [declaration] = declarations;
+    expect(Object.keys(declaration).sort()).toEqual([
+      'description',
+      'name',
+      'parametersJsonSchema',
+    ]);
+    expect(declaration).not.toHaveProperty('parameters');
+    expect(declaration.parametersJsonSchema).toEqual(getWeather.parameters);
+    expect(
+      declaration.parametersJsonSchema.properties.options.additionalProperties
+    ).toBe(false);
+
+    if (res instanceof ReadableStream) {
+      throw new Error('expected a non-streaming response');
+    }
+    expect(res.results[0]?.functionCalls?.[0]?.function).toEqual({
+      name: 'getWeather',
+      params: { city: 'Paris' },
+    });
+  });
+
+  it('nests allowed_function_names inside function_calling_config for forced function calls', async () => {
+    // Gemini 400s on allowedFunctionNames at the toolConfig level.
+    const ai = new AxAIGoogleGemini({
+      apiKey: 'key',
+      config: { model: AxAIGoogleGeminiModel.Gemini36Flash },
+      models: [],
+    });
+
+    const capture: { lastBody?: any } = {};
+    ai.setOptions({
+      fetch: createMockFetch(
+        {
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    functionCall: {
+                      name: 'getTime',
+                      args: { city: 'Paris' },
+                    },
+                  },
+                ],
+              },
+              finishReason: 'STOP',
+            },
+          ],
+        },
+        capture
+      ),
+    });
+
+    const parameters = {
+      type: 'object',
+      properties: { city: { type: 'string' } },
+      required: ['city'],
+    } as const;
+    await ai.chat(
+      {
+        chatPrompt: [{ role: 'user', content: 'Time in Paris?' }],
+        functions: [
+          { name: 'getWeather', description: 'Get the weather', parameters },
+          { name: 'getTime', description: 'Get the time', parameters },
+        ],
+        functionCall: { type: 'function', function: { name: 'getTime' } },
+      },
+      { stream: false }
+    );
+
+    expect(capture.lastBody?.toolConfig).toEqual({
+      function_calling_config: {
+        mode: 'ANY',
+        allowed_function_names: ['getTime'],
+      },
+    });
   });
 });
 
@@ -406,6 +584,191 @@ describe('AxAIGoogleGemini model key preset merging', () => {
     expect(capture.calls[0]?.url).toContain(
       '/v1/projects/demo-project/locations/us-central1/publishers/google/models/gemini-embedding-001:predict'
     );
+  });
+
+  it('sends the Vertex embedding task type as task_type', async () => {
+    const capture: { calls: Array<{ url: string; body?: any }> } = {
+      calls: [],
+    };
+    const fetch = createSequencedMockFetch(
+      [{ predictions: [{ embeddings: { values: [0.1, 0.2, 0.3] } }] }],
+      capture
+    );
+
+    const ai = new AxAIGoogleGemini({
+      apiKey: async () => 'vertex-token',
+      projectId: 'demo-project',
+      region: 'us-central1',
+      config: {
+        model: AxAIGoogleGeminiModel.Gemini25Flash,
+        embedType: AxAIGoogleGeminiEmbedTypes.RetrievalDocument,
+      },
+    });
+
+    ai.setOptions({ fetch });
+
+    await ai.embed({
+      embedModel: AxAIGoogleGeminiEmbedModel.GeminiEmbedding001,
+      texts: ['hello world'],
+    });
+
+    // Vertex :predict silently ignores `taskType` and embeds as RETRIEVAL_QUERY.
+    const instance = capture.calls[0]?.body?.instances?.[0];
+    expect(instance).toEqual({
+      content: 'hello world',
+      task_type: 'RETRIEVAL_DOCUMENT',
+    });
+  });
+
+  describe('gemini-embedding-2 embeddings', () => {
+    const embedContentResponse = {
+      embedding: { values: [0.1, 0.2, 0.3] },
+      usageMetadata: { promptTokenCount: 2, totalTokenCount: 2 },
+    };
+
+    const createVertexAI = (
+      fetch: typeof globalThis.fetch,
+      { beta, autoTruncate }: { beta?: boolean; autoTruncate?: boolean } = {}
+    ) =>
+      new AxAIGoogleGemini({
+        apiKey: async () => 'vertex-token',
+        projectId: 'demo-project',
+        region: 'us-central1',
+        config: {
+          model: AxAIGoogleGeminiModel.Gemini25Flash,
+          embedModel: AxAIGoogleGeminiEmbedModel.GeminiEmbedding2,
+          embedType: AxAIGoogleGeminiEmbedTypes.RetrievalDocument,
+          dimensions: 768,
+          autoTruncate,
+        },
+        options: { beta, fetch },
+      });
+
+    it('sends one text to the global :embedContent endpoint with no task type', async () => {
+      const capture: { calls: Array<{ url: string; body?: any }> } = {
+        calls: [],
+      };
+      const fetch = createSequencedMockFetch([embedContentResponse], capture);
+      const ai = createVertexAI(fetch);
+
+      const res = await ai.embed({ texts: ['hello world'] });
+
+      // Vertex serves this model only at locations/global; us-central1 404s.
+      expect(capture.calls[0]?.url).toBe(
+        'https://aiplatform.googleapis.com/v1/projects/demo-project/locations/global/publishers/google/models/gemini-embedding-2:embedContent'
+      );
+      // embedType is configured, but Vertex ignores a task type for this model.
+      expect(capture.calls[0]?.body).toEqual({
+        content: { parts: [{ text: 'hello world' }] },
+        outputDimensionality: 768,
+      });
+      expect(res.embeddings).toEqual([[0.1, 0.2, 0.3]]);
+      expect(res.modelUsage?.model).toBe('gemini-embedding-2');
+      expect(res.modelUsage?.tokens).toEqual({
+        promptTokens: 2,
+        completionTokens: 0,
+        totalTokens: 2,
+      });
+      expect(ai.getLastUsedEmbedModel()).toBe('gemini-embedding-2');
+    });
+
+    it('honors options.beta by routing onto v1beta1', async () => {
+      const capture: { calls: Array<{ url: string; body?: any }> } = {
+        calls: [],
+      };
+      const fetch = createSequencedMockFetch([embedContentResponse], capture);
+      const ai = createVertexAI(fetch, { beta: true });
+
+      await ai.embed({ texts: ['hello world'] });
+
+      expect(capture.calls[0]?.url).toBe(
+        'https://aiplatform.googleapis.com/v1beta1/projects/demo-project/locations/global/publishers/google/models/gemini-embedding-2:embedContent'
+      );
+    });
+
+    it('sends autoTruncate when configured', async () => {
+      const capture: { calls: Array<{ url: string; body?: any }> } = {
+        calls: [],
+      };
+      const fetch = createSequencedMockFetch([embedContentResponse], capture);
+      const ai = createVertexAI(fetch, { autoTruncate: false });
+
+      await ai.embed({ texts: ['hello world'] });
+
+      // Vertex truncates past 8,192 tokens by default; false makes it return 400.
+      expect(capture.calls[0]?.body?.autoTruncate).toBe(false);
+    });
+
+    it('rejects more than one text without calling Vertex', async () => {
+      const capture: { calls: Array<{ url: string; body?: any }> } = {
+        calls: [],
+      };
+      const fetch = createSequencedMockFetch([embedContentResponse], capture);
+      const ai = createVertexAI(fetch);
+
+      // Vertex would fuse both texts into one vector.
+      await expect(ai.embed({ texts: ['a', 'b'] })).rejects.toThrow(
+        'gemini-embedding-2 on Vertex embeds one text per request'
+      );
+      expect(fetch).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      {
+        label: 'an :embedContent response without usageMetadata',
+        embedModel: AxAIGoogleGeminiEmbedModel.GeminiEmbedding2,
+        response: { embedding: { values: [0.4] } },
+      },
+      {
+        label: 'a :predict response',
+        embedModel: AxAIGoogleGeminiEmbedModel.GeminiEmbedding001,
+        response: { predictions: [{ embeddings: { values: [0.4] } }] },
+      },
+    ])(
+      'records no usage for $label after a call that reported usage',
+      async ({ embedModel, response }) => {
+        const fetch = createSequencedMockFetch(
+          [embedContentResponse, response],
+          { calls: [] }
+        );
+        const ai = createVertexAI(fetch);
+
+        const first = await ai.embed({ texts: ['a'] });
+        const second = await ai.embed({ embedModel, texts: ['b'] });
+
+        expect(first.modelUsage?.tokens?.promptTokens).toBe(2);
+        expect(second.modelUsage).toBeUndefined();
+      }
+    );
+
+    it('leaves the Gemini API on batchEmbedContents with taskType', async () => {
+      const capture: { calls: Array<{ url: string; body?: any }> } = {
+        calls: [],
+      };
+      const fetch = createSequencedMockFetch(
+        [{ embeddings: [{ values: [0.1] }, { values: [0.2] }] }],
+        capture
+      );
+      const ai = new AxAIGoogleGemini({
+        apiKey: 'gemini-key',
+        config: {
+          model: AxAIGoogleGeminiModel.Gemini25Flash,
+          embedModel: AxAIGoogleGeminiEmbedModel.GeminiEmbedding2,
+          embedType: AxAIGoogleGeminiEmbedTypes.RetrievalDocument,
+        },
+        options: { fetch },
+      });
+
+      const res = await ai.embed({ texts: ['a', 'b'] });
+
+      expect(capture.calls[0]?.url).toBe(
+        'https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:batchEmbedContents'
+      );
+      expect(capture.calls[0]?.body?.requests?.[0]?.taskType).toBe(
+        'RETRIEVAL_DOCUMENT'
+      );
+      expect(res.embeddings).toEqual([[0.1], [0.2]]);
+    });
   });
 
   it('honors options.beta by routing Vertex chat requests onto v1beta1', async () => {
@@ -559,7 +922,7 @@ describe('AxAIGoogleGemini model key preset merging', () => {
     expect(mc?.topP).toBe(0.9);
 
     // Sanity: defaults applied if not set
-    expect(defaultCfg.model).toBe(AxAIGoogleGeminiModel.Gemini25Flash);
+    expect(defaultCfg.model).toBe(AxAIGoogleGeminiModel.Gemini36Flash);
   });
 
   it('maps modelConfig.n to Gemini candidateCount', async () => {
@@ -596,6 +959,7 @@ describe('AxAIGoogleGemini model key preset merging', () => {
   });
 
   it.each([
+    AxAIGoogleGeminiModel.Gemini38Flash,
     AxAIGoogleGeminiModel.Gemini37Flash,
     AxAIGoogleGeminiModel.Gemini36Flash,
     AxAIGoogleGeminiModel.Gemini35FlashLite,
@@ -635,6 +999,53 @@ describe('AxAIGoogleGemini model key preset merging', () => {
     expect(capture.lastBody?.generationConfig).not.toHaveProperty('topP');
     expect(capture.lastBody?.generationConfig).not.toHaveProperty('topK');
   });
+
+  it.each([
+    AxAIGoogleGeminiModel.Gemini38Flash,
+    AxAIGoogleGeminiModel.Gemini37Flash,
+    AxAIGoogleGeminiModel.Gemini36Flash,
+  ])(
+    'omits unsupported candidate and penalty parameters for %s',
+    async (model) => {
+      const capture: { lastBody?: any } = {};
+      const ai = new AxAIGoogleGemini({
+        apiKey: 'key',
+        config: { model, n: 2, frequencyPenalty: 0.4 },
+        models: [],
+        options: {
+          fetch: createMockFetch(
+            {
+              candidates: [
+                {
+                  content: { parts: [{ text: 'ok' }] },
+                  finishReason: 'STOP',
+                },
+              ],
+            },
+            capture
+          ),
+        },
+      });
+
+      await ai.chat(
+        {
+          chatPrompt: [{ role: 'user', content: 'hi' }],
+          modelConfig: { n: 3, frequencyPenalty: 0.2 },
+        },
+        { stream: false }
+      );
+
+      expect(capture.lastBody?.generationConfig).not.toHaveProperty(
+        'candidateCount'
+      );
+      expect(capture.lastBody?.generationConfig).not.toHaveProperty(
+        'frequencyPenalty'
+      );
+      expect(capture.lastBody?.generationConfig).not.toHaveProperty(
+        'presencePenalty'
+      );
+    }
+  );
 
   it('maps numeric thinkingTokenBudget in item config to per-model options and preserves explicit overrides', async () => {
     const ai = new AxAIGoogleGemini({
@@ -700,6 +1111,11 @@ describe('AxAIGoogleGemini model key preset merging', () => {
       model: AxAIGoogleGeminiModel.Gemini35Flash,
       requested: 'highest' as const,
       expectedLevel: 'high',
+    },
+    {
+      model: AxAIGoogleGeminiModel.Gemini38Flash,
+      requested: 'minimal' as const,
+      expectedLevel: 'low',
     },
     {
       model: AxAIGoogleGeminiModel.Gemini37Flash,
@@ -815,7 +1231,7 @@ describe('AxAIGoogleGemini model key preset merging', () => {
     const ai = new AxAIGoogleGemini({
       apiKey: 'key',
       config: {
-        model: AxAIGoogleGeminiModel.Gemini37Flash,
+        model: AxAIGoogleGeminiModel.Gemini38Flash,
         thinkingLevelMapping: { minimal: 'minimal' },
       },
       models: [],
@@ -852,7 +1268,7 @@ describe('AxAIGoogleGemini model key preset merging', () => {
       models: [
         {
           key: 'modern',
-          model: AxAIGoogleGeminiModel.Gemini37Flash,
+          model: AxAIGoogleGeminiModel.Gemini38Flash,
           description: 'Gemini 3 preset',
           thinkingTokenBudget: 'minimal',
           showThoughts: true,
@@ -1240,7 +1656,11 @@ describe('AxAIGoogleGemini model key preset merging', () => {
             content: {
               parts: [
                 {
-                  functionCall: { name: 'foo', args: {} },
+                  functionCall: {
+                    id: 'provider-call-foo',
+                    name: 'foo',
+                    args: {},
+                  },
                   thoughtSignature: 'sig123',
                 },
               ],
@@ -1263,6 +1683,7 @@ describe('AxAIGoogleGemini model key preset merging', () => {
     );
 
     expect(res.results[0]?.functionCalls?.[0].function.name).toBe('foo');
+    expect(res.results[0]?.functionCalls?.[0].id).toBe('provider-call-foo');
     expect(res.results[0]?.thoughtBlocks?.[0]?.signature).toBe('sig123');
 
     // 2. Second turn: User sends function result, Model should receive signature back
@@ -1276,7 +1697,7 @@ describe('AxAIGoogleGemini model key preset merging', () => {
       },
       {
         role: 'function',
-        functionId: 'foo',
+        functionId: 'provider-call-foo',
         result: JSON.stringify({ ok: true }),
       },
     ];
@@ -1292,8 +1713,13 @@ describe('AxAIGoogleGemini model key preset merging', () => {
     // Verify the assistant message in the request contains the signature on the function call part
     const assistantMsg = reqBody.contents[1];
     expect(assistantMsg.role).toBe('model');
+    expect(assistantMsg.parts[0].functionCall.id).toBe('provider-call-foo');
     expect(assistantMsg.parts[0].functionCall.name).toBe('foo');
     expect(assistantMsg.parts[0].thought_signature).toBe('sig123');
+    expect(reqBody.contents[2].parts[0].functionResponse).toMatchObject({
+      id: 'provider-call-foo',
+      name: 'foo',
+    });
   });
 
   it('groups parallel function responses into a single user turn', async () => {
@@ -1331,8 +1757,8 @@ describe('AxAIGoogleGemini model key preset merging', () => {
           },
         ],
       },
-      { role: 'function', functionId: 'f1', result: 'r1' },
-      { role: 'function', functionId: 'f2', result: 'r2' },
+      { role: 'function', functionId: 'id1', result: 'r1' },
+      { role: 'function', functionId: 'id2', result: 'r2' },
     ];
 
     await ai.chat({ chatPrompt: history }, { stream: false });
@@ -1343,7 +1769,11 @@ describe('AxAIGoogleGemini model key preset merging', () => {
     const lastUserMsg = reqBody.contents[2];
     expect(lastUserMsg.role).toBe('user');
     expect(lastUserMsg.parts).toHaveLength(2);
+    expect(reqBody.contents[1].parts[0].functionCall.id).toBe('id1');
+    expect(reqBody.contents[1].parts[1].functionCall.id).toBe('id2');
+    expect(lastUserMsg.parts[0].functionResponse.id).toBe('id1');
     expect(lastUserMsg.parts[0].functionResponse.name).toBe('f1');
+    expect(lastUserMsg.parts[1].functionResponse.id).toBe('id2');
     expect(lastUserMsg.parts[1].functionResponse.name).toBe('f2');
   });
 
@@ -1756,7 +2186,7 @@ describe('AxAIGoogleGemini model key preset merging', () => {
     expect(assistantMsg.parts[1].thought_signature).toBe('sig1');
   });
 
-  describe('context caching tool semantics', () => {
+  describe('context caching semantics', () => {
     const cacheCreateResponse = {
       name: 'cachedContents/test-cache',
       expireTime: '2099-01-01T00:00:00Z',
@@ -1793,6 +2223,85 @@ describe('AxAIGoogleGemini model key preset merging', () => {
     };
 
     it.each([
+      {
+        name: 'multiple system messages before and after the breakpoint',
+        before: ['Follow the policy.', 'Keep answers concise.'],
+        after: ['Answer in French.'],
+        expected: {
+          role: 'user',
+          parts: [
+            {
+              text: 'Follow the policy. Keep answers concise. Answer in French.',
+            },
+          ],
+        },
+      },
+      {
+        name: 'one system message',
+        before: ['Follow the policy.'],
+        after: [],
+        expected: { role: 'user', parts: [{ text: 'Follow the policy.' }] },
+      },
+      {
+        name: 'no system messages',
+        before: [],
+        after: [],
+        expected: undefined,
+      },
+    ])('preserves $name when caching', async ({ before, after, expected }) => {
+      const ai = createAI({
+        name: 'google-gemini',
+        apiKey: 'key',
+        config: { model: AxAIGoogleGeminiModel.Gemini38Flash },
+      });
+      const capture = { calls: [] as Array<{ url: string; body?: any }> };
+      const fetch = createSequencedMockFetch(
+        [
+          generateResponse,
+          cacheCreateResponse,
+          generateResponse,
+          generateResponse,
+        ],
+        capture
+      );
+      const { registry } = createRegistry();
+      ai.setOptions({ fetch });
+
+      const chatPrompt = [
+        ...before.map((content) => ({ role: 'system' as const, content })),
+        { role: 'user' as const, content: 'Reference material', cache: true },
+        ...after.map((content) => ({ role: 'system' as const, content })),
+        { role: 'user' as const, content: 'Summarize it.' },
+      ];
+
+      await ai.chat({ chatPrompt }, { stream: false });
+      const options = {
+        stream: false,
+        contextCache: { minTokens: 0, registry },
+      };
+      await ai.chat({ chatPrompt }, options);
+      await ai.chat({ chatPrompt }, options);
+
+      expect(capture.calls).toHaveLength(4);
+      const uncachedRequest = capture.calls[0]?.body;
+      const cacheCreateRequest = capture.calls[1]?.body;
+      expect(uncachedRequest.systemInstruction).toEqual(expected);
+      expect(cacheCreateRequest.systemInstruction).toEqual(expected);
+      expect(cacheCreateRequest.contents).toEqual([
+        { role: 'user', parts: [{ text: 'Reference material' }] },
+      ]);
+      for (const { body } of capture.calls.slice(2)) {
+        expect(body.cachedContent).toBe('cachedContents/test-cache');
+        expect(body).not.toHaveProperty('systemInstruction');
+        expect(body.contents).toEqual([
+          { role: 'user', parts: [{ text: 'Summarize it.' }] },
+        ]);
+      }
+    });
+
+    it.each([
+      AxAIGoogleGeminiModel.Gemini38Flash,
+      AxAIGoogleGeminiModel.Gemini37Flash,
       AxAIGoogleGeminiModel.Gemini36Flash,
       AxAIGoogleGeminiModel.Gemini35FlashLite,
     ])(
@@ -1830,6 +2339,10 @@ describe('AxAIGoogleGemini model key preset merging', () => {
         expect(generationConfig).not.toHaveProperty('temperature');
         expect(generationConfig).not.toHaveProperty('topP');
         expect(generationConfig).not.toHaveProperty('topK');
+        if (model !== AxAIGoogleGeminiModel.Gemini35FlashLite) {
+          expect(generationConfig).not.toHaveProperty('candidateCount');
+          expect(generationConfig).not.toHaveProperty('frequencyPenalty');
+        }
       }
     );
 
@@ -1935,14 +2448,19 @@ describe('AxAIGoogleGemini model key preset merging', () => {
       expect(
         cacheCreateReq.tools[0].function_declarations.map((fn: any) => fn.name)
       ).toEqual(['search', 'spawnSearchAgent']);
+      for (const declaration of cacheCreateReq.tools[0].function_declarations) {
+        expect(declaration).not.toHaveProperty('parameters');
+        expect(declaration.parametersJsonSchema?.required).toEqual(['query']);
+      }
       expect(cacheCreateReq.toolConfig?.function_calling_config?.mode).toBe(
         'ANY'
       );
-      expect(
-        cacheCreateReq.toolConfig?.allowedFunctionNames ??
-          cacheCreateReq.toolConfig?.function_calling_config
-            ?.allowedFunctionNames
-      ).toContain('spawnSearchAgent');
+      expect(cacheCreateReq.toolConfig).toEqual({
+        function_calling_config: {
+          mode: 'ANY',
+          allowed_function_names: ['spawnSearchAgent'],
+        },
+      });
 
       const generateReq = capture.calls[1]?.body;
       expect(generateReq.cachedContent).toBe('cachedContents/test-cache');
@@ -2085,11 +2603,12 @@ describe('AxAIGoogleGemini model key preset merging', () => {
       expect(cacheCreateReq.toolConfig?.function_calling_config?.mode).toBe(
         'ANY'
       );
-      expect(
-        cacheCreateReq.toolConfig?.allowedFunctionNames ??
-          cacheCreateReq.toolConfig?.function_calling_config
-            ?.allowedFunctionNames
-      ).toContain('spawnSearchAgent');
+      expect(cacheCreateReq.toolConfig).toEqual({
+        function_calling_config: {
+          mode: 'ANY',
+          allowed_function_names: ['spawnSearchAgent'],
+        },
+      });
 
       const generateReq = capture.calls[1]?.body;
       expect(generateReq.cachedContent).toBe('cachedContents/test-cache');
@@ -2158,9 +2677,15 @@ describe('AxAIGoogleGemini model key preset merging', () => {
       expect(cacheCreateReq.contents[1]?.parts?.[0]?.functionCall?.name).toBe(
         '__axOutput'
       );
+      expect(cacheCreateReq.contents[1]?.parts?.[0]?.functionCall?.id).toBe(
+        'example-0'
+      );
       expect(
         cacheCreateReq.contents[2]?.parts?.[0]?.functionResponse?.name
       ).toBe('__axOutput');
+      expect(cacheCreateReq.contents[2]?.parts?.[0]?.functionResponse?.id).toBe(
+        'example-0'
+      );
 
       const generateReq = capture.calls[1]?.body;
       expect(generateReq.contents).toHaveLength(1);
@@ -2267,8 +2792,14 @@ describe('AxAIGoogleGemini model key preset merging', () => {
       expect(generateReq.contents[1]?.parts?.[0]?.functionCall?.name).toBe(
         '__axOutput'
       );
+      expect(generateReq.contents[1]?.parts?.[0]?.functionCall?.id).toBe(
+        'example-0'
+      );
       expect(generateReq.contents[2]?.parts?.[0]?.functionResponse?.name).toBe(
         '__axOutput'
+      );
+      expect(generateReq.contents[2]?.parts?.[0]?.functionResponse?.id).toBe(
+        'example-0'
       );
       expect(generateReq.contents[3]?.parts?.[0]?.text).toBe('Live question');
     });
@@ -2808,10 +3339,10 @@ describe('AxAIGoogleGemini Live audio chat', () => {
     ).toBe(true);
   });
 
-  it('provides a native audio default config', () => {
+  it('provides a Live audio default config', () => {
     const config = axAIGoogleGeminiLiveAudioDefaultConfig();
 
-    expect(config.model).toBe(AxAIGoogleGeminiModel.Gemini25FlashNativeAudio);
+    expect(config.model).toBe(AxAIGoogleGeminiModel.Gemini38Live);
     expect(config.stream).toBe(false);
     expect(config.audio?.output?.enabled).toBe(true);
     expect(config.audio?.output?.voice).toBe('Kore');
@@ -2829,6 +3360,15 @@ describe('AxAIGoogleGemini Live audio chat', () => {
     {
       model: AxAIGoogleGeminiModel.Gemini25FlashNativeAudio,
       expected: { thinkingBudget: 10_000, includeThoughts: true },
+    },
+    {
+      model: AxAIGoogleGeminiModel.Gemini38LiveExtendedThinking,
+      expected: { thinkingLevel: 'high', includeThoughts: true },
+    },
+    {
+      // 3.8 Live refuses every thinking setting, so none is sent.
+      model: AxAIGoogleGeminiModel.Gemini38Live,
+      expected: undefined,
     },
   ])(
     'uses model-aware thinking in Live setup for $model',
@@ -3036,6 +3576,173 @@ describe('AxAIGoogleGemini Live audio chat', () => {
     }
   });
 
+  // A frame the client cannot read leaves the turn waiting for its timeout;
+  // a short timeout keeps that failure quick and readable.
+  const quickTimeoutLiveConfig = () => {
+    const config = axAIGoogleGeminiLiveAudioDefaultConfig();
+    return {
+      ...config,
+      audio: { ...config.audio, live: { turnTimeoutMs: 1_000 } },
+    };
+  };
+
+  it.each(['binary', 'text', 'bytes'] as const)(
+    'reads Live server messages sent in %s frames',
+    async (frames) => {
+      const restore = installFakeGeminiLiveWebSocket(
+        [
+          {
+            serverContent: {
+              outputTranscription: { text: 'hi' },
+              modelTurn: {
+                parts: [
+                  {
+                    inlineData: {
+                      mimeType: 'audio/pcm;rate=24000',
+                      data: 'AQI=',
+                    },
+                  },
+                ],
+              },
+              turnComplete: true,
+            },
+          },
+        ],
+        { frames }
+      );
+
+      try {
+        const ai = new AxAIGoogleGemini({
+          apiKey: 'key',
+          config: quickTimeoutLiveConfig(),
+          models: [],
+        });
+
+        const res = (await ai.chat(
+          { chatPrompt: [{ role: 'user', content: 'say hi' }] },
+          { stream: false }
+        )) as any;
+
+        expect(FakeGeminiLiveWebSocket.instances[0]?.binaryType).toBe(
+          'arraybuffer'
+        );
+        expect(res.results[0]?.content).toBe('hi');
+        expect(res.results[0]?.audio?.data).toBe('AQI=');
+      } finally {
+        restore();
+      }
+    }
+  );
+
+  it('keeps thought summaries out of the spoken answer', async () => {
+    const restore = installFakeGeminiLiveWebSocket([
+      {
+        serverContent: {
+          modelTurn: {
+            parts: [{ text: '**Picking a greeting**\n\n', thought: true }],
+          },
+        },
+      },
+      { serverContent: { outputTranscription: { text: 'Hello there.' } } },
+      {
+        serverContent: {
+          modelTurn: {
+            parts: [
+              {
+                inlineData: { mimeType: 'audio/pcm;rate=24000', data: 'AQI=' },
+              },
+            ],
+          },
+        },
+      },
+      { serverContent: { turnComplete: true } },
+    ]);
+
+    try {
+      const ai = new AxAIGoogleGemini({
+        apiKey: 'key',
+        config: axAIGoogleGeminiLiveAudioDefaultConfig(),
+        models: [],
+      });
+
+      const res = (await ai.chat(
+        { chatPrompt: [{ role: 'user', content: 'say hello' }] },
+        { stream: false }
+      )) as any;
+
+      expect(res.results[0]?.content).toBe('Hello there.');
+      expect(res.results[0]?.thought).toBe('**Picking a greeting**\n\n');
+      expect(res.results[0]?.audio?.data).toBe('AQI=');
+    } finally {
+      restore();
+    }
+  });
+
+  it('waits for the answer after an extended-thinking acknowledgement', async () => {
+    const spoken = (text: string, data: string) => ({
+      serverContent: {
+        outputTranscription: { text },
+        modelTurn: {
+          parts: [{ inlineData: { mimeType: 'audio/pcm;rate=24000', data } }],
+        },
+      },
+    });
+    const restore = installFakeGeminiLiveWebSocket([
+      spoken('Let me think.', 'AQI='),
+      {
+        serverContent: { turnComplete: true, interactionStatus: 'IN_PROGRESS' },
+      },
+      spoken('Hello there.', 'AwQ='),
+      { serverContent: { turnComplete: true, interactionStatus: 'IDLE' } },
+    ]);
+
+    try {
+      const ai = new AxAIGoogleGemini({
+        apiKey: 'key',
+        config: quickTimeoutLiveConfig(),
+        models: [],
+      });
+
+      const res = (await ai.chat(
+        { chatPrompt: [{ role: 'user', content: 'say hello' }] },
+        { stream: false }
+      )) as any;
+
+      expect(res.results[0]?.content).toBe('Let me think. Hello there.');
+      expect(res.results[0]?.audio?.data).toBe('AQIDBA==');
+    } finally {
+      restore();
+    }
+  });
+
+  it('fails with the close reason when the Live server rejects the setup', async () => {
+    const restore = installFakeGeminiLiveWebSocket([], {
+      closeOnSetup: {
+        code: 1007,
+        reason: 'Thinking level must be specified for this model.',
+      },
+    });
+
+    try {
+      const ai = new AxAIGoogleGemini({
+        apiKey: 'key',
+        config: quickTimeoutLiveConfig(),
+        models: [],
+      });
+
+      await expect(
+        ai.chat(
+          { chatPrompt: [{ role: 'user', content: 'say hi' }] },
+          { stream: false }
+        )
+      ).rejects.toThrow(
+        'Gemini Live WebSocket closed before completion (code 1007): Thinking level must be specified for this model.'
+      );
+    } finally {
+      restore();
+    }
+  });
+
   it('rejects structured output with Live audio output enabled', async () => {
     const ai = new AxAIGoogleGemini({
       apiKey: 'key',
@@ -3098,5 +3805,204 @@ describe('AxAIGoogleGemini Live audio chat', () => {
     } finally {
       restore();
     }
+  });
+});
+
+describe('AxAIGoogleGemini Sept-2026 models and audio defaults', () => {
+  const liveSetupThinking = async (
+    options: Record<string, unknown>
+  ): Promise<unknown> => {
+    const restore = installFakeGeminiLiveWebSocket([
+      { serverContent: { turnComplete: true } },
+    ]);
+    try {
+      const ai = new AxAIGoogleGemini({
+        apiKey: 'key',
+        config: {
+          ...axAIGoogleGeminiLiveAudioDefaultConfig(),
+          model: AxAIGoogleGeminiModel.Gemini38LiveExtendedThinking,
+        },
+        models: [],
+      });
+      await ai.chat(
+        { chatPrompt: [{ role: 'user', content: 'answer aloud' }] },
+        { stream: false, ...options }
+      );
+      const socket = FakeGeminiLiveWebSocket.instances.at(-1);
+      return JSON.parse(socket?.sent[0] ?? '{}').setup.generationConfig
+        .thinkingConfig;
+    } finally {
+      restore();
+    }
+  };
+
+  it('uses Gemini 3.6 Flash as the chat default', () => {
+    expect(axAIGoogleGeminiDefaultConfig().model).toBe(
+      AxAIGoogleGeminiModel.Gemini36Flash
+    );
+    expect(axAIGoogleGeminiDefaultCreativeConfig().model).toBe(
+      AxAIGoogleGeminiModel.Gemini36Flash
+    );
+  });
+
+  it('gives Live Extended Thinking the thinking level its setup requires', async () => {
+    expect(await liveSetupThinking({})).toEqual({ thinkingLevel: 'medium' });
+    // `minimal` is refused too, so `none` lands on the lowest level served.
+    expect(await liveSetupThinking({ thinkingTokenBudget: 'none' })).toEqual({
+      thinkingLevel: 'low',
+      includeThoughts: false,
+    });
+  });
+
+  it('recognizes the 3.8 Live models without catching live transcription', () => {
+    expect(axIsGeminiLiveAudioModel(AxAIGoogleGeminiModel.Gemini38Live)).toBe(
+      true
+    );
+    expect(
+      axIsGeminiLiveAudioModel(
+        AxAIGoogleGeminiModel.Gemini38LiveExtendedThinking
+      )
+    ).toBe(true);
+    expect(axIsGeminiLiveAudioModel('gemini-3.5-transcribe-live')).toBe(false);
+  });
+
+  it.each([
+    {
+      mimeType: 'audio/wav',
+      expected: { format: 'wav' },
+    },
+    {
+      mimeType: 'audio/l16; rate=24000; channels=1',
+      expected: { format: 'pcm16', sampleRate: 24_000, channels: 1 },
+    },
+  ])(
+    'speaks with 3.8 Flash TTS by default and labels $mimeType audio',
+    async ({ mimeType, expected }) => {
+      let url = '';
+      let body: any;
+      const ai = new AxAIGoogleGemini({ apiKey: 'key' });
+      const result = await ai.speak(
+        { text: 'Hello from Ax.' },
+        {
+          fetch: async (input, init) => {
+            url = String(input);
+            body = JSON.parse(String(init?.body));
+            return Response.json({
+              candidates: [
+                {
+                  content: {
+                    role: 'model',
+                    parts: [{ inlineData: { mimeType, data: 'UklGRg==' } }],
+                  },
+                },
+              ],
+            });
+          },
+        }
+      );
+      expect(url).toContain('/models/gemini-3.8-flash-tts:generateContent');
+      expect(body.generationConfig.speechConfig).toEqual({
+        voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
+      });
+      expect(result).toMatchObject({ data: 'UklGRg==', mimeType, ...expected });
+    }
+  );
+
+  it('transcribes with 3.5 Transcribe by default and reads its transcription parts', async () => {
+    let url = '';
+    const ai = new AxAIGoogleGemini({ apiKey: 'key' });
+    const result = await ai.transcribe(
+      { audio: { data: 'UklGRg==', format: 'wav' } },
+      {
+        fetch: async (input) => {
+          url = String(input);
+          return Response.json({
+            candidates: [
+              {
+                content: {
+                  role: 'model',
+                  parts: [{ audioTranscription: { text: '10 9 8' } }],
+                },
+              },
+            ],
+          });
+        },
+      }
+    );
+    expect(url).toContain('/models/gemini-3.5-transcribe:generateContent');
+    expect(result.text).toBe('10 9 8');
+  });
+
+  it('leaves thought parts out of a transcript from a general model', async () => {
+    const ai = new AxAIGoogleGemini({ apiKey: 'key' });
+    const result = await ai.transcribe(
+      {
+        audio: { data: 'UklGRg==', format: 'wav' },
+        model: AxAIGoogleGeminiModel.Gemini38Flash,
+      },
+      {
+        fetch: async () =>
+          Response.json({
+            candidates: [
+              {
+                content: {
+                  role: 'model',
+                  parts: [
+                    { text: 'The user wants a transcript.', thought: true },
+                    { text: '10 9 8' },
+                  ],
+                },
+              },
+            ],
+          }),
+      }
+    );
+    expect(result.text).toBe('10 9 8');
+  });
+
+  it('keeps the TypeScript audio defaults in step with the provider profile', () => {
+    const operations = axAIProviderProfiles['google-gemini'].operations as any;
+    expect(operations.speak.defaultModel).toBe(
+      AxAIGoogleGeminiModel.Gemini38FlashTTS
+    );
+    expect(operations.transcribe.defaultModel).toBe(
+      AxAIGoogleGeminiModel.Gemini35Transcribe
+    );
+    expect(operations.realtime.defaultModel).toBe(
+      axAIGoogleGeminiLiveAudioDefaultConfig().model
+    );
+    expect(axAIProviderProfiles['google-gemini'].defaults.model).toBe(
+      axAIGoogleGeminiDefaultConfig().model
+    );
+  });
+
+  it('points the image members at GA ids and still prices the preview ids', () => {
+    expect(AxAIGoogleGeminiModel.Gemini31FlashImage).toBe(
+      'gemini-3.1-flash-image'
+    );
+    expect(AxAIGoogleGeminiModel.Gemini3ProImage).toBe('gemini-3-pro-image');
+    for (const preview of [
+      'gemini-3.1-flash-image-preview',
+      'gemini-3-pro-image-preview',
+    ]) {
+      expect(
+        axModelInfoGoogleGemini.some((m) => m.aliases?.includes(preview))
+      ).toBe(true);
+    }
+  });
+
+  it.each([
+    [AxAIGoogleGeminiModel.Gemini38FlashTTS, 1, 18],
+    [AxAIGoogleGeminiModel.Gemini38FlashLiteTTS, 1, 12],
+    [AxAIGoogleGeminiModel.Gemini31FlashTTS, 1, 20],
+  ])('prices TTS model %s per text and audio token', (name, input, output) => {
+    const entry = axModelInfoGoogleGemini.find((m) => m.name === name);
+    expect(entry).toMatchObject({
+      promptTokenCostPer1M: input,
+      completionTokenCostPer1M: output,
+      contextWindow: 8192,
+      maxTokens: 16_384,
+      audio: { input: false, output: true },
+    });
   });
 });

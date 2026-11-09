@@ -23,9 +23,9 @@ public final class AgentPlaybookEvolveExample {
   }
 
   public static void main(String[] args) throws Exception {
-    OpenAICompatibleClient client = new OpenAICompatibleClient(Map.of(
+    AxAIService client = Ax.ai("openai", Map.of(
         "api_key", apiKey(),
-        "model", System.getenv().getOrDefault("AX_OPENAI_MODEL", "gpt-5.4-mini")));
+        "model", System.getenv().getOrDefault("AX_OPENAI_MODEL", "gpt-6-luna")));
 
     Map<String, Object> bullet = Map.of(
         "id", "failures-to-avoid-00001",
@@ -52,7 +52,7 @@ public final class AgentPlaybookEvolveExample {
             "ai", client,
             "contextFields", List.of(),
             "runtime", Map.of("language", "JavaScript"),
-            "playbook", Map.of("seed", seed, "onUpdate", playbookObserver),
+            "playbook", Map.of("playbook", seed, "seed", 7, "onUpdate", playbookObserver),
             "citations", Map.of("surface", "hidden", "onCitations", citationObserver)));
     assistant
         .setInstruction("Answer from evidence and state uncertainty plainly.")
@@ -72,7 +72,20 @@ public final class AgentPlaybookEvolveExample {
           dataset,
           Map.of("verify", true, "maxProposals", 1, "runtime", runtime));
 
+      // Each train task replays on the runtime. A replay that fails scores 0
+      // and would be mined as the weakness, so stop instead.
+      List<Object> replays = new java.util.ArrayList<>();
+      for (Object raw : (List<?>) evolution.get("records")) {
+        Map<?, ?> record = (Map<?, ?>) raw;
+        Map<?, ?> prediction = record.get("prediction") instanceof Map<?, ?> found ? found : Map.of();
+        if (record.get("error") != null || "error".equals(prediction.get("completionType"))) {
+          throw new IllegalStateException("evolve replay failed: " + (record.get("error") != null ? record.get("error") : prediction.get("error")));
+        }
+        replays.add(prediction.get("completionType"));
+      }
+
       System.out.println(Json.pretty(answer));
+      System.out.println("replays: " + replays);
       System.out.println("citations: " + (observedCitations.isEmpty() ? List.of() : observedCitations.get(observedCitations.size() - 1)));
       System.out.println("run-end updates: " + playbookUpdates.size());
       System.out.println("outcomes: " + evolution.get("outcomes"));

@@ -80,7 +80,7 @@ const { sentiment } = await classify.forward(llm, {
 ```
 
 No prompt engineering. Switch `name: "openai"` to `"anthropic"`, `"google-gemini"`,
-`"together"`, `"fireworks"`, `"deepseek"`, `"grok"`, etc. — same signature,
+`"meta"`, `"together"`, `"fireworks"`, `"deepseek"`, `"grok"`, etc. — same signature,
 same code. The name is a deployment profile: a DeepSeek model hosted by
 Together uses Together's endpoint and reasoning rules, not DeepSeek's native
 wire format.
@@ -514,10 +514,11 @@ const result = await optimizer.compile(
 | Standard Schema v1 | `f`, `fn` | Zod, Valibot, ArkType — per-field or whole-object |
 | Tools / function calling | `fn`, `functions:` option | typed args, typed return, async handler |
 | Streaming + validation | `.streamingForward()` | parses at field boundaries |
-| Multi-modal | `f.image`, `f.audio`, `.chat({ audio })` | OpenAI, Gemini, Anthropic |
-| Batch STT/TTS | `ai.transcribe`, `ai.speak` | OpenAI, xAI, Gemini, Mistral where provider endpoints exist |
+| Multi-modal | `f.image`, `f.audio`, `.chat({ audio })` | OpenAI, Gemini, Anthropic, Meta Muse Spark |
+| Image generation/editing | `ai.chat` + `result.images` | Meta Muse Image uses normal multi-turn chat memory |
+| Batch STT/TTS | `ai.transcribe`, `ai.speak` | OpenAI, xAI, Gemini, Mistral, and Meta Voice where provider endpoints exist |
 | Signature audio artifacts | `speech:audio` outputs + `speech` options | model emits script text, Ax synthesizes audio after parsing |
-| Conversational audio | `.chat()` + `result.audio` | OpenAI `gpt-audio*`, `gpt-realtime-2`, `gpt-realtime-whisper`; Gemini Live native audio; Grok Voice; also in Python/Go/Rust/Java/C++ via `realtime_chat()` |
+| Conversational audio | `.chat()` + `result.audio` | OpenAI `gpt-audio*`, `gpt-realtime-2`, `gpt-realtime-whisper`; Gemini Live native audio; Grok Voice; Meta Voice realtime transcription; also in Python/Go/Rust/Java/C++ via `realtime_chat()` |
 | Workflows | `flow` | typed program graphs, branching, loops, parallelism, `.returns(...)` |
 | Optimization | `AxGEPA`, `AxBootstrapFewShot` | Pareto front, few-shot, portable optimizer artifacts |
 | Agent loop | `agent`, `AxAgent` | distiller → executor → responder |
@@ -526,7 +527,7 @@ const result = await optimizer.compile(
 | Skills | `onSkillsSearch`, `consult(...)` | on-demand prompt-section loader |
 | Sandboxed JS runtime | `AxJSRuntime`, `AxJSRuntimePermission` | TypeScript runtime for Node, Bun, Deno, browser |
 | Recursive runtime (RLM) | `agent({ runtime, contextFields })` | long-context REPL with checkpointed replay |
-| Deployment profiles | `ai({ name: ... })` | 46 named native, router/cloud, hosted-inference, and configurable-runtime deployments |
+| Deployment profiles | `ai({ name: ... })` | 49 named native, router/cloud, hosted-inference, and configurable-runtime deployments |
 | Custom OpenAI-compatible endpoint | `ai({ name: "openai-compatible", apiURL, apiKey, config: { model } })` | conservative capabilities; unknown names are errors |
 | Observability | OpenTelemetry, `actorTurnCallback`, `onFunctionCall` | per-turn telemetry, tool-call tracing |
 | MCP | `AxMCPClient`, `AxMCPStreamableHTTPTransport`, `AxMCPStdioTransport` | use any MCP server as a tool source |
@@ -538,6 +539,22 @@ TypeScript / JavaScript:
 ```bash
 npm install @ax-llm/ax
 ```
+
+When listed in your project's `dependencies`, `devDependencies`, or
+`optionalDependencies`, the package automatically installs one Claude Code
+skill, `ax-llm`, with a compact capability index and local guides that load as
+needed. Run
+`npx @ax-llm/ax skills-auto-install off` from your project root to disable
+future automatic setup. This saves `ax.skills.autoInstall: false` in your
+project's `package.json`; use `skills-auto-install on` to re-enable it.
+Set `AX_SKIP_SKILL_INSTALL=1` during installation to skip setup for that run;
+CI, global installs, and transitive installs skip it too. Use
+`npx @ax-llm/ax setup-claude` to install the bundle explicitly in other projects.
+Use `npx @ax-llm/ax setup-claude --all` for separate specialist skills, or
+`npx @ax-llm/ax setup-claude --skill ax-ai` for a specific one.
+
+Other coding agents and languages can install one bundle from the
+[Agent Skills guide](https://axllm.dev/typescript/skills/).
 
 The generated Python, Java, C++, Go, and Rust libraries are checked in under `packages/`,
 verified in this repo, and installable from each language's package manager (all Apache-2.0):
@@ -569,6 +586,7 @@ npm install @ax-llm/ax-tools              # MCP stdio transport, JS runtime extr
 
 **Deep dives**
 - [AI providers](https://github.com/ax-llm/ax/blob/main/src/ax/skills/ax-ai.md)
+- [Typesafe / Jev decisions and native scoring](https://github.com/ax-llm/ax/blob/main/src/ax/skills/ax-typesafe.md)
 - [Audio I/O](https://github.com/ax-llm/ax/blob/main/src/ax/skills/ax-audio.md)
 - [AxFlow workflows](https://github.com/ax-llm/ax/blob/main/src/ax/skills/ax-flow.md)
 - [Optimization (GEPA, ACE)](https://axllm.dev/typescript/concepts/optimization/)
@@ -634,3 +652,11 @@ me about the project — or [open an issue](https://github.com/ax-llm/ax/issues)
 ## License
 
 Apache 2.0
+
+Typesafe/Jev is supported in TypeScript, Python, Java, C++, Go, and Rust:
+boolean/class and ordered rubric score signatures, per-value criteria, and
+configurable boolean conversion. Add `.withEvidence()` to retain probabilities,
+native values, and confidence through AxGen. The same signature works with
+OpenAI Decisions and generative providers, with explicit provenance. Native
+clients support advanced provider request shapes. See the
+[decision evidence and reranking guide](src/ax/skills/ax-typesafe.md#decision-evidence-and-reranking).

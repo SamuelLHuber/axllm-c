@@ -46,7 +46,7 @@ export function axWorkerRuntime(config: AxWorkerRuntimeConfig): void {
   // ║                                                                    ║
   // ║  - vitest runs unminified TS source → bundler helpers are absent.  ║
   // ║    Tests pass but the built bundle may still break at runtime.     ║
-  // ║  - To catch this: `npx tsup && node -e "..."` to evaluate         ║
+  // ║  - To catch this: `npx tsdown && node -e "..."` to evaluate         ║
   // ║    getWorkerSource() output in a clean context.                    ║
   // ║  - The "isolated sandbox" test in worker.runtime.test.ts runs      ║
   // ║    getWorkerSource() in node:vm with no bundler helpers.           ║
@@ -2680,10 +2680,13 @@ export function axWorkerRuntime(config: AxWorkerRuntimeConfig): void {
     } catch (err) {
       if (_isCodeExecutionError(err)) {
         const lineOffset = isAsync ? asyncLineOffset : 0;
+        // The formatted error is the result value (the caller reads it like
+        // output); `codeError` lets the host still classify it as a failure.
         _send({
           type: 'result',
           id,
           value: _formatCodeError(err, code, lineOffset),
+          codeError: true,
         });
       } else {
         _send({ type: 'result', id, error: _serializeError(err) });

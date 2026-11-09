@@ -1,6 +1,10 @@
 import type { Counter, Gauge, Histogram, Meter } from '@opentelemetry/api';
 import { mergeCustomLabels } from '../ai/metrics.js';
-import type { AxAIService, AxLoggerFunction } from '../ai/types.js';
+import type {
+  AxAIService,
+  AxAIServiceOptions,
+  AxLoggerFunction,
+} from '../ai/types.js';
 
 // FIXME: Circular dependency - import { ax } from '../index.js';
 
@@ -796,6 +800,14 @@ export interface AxOptimizerResult<OUT> {
   demos?: AxProgramDemos<any, OUT>[];
   stats: AxOptimizationStats;
   bestScore: number;
+  /**
+   * Scalarized validation score before this run changes the program.
+   * GEPA and optimize() measure this before bootstrap, retaining any demos
+   * already supplied by the caller. Other optimizers may omit it.
+   */
+  baselineScore?: number;
+  /** Averaged baseline objectives before scalarization; scalar metrics use `score`. */
+  baselineScores?: Record<string, number>;
   finalConfiguration?: Record<string, unknown>;
 
   // Optimization history for analysis
@@ -1226,6 +1238,7 @@ export abstract class AxBaseOptimizer implements AxOptimizer {
   // Common AxOptimizerArgs fields
   protected readonly studentAI: AxAIService;
   protected readonly teacherAI?: AxAIService;
+  protected readonly teacherOptions?: AxAIServiceOptions;
   protected readonly targetScore?: number;
   protected readonly minSuccessRate?: number;
   protected readonly onProgress?: (
@@ -1268,6 +1281,7 @@ export abstract class AxBaseOptimizer implements AxOptimizer {
     // Set common fields from AxOptimizerArgs
     this.studentAI = args.studentAI;
     this.teacherAI = args.teacherAI;
+    this.teacherOptions = args.teacherOptions;
     this.targetScore = args.targetScore;
     this.minSuccessRate = args.minSuccessRate;
     this.onProgress = args.onProgress;
@@ -2421,7 +2435,7 @@ export abstract class AxBaseOptimizer implements AxOptimizer {
     return (
       this.studentAI.getOptions?.()?.logger ??
       axGlobals.logger ??
-      this.studentAI.getLogger()
+      this.studentAI.getLogger?.()
     );
   }
 

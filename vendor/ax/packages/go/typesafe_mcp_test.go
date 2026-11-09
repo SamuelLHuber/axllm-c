@@ -1,0 +1,395 @@
+package axllm
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"github.com/coder/websocket"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+type paritySocket struct {
+	incoming chan string
+	sent     chan string
+	closed   chan struct{}
+	once     sync.Once
+	fail     atomic.Bool
+}
+
+func newParitySocket() *paritySocket {
+	return &paritySocket{incoming: make(chan string, 8), sent: make(chan string, 8), closed: make(chan struct{})}
+}
+func (s *paritySocket) Send(text string) error {
+	if s.fail.Load() {
+		return fmt.Errorf("send failed")
+	}
+	s.sent <- text
+	return nil
+}
+func (s *paritySocket) Receive() (string, error) {
+	select {
+	case text := <-s.incoming:
+		return text, nil
+	case <-s.closed:
+		return "", fmt.Errorf("socket closed")
+	}
+}
+func (s *paritySocket) Close() error { s.once.Do(func() { close(s.closed) }); return nil }
+func parityWaitSent(t *testing.T, s *paritySocket) {
+	t.Helper()
+	select {
+	case <-s.sent:
+	case <-time.After(time.Second):
+		t.Fatal("request did not start")
+	}
+}
+func parityWaitResult(t *testing.T, done chan error, want string) {
+	t.Helper()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected %q, got %v", want, err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pending request leaked")
+	}
+}
+func TestMCPWebSocketCleanup(t *testing.T) {
+	socket := newParitySocket()
+	transport := NewAxMCPWebSocketTransport("ws://example.test", map[string]Value{"webSocketFactory": AxMCPWebSocketFactory(func(string, []string) (AxMCPWebSocket, error) { return socket, nil })})
+	defer transport.Close()
+	transport.SetProtocolVersion("2025-03-26")
+	request := map[string]Value{"jsonrpc": "2.0", "id": 1, "method": "ping"}
+	socket.fail.Store(true)
+	if _, err := transport.Send(request); err == nil {
+		t.Fatal("missing synchronous send failure")
+	}
+	if _, err := transport.SendBatch(context.Background(), []Value{request, map[string]Value{"id": 2, "method": "ping"}}); err == nil {
+		t.Fatal("missing batch failure")
+	}
+	if len(transport.pending) != 0 {
+		t.Fatal("send failure retained pending work")
+	}
+	socket.fail.Store(false)
+	old, cancelOld := context.WithCancel(context.Background())
+	defer cancelOld()
+	done := make(chan error, 1)
+	go func() { _, err := transport.SendWithContext(old, request, nil); done <- err }()
+	parityWaitSent(t, socket)
+	socket.incoming <- `{"id":1,"result":"first"}`
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		result, err := transport.Send(request)
+		if err == nil && result["result"] != "second" {
+			err = fmt.Errorf("wrong response")
+		}
+		done <- err
+	}()
+	parityWaitSent(t, socket)
+	cancelOld()
+	if _, err := transport.Send(request); err == nil {
+		t.Fatal("overwrote pending request")
+	}
+	socket.incoming <- `{"id":1,"result":"second"}`
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		_, err := transport.SendBatch(ctx, []Value{request, map[string]Value{"id": 2, "method": "ping"}})
+		done <- err
+	}()
+	parityWaitSent(t, socket)
+	cancel()
+	parityWaitResult(t, done, "canceled")
+	go func() {
+		_, err := transport.SendBatch(context.Background(), []Value{request, map[string]Value{"id": 2, "method": "ping"}})
+		done <- err
+	}()
+	parityWaitSent(t, socket)
+	_ = transport.Close()
+	parityWaitResult(t, done, "closed")
+	transport.mu.Lock()
+	defer transport.mu.Unlock()
+	if len(transport.pending) != 0 {
+		t.Fatal("close retained pending work")
+	}
+}
+func TestTypesafeNativeHTTP(t *testing.T) {
+	var calls atomic.Int32
+	started := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/models" {
+			if r.Method != "GET" || r.ContentLength != 0 {
+				t.Error("model discovery must use bodyless GET")
+			}
+			if r.Header.Get("Authorization") != "Bearer test" {
+				t.Error("missing credentials")
+			}
+			if calls.Add(1) == 1 {
+				w.WriteHeader(429)
+				_, _ = w.Write([]byte(`{"error":"retry"}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"models":[{"name":"jev-latest","description":"Jev","release_date":"2026-09-01"}]}`))
+			return
+		}
+		var body map[string]Value
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+			return
+		}
+		if body["state"] == "stall" {
+			w.Header().Set("Content-Length", "10000")
+			w.WriteHeader(200)
+			w.(http.Flusher).Flush()
+			started <- struct{}{}
+			<-r.Context().Done()
+			return
+		}
+		answers := map[string]Value{}
+		for key := range body["questions"].(map[string]Value) {
+			answers[key] = map[string]Value{"type": "noul", "noul": body["state"].(map[string]Value)["probability"]}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]Value{"model": body["model"], "answers": answers, "usage": map[string]Value{"input_tokens": 1, "output_tokens": 1}})
+	}))
+	defer server.Close()
+	client := Typesafe(map[string]Value{"api_key": "test", "base_url": server.URL, "retry": map[string]Value{"maxRetries": 1, "initialDelayMs": 1}})
+	models, err := client.ListModels(context.Background(), nil)
+	if err != nil || len(models) != 1 || calls.Load() != 2 {
+		t.Fatalf("model discovery/retry: %v %v", models, err)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			key := fmt.Sprintf("question%d", i)
+			probability := float64(i) / 10
+			result, err := client.SystemOne(context.Background(), TypesafeRequest{State: map[string]Value{"probability": probability}, Questions: map[string]TypesafeQuestion{key: {Type: "noul"}}}, nil)
+			if err != nil || result.Answers[key].Noul != probability {
+				t.Errorf("request isolation: %v %v", result, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.SystemOne(ctx, TypesafeRequest{State: "stall", Questions: map[string]TypesafeQuestion{"flag": {Type: "noul"}}}, nil)
+		done <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("native call did not start")
+	}
+	cancel()
+	parityWaitResult(t, done, "abort")
+}
+
+func TestMCPWebSocketLateServerReply(t *testing.T) {
+	var connections atomic.Int32
+	socket := newParitySocket()
+	transport := NewAxMCPWebSocketTransport("ws://example.test", map[string]Value{"webSocketFactory": AxMCPWebSocketFactory(func(string, []string) (AxMCPWebSocket, error) { connections.Add(1); return socket, nil })})
+	defer transport.Close()
+	started, release, returned := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	transport.SetRequestHandler(func(message map[string]Value) map[string]Value {
+		close(started)
+		<-release
+		close(returned)
+		return map[string]Value{"id": message["id"], "result": map[string]Value{}}
+	})
+	if err := transport.StartListening(); err != nil { t.Fatal(err) }
+	socket.incoming <- `{"id":"server-1","method":"roots/list"}`
+	select { case <-started: case <-time.After(time.Second): close(release); t.Fatal("server request was not dispatched") }
+	_ = transport.Close()
+	close(release)
+	<-returned
+	select { case <-socket.sent: t.Fatal("late server reply wrote to a closed transport"); case <-time.After(100*time.Millisecond): }
+	if connections.Load() != 1 { t.Fatal("late server reply reopened the closed transport") }
+}
+
+// Exercise the built-in socket, including concurrent requests and remote close.
+func TestMCPWebSocketNativeRoundTrip(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		socket, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer socket.CloseNow()
+		for {
+			_, data, err := socket.Read(r.Context())
+			if err != nil {
+				return
+			}
+			var request map[string]Value
+			if err = json.Unmarshal(data, &request); err != nil {
+				t.Error(err)
+				return
+			}
+			if request["method"] == "close" {
+				return
+			}
+			var result Value = request["id"]
+			if request["method"] == "large" { result = strings.Repeat("x", 64*1024) }
+			response, _ := json.Marshal(map[string]Value{"jsonrpc": "2.0", "id": request["id"], "result": result})
+			if err = socket.Write(r.Context(), websocket.MessageText, response); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+	transport := NewAxMCPWebSocketTransport("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	defer transport.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			response, err := transport.SendWithContext(ctx, map[string]Value{"id": i, "method": "ping"}, nil)
+			if err != nil || response["result"] != float64(i) {
+				t.Errorf("native socket response: %v %v", response, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	large, err := transport.SendWithContext(ctx, map[string]Value{"id": "large", "method": "large"}, nil)
+	if err != nil || large["result"] != strings.Repeat("x", 64*1024) {
+		t.Fatalf("large tool result was not delivered: %v", err)
+	}
+	if _, err := transport.SendWithContext(ctx, map[string]Value{"id": 11, "method": "close"}, nil); err == nil {
+		t.Fatal("remote close did not reject pending request")
+	}
+	transport.mu.Lock()
+	defer transport.mu.Unlock()
+	if len(transport.pending) != 0 {
+		t.Fatal("native socket close retained pending work")
+	}
+}
+
+func TestTypesafeNestedBalancerValidation(t *testing.T) {
+	typed := NewAI("typesafe", map[string]Value{"api_key": "test", "models": []Value{}}).(AxAIService)
+	only, err := NewAxBalancer([]AxAIService{typed}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prose := map[string]Value{"chat_prompt": []Value{map[string]Value{"role": "user", "content": "reply"}}}
+	if only.ValidateChatRequest(prose) == nil {
+		t.Fatal("nested Typesafe accepted prose")
+	}
+	var supported map[string]Value
+	if err = json.Unmarshal([]byte(`{"chat_prompt":[{"role":"user","content":"outage"}],"response_format":{"type":"json_schema","schema":{"name":"decision","schema":{"type":"object","properties":{"urgent":{"type":"boolean"}},"required":["urgent"]}}}}`), &supported); err != nil {
+		t.Fatal(err)
+	}
+	if err = only.ValidateChatRequest(supported); err != nil {
+		t.Fatal(err)
+	}
+	mixed, err := NewAxBalancer([]AxAIService{only, NewAI("openai", map[string]Value{"api_key": "test", "models": []Value{}}).(AxAIService)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := mixed.candidateServices(prose)
+	if err != nil || len(candidates) != 1 {
+		t.Fatalf("nested selection: %v %v", candidates, err)
+	}
+}
+func TestDecisionsNestedBalancerValidation(t *testing.T) {
+	typed := NewAI("openai-decisions", map[string]Value{"api_key": "test", "models": []Value{}}).(AxAIService)
+	only, err := NewAxBalancer([]AxAIService{typed}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prose := map[string]Value{"chat_prompt": []Value{map[string]Value{"role": "user", "content": "reply"}}}
+	if only.ValidateChatRequest(prose) == nil {
+		t.Fatal("nested Decisions accepted prose")
+	}
+	var supported map[string]Value
+	if err = json.Unmarshal([]byte(`{"chat_prompt":[{"role":"user","content":"outage"}],"response_format":{"type":"json_schema","schema":{"name":"decision","schema":{"type":"object","properties":{"urgent":{"type":"boolean"}},"required":["urgent"]}}}}`), &supported); err != nil {
+		t.Fatal(err)
+	}
+	if err = only.ValidateChatRequest(supported); err != nil {
+		t.Fatal(err)
+	}
+	mixed, err := NewAxBalancer([]AxAIService{only, NewAI("openai", map[string]Value{"api_key": "test", "models": []Value{}}).(AxAIService)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := mixed.candidateServices(prose)
+	if err != nil || len(candidates) != 1 {
+		t.Fatalf("nested selection: %v %v", candidates, err)
+	}
+}
+
+func TestDecisionsNativeAndAdapterCredentialRefresh(t *testing.T) {
+ for _,native:=range []bool{true,false} {
+  var calls,credentials atomic.Int32
+  server:=httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){
+   count:=calls.Add(1)
+   if r.URL.Path!="/v1/decisions" || r.Method!="POST" { t.Error("wrong Decisions endpoint") }
+   if len(r.Header.Values("Authorization"))!=1 || r.Header.Get("Authorization")!=fmt.Sprintf("Bearer fresh-%d",count) {t.Error("credential precedence duplicated authorization")}
+   if r.Header.Get("x-trace")!="kept" {t.Error("custom header lost")}
+   if count==1 {w.WriteHeader(429);_,_=w.Write([]byte(`{"error":"retry"}`));return}
+   _,_=w.Write([]byte(`{"model":"gpt-6-luna","answers":[{"type":"predicate","name":"flag","probability":0.8}],"usage":{"input_tokens":1,"output_tokens":0,"total_tokens":1,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}}`))
+  }))
+  provider:=AxCredentialProviderFunc(func(_ context.Context,request AxCredentialRequest)(map[string]string,error){
+   if request.Profile!="openai-decisions" || request.Operation!="chat" {t.Error("wrong credential operation")}
+   return map[string]string{"authorization":fmt.Sprintf("Bearer fresh-%d",credentials.Add(1))},nil
+  })
+  options:=map[string]Value{"api_key":"static","base_url":server.URL+"/v1","headers":Object("AUTHORIZATION","Bearer custom","x-trace","kept"),"credential_provider":provider,"retry":Object("maxRetries",1,"initialDelayMs",1)}
+  nativeRequest:=asMap(parseJSON(`{"input":"red","questions":[{"type":"predicate","name":"flag","instructions":"Is this red?"}]}`))
+  chatRequest:=asMap(parseJSON(`{"chatPrompt":[{"role":"user","content":"red"}],"responseFormat":{"type":"json_schema","schema":{"name":"output","schema":{"type":"object","properties":{"flag":{"type":"boolean"}},"required":["flag"]}}}}`))
+  var call func(context.Context)(Value,error)
+  if native {client:=OpenAIDecisions(options);call=func(ctx context.Context)(Value,error){return client.Create(ctx,nativeRequest,nil)}} else {client:=NewAI("openai-decisions",options);call=func(ctx context.Context)(Value,error){return client.Chat(ctx,chatRequest,nil)}}
+  result,err:=call(context.Background());if err!=nil{server.Close();t.Fatal(err)}
+  if native {if coreGet(asSlice(coreGet(result,"answers",nil))[0],"probability",nil)!=0.8{t.Error("native probability changed")}} else {content:=coreGet(asSlice(coreGet(result,"results",nil))[0],"content",nil);if coreGet(parseJSON(display(content)),"flag",nil)!=true{t.Error("predicate threshold changed")}}
+  ctx,cancel:=context.WithCancel(context.Background());cancel()
+  if _,err=call(ctx);err==nil{t.Error("pre-aborted Decisions call accepted")}
+  if calls.Load()!=2 || credentials.Load()!=2 {t.Error("retry refresh or cancellation attempt count")}
+  server.Close()
+ }
+}
+
+func TestTypesafeImageBoxTypedAPI(t *testing.T) {
+    box:=AxBox{Top:0.2,Bottom:0.8,Left:0.1,Right:0.7}
+    server:=httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){
+        if r.Header.Get("TypeSafe-Danger-Zone-Images")!="true" { t.Error("missing experimental header") }
+        var request map[string]Value
+        if err:=json.NewDecoder(r.Body).Decode(&request);err!=nil { t.Error(err);return }
+        json.NewEncoder(w).Encode(map[string]Value{"model":"jev-1.14.0","answers":map[string]Value{"target":map[string]Value{"type":"box","box":box,"confidence":0}},"usage":map[string]Value{"input_tokens":1,"output_tokens":1}})
+    }))
+    defer server.Close()
+    client:=Typesafe(map[string]Value{"api_key":"test","base_url":server.URL})
+    result,err:=client.SystemOne(context.Background(),TypesafeRequest{State:"photo",Assets:map[string]TypesafeImageAsset{"photo":{Format:"png",DataBase64:"AAAA"}},Questions:map[string]TypesafeQuestion{"target":{Type:"box",Instructions:"Find it in photo"}}},nil)
+    if err!=nil {t.Fatal(err)}
+    if result.Answers["target"].Box!=box || result.Answers["target"].Confidence!=0 {t.Fatal("typed Box changed")}
+    if Box().WithEvidence().Name!="box" {t.Fatal("Box factory")}
+}
+
+func TestMCPCloseWakesReconnectDelay(t *testing.T) {
+    server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Header().Set("Content-Type","text/event-stream"); w.WriteHeader(200) }))
+    defer server.Close()
+    transport,err := NewAxMCPStreamableHTTPTransport(server.URL,Object("reconnectDelayMs",5000,"ssrfProtection",Object("requireHttps",false,"allowLocalhost",true,"allowPrivateNetworks",true)))
+    if err != nil {t.Fatal(err)}
+    defer transport.Close()
+    ended:=make(chan struct{},1)
+    transport.SetLifecycleHandler(func(event string){if event=="disconnected"{select{case ended<-struct{}{}:default:}}})
+    if err=transport.StartListening();err!=nil{t.Fatal(err)}
+    select{case <-ended:case <-time.After(2*time.Second):t.Fatal("listener did not reach reconnect wait")}
+    done:=transport.listenDone
+    started:=time.Now();if err=transport.Close();err!=nil{t.Fatal(err)}
+    if time.Since(started)>500*time.Millisecond{t.Fatal("close retained reconnect wait")}
+    select{case <-done:default:t.Fatal("listener worker survived close")}
+}

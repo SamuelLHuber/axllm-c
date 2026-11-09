@@ -63,6 +63,7 @@ function buildMultipleCodeBlocksPolicyGuidance(
 
 function extractRawActorCode(
   chatLog: readonly AxChatLogEntry[],
+  runtimeCodeFieldName: string,
   runtimeCodeFieldTitle: string
 ): string | undefined {
   const messages = chatLog[chatLog.length - 1]?.messages;
@@ -80,6 +81,23 @@ function extractRawActorCode(
       .replace(/<think>[\s\S]*?<\/think>/g, '')
       .replace(/[^\n]*<\/think>/g, '')
       .trim();
+
+    // Structured responses carry escaped newlines in JSON. Decode the original
+    // code field before checking fences; field parsing may already have removed
+    // a second block from the parsed value.
+    try {
+      const parsed: unknown = JSON.parse(content);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const rawCode = (parsed as Record<string, unknown>)[
+          runtimeCodeFieldName
+        ];
+        if (typeof rawCode === 'string') {
+          return rawCode;
+        }
+      }
+    } catch {
+      // Text responses use the field-title prefix below.
+    }
 
     const prefix = `${runtimeCodeFieldTitle}:`;
     const prefixIndex = content.indexOf(prefix);
@@ -304,6 +322,7 @@ export async function runActorTurn<_IN extends AxGenIn>(
   actorCallOptions = {
     ...actorCallOptions,
     debugHideSystemPrompt,
+    functions: runtimeContext.getNativeFunctions?.(actorCallOptions),
   };
 
   const usageBefore = s.actorProgram.getUsage()?.length ?? 0;
@@ -351,6 +370,7 @@ export async function runActorTurn<_IN extends AxGenIn>(
   // response before a later block can disappear from the actor turn.
   const rawResponseCode = extractRawActorCode(
     actorChatLog,
+    runtimeCodeFieldName,
     runtimeCodeFieldTitle
   )?.trim();
   const codeBeforeNormalization = rawResponseCode ?? trimmedCode;
@@ -401,7 +421,10 @@ export async function runActorTurn<_IN extends AxGenIn>(
       actionLogEntries.push({
         turn: entryTurn,
         code,
-        output: policyViolation,
+        output: [
+          ...(runtimeContext.consumeNativeToolActivity?.() ?? []),
+          policyViolation,
+        ].join('\n'),
         tags: ['error'],
         ...(() => {
           const calls =
@@ -453,12 +476,14 @@ export async function runActorTurn<_IN extends AxGenIn>(
   let result: unknown;
   let output: string;
   let isError: boolean;
+  let isCodeError: boolean;
 
   try {
     const executionResult = await runtimeContext.executeActorCode(code);
     result = executionResult.result;
     output = executionResult.output;
     isError = executionResult.isError;
+    isCodeError = executionResult.isCodeError === true;
   } catch (err) {
     if (
       err instanceof AxAgentClarificationError ||
@@ -514,14 +539,22 @@ export async function runActorTurn<_IN extends AxGenIn>(
     result = undefined;
     output = buildGuidanceActionLogOutput(guidancePayload);
     isError = false;
+    isCodeError = false;
   }
 
+  // A code error is still the live session's own output, so it keeps the
+  // output shaping and state refresh that only a failed execution skips.
+  const executionFailed = isError && !isCodeError;
   const discoveryTurnArtifacts = runtimeContext.consumeDiscoveryTurnArtifacts();
-  if (!isError) {
+  if (!executionFailed) {
     output = stripDiscoveryTurnOutput(output, discoveryTurnArtifacts.texts);
     output = appendDiscoveryTurnSummary(output, discoveryTurnArtifacts.summary);
   }
 
+  output = [
+    ...(runtimeContext.consumeNativeToolActivity?.() ?? []),
+    output,
+  ].join('\n');
   const entryTurn = actionLogEntries.length + 1;
   const actionLogCode = guidancePayload
     ? buildGuidanceActionLogCode(guidancePayload)
@@ -566,7 +599,7 @@ export async function runActorTurn<_IN extends AxGenIn>(
     summaryForwardOptions,
     { stage: contextStage, onContextEvent: s.onContextEvent }
   );
-  if (!isError) {
+  if (!executionFailed) {
     mutableState.runtimeStateSummary =
       await runtimeContext.captureRuntimeStateSummary();
   }

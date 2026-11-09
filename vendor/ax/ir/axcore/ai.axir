@@ -7,10 +7,29 @@ module @ax.ai version "0.1" {
     type fields = "message:string,status?:i64,code?:string,response_body?:json,request?:json,retryable?:bool"
   }
 
+  op ax.ai.error @AxAIServiceAbortedError {
+    attr core_kind = "error"
+    attr public = true
+    attr retryable = false
+    attr semantics = "caller cancellation is terminal, preserves the first reason, and must not retry or fail over"
+    tag "src/ax/util/apicall.ts"
+    type fields = "message:string,reason?:string,retryable:bool"
+  }
+
+  op ax.ai.interface @AxCancellationToken {
+    attr core_kind = "interface"
+    attr public = true
+    attr semantics = "thread-safe one-shot cancellation; first reason wins; subscriptions are removable and released after completion"
+    tag "cancellation-host-boundary"
+    type cancel = "(reason?:string) -> bool"
+    type subscribe = "(wake:json) -> json"
+    type throwIfCancelled = "() -> void throws"
+  }
+
   op ax.ai.record @ChatMessage {
     attr core_kind = "record"
     tag "src/ax/ai/types.ts"
-    type fields = "role:string,content:json,name?:string,toolCalls?:list<json>,thought?:string,thoughtBlocks?:list<json>"
+    type fields = "role:string,content:json,name?:string,toolCalls?:list<json>,thought?:string,thoughtBlocks?:list<json>,images?:list<json>,phase?:string"
   }
 
   op ax.ai.record @AxChatRequest {
@@ -46,7 +65,7 @@ module @ax.ai version "0.1" {
   op ax.ai.record @AxAIServiceOptions {
     attr core_kind = "record"
     tag "src/ax/ai/types.ts"
-    type fields = "debug?:bool,stream?:bool,functionCallMode?:string,timeout?:i64,retry?:json,useExpensiveModel?:string,thinkingTokenBudget?:string,showThoughts?:bool,serviceTier?:string,sessionId?:string,promptCacheKey?:string,contextCache?:json,usageContext?:AxUsageContext"
+    type fields = "debug?:bool,stream?:bool,functionCallMode?:string,timeout?:i64,retry?:json,useExpensiveModel?:string,thinkingTokenBudget?:string,showThoughts?:bool,serviceTier?:string,sessionId?:string,promptCacheKey?:string,promptCacheRetention?:string,contextCache?:json,usageContext?:AxUsageContext,cancellation?:AxCancellationToken"
   }
 
   op ax.ai.record @AxTokenUsage {
@@ -209,6 +228,123 @@ module @ax.ai version "0.1" {
     type signature = "(AxAIService, requested?:string, embed?:bool) -> string throws"
   }
 
+  op ax.ai.semantic @resolve_model_key {
+    attr core_kind = "func"
+    attr emit_module = "ai"
+    tag "src/ax/ai/base.ts"
+    type signature = "(client_options:json, request:json, options:json, default_model:json, embed:bool) -> json"
+    body @entry(%client_options: json, %request: json, %options: json, %default_model: json, %embed: bool) {
+      %options = core.call @provider_normalize_call_options(%options)
+      %empty_models = core.list
+      %model_list_camel = core.get %client_options["modelList"] default %empty_models
+      %model_list_snake = core.get %client_options["model_list"] default %model_list_camel
+      %models = core.get %client_options["models"] default %model_list_snake
+      %call_options = core.map
+      %has_call_options = core.call intrinsic.is_not_none(%options)
+      core.if %has_call_options {
+        %call_options = core.call intrinsic.map.merge(%call_options, %options)
+      }
+      %request_copy = core.map
+      %resolved = core.call intrinsic.map.merge(%request_copy, %request)
+      %field = core.let "model"
+      %requested = core.get %request["model"]
+      core.if %embed {
+        %field = core.let "embed_model"
+        %requested_camel = core.get %request["embedModel"]
+        %requested = core.get %request["embed_model"] default %requested_camel
+      }
+      %has_requested = core.call intrinsic.truthy(%requested)
+      %lookup = core.let %requested
+      core.if %has_requested {
+      } else {
+        %lookup = core.let %default_model
+      }
+      %entry = core.call intrinsic.none()
+      %has_models = core.call intrinsic.truthy(%models)
+      %has_lookup = core.call intrinsic.truthy(%lookup)
+      %can_match = core.call intrinsic.and(%has_models, %has_lookup)
+      core.if %can_match {
+        core.for %candidate in %models {
+          %candidate_key = core.get %candidate["key"]
+          %matches = core.call intrinsic.eq(%candidate_key, %lookup)
+          %unmatched = core.call intrinsic.is_none(%entry)
+          %take = core.call intrinsic.and(%matches, %unmatched)
+          core.if %take {
+            %entry = core.let %candidate
+          }
+        }
+      }
+      %out = core.map
+      %has_entry = core.call intrinsic.is_not_none(%entry)
+      core.if %has_entry {
+        %target = core.get %entry["model"]
+        core.if %embed {
+          %target_snake = core.get %entry["embed_model"]
+          %target = core.get %entry["embedModel"] default %target_snake
+        }
+        %has_target = core.call intrinsic.is_not_none(%target)
+        core.if %has_target {
+          core.set %resolved[%field] = %target
+          core.if %embed {
+            core.call intrinsic.map.delete(%resolved, "embedModel")
+          }
+        }
+      }
+      %key_defaults = core.call intrinsic.and(%has_entry, %has_requested)
+      core.if %key_defaults {
+        %chat = core.call intrinsic.not(%embed)
+        core.if %chat {
+          %entry_config_snake = core.get %entry["model_config"]
+          %entry_config = core.get %entry["modelConfig"] default %entry_config_snake
+          %has_entry_config = core.call intrinsic.truthy(%entry_config)
+          core.if %has_entry_config {
+            %no_request_config = core.map
+            %request_config_camel = core.get %request["modelConfig"] default %no_request_config
+            %request_config = core.get %request["model_config"] default %request_config_camel
+            %merged_config = core.call intrinsic.map.merge(%entry_config, %request_config)
+            core.set %resolved["model_config"] = %merged_config
+            core.call intrinsic.map.delete(%resolved, "modelConfig")
+          }
+          core.call @apply_model_key_option_impl(%call_options, %entry, "serviceTier", "service_tier")
+        }
+        core.call @apply_model_key_option_impl(%call_options, %entry, "thinkingTokenBudget", "thinking_token_budget")
+        core.call @apply_model_key_option_impl(%call_options, %entry, "showThoughts", "show_thoughts")
+        core.call @apply_model_key_option_impl(%call_options, %entry, "stream", "stream")
+        core.call @apply_model_key_option_impl(%call_options, %entry, "debug", "debug")
+        core.call @apply_model_key_option_impl(%call_options, %entry, "useExpensiveModel", "use_expensive_model")
+        core.call @apply_model_key_option_impl(%call_options, %entry, "beta", "beta")
+      }
+      core.set %out["request"] = %resolved
+      core.set %out["options"] = %call_options
+      core.return %out
+    }
+  }
+
+  op ax.ai.semantic @apply_model_key_option_impl {
+    attr core_kind = "func"
+    attr emit_module = "ai"
+    attr private = true
+    tag "src/ax/ai/base.ts"
+    type signature = "(options:json, entry:json, camel:string, snake:string) -> void"
+    body @entry(%options: json, %entry: json, %camel: string, %snake: string) {
+      %call_camel = core.get %options[%camel]
+      %call_snake = core.get %options[%snake]
+      %has_call_camel = core.call intrinsic.is_not_none(%call_camel)
+      %has_call_snake = core.call intrinsic.is_not_none(%call_snake)
+      %caller_set = core.call intrinsic.or(%has_call_camel, %has_call_snake)
+      core.if %caller_set {
+        core.return
+      }
+      %entry_snake = core.get %entry[%snake]
+      %entry_value = core.get %entry[%camel] default %entry_snake
+      %has_entry_value = core.call intrinsic.is_not_none(%entry_value)
+      core.if %has_entry_value {
+        core.set %options[%camel] = %entry_value
+      }
+      core.return
+    }
+  }
+
   op ax.ai.semantic @merge_model_config {
     attr core_kind = "func"
     attr emit_module = "ai"
@@ -280,6 +416,25 @@ module @ax.ai version "0.1" {
       }
       core.for %message in %prompt {
         %role = core.get %message["role"]
+        // As TS's axValidateChatRequestMessage: a role that is not a
+        // non-empty string is missing (a non-string one reads as undefined),
+        // and an unknown one is unsupported; each shows JSON.stringify(role,
+        // null, 2).
+        %role_is_text = core.type_is %role type "string"
+        %role_given = core.let false
+        core.if %role_is_text {
+          %role_given = core.call intrinsic.ne(%role, "")
+        }
+        %role_missing = core.call intrinsic.not(%role_given)
+        core.if %role_missing {
+          %received_role = core.let "undefined"
+          core.if %role_is_text {
+            %received_role = core.call intrinsic.json.pretty(%role)
+          }
+          %missing_role_text = core.call intrinsic.string.format("Chat request message must have a role, received: {}", %received_role)
+          %missing_role_error = core.call intrinsic.ai.error.response(%missing_role_text)
+          core.raise %missing_role_error
+        }
         %is_system = core.call intrinsic.eq(%role, "system")
         %is_user = core.call intrinsic.eq(%role, "user")
         %is_assistant = core.call intrinsic.eq(%role, "assistant")
@@ -289,11 +444,53 @@ module @ax.ai version "0.1" {
         %valid_role = core.call intrinsic.or(%valid_left, %valid_right)
         %invalid_role = core.call intrinsic.not(%valid_role)
         core.if %invalid_role {
-          %message_text = core.call intrinsic.string.format("Invalid chat message role: {}", %role)
+          %role_json = core.call intrinsic.json.pretty(%role)
+          %message_text = core.call intrinsic.string.format("Unsupported message role: {}", %role_json)
           %error = core.call intrinsic.ai.error.response(%message_text)
           core.raise %error
         }
         %content = core.get %message["content"]
+        // A user message's content items: each must be an object with a type,
+        // as TS checks them (a type that is not a non-empty string reads as
+        // undefined, as the role does). The ports keep the unsupported-content
+        // error class they raised before; it becomes the response error at
+        // the next major.
+        %content_is_list = core.type_is %content type "list"
+        %user_items = core.call intrinsic.and(%is_user, %content_is_list)
+        core.if %user_items {
+          %item_index = core.let 0
+          core.for %item in %content {
+            // An array passes, as JavaScript's typeof calls it an object.
+            %item_is_map = core.type_is %item type "object"
+            %item_is_list = core.type_is %item type "list"
+            %item_is_object = core.call intrinsic.or(%item_is_map, %item_is_list)
+            %item_not_map = core.call intrinsic.not(%item_is_object)
+            core.if %item_not_map {
+              %item_json = core.call intrinsic.json.pretty(%item)
+              %item_text = core.call intrinsic.string.format("User message content item at index {} must be an object, received: {}", %item_index, %item_json)
+              %item_error = core.call intrinsic.ai.error.response(%item_text)
+              core.raise %item_error
+            }
+            %item_type = core.get %item["type"]
+            %item_type_is_text = core.type_is %item_type type "string"
+            %item_type_given = core.let false
+            core.if %item_type_is_text {
+              %item_type_given = core.call intrinsic.ne(%item_type, "")
+            }
+            %item_type_missing = core.call intrinsic.not(%item_type_given)
+            core.if %item_type_missing {
+              %received_type = core.let "undefined"
+              core.if %item_type_is_text {
+                %received_type = core.call intrinsic.json.pretty(%item_type)
+              }
+              %type_text = core.call intrinsic.string.format("User message content item at index {} must have a type, received: {}", %item_index, %received_type)
+              %type_error = core.call intrinsic.ai.error.response(%type_text)
+              core.raise %type_error
+            }
+            %next_item_index = core.call intrinsic.add(%item_index, 1)
+            %item_index = core.let %next_item_index
+          }
+        }
         %empty_function_calls = core.list
         %function_calls_snake = core.get %message["function_calls"] default %empty_function_calls
         %function_calls = core.get %message["functionCalls"] default %function_calls_snake
@@ -303,6 +500,13 @@ module @ax.ai version "0.1" {
         %has_thought = core.call intrinsic.truthy(%thought)
         %has_assistant_payload = core.call intrinsic.or(%has_content, %has_calls)
         %has_assistant_payload = core.call intrinsic.or(%has_assistant_payload, %has_thought)
+        %images = core.get %message["images"]
+        %has_images = core.call intrinsic.truthy(%images)
+        %thought_blocks_snake = core.get %message["thought_blocks"] default %empty_function_calls
+        %thought_blocks = core.get %message["thoughtBlocks"] default %thought_blocks_snake
+        %has_thought_blocks = core.call intrinsic.truthy(%thought_blocks)
+        %has_assistant_payload = core.call intrinsic.or(%has_assistant_payload, %has_images)
+        %has_assistant_payload = core.call intrinsic.or(%has_assistant_payload, %has_thought_blocks)
         %missing_assistant_payload = core.call intrinsic.not(%has_assistant_payload)
         %bad_assistant = core.call intrinsic.and(%is_assistant, %missing_assistant_payload)
         core.if %bad_assistant {
@@ -458,7 +662,9 @@ module @ax.ai version "0.1" {
           %service_tier = core.let "standard"
         }
         %is_performance = core.call intrinsic.eq(%service_tier, "performance")
-        core.if %is_performance {
+        %is_fast = core.call intrinsic.eq(%service_tier, "fast")
+        %is_priority_alias = core.call intrinsic.or(%is_performance, %is_fast)
+        core.if %is_priority_alias {
           %service_tier = core.let "priority"
         }
         core.set %out["service_tier"] = %service_tier
@@ -583,6 +789,125 @@ module @ax.ai version "0.1" {
     }
   }
 
+  op ax.ai.semantic @ai_merge_replay_metadata {
+    attr core_kind = "func"
+    attr emit_module = "ai"
+    tag "src/ax/mem/memory.ts"
+    type signature = "(previous:json, incoming:json) -> json"
+    body @entry(%previous: json, %incoming: json) {
+      %out = core.call intrinsic.map.merge(%previous, %incoming)
+      %empty = core.list
+      %fields = core.list
+      core.append %fields, "images"
+      core.append %fields, "thought_blocks"
+      core.append %fields, "thoughtBlocks"
+      core.for %field in %fields {
+        %old = core.get %previous[%field] default %empty
+        %incoming_items = core.get %incoming[%field] default %empty
+        %merged = core.list
+        core.for %item in %old {
+          core.append %merged, %item
+        }
+        core.for %item in %incoming_items {
+          %id = core.get %item["id"]
+          %has_id = core.call intrinsic.truthy(%id)
+          %found = core.let false
+          %updated = core.list
+          core.for %existing in %merged {
+            %old_id = core.get %existing["id"]
+            %same = core.call intrinsic.eq(%id, %old_id)
+            %same = core.call intrinsic.and(%same, %has_id)
+            core.if %same {
+              %replacement = core.call intrinsic.map.merge(%existing, %item)
+              %is_image = core.call intrinsic.eq(%field, "images")
+              core.if %is_image {
+                %replacement = core.let %item
+              }
+              %has_summary = core.call intrinsic.map.contains(%item, "summary")
+              %encrypted_snake = core.call intrinsic.map.contains(%item, "encrypted_content")
+              %encrypted_camel = core.call intrinsic.map.contains(%item, "encryptedContent")
+              %is_complete = core.call intrinsic.or(%has_summary, %encrypted_snake)
+              %is_complete = core.call intrinsic.or(%is_complete, %encrypted_camel)
+              %is_complete = core.call intrinsic.or(%is_complete, %is_image)
+              core.if %is_complete {
+              } else {
+                %old_data = core.get %existing["data"] default ""
+                %new_data = core.get %item["data"] default ""
+                %data = core.call intrinsic.string.format("{}{}", %old_data, %new_data)
+                core.set %replacement["data"] = %data
+              }
+              core.append %updated, %replacement
+              %found = core.let true
+            } else {
+              core.append %updated, %existing
+            }
+          }
+          core.if %found {
+          } else {
+            %is_image = core.call intrinsic.eq(%field, "images")
+            %has_encrypted_flag = core.call intrinsic.map.contains(%item, "encrypted")
+            %no_id = core.call intrinsic.not(%has_id)
+            %legacy_thought = core.call intrinsic.and(%has_encrypted_flag, %no_id)
+            %not_image = core.call intrinsic.not(%is_image)
+            %legacy_thought = core.call intrinsic.and(%legacy_thought, %not_image)
+            core.if %legacy_thought {
+              %delta = core.list
+              core.append %delta, %item
+              core.call @ai_append_thought_deltas_impl(%updated, %delta)
+            } else {
+              core.append %updated, %item
+            }
+          }
+          %merged = core.let %updated
+        }
+        %has_items = core.call intrinsic.truthy(%merged)
+        core.if %has_items {
+          core.set %out[%field] = %merged
+        }
+      }
+      %thought = core.get %out["thought"]
+      %show_thought = core.type_is %thought type "string"
+      core.if %show_thought {
+        %snake_blocks = core.get %out["thought_blocks"] default %empty
+        %display_blocks = core.get %out["thoughtBlocks"] default %snake_blocks
+        %has_display_blocks = core.call intrinsic.truthy(%display_blocks)
+        core.if %has_display_blocks {
+          %visible_parts = core.list
+          core.for %block in %display_blocks {
+            %encrypted = core.get %block["encrypted"] default false
+            %visible = core.call intrinsic.not(%encrypted)
+            core.if %visible {
+              %data = core.get %block["data"] default ""
+              core.append %visible_parts, %data
+            }
+          }
+          %visible_text = core.call intrinsic.string.join("", %visible_parts)
+          core.set %out["thought"] = %visible_text
+        }
+      }
+      %results = core.get %incoming["results"]
+      %has_results = core.call intrinsic.is_not_none(%results)
+      core.if %has_results {
+        %old_results = core.get %previous["results"] default %empty
+        %merged_results = core.list
+        core.for %result in %results {
+          %index = core.get %result["index"] default 0
+          %updated_result = core.let %result
+          core.for %old_result in %old_results {
+            %old_index = core.get %old_result["index"] default 0
+            %same = core.call intrinsic.eq(%index, %old_index)
+            core.if %same {
+              %updated_result = core.call @ai_merge_replay_metadata(%old_result, %result)
+            }
+          }
+          core.append %merged_results, %updated_result
+        }
+        core.set %out["results"] = %merged_results
+      }
+      core.return %out
+    }
+  }
+
   op ax.ai.semantic @chat_result_to_completion {
     attr core_kind = "func"
     attr emit_module = "ai"
@@ -591,17 +916,36 @@ module @ax.ai version "0.1" {
     type signature = "(json, number) -> json"
     body @entry(%result: json, %fallback_index: number) {
       %content = core.get %result["content"] default ""
+      // TS's checks of the result's calls need the nested calls this
+      // flattens, so their outcome goes with the completion (AxGen's check
+      // takes it off; see @completion_function_call_problems).
+      %call_problems = core.call @chat_result_function_call_problems(%result, %fallback_index)
       %calls = core.list
       %empty_calls = core.list
       %function_calls = core.get %result["function_calls"] default %empty_calls
       core.for %call in %function_calls {
+        // A call is TS's nested {id, type, function: {name, params}} or the
+        // flat {id, name, params} that completion responses carry.
         %fn = core.get %call["function"]
         %id = core.get %call["id"]
-        %name = core.get %fn["name"]
-        %params = core.get %fn["params"]
+        %flat_name = core.get %call["name"]
+        %name = core.get %fn["name"] default %flat_name
+        %flat_params = core.get %call["params"]
+        %params = core.get %fn["params"] default %flat_params
+        // A call that has no name keeps it absent, so the response check can
+        // tell a missing name from a null one, as TS does.
+        %fn_is_map = core.type_is %fn type "object"
+        %fn_has_name = core.let false
+        core.if %fn_is_map {
+          %fn_has_name = core.call intrinsic.map.contains(%fn, "name")
+        }
+        %flat_has_name = core.call intrinsic.map.contains(%call, "name")
+        %has_name = core.call intrinsic.or(%fn_has_name, %flat_has_name)
         %compat_call = core.map
         core.set %compat_call["id"] = %id
-        core.set %compat_call["name"] = %name
+        core.if %has_name {
+          core.set %compat_call["name"] = %name
+        }
         core.set %compat_call["params"] = %params
         core.append %calls, %compat_call
       }
@@ -620,6 +964,29 @@ module @ax.ai version "0.1" {
       core.if %has_thought_blocks {
         core.set %completion["thought_blocks"] = %thought_blocks
       }
+      %images = core.get %result["images"]
+      %has_images = core.call intrinsic.is_not_none(%images)
+      core.if %has_images {
+        core.set %completion["images"] = %images
+      }
+      %phase = core.get %result["phase"]
+      %has_phase = core.call intrinsic.is_not_none(%phase)
+      core.if %has_phase {
+        core.set %completion["phase"] = %phase
+      }
+      %finish_snake = core.get %result["finish_reason"]
+      %finish = core.get %result["finishReason"] default %finish_snake
+      %has_finish = core.call intrinsic.is_not_none(%finish)
+      core.if %has_finish {
+        core.set %completion["finish_reason"] = %finish
+      }
+      %has_call_problems = core.call intrinsic.is_not_none(%call_problems)
+      core.if %has_call_problems {
+        core.set %completion["function_call_problems"] = %call_problems
+      }
+      %trusted = core.get %result["decisionContext"]
+      %has_trusted = core.call intrinsic.is_not_none(%trusted)
+      core.if %has_trusted { core.set %completion["decisionContext"] = %trusted }
       core.return %completion
     }
   }
@@ -630,12 +997,22 @@ module @ax.ai version "0.1" {
     tag "legacy-completion-compat"
     type signature = "(AxChatResponse) -> json"
     body @entry(%response: AxChatResponse) {
+      %has_routing = core.call intrinsic.map.contains(%response, "routing")
+      %has_response = core.call intrinsic.map.contains(%response, "response")
+      %router_envelope = core.call intrinsic.and(%has_routing, %has_response)
+      core.if %router_envelope {
+        %response = core.get %response["response"]
+      }
       %empty_results = core.list
       %results = core.get %response["results"] default %empty_results
       %completions = core.list
       %position = core.const 0
+      %snake_model_usage = core.get %response["model_usage"]
+      %model_usage = core.get %response["modelUsage"] default %snake_model_usage
+      %has_model_usage = core.call intrinsic.is_not_none(%model_usage)
       core.for %result in %results {
         %completion = core.call @chat_result_to_completion(%result, %position)
+        core.if %has_model_usage { core.set %completion["modelUsage"] = %model_usage }
         core.append %completions, %completion
         %next_position = core.call intrinsic.add(%position, 1)
         %position = core.let %next_position
@@ -644,7 +1021,6 @@ module @ax.ai version "0.1" {
       %first = core.call intrinsic.list.get(%completions, 0, %empty_completion)
       %content = core.get %first["content"] default ""
       %calls = core.get %first["function_calls"] default %empty_results
-      %model_usage = core.get %response["model_usage"]
       %usage = core.get %model_usage["tokens"]
       %thought = core.get %first["thought"]
       %has_thought = core.call intrinsic.is_not_none(%thought)
@@ -655,11 +1031,42 @@ module @ax.ai version "0.1" {
       core.set %out["function_calls"] = %calls
       core.set %out["results"] = %completions
       core.set %out["usage"] = %usage
+      core.if %has_model_usage { core.set %out["modelUsage"] = %model_usage }
+      %trusted = core.get %first["decisionContext"]
+      %has_trusted = core.call intrinsic.is_not_none(%trusted)
+      core.if %has_trusted { core.set %out["decisionContext"] = %trusted }
       core.if %has_thought {
         core.set %out["thought"] = %thought
       }
       core.if %has_thought_blocks {
         core.set %out["thought_blocks"] = %thought_blocks
+      }
+      %session_id = core.get %response["__session_response_id"]
+      %has_session_id = core.call intrinsic.is_not_none(%session_id)
+      core.if %has_session_id {
+        core.set %out["remote_id"] = %session_id
+      }
+      // A native chat session's turns before its final response, for the
+      // request's prompt (see @chat_session_final_result).
+      %session_turns = core.get %response["__session_turns"]
+      %has_session_turns = core.call intrinsic.is_not_none(%session_turns)
+      core.if %has_session_turns {
+        core.set %out["session_turns"] = %session_turns
+      }
+      %images = core.get %first["images"]
+      %has_images = core.call intrinsic.is_not_none(%images)
+      core.if %has_images {
+        core.set %out["images"] = %images
+      }
+      %phase = core.get %first["phase"]
+      %has_phase = core.call intrinsic.is_not_none(%phase)
+      core.if %has_phase {
+        core.set %out["phase"] = %phase
+      }
+      %finish = core.get %first["finish_reason"]
+      %has_finish = core.call intrinsic.is_not_none(%finish)
+      core.if %has_finish {
+        core.set %out["finish_reason"] = %finish
       }
       core.return %out
     }
@@ -872,4 +1279,666 @@ module @ax.ai version "0.1" {
     tag "src/ax/ai/base.ts"
     type signature = "(AxAIService, kind:string, durationMs:f64, error?:json) -> void"
   }
+
+  op ax.ai.semantic @fold_chat_response_stream {
+    attr core_kind = "func"
+    attr emit_module = "ai"
+    tag "src/ax/dsp/response/streaming.ts"
+    type signature = "(list<json>) -> json"
+    body @entry(%events: list<json>) {
+      // Folds streamed chat response chunks into one response, the way TS
+      // accumulates a stream. Per result index, content and thought append,
+      // thought blocks accumulate, and function-call fragments merge by id: a
+      // string name or params appends, object params replace. The last finish
+      // reason and usage win.
+      %results = core.list
+      %usage = core.call intrinsic.none()
+      core.for %raw_event in %events {
+        %event = core.let %raw_event
+        %has_routing = core.call intrinsic.map.contains(%raw_event, "routing")
+        %has_response = core.call intrinsic.map.contains(%raw_event, "response")
+        %router_envelope = core.call intrinsic.and(%has_routing, %has_response)
+        core.if %router_envelope {
+          %event = core.get %raw_event["response"]
+        }
+        %empty_chunks = core.list
+        %chunks = core.get %event["results"] default %empty_chunks
+        core.for %chunk in %chunks {
+          %index = core.get %chunk["index"] default 0
+          %target = core.call intrinsic.none()
+          core.for %candidate in %results {
+            %candidate_index = core.get %candidate["index"]
+            %same_index = core.call intrinsic.eq(%candidate_index, %index)
+            core.if %same_index {
+              %target = core.let %candidate
+            }
+          }
+          %missing_target = core.call intrinsic.is_none(%target)
+          core.if %missing_target {
+            %new_target = core.map
+            core.set %new_target["index"] = %index
+            core.set %new_target["content"] = ""
+            %new_calls = core.list
+            core.set %new_target["function_calls"] = %new_calls
+            core.append %results, %new_target
+            %target = core.let %new_target
+          }
+          core.call @fold_chat_stream_chunk_impl(%target, %chunk)
+        }
+        %usage_snake = core.get %event["model_usage"]
+        %event_usage = core.get %event["modelUsage"] default %usage_snake
+        %has_usage = core.call intrinsic.is_not_none(%event_usage)
+        core.if %has_usage {
+          %usage = core.let %event_usage
+        }
+      }
+      %response = core.map
+      core.set %response["results"] = %results
+      %found_usage = core.call intrinsic.is_not_none(%usage)
+      core.if %found_usage {
+        core.set %response["model_usage"] = %usage
+      }
+      core.return %response
+    }
+  }
+
+  op ax.ai.semantic @ai_append_thought_deltas_impl {
+    attr core_kind = "func"
+    attr emit_module = "ai"
+    attr private = true
+    tag "src/ax/mem/memory.ts"
+    type signature = "(list<json>, list<json>) -> void"
+    body @entry(%existing: list<json>, %incoming: list<json>) {
+      core.for %block in %incoming {
+        %empty = core.map
+        %copy = core.call intrinsic.map.merge(%block, %empty)
+        %encrypted = core.get %block["encrypted"] default false
+        %signature = core.get %block["signature"] default ""
+        %has_signature = core.call intrinsic.truthy(%signature)
+        %without_signature = core.call intrinsic.not(%has_signature)
+        %opaque = core.call intrinsic.and(%encrypted, %without_signature)
+        // Opaque blocks are complete, independent replay payloads.
+        core.if %opaque {
+          core.append %existing, %copy
+          core.continue
+        }
+        %count = core.call intrinsic.len(%existing)
+        %last_index = core.call intrinsic.add(%count, -1)
+        %last = core.call intrinsic.list.get(%existing, %last_index, %empty)
+        %last_signature = core.get %last["signature"] default ""
+        %last_open = core.call intrinsic.not(%last_signature)
+        %last_encrypted = core.get %last["encrypted"] default false
+        %same_kind = core.call intrinsic.eq(%last_encrypted, %encrypted)
+        %has_last = core.call intrinsic.gt(%count, 0)
+        %legacy = core.call intrinsic.map.contains(%block, "encrypted")
+        %id = core.get %block["id"] default ""
+        %phase = core.get %block["phase"] default ""
+        %identified = core.call intrinsic.or(%id, %phase)
+        %unidentified = core.call intrinsic.not(%identified)
+        %merge = core.call intrinsic.and(%has_last, %last_open)
+        %merge = core.call intrinsic.and(%merge, %same_kind)
+        %merge = core.call intrinsic.and(%merge, %legacy)
+        %merge = core.call intrinsic.and(%merge, %unidentified)
+        core.if %merge {
+          %old_data = core.get %last["data"] default ""
+          %data = core.get %block["data"] default ""
+          %joined = core.call intrinsic.add(%old_data, %data)
+          core.set %last["data"] = %joined
+          core.if %has_signature {
+            core.set %last["signature"] = %signature
+          }
+        } else {
+          core.append %existing, %copy
+        }
+      }
+      core.return
+    }
+  }
+
+  op ax.ai.semantic @fold_chat_stream_chunk_impl {
+    attr core_kind = "func"
+    attr emit_module = "ai"
+    attr private = true
+    tag "src/ax/dsp/response/streaming.ts"
+    type signature = "(json, json) -> void"
+    body @entry(%target: json, %chunk: json) {
+      %trusted = core.get %chunk["decisionContext"]
+      %has_trusted = core.call intrinsic.is_not_none(%trusted)
+      core.if %has_trusted { core.set %target["decisionContext"] = %trusted }
+      %content = core.get %chunk["content"]
+      %content_text = core.type_is %content type "string"
+      core.if %content_text {
+        %old_content = core.get %target["content"] default ""
+        %joined_content = core.call intrinsic.add(%old_content, %content)
+        core.set %target["content"] = %joined_content
+      }
+      %thought = core.get %chunk["thought"]
+      %thought_text = core.type_is %thought type "string"
+      core.if %thought_text {
+        %old_thought = core.get %target["thought"] default ""
+        %joined_thought = core.call intrinsic.add(%old_thought, %thought)
+        core.set %target["thought"] = %joined_thought
+      }
+      %blocks_snake = core.get %chunk["thought_blocks"]
+      %blocks = core.get %chunk["thoughtBlocks"] default %blocks_snake
+      %blocks_list = core.type_is %blocks type "list"
+      core.if %blocks_list {
+        %empty_blocks = core.list
+        %target_blocks = core.get %target["thought_blocks"] default %empty_blocks
+        core.call @ai_append_thought_deltas_impl(%target_blocks, %blocks)
+        core.set %target["thought_blocks"] = %target_blocks
+        %display = core.get %target["thought"]
+        %display_text = core.type_is %display type "string"
+        core.if %display_text {
+          %visible_parts = core.list
+          core.for %block in %target_blocks {
+            %encrypted = core.get %block["encrypted"] default false
+            %visible = core.call intrinsic.not(%encrypted)
+            core.if %visible {
+              %data = core.get %block["data"] default ""
+              core.append %visible_parts, %data
+            }
+          }
+          %visible_text = core.call intrinsic.string.join("", %visible_parts)
+          core.set %target["thought"] = %visible_text
+        }
+      }
+      %empty_deltas = core.list
+      %deltas_snake = core.get %chunk["function_calls"] default %empty_deltas
+      %deltas = core.get %chunk["functionCalls"] default %deltas_snake
+      %empty_calls = core.list
+      %calls = core.get %target["function_calls"] default %empty_calls
+      core.for %delta in %deltas {
+        %delta_id = core.get %delta["id"]
+        %existing = core.call intrinsic.none()
+        core.for %candidate in %calls {
+          %candidate_id = core.get %candidate["id"]
+          %same_id = core.call intrinsic.eq(%candidate_id, %delta_id)
+          core.if %same_id {
+            %existing = core.let %candidate
+          }
+        }
+        %new_call = core.call intrinsic.is_none(%existing)
+        core.if %new_call {
+          core.append %calls, %delta
+        } else {
+          %empty_function = core.map
+          %existing_fn = core.get %existing["function"] default %empty_function
+          %delta_fn = core.get %delta["function"] default %empty_function
+          %name = core.get %delta_fn["name"]
+          %name_text = core.type_is %name type "string"
+          %name_nonempty = core.call intrinsic.truthy(%name)
+          %append_name = core.call intrinsic.and(%name_text, %name_nonempty)
+          core.if %append_name {
+            %old_name = core.get %existing_fn["name"] default ""
+            %joined_name = core.call intrinsic.add(%old_name, %name)
+            core.set %existing_fn["name"] = %joined_name
+          }
+          %params = core.get %delta_fn["params"]
+          %params_text = core.type_is %params type "string"
+          %params_nonempty = core.call intrinsic.truthy(%params)
+          %append_params = core.call intrinsic.and(%params_text, %params_nonempty)
+          core.if %append_params {
+            %old_params = core.get %existing_fn["params"] default ""
+            %joined_params = core.call intrinsic.add(%old_params, %params)
+            core.set %existing_fn["params"] = %joined_params
+          }
+          %params_object = core.type_is %params type "object"
+          core.if %params_object {
+            core.set %existing_fn["params"] = %params
+          }
+          core.set %existing["function"] = %existing_fn
+        }
+      }
+      core.set %target["function_calls"] = %calls
+      %finish_snake = core.get %chunk["finish_reason"]
+      %finish = core.get %chunk["finishReason"] default %finish_snake
+      %finish_text = core.type_is %finish type "string"
+      %finish_nonempty = core.call intrinsic.truthy(%finish)
+      %has_finish = core.call intrinsic.and(%finish_text, %finish_nonempty)
+      core.if %has_finish {
+        core.set %target["finish_reason"] = %finish
+      }
+      core.return
+    }
+  }
+
+  op ax.ai.semantic @ai_custom_labels {
+    attr core_kind = "func"
+    attr emit_module = "ai"
+    tag "source:src/ax/ai/metrics.ts#mergeCustomLabels"
+    type signature = "(service_options:json, call_options:json, sanitize:bool) -> json"
+    body @entry(%service_options: json, %call_options: json, %sanitize: bool) {
+      // TS's custom labels for a metric: the service's customLabels, then
+      // the call's, key by key (mergeCustomLabels). With sanitize, as TS's
+      // sanitizeLabels does for the request duration and errors and the
+      // AxGen metrics, a null value is dropped and each value is a string cut
+      // to 100 characters; TS's AI request counter takes them as they are.
+      %empty = core.map
+      %labels = core.map
+      %sources = core.list
+      core.append %sources, %service_options
+      core.append %sources, %call_options
+      core.for %source in %sources {
+        %source_map = core.type_is %source type "object"
+        core.if %source_map {
+          %snake = core.get %source["custom_labels"] default %empty
+          %camel = core.get %source["customLabels"] default %snake
+          %camel_map = core.type_is %camel type "object"
+          core.if %camel_map {
+            %labels = core.call intrinsic.map.merge(%labels, %camel)
+          }
+        }
+      }
+      core.if %sanitize {
+      } else {
+        core.return %labels
+      }
+      %sanitized = core.map
+      %keys = core.call intrinsic.map.keys(%labels)
+      core.for %key in %keys {
+        %value = core.get %labels[%key] default null
+        %missing = core.call intrinsic.is_none(%value)
+        core.if %missing {
+        } else {
+          %text = core.call intrinsic.string.str(%value)
+          %length = core.call intrinsic.len(%text)
+          %over_limit = core.call intrinsic.gt(%length, 100)
+          core.if %over_limit {
+            %text = core.call intrinsic.string.slice(%text, 0, 100)
+          }
+          core.set %sanitized[%key] = %text
+        }
+      }
+      core.return %sanitized
+    }
+  }
+
+  op ax.ai.semantic @ai_redact_headers {
+    attr core_kind = "func"
+    attr emit_module = "ai"
+    tag "source:src/ax/util/apicall.ts#redactHeaders"
+    type signature = "(headers:json) -> json"
+    body @entry(%headers: json) {
+      // TS's redactHeaders: the value of each sensitive header (by its name
+      // in lower case) is "***".
+      %sensitive = core.list
+      core.append %sensitive, "authorization"
+      core.append %sensitive, "proxy-authorization"
+      core.append %sensitive, "x-api-key"
+      core.append %sensitive, "api-key"
+      core.append %sensitive, "apikey"
+      core.append %sensitive, "x-goog-api-key"
+      core.append %sensitive, "x-amz-security-token"
+      core.append %sensitive, "cookie"
+      core.append %sensitive, "set-cookie"
+      %redacted = core.map
+      %headers_map = core.type_is %headers type "object"
+      core.if %headers_map {
+      } else {
+        core.return %redacted
+      }
+      %keys = core.call intrinsic.map.keys(%headers)
+      core.for %key in %keys {
+        %value = core.get %headers[%key] default null
+        %lower = core.call intrinsic.string.lower(%key)
+        %masked = core.call intrinsic.contains(%sensitive, %lower)
+        core.if %masked {
+          core.set %redacted[%key] = "***"
+        } else {
+          core.set %redacted[%key] = %value
+        }
+      }
+      core.return %redacted
+    }
+  }
+
+  op ax.ai.semantic @ai_http_status_text {
+    attr core_kind = "func"
+    attr emit_module = "ai"
+    tag "source:src/ax/util/apicall.ts#apiCall"
+    type signature = "(status:i64) -> string"
+    body @entry(%status: i64) {
+      // The status text a response carries, for the common HTTP statuses.
+      %texts = core.map
+      core.set %texts["200"] = "OK"
+      core.set %texts["201"] = "Created"
+      core.set %texts["202"] = "Accepted"
+      core.set %texts["204"] = "No Content"
+      core.set %texts["400"] = "Bad Request"
+      core.set %texts["401"] = "Unauthorized"
+      core.set %texts["403"] = "Forbidden"
+      core.set %texts["404"] = "Not Found"
+      core.set %texts["408"] = "Request Timeout"
+      core.set %texts["409"] = "Conflict"
+      core.set %texts["413"] = "Payload Too Large"
+      core.set %texts["422"] = "Unprocessable Entity"
+      core.set %texts["429"] = "Too Many Requests"
+      core.set %texts["500"] = "Internal Server Error"
+      core.set %texts["502"] = "Bad Gateway"
+      core.set %texts["503"] = "Service Unavailable"
+      core.set %texts["504"] = "Gateway Timeout"
+      %key = core.call intrinsic.string.format("{}", %status)
+      %text = core.get %texts[%key] default ""
+      core.return %text
+    }
+  }
+
+  op ax.ai.semantic @ai_verbose_request_log {
+    attr core_kind = "func"
+    attr emit_module = "ai"
+    tag "source:src/ax/util/apicall.ts#apiCall"
+    type signature = "(url:string, method:string, headers:json, body:json) -> string"
+    body @entry(%url: string, %method: string, %headers: json, %body: json) {
+      // What TS's apiCall logs before a verbose request: console.log joins
+      // its arguments with spaces; the headers have their secrets masked.
+      %redacted = core.call @ai_redact_headers(%headers)
+      %headers_text = core.call intrinsic.json.pretty(%redacted)
+      %body_text = core.call intrinsic.json.pretty(%body)
+      %text = core.call intrinsic.string.format("\n--- [AxAI API Request] ---\n URL: {}\n Method: {}\n Headers: {} \nBody: {} \n------------------------\n", %url, %method, %headers_text, %body_text)
+      core.return %text
+    }
+  }
+
+  op ax.ai.semantic @ai_verbose_response_log {
+    attr core_kind = "func"
+    attr emit_module = "ai"
+    tag "source:src/ax/util/apicall.ts#apiCall"
+    type signature = "(status:i64, body:json) -> string"
+    body @entry(%status: i64, %body: json) {
+      // What TS's apiCall logs after a verbose request's JSON response.
+      %status_text = core.call @ai_http_status_text(%status)
+      %body_text = core.call intrinsic.json.pretty(%body)
+      %text = core.call intrinsic.string.format("\n--- [AxAI API Response] ---\n Status: {} {}\n Body: {} \n-------------------------\n", %status, %status_text, %body_text)
+      core.return %text
+    }
+  }
+
+  op ax.ai.semantic @ai_verbose_stream_log {
+    attr core_kind = "func"
+    attr emit_module = "ai"
+    tag "source:src/ax/util/apicall.ts#apiCall"
+    type signature = "(status:i64) -> string"
+    body @entry(%status: i64) {
+      // What TS's apiCall logs when a verbose request's stream starts.
+      %status_text = core.call @ai_http_status_text(%status)
+      %text = core.call intrinsic.string.format("\n--- [AxAI API Streaming Response Started] ---\n Status: {} {}\n \n-------------------------------------------\n", %status, %status_text)
+      core.return %text
+    }
+  }
+
+  op ax.ai.semantic @chat_result_function_call_problems {
+    attr core_kind = "func"
+    attr emit_module = "ai"
+    attr private = true
+    tag "source:src/ax/ai/validate.ts#validateChatResponseFunctionCalls"
+    type signature = "(json, number) -> json"
+    body @entry(%result: json, %result_index: number) {
+      // TS's checks of one result's function calls, in its order for each
+      // call: the call is not null, its id is a non-empty string, its type is
+      // 'function', it has a function object, its name is a non-empty string,
+      // and its params, when given, are a string or an object. The messages
+      // are TS's, with each value as JSON.stringify(value, null, 2) and
+      // undefined for a missing one.
+      //
+      // Returns null when every call passes, else {first, unnamed, call}:
+      // first is the message TS fails with; unnamed is the first failure the
+      // ports' default handles as a call without a name (a null call, one
+      // without a function object or without a name: a correction and
+      // another request); call is the first failure whose call the ports'
+      // default runs as given (the id, type and params checks).
+      //
+      // A flat {id, name, params} call, the ports' completion shape (no type
+      // and no function object), gets the id, name and params checks.
+      %empty = core.list
+      %calls = core.get %result["function_calls"] default %empty
+      %calls_is_list = core.type_is %calls type "list"
+      core.if %calls_is_list {
+      } else {
+        %calls = core.let %empty
+      }
+      %first = core.call intrinsic.none()
+      %unnamed = core.call intrinsic.none()
+      %call_problem = core.call intrinsic.none()
+      %call_index = core.let 0
+      core.for %call in %calls {
+        %problem = core.let ""
+        %kind = core.let ""
+        %is_map = core.type_is %call type "object"
+        core.if %is_map {
+          %has_function = core.call intrinsic.map.contains(%call, "function")
+          %has_type = core.call intrinsic.map.contains(%call, "type")
+          %nested = core.call intrinsic.or(%has_function, %has_type)
+          // The id.
+          %has_id = core.call intrinsic.map.contains(%call, "id")
+          %id = core.get %call["id"]
+          %id_ok = core.let false
+          %id_is_text = core.type_is %id type "string"
+          core.if %id_is_text {
+            %id_trimmed = core.string_trim %id
+            %id_ok = core.call intrinsic.ne(%id_trimmed, "")
+          }
+          %id_bad = core.call intrinsic.not(%id_ok)
+          core.if %id_bad {
+            %id_received = core.let "undefined"
+            core.if %has_id {
+              %id_received = core.call intrinsic.json.pretty(%id)
+            }
+            %problem = core.call intrinsic.string.format("Function call at index {} in result {} must have a non-empty string id, received: {}", %call_index, %result_index, %id_received)
+            %kind = core.let "call"
+          }
+          %fn = core.get %call["function"]
+          %fn_is_map = core.type_is %fn type "object"
+          // The type and the function object (a nested call only).
+          %check_nested = core.call intrinsic.eq(%problem, "")
+          %check_nested = core.call intrinsic.and(%check_nested, %nested)
+          core.if %check_nested {
+            %type = core.get %call["type"]
+            %type_ok = core.call intrinsic.eq(%type, "function")
+            %type_bad = core.call intrinsic.not(%type_ok)
+            core.if %type_bad {
+              %type_received = core.let "undefined"
+              core.if %has_type {
+                %type_received = core.call intrinsic.json.pretty(%type)
+              }
+              %problem = core.call intrinsic.string.format("Function call at index {} in result {} must have type 'function', received: {}", %call_index, %result_index, %type_received)
+              %kind = core.let "call"
+            } else {
+              // TS's !functionCall.function: a missing, null, false, 0 or ''
+              // function fails; any other value goes on to the name.
+              %fn_falsy = core.call intrinsic.is_none(%fn)
+              %fn_false = core.call intrinsic.eq(%fn, false)
+              %fn_zero = core.call intrinsic.eq(%fn, 0)
+              %fn_empty = core.call intrinsic.eq(%fn, "")
+              %fn_falsy = core.call intrinsic.or(%fn_falsy, %fn_false)
+              %fn_falsy = core.call intrinsic.or(%fn_falsy, %fn_zero)
+              %fn_falsy = core.call intrinsic.or(%fn_falsy, %fn_empty)
+              core.if %fn_falsy {
+                %fn_received = core.let "undefined"
+                core.if %has_function {
+                  %fn_received = core.call intrinsic.json.pretty(%fn)
+                }
+                %problem = core.call intrinsic.string.format("Function call at index {} in result {} must have a function object, received: {}", %call_index, %result_index, %fn_received)
+                %kind = core.let "unnamed"
+              }
+            }
+          }
+          // The name: the function object's, or the flat call's.
+          %check_name = core.call intrinsic.eq(%problem, "")
+          core.if %check_name {
+            %has_name = core.let false
+            %name = core.call intrinsic.none()
+            core.if %nested {
+              core.if %fn_is_map {
+                %has_name = core.call intrinsic.map.contains(%fn, "name")
+                %name = core.get %fn["name"]
+              }
+            } else {
+              %has_name = core.call intrinsic.map.contains(%call, "name")
+              %name = core.get %call["name"]
+            }
+            %named = core.let false
+            %name_is_text = core.type_is %name type "string"
+            core.if %name_is_text {
+              %name_trimmed = core.string_trim %name
+              %named = core.call intrinsic.ne(%name_trimmed, "")
+            }
+            %unnamed_call = core.call intrinsic.not(%named)
+            core.if %unnamed_call {
+              %name_received = core.let "undefined"
+              core.if %has_name {
+                %name_received = core.call intrinsic.json.pretty(%name)
+              }
+              %problem = core.call intrinsic.string.format("Function call at index {} in result {} must have a non-empty function name, received: {}", %call_index, %result_index, %name_received)
+              %kind = core.let "unnamed"
+            }
+          }
+          // The params, when given: a string or an object (TS's typeof, so
+          // null and lists pass too); a number or a boolean fails.
+          %check_params = core.call intrinsic.eq(%problem, "")
+          core.if %check_params {
+            %has_params = core.let false
+            %params = core.call intrinsic.none()
+            core.if %nested {
+              core.if %fn_is_map {
+                %has_params = core.call intrinsic.map.contains(%fn, "params")
+                %params = core.get %fn["params"]
+              }
+            } else {
+              %has_params = core.call intrinsic.map.contains(%call, "params")
+              %params = core.get %call["params"]
+            }
+            %params_number = core.type_is %params type "number"
+            %params_bool = core.type_is %params type "boolean"
+            %params_bad = core.call intrinsic.or(%params_number, %params_bool)
+            %params_bad = core.call intrinsic.and(%params_bad, %has_params)
+            core.if %params_bad {
+              %params_received = core.call intrinsic.json.pretty(%params)
+              %problem = core.call intrinsic.string.format("Function call params at index {} in result {} must be a string or object, received: {}", %call_index, %result_index, %params_received)
+              %kind = core.let "call"
+            }
+          }
+        } else {
+          // TS's !functionCall: a null, false, 0 or '' call fails as null;
+          // any other value has no id.
+          %call_null = core.call intrinsic.is_none(%call)
+          %call_false = core.call intrinsic.eq(%call, false)
+          %call_zero = core.call intrinsic.eq(%call, 0)
+          %call_empty = core.call intrinsic.eq(%call, "")
+          %call_falsy = core.call intrinsic.or(%call_null, %call_false)
+          %call_falsy = core.call intrinsic.or(%call_falsy, %call_zero)
+          %call_falsy = core.call intrinsic.or(%call_falsy, %call_empty)
+          core.if %call_falsy {
+            %call_received = core.call intrinsic.json.pretty(%call)
+            %problem = core.call intrinsic.string.format("Function call at index {} in result {} cannot be null or undefined, received: {}", %call_index, %result_index, %call_received)
+          } else {
+            %problem = core.call intrinsic.string.format("Function call at index {} in result {} must have a non-empty string id, received: undefined", %call_index, %result_index)
+          }
+          %kind = core.let "unnamed"
+        }
+        %failed = core.call intrinsic.ne(%problem, "")
+        core.if %failed {
+          %first_unset = core.call intrinsic.is_none(%first)
+          core.if %first_unset {
+            %first = core.let %problem
+          }
+          %is_unnamed = core.call intrinsic.eq(%kind, "unnamed")
+          core.if %is_unnamed {
+            %unnamed_unset = core.call intrinsic.is_none(%unnamed)
+            core.if %unnamed_unset {
+              %unnamed = core.let %problem
+            }
+          } else {
+            %call_unset = core.call intrinsic.is_none(%call_problem)
+            core.if %call_unset {
+              %call_problem = core.let %problem
+            }
+          }
+        }
+        %next_call_index = core.call intrinsic.add(%call_index, 1)
+        %call_index = core.let %next_call_index
+      }
+      %none_failed = core.call intrinsic.is_none(%first)
+      core.if %none_failed {
+        %nothing = core.call intrinsic.none()
+        core.return %nothing
+      }
+      %out = core.map
+      core.set %out["first"] = %first
+      core.set %out["unnamed"] = %unnamed
+      core.set %out["call"] = %call_problem
+      core.return %out
+    }
+  }
+  op ax.ai.semantic @router_embed_request {
+    attr core_kind = "func"
+    attr emit_module = "ai"
+    tag "src/ax/ai/multiservice.ts"
+    type signature = "(request:json, model:json, embed_model:json) -> json"
+    body @entry(%request: json, %model: json, %embed_model: json) {
+      %empty = core.map
+      %out = core.call intrinsic.map.merge(%empty, %request)
+      %chat_key = core.call intrinsic.truthy(%model)
+      %embed_key = core.call intrinsic.truthy(%embed_model)
+      %service_key = core.call intrinsic.or(%chat_key, %embed_key)
+      core.if %service_key {
+      } else {
+        core.call intrinsic.map.delete(%out, "embedModel")
+        core.call intrinsic.map.delete(%out, "embed_model")
+      }
+      core.return %out
+    }
+  }
+
+  op ax.ai.semantic @router_embed_route {
+    attr core_kind = "func"
+    attr emit_module = "ai"
+    tag "src/ax/ai/multiservice.ts"
+    type signature = "(request:json, entries:json) -> json throws"
+    body @entry(%request: json, %entries: json) {
+      %snake = core.get %request["embed_model"]
+      %key = core.get %request["embedModel"] default %snake
+      %has_key = core.call intrinsic.truthy(%key)
+      core.if %has_key {
+      } else {
+        %error = core.call intrinsic.error.runtime("Embed model key must be specified for multi-service")
+        core.raise %error
+      }
+      %empty = core.list
+      core.for %entry in %entries {
+        %service_key = core.get %entry["key"]
+        %models = core.get %entry["models"] default %empty
+        core.for %model in %models {
+          %model_key = core.get %model["key"]
+          %matches = core.call intrinsic.eq(%model_key, %key)
+          core.if %matches {
+            %chat_model = core.get %model["model"]
+            %embed_snake = core.get %model["embed_model"]
+            %embed_model = core.get %model["embedModel"] default %embed_snake
+            %forwarded = core.call @router_embed_request(%request, %chat_model, %embed_model)
+            %out = core.map
+            core.set %out["key"] = %service_key
+            core.set %out["request"] = %forwarded
+            core.return %out
+          }
+        }
+      }
+      core.for %entry in %entries {
+        %service_key = core.get %entry["key"]
+        %matches = core.call intrinsic.eq(%service_key, %key)
+        core.if %matches {
+          %none = core.call intrinsic.none()
+          %forwarded = core.call @router_embed_request(%request, %none, %none)
+          %out = core.map
+          core.set %out["key"] = %service_key
+          core.set %out["request"] = %forwarded
+          core.return %out
+        }
+      }
+      %message = core.call intrinsic.string.format("No service found for embed model key: {}", %key)
+      %error = core.call intrinsic.error.runtime(%message)
+      core.raise %error
+    }
+  }
+
 }

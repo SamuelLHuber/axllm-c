@@ -1290,7 +1290,7 @@ describe('Split-architecture signature derivation', () => {
           execute: async (code: string) => {
             if (code.startsWith(AX_HOST_SNIPPET_MARKER)) return 'host-snippet';
             executedCodes.push(code);
-            (globals?.final as (...args: unknown[]) => void)('done', {
+            (globals!.final as (...args: unknown[]) => void)('done', {
               answer: 'ok',
             });
             return 'python-result';
@@ -3230,6 +3230,69 @@ describe('Actor/Responder execution loop', () => {
       '[TOMBSTONE]: Resolved Error: Execution timed out in turn 2.'
     );
     expect(thirdActorPrompt).toContain('const recovered = 7');
+  });
+
+  it('should tombstone a resolved runtime ReferenceError from the default runtime', async () => {
+    const executorPrompts: string[] = [];
+    const events: AxAgentContextEvent[] = [];
+    const executorTurns = [
+      'console.log(brokenHelper())',
+      'console.log("recovered")',
+      'await final("generate output", { data: "done" })',
+    ];
+
+    const testMockAI = new AxMockAIService({
+      features: { functions: false, streaming: false },
+      chatResponse: async (req) => {
+        const systemPrompt = String(req.chatPrompt[0]?.content ?? '');
+        const reply = (content: string) => ({
+          results: [{ index: 0, content, finishReason: 'stop' as const }],
+          modelUsage: makeModelUsage(),
+        });
+        if (systemPrompt.includes('You (`distiller`)')) {
+          return reply('Javascript Code: await final("generate output", {})');
+        }
+        if (systemPrompt.includes('You (`executor`)')) {
+          executorPrompts.push(String(req.chatPrompt[1]?.content ?? ''));
+          const code =
+            executorTurns[
+              Math.min(executorPrompts.length, executorTurns.length) - 1
+            ];
+          return reply(`Javascript Code: ${code}`);
+        }
+        return reply('Answer: done');
+      },
+    });
+
+    const testAgent = agent('query:string -> answer:string', {
+      ai: testMockAI,
+      directResponse: 'off',
+      contextPolicy: { preset: 'adaptive' },
+      onContextEvent: (event) => {
+        events.push(event);
+      },
+    });
+
+    await testAgent.forward(testMockAI, { query: 'unused' });
+
+    expect(executorPrompts).toHaveLength(3);
+    // The actor reads the runtime's formatted error on the next turn...
+    expect(executorPrompts[1]).toContain(
+      'ReferenceError: brokenHelper is not defined'
+    );
+    // ...and once a later turn succeeds, the error turn is tombstoned.
+    const tombstone =
+      '[TOMBSTONE]: Resolved ReferenceError: brokenHelper is not defined in turn 2.';
+    expect(executorPrompts[2]).toContain(tombstone);
+    expect(executorPrompts[2]).not.toContain('Source:');
+    expect(events).toContainEqual({
+      kind: 'tombstone_created',
+      stage: 'executor',
+      turn: 1,
+      resolvedByTurn: 2,
+      source: 'deterministic',
+      summaryChars: tombstone.length,
+    });
   });
 
   it('should forward request-level options into tombstone summarizer calls', async () => {
@@ -6563,7 +6626,7 @@ describe('final()/askClarification() as runtime globals', () => {
         return {
           execute: async (code: string) => {
             if (code.startsWith(AX_HOST_SNIPPET_MARKER)) return 'host-snippet';
-            (globals?.final as (...args: unknown[]) => void)();
+            (globals!.final as (...args: unknown[]) => void)();
             return 'unreachable';
           },
           // REPL-faithful: merge (phase-2 rebinding) + honor staged input merges.
@@ -6654,7 +6717,7 @@ describe('final()/askClarification() as runtime globals', () => {
         return {
           execute: async (code: string) => {
             if (code.startsWith(AX_HOST_SNIPPET_MARKER)) return 'host-snippet';
-            (globals?.askClarification as (...args: unknown[]) => void)();
+            (globals!.askClarification as (...args: unknown[]) => void)();
             return 'unreachable';
           },
           // REPL-faithful: merge (phase-2 rebinding) + honor staged input merges.
@@ -8073,6 +8136,50 @@ console.log('Keys:', Object.keys(globalThis));`;
     correctedCode: string;
     rejectedCodes: readonly string[];
   }> = [
+    {
+      name: 'should reject CRLF fenced actor blocks in a structured JSON response',
+      codeFieldTitle: 'Javascript Code',
+      usageInstructions: runtimeWithConsoleMode.getUsageInstructions(),
+      firstResponse: JSON.stringify({
+        javascriptCode: [
+          '```javascript',
+          'console.log("partial");',
+          '```',
+          '```javascript',
+          'await final("premature", { partial: true });',
+          '```',
+        ].join('\r\n'),
+      }),
+      correctedResponse:
+        'Javascript Code: await final("done", { data: "done" });',
+      correctedCode: 'await final("done", { data: "done" });',
+      rejectedCodes: [
+        'console.log("partial");',
+        'await final("premature", { partial: true });',
+      ],
+    },
+    {
+      name: 'should reject CRLF fenced Python blocks in a structured JSON response',
+      language: 'Python',
+      codeFieldTitle: 'Python Code',
+      usageInstructions: '- Use Python syntax for runtime code.',
+      firstResponse: JSON.stringify({
+        pythonCode: [
+          '```python',
+          'print("partial")',
+          '```',
+          '```python',
+          'final("premature", {"partial": True})',
+          '```',
+        ].join('\r\n'),
+      }),
+      correctedResponse: 'Python Code: final("done", {"data": "done"})',
+      correctedCode: 'final("done", {"data": "done"})',
+      rejectedCodes: [
+        'print("partial")',
+        'final("premature", {"partial": True})',
+      ],
+    },
     {
       name: 'should reject multiple fenced actor code blocks without executing either block',
       codeFieldTitle: 'Javascript Code',
@@ -9712,7 +9819,7 @@ describe('RLM llmQuery runtime behavior', () => {
             abortController.abort('stop now');
             try {
               await (
-                globals?.llmQuery as (
+                globals!.llmQuery as (
                   q: string,
                   context?: string
                 ) => Promise<string>
@@ -12946,7 +13053,7 @@ describe('judgeOptions / optimize', () => {
     expect(compileSpy).toHaveBeenCalledOnce();
   });
 
-  it('should forward GEPA logging and progress options through agent.optimize()', async () => {
+  it('should forward GEPA logging, progress, and teacher options through agent.optimize()', async () => {
     const studentAI = makeStudentAI();
     const optimizerLogger = vi.fn();
     const onProgress = vi.fn();
@@ -12963,6 +13070,7 @@ describe('judgeOptions / optimize', () => {
       ) {
         expect(this.verbose).toBe(true);
         expect(this.debugOptimizer).toBe(true);
+        expect(this.teacherOptions).toEqual({ useExpensiveModel: 'yes' });
         expect(this.optimizerLogger).toBe(optimizerLogger);
         expect(this.onProgress).toBe(onProgress);
         expect(this.onEarlyStop).toBe(onEarlyStop);
@@ -13000,6 +13108,7 @@ describe('judgeOptions / optimize', () => {
       metric: async () => 1,
       verbose: true,
       debugOptimizer: true,
+      teacherOptions: { useExpensiveModel: 'yes' },
       optimizerLogger,
       onProgress,
       onEarlyStop,
@@ -15513,7 +15622,7 @@ describe('AxFunction', () => {
           execute: async (code: string) => {
             if (code.startsWith(AX_HOST_SNIPPET_MARKER)) return 'host-snippet';
             if (code === 'RUNTIME_FINAL') {
-              (globals?.final as (...args: unknown[]) => never)('done', {});
+              (globals!.final as (...args: unknown[]) => never)('done', {});
               continuedAfterCompletion = true;
               return 'after final';
             }
@@ -15688,7 +15797,7 @@ describe('AxFunction', () => {
           execute: async (code: string) => {
             if (code.startsWith(AX_HOST_SNIPPET_MARKER)) return 'host-snippet';
             if (code === 'RUNTIME_ASK') {
-              (globals?.askClarification as (...args: unknown[]) => never)(
+              (globals!.askClarification as (...args: unknown[]) => never)(
                 'Need more details'
               );
               continuedAfterClarification = true;

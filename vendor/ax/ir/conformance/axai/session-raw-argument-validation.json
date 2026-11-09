@@ -1,0 +1,895 @@
+{
+  "cases": [],
+  "expected_pending": [],
+  "expected_steps": 0,
+  "kind": "ai_session_state",
+  "max_steps": 3,
+  "model": "gpt-6-astra",
+  "name": "session-raw-argument-validation",
+  "path": "root",
+  "validation_cases": [
+    {
+      "schema": {
+        "const": {}
+      },
+      "arguments": null,
+      "valid": false,
+      "errors": [
+        {
+          "field": "arguments",
+          "message": "Value does not match const"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "const": null
+      },
+      "arguments": {},
+      "valid": false,
+      "errors": [
+        {
+          "field": "arguments",
+          "message": "Value does not match const"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "const": false
+      },
+      "arguments": 0,
+      "valid": false,
+      "errors": [
+        {
+          "field": "arguments",
+          "message": "Value does not match const"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "enum": [
+          true
+        ]
+      },
+      "arguments": 1,
+      "valid": false,
+      "errors": [
+        {
+          "field": "arguments",
+          "message": "Value is not in the allowed enum"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "const": {
+          "z": 1,
+          "a": 2
+        }
+      },
+      "arguments": {
+        "z": 1,
+        "a": 2
+      },
+      "valid": true,
+      "errors": []
+    },
+    {
+      "schema": {
+        "const": {
+          "z": 1,
+          "a": 2
+        }
+      },
+      "arguments": {
+        "a": 2,
+        "z": 1
+      },
+      "valid": false,
+      "errors": [
+        {
+          "field": "arguments",
+          "message": "Value does not match const"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "enum": [
+          {
+            "nested": [
+              1,
+              null,
+              {
+                "z": true,
+                "a": false
+              }
+            ]
+          }
+        ]
+      },
+      "arguments": {
+        "nested": [
+          1,
+          null,
+          {
+            "a": false,
+            "z": true
+          }
+        ]
+      },
+      "valid": false,
+      "errors": [
+        {
+          "field": "arguments",
+          "message": "Value is not in the allowed enum"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "$defs": {
+          "target": false
+        },
+        "$ref": "#/$defs/target"
+      },
+      "arguments": 2,
+      "valid": false,
+      "errors": [
+        {
+          "field": "arguments",
+          "message": "Unresolved schema reference"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "$defs": {
+          "target": {}
+        },
+        "$ref": "#/$defs/target"
+      },
+      "arguments": 2,
+      "valid": true,
+      "errors": []
+    },
+    {
+      "schema": {
+        "allOf": [
+          {
+            "type": "integer"
+          }
+        ],
+        "$ref": "#/allOf/0"
+      },
+      "arguments": 2,
+      "valid": true,
+      "errors": []
+    },
+    {
+      "schema": {
+        "allOf": [
+          {
+            "type": "integer"
+          }
+        ],
+        "$ref": "#/allOf/0"
+      },
+      "arguments": "2",
+      "valid": false,
+      "errors": [
+        {
+          "field": "arguments",
+          "message": "Expected integer, received string"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "allOf": [
+          {
+            "type": "integer"
+          }
+        ],
+        "$ref": "#/allOf/00"
+      },
+      "arguments": 2,
+      "valid": false,
+      "errors": [
+        {
+          "field": "arguments",
+          "message": "Unresolved schema reference"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "type": "integer"
+      },
+      "arguments": 1.5,
+      "valid": false,
+      "errors": [
+        {
+          "field": "arguments",
+          "message": "Expected integer, received number"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "arguments": null,
+      "valid": true,
+      "errors": []
+    },
+    {
+      "schema": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "arguments": 3,
+      "valid": false,
+      "errors": [
+        {
+          "field": "arguments",
+          "message": "Expected string or null, received number"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "minimum": 2,
+        "maximum": 4
+      },
+      "arguments": 2,
+      "valid": true,
+      "errors": []
+    },
+    {
+      "schema": {
+        "minimum": 2,
+        "maximum": 4
+      },
+      "arguments": 1,
+      "valid": false,
+      "errors": [
+        {
+          "field": "arguments",
+          "message": "Number is below minimum"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "minimum": 2,
+        "maximum": 4
+      },
+      "arguments": 5,
+      "valid": false,
+      "errors": [
+        {
+          "field": "arguments",
+          "message": "Number is above maximum"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "minLength": 2,
+        "maxLength": 2
+      },
+      "arguments": "😀a",
+      "valid": true,
+      "errors": []
+    },
+    {
+      "schema": {
+        "minLength": 2
+      },
+      "arguments": "😀",
+      "valid": false,
+      "errors": [
+        {
+          "field": "arguments",
+          "message": "String is too short"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "maxLength": 1
+      },
+      "arguments": "😀a",
+      "valid": false,
+      "errors": [
+        {
+          "field": "arguments",
+          "message": "String is too long"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "pattern": "[A-Z]{2}[0-9]+"
+      },
+      "arguments": "prefix AB12 suffix",
+      "valid": true,
+      "errors": []
+    },
+    {
+      "schema": {
+        "pattern": "^[A-Z]{2}[0-9]+$"
+      },
+      "arguments": "prefix AB12 suffix",
+      "valid": false,
+      "errors": [
+        {
+          "field": "arguments",
+          "message": "String does not match pattern"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "enum": [
+          "a",
+          2,
+          null
+        ]
+      },
+      "arguments": null,
+      "valid": true,
+      "errors": []
+    },
+    {
+      "schema": {
+        "enum": [
+          "a",
+          2,
+          null
+        ]
+      },
+      "arguments": "2",
+      "valid": false,
+      "errors": [
+        {
+          "field": "arguments",
+          "message": "Value is not in the allowed enum"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "const": {
+          "a": [
+            1,
+            true
+          ]
+        }
+      },
+      "arguments": {
+        "a": [
+          1,
+          true
+        ]
+      },
+      "valid": true,
+      "errors": []
+    },
+    {
+      "schema": {
+        "const": null
+      },
+      "arguments": false,
+      "valid": false,
+      "errors": [
+        {
+          "field": "arguments",
+          "message": "Value does not match const"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "allOf": [
+          {
+            "minimum": 2
+          },
+          {
+            "maximum": 4
+          }
+        ]
+      },
+      "arguments": 5,
+      "valid": false,
+      "errors": [
+        {
+          "field": "arguments",
+          "message": "Number is above maximum"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "const": "yes"
+          }
+        ]
+      },
+      "arguments": "yes",
+      "valid": true,
+      "errors": []
+    },
+    {
+      "schema": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "const": "yes"
+          }
+        ]
+      },
+      "arguments": "no",
+      "valid": false,
+      "errors": [
+        {
+          "field": "arguments",
+          "message": "Arguments do not match anyOf"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "oneOf": [
+          {
+            "type": "number"
+          },
+          {
+            "type": "integer"
+          }
+        ]
+      },
+      "arguments": 2,
+      "valid": false,
+      "errors": [
+        {
+          "field": "arguments",
+          "message": "Arguments do not match oneOf"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "oneOf": [
+          {
+            "type": "number"
+          },
+          {
+            "type": "integer"
+          }
+        ]
+      },
+      "arguments": 2.5,
+      "valid": true,
+      "errors": []
+    },
+    {
+      "schema": {
+        "anyOf": []
+      },
+      "arguments": {},
+      "valid": false,
+      "errors": [
+        {
+          "field": "arguments",
+          "message": "Arguments do not match anyOf"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "type": "array",
+        "minItems": 2,
+        "maxItems": 3,
+        "items": {
+          "type": "integer"
+        }
+      },
+      "arguments": [
+        1,
+        2
+      ],
+      "valid": true,
+      "errors": []
+    },
+    {
+      "schema": {
+        "minItems": 2
+      },
+      "arguments": [
+        1
+      ],
+      "valid": false,
+      "errors": [
+        {
+          "field": "arguments",
+          "message": "Too few items"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "maxItems": 1
+      },
+      "arguments": [
+        1,
+        2
+      ],
+      "valid": false,
+      "errors": [
+        {
+          "field": "arguments",
+          "message": "Too many items"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "items": {
+          "type": "integer"
+        }
+      },
+      "arguments": [
+        1,
+        "2"
+      ],
+      "valid": false,
+      "errors": [
+        {
+          "field": "[1]",
+          "message": "Expected integer, received string"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "type": "object",
+        "required": [
+          "a"
+        ],
+        "properties": {
+          "a": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "arguments": {
+        "a": "ok",
+        "extra": true
+      },
+      "valid": false,
+      "errors": [
+        {
+          "field": "arguments",
+          "message": "Unexpected property: extra"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "required": [
+          "a"
+        ]
+      },
+      "arguments": {},
+      "valid": false,
+      "errors": [
+        {
+          "field": "a",
+          "message": "Required argument is missing"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "additionalProperties": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "arguments": {
+        "a": 1,
+        "b": -1
+      },
+      "valid": false,
+      "errors": [
+        {
+          "field": ".b",
+          "message": "Number is below minimum"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "additionalProperties": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "arguments": {
+        "a": 1,
+        "b": 2
+      },
+      "valid": true,
+      "errors": []
+    },
+    {
+      "schema": {
+        "$defs": {
+          "a/b~c": {
+            "type": "integer",
+            "minimum": 2
+          }
+        },
+        "$ref": "#/$defs/a~1b~0c"
+      },
+      "arguments": 3,
+      "valid": true,
+      "errors": []
+    },
+    {
+      "schema": {
+        "$defs": {
+          "n": {
+            "type": "integer"
+          }
+        },
+        "properties": {
+          "nested": {
+            "items": {
+              "$ref": "#/$defs/n"
+            }
+          }
+        }
+      },
+      "arguments": {
+        "nested": [
+          1,
+          "bad"
+        ]
+      },
+      "valid": false,
+      "errors": [
+        {
+          "field": "nested[1]",
+          "message": "Expected integer, received string"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "$ref": "#/missing"
+      },
+      "arguments": {},
+      "valid": false,
+      "errors": [
+        {
+          "field": "arguments",
+          "message": "Unresolved schema reference"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "$ref": "https://example.com/schema"
+      },
+      "arguments": {},
+      "valid": false,
+      "errors": [
+        {
+          "field": "arguments",
+          "message": "External schema references are unsupported"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "$defs": {
+          "loop": {
+            "$ref": "#/$defs/loop"
+          }
+        },
+        "$ref": "#/$defs/loop"
+      },
+      "arguments": {},
+      "valid": false,
+      "errors": [
+        {
+          "field": "arguments",
+          "message": "Arguments exceed schema nesting limit"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "$defs": {
+          "n": {
+            "type": "integer"
+          }
+        },
+        "$ref": "#/$defs/n",
+        "type": "string"
+      },
+      "arguments": 3,
+      "valid": true,
+      "errors": []
+    },
+    {
+      "schema": {
+        "type": "object",
+        "properties": {
+          "a": {
+            "type": "object",
+            "required": [
+              "b"
+            ],
+            "properties": {
+              "b": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "arguments": {
+        "a": {}
+      },
+      "valid": false,
+      "errors": [
+        {
+          "field": "a.b",
+          "message": "Required argument is missing"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "type": "object",
+        "properties": {
+          "a": {
+            "type": "object",
+            "properties": {
+              "b": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "arguments": {
+        "a": {
+          "b": 1
+        }
+      },
+      "valid": false,
+      "errors": [
+        {
+          "field": "a.b",
+          "message": "Expected string, received number"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "type": "string"
+      },
+      "arguments": [
+        1
+      ],
+      "valid": false,
+      "errors": [
+        {
+          "field": "arguments",
+          "message": "Expected string, received array"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "type": "boolean"
+      },
+      "arguments": null,
+      "valid": false,
+      "errors": [
+        {
+          "field": "arguments",
+          "message": "Expected boolean, received null"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "type": [
+          "integer",
+          "string"
+        ]
+      },
+      "arguments": {},
+      "valid": false,
+      "errors": [
+        {
+          "field": "arguments",
+          "message": "Expected integer or string, received object"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "type": "object",
+        "properties": {
+          "a": {
+            "enum": [
+              "x"
+            ]
+          }
+        }
+      },
+      "arguments": {
+        "a": "y"
+      },
+      "valid": false,
+      "errors": [
+        {
+          "field": "a",
+          "message": "Value is not in the allowed enum"
+        }
+      ]
+    },
+    {
+      "schema": {
+        "type": "object",
+        "required": [
+          "a",
+          "b"
+        ],
+        "properties": {
+          "a": {
+            "type": "string"
+          },
+          "b": {
+            "type": "number"
+          }
+        }
+      },
+      "arguments": {
+        "b": "two"
+      },
+      "valid": false,
+      "errors": [
+        {
+          "field": "a",
+          "message": "Required argument is missing"
+        },
+        {
+          "field": "b",
+          "message": "Expected number, received string"
+        }
+      ]
+    }
+  ]
+}

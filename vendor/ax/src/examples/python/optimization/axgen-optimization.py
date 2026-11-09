@@ -1,7 +1,7 @@
 # ax-example:start
 # title: Python AxGen Optimization
 # group: optimization
-# description: Runs a baseline OpenAI prediction and applies an optimizer artifact.
+# description: Runs an OpenAI prediction, applies an optimizer artifact, and scores novel rationale overlap.
 # provider: openai
 # env: OPENAI_API_KEY, OPENAI_APIKEY
 # level: beginner
@@ -11,16 +11,17 @@
 import json
 import os
 
-from axllm import OpenAICompatibleClient, ax, OptimizerEngine
+from axllm import OptimizerEngine, ai, ax, novel_f1_score
 
 
 api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_APIKEY")
 if not api_key:
     raise SystemExit("Set OPENAI_API_KEY or OPENAI_APIKEY to run this example.")
 
-client = OpenAICompatibleClient(
+client = ai(
+    "openai",
     api_key=api_key,
-    model=os.getenv("AX_OPENAI_MODEL", "gpt-5.4-mini"),
+    model=os.getenv("AX_OPENAI_MODEL", "gpt-6-luna"),
     model_config={"temperature": 0},
 )
 program = ax('emailText:string -> priority:class "high, normal, low", rationale:string', {"id": "priority", "instruction": "Classify the email priority."})
@@ -38,4 +39,5 @@ class ExampleOptimizer(OptimizerEngine):
 artifact = program.optimize_with(ExampleOptimizer(), [{"emailText": "URGENT: checkout is down", "priority": "high"}], {"apply": False})
 program.apply_optimization(json.dumps(artifact))
 after = program.forward(client, {"emailText": "Production checkout is failing for enterprise customers."})
-print(json.dumps({"baseline": baseline, "after": after}, indent=2, sort_keys=True))
+score = novel_f1_score("", after["rationale"], "Production checkout is failing for enterprise customers.")
+print(json.dumps({"baseline": baseline, "after": after, "rationaleNovelF1": score}, indent=2, sort_keys=True))

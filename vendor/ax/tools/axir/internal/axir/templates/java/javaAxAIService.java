@@ -3,6 +3,11 @@ package dev.axllm.ax;
 import java.util.Map;
 
 public interface AxAIService extends AiClient {
+  default void validateChatRequest(Map<String, Object> request) {}
+  static boolean acceptsRequest(AxAIService service, Map<String, Object> request) {
+    try { service.validateChatRequest(request); return true; }
+    catch (RuntimeException error) { return false; }
+  }
   String getId();
   String getName();
   Map<String, Object> getFeatures(String model);
@@ -16,6 +21,7 @@ public interface AxAIService extends AiClient {
   Map<String, Object> getOptions();
   Map<String, Object> embed(Map<String, Object> request) throws Exception;
   default Map<String, Object> embed(Map<String, Object> request, Map<String, Object> options) throws Exception { return embed(request); }
+  default Map<String,Object> embedWithCancellation(Map<String,Object> request,Map<String,Object> options,AxCancellationToken cancellation)throws Exception{Map<String,Object> resolved=new java.util.LinkedHashMap<>(options==null?Map.of():options);resolved.put("cancellation",cancellation);return embed(request,resolved);}
   default Map<String, Object> embed(Map<String, Object> request, Map<String, Object> options, AxRuntimeHooks hooks) throws Exception {
     Map<String, Object> resolved = new java.util.LinkedHashMap<>(options == null ? Map.of() : options);
     resolved.put("runtimeHooks", hooks);
@@ -24,6 +30,7 @@ public interface AxAIService extends AiClient {
   default double getEstimatedCost(Map<String, Object> modelUsage) { return 0.0; }
 
   default Map<String, Object> chat(Map<String, Object> request, Map<String, Object> options) throws Exception { return chat(request); }
+  default Map<String,Object> chatWithCancellation(Map<String,Object> request,Map<String,Object> options,AxCancellationToken cancellation)throws Exception{Map<String,Object> resolved=new java.util.LinkedHashMap<>(options==null?Map.of():options);resolved.put("cancellation",cancellation);return chat(request,resolved);}
   default Map<String, Object> chat(Map<String, Object> request, Map<String, Object> options, AxRuntimeHooks hooks) throws Exception {
     Map<String, Object> resolved = new java.util.LinkedHashMap<>(options == null ? Map.of() : options);
     resolved.put("runtimeHooks", hooks);
@@ -35,7 +42,9 @@ public interface AxAIService extends AiClient {
 
   Map<String, Object> transcribe(Map<String, Object> request) throws Exception;
   default Map<String, Object> transcribe(Map<String, Object> request, Map<String, Object> options) throws Exception { return transcribe(request); }
+  default Map<String,Object> transcribeWithCancellation(Map<String,Object> request,Map<String,Object> options,AxCancellationToken cancellation)throws Exception{Map<String,Object> resolved=new java.util.LinkedHashMap<>(options==null?Map.of():options);resolved.put("cancellation",cancellation);return transcribe(request,resolved);}
 
   Map<String, Object> speak(Map<String, Object> request) throws Exception;
   default Map<String, Object> speak(Map<String, Object> request, Map<String, Object> options) throws Exception { return speak(request); }
+  default Map<String,Object> speakWithCancellation(Map<String,Object> request,Map<String,Object> options,AxCancellationToken cancellation)throws Exception{Map<String,Object> resolved=new java.util.LinkedHashMap<>(options==null?Map.of():options);resolved.put("cancellation",cancellation);return speak(request,resolved);}
 }

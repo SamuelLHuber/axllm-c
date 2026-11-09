@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { AxAIAnthropicModel } from './anthropic/types.js';
 import { axGetSupportedAIModels } from './catalog.js';
+// axir-nonportable:start chrome-ai
+import { AxAIChromeAIModel } from './chrome-ai/types.js';
+// axir-nonportable:end chrome-ai
 import { AxAIDeepSeekModel } from './deepseek/types.js';
 import {
   AxAIGoogleGeminiEmbedModel,
@@ -12,6 +15,7 @@ import { axAIProfiles } from './provider_profiles.js';
 import { AxAIWebLLMModel } from './webllm/types.js';
 
 // axir-nonportable:end webllm
+import { AxAIGrokModel } from './x-grok/types.js';
 
 describe('axGetSupportedAIModels', () => {
   it('returns every ai() provider', () => {
@@ -34,10 +38,15 @@ describe('axGetSupportedAIModels', () => {
         // axir-nonportable:start webllm
         'webllm',
         // axir-nonportable:end webllm
+        // axir-nonportable:start chrome-ai
+        'chrome-ai',
+        // axir-nonportable:end chrome-ai
       ])
     );
     // axir-nonportable:start webllm
-    expect(providerNames).toHaveLength(axAIProfiles().length);
+    // axir-nonportable:start chrome-ai
+    expect(providerNames).toHaveLength(axAIProfiles().length + 1);
+    // axir-nonportable:end chrome-ai
     // axir-nonportable:end webllm
   });
 
@@ -141,10 +150,10 @@ describe('axGetSupportedAIModels', () => {
       (provider) => provider.name === 'anthropic'
     );
     const claude = anthropic?.models.find(
-      (model) => model.name === AxAIAnthropicModel.Claude37Sonnet
+      (model) => model.name === AxAIAnthropicModel.Claude5Sonnet
     );
 
-    expect(anthropic?.defaultModel).toBe(AxAIAnthropicModel.Claude37Sonnet);
+    expect(anthropic?.defaultModel).toBe(AxAIAnthropicModel.Claude5Sonnet);
     expect(claude?.capabilities).toMatchObject({
       thinkingBudget: true,
       showThoughts: true,
@@ -155,6 +164,9 @@ describe('axGetSupportedAIModels', () => {
     );
     const gemini35Flash = gemini?.models.find(
       (model) => model.name === AxAIGoogleGeminiModel.Gemini35Flash
+    );
+    const gemini38Flash = gemini?.models.find(
+      (model) => model.name === AxAIGoogleGeminiModel.Gemini38Flash
     );
     const gemini37Flash = gemini?.models.find(
       (model) => model.name === AxAIGoogleGeminiModel.Gemini37Flash
@@ -184,6 +196,22 @@ describe('axGetSupportedAIModels', () => {
         thinkingBudget: true,
         showThoughts: true,
         structuredOutputs: true,
+      },
+    });
+    expect(gemini38Flash).toMatchObject({
+      provider: 'google-gemini',
+      type: 'text',
+      promptTokenCostPer1M: 1.5,
+      completionTokenCostPer1M: 7.5,
+      contextWindow: 1_048_576,
+      maxTokens: 65_536,
+      capabilities: {
+        thinkingBudget: true,
+        showThoughts: true,
+        structuredOutputs: true,
+        temperature: false,
+        topP: false,
+        serviceTiers: ['standard', 'flex', 'priority'],
       },
     });
     expect(gemini37Flash).toMatchObject({
@@ -277,9 +305,178 @@ describe('axGetSupportedAIModels', () => {
       completionTokenCostPer1M: 0,
     });
     // axir-nonportable:end webllm
+    // axir-nonportable:start chrome-ai
+    const chromeAI = providers.find(
+      (provider) => provider.name === 'chrome-ai'
+    );
+    const geminiNano = chromeAI?.models.find(
+      (model) => model.name === AxAIChromeAIModel.GeminiNano
+    );
+
+    expect(chromeAI?.defaultModel).toBe(AxAIChromeAIModel.GeminiNano);
+    expect(geminiNano).toMatchObject({
+      provider: 'chrome-ai',
+      type: 'text',
+      isDefault: true,
+      promptTokenCostPer1M: 0,
+      completionTokenCostPer1M: 0,
+    });
+    // axir-nonportable:end chrome-ai
+  });
+
+  it('returns provider and model thinking levels and service tiers', () => {
+    const providers = axGetSupportedAIModels();
+    const portableThinkingLevels = [
+      'none',
+      'minimal',
+      'low',
+      'medium',
+      'high',
+      'highest',
+    ];
+
+    const openai = providers.find((provider) => provider.name === 'openai');
+    const gpt56Luna = openai?.models.find(
+      (model) => model.name === AxAIOpenAIModel.GPT56Luna
+    );
+    const realtime = openai?.models.find(
+      (model) => model.name === AxAIOpenAIModel.GPTRealtime2
+    );
+
+    expect(openai?.capabilities).toEqual({
+      thinking: true,
+      thinkingLevels: portableThinkingLevels,
+      serviceTiers: ['standard', 'flex', 'priority'],
+    });
+    expect(gpt56Luna?.capabilities.thinkingLevels).toEqual(
+      portableThinkingLevels
+    );
+    expect(gpt56Luna?.capabilities.serviceTiers).toEqual([
+      'standard',
+      'flex',
+      'priority',
+    ]);
+    expect(realtime?.capabilities.serviceTiers).toEqual([]);
+
+    const gemini = providers.find(
+      (provider) => provider.name === 'google-gemini'
+    );
+    const geminiLive = gemini?.models.find(
+      (model) => model.name === AxAIGoogleGeminiModel.Gemini31FlashLive
+    );
+    const geminiEmbedding = gemini?.models.find(
+      (model) => model.name === AxAIGoogleGeminiEmbedModel.GeminiEmbedding2
+    );
+
+    expect(geminiLive?.capabilities.serviceTiers).toEqual([]);
+    expect(geminiEmbedding?.capabilities.serviceTiers).toEqual([]);
+
+    const grok = providers.find((provider) => provider.name === 'grok');
+    const grok46 = grok?.models.find(
+      (model) => model.name === AxAIGrokModel.Grok46
+    );
+    const grok3Mini = grok?.models.find(
+      (model) => model.name === AxAIGrokModel.Grok3Mini
+    );
+    const grokVoice = grok?.models.find(
+      (model) => model.name === AxAIGrokModel.GrokVoiceThinkFast
+    );
+
+    expect(grok46?.capabilities.thinkingLevels).toEqual([
+      'minimal',
+      'low',
+      'medium',
+      'high',
+      'highest',
+    ]);
+    expect(grok46?.capabilities.serviceTiers).toEqual(['standard', 'priority']);
+    expect(grok3Mini?.capabilities.thinkingLevels).toEqual([
+      'minimal',
+      'low',
+      'medium',
+      'high',
+      'highest',
+    ]);
+    expect(grokVoice?.capabilities.serviceTiers).toEqual([]);
+
+    const azure = providers.find(
+      (provider) => provider.name === 'azure-openai'
+    );
+    expect(azure?.models).toEqual([]);
+    expect(azure?.capabilities.serviceTiers).toEqual(['standard', 'priority']);
   });
 
   it.each([
+    {
+      label: 'Claude 5.5 Haiku',
+      name: AxAIAnthropicModel.Claude55Haiku,
+      pricing: {
+        promptTokenCostPer1M: 0.1,
+        completionTokenCostPer1M: 0.5,
+        cacheReadTokenCostPer1M: 0.01,
+        cacheWriteTokenCostPer1M: 0.125,
+        longContextThreshold: 100_000,
+        longContextPromptTokenCostPer1M: 0.5,
+        longContextCompletionTokenCostPer1M: 2.5,
+        longContextCacheReadTokenCostPer1M: 0.05,
+        longContextCacheWriteTokenCostPer1M: 0.625,
+      },
+      fastPricing: undefined,
+    },
+    {
+      label: 'Claude 5.5 Opus',
+      name: AxAIAnthropicModel.Claude55Opus,
+      pricing: {
+        promptTokenCostPer1M: 4,
+        completionTokenCostPer1M: 20,
+        cacheReadTokenCostPer1M: 0.2,
+        cacheWriteTokenCostPer1M: 5,
+      },
+      fastPricing: {
+        fastPromptTokenCostPer1M: 8,
+        fastCompletionTokenCostPer1M: 40,
+        fastCacheReadTokenCostPer1M: 0.4,
+        fastCacheWriteTokenCostPer1M: 10,
+      },
+    },
+    {
+      label: 'Claude 5.1 Fable',
+      name: AxAIAnthropicModel.Claude51Fable,
+      pricing: {
+        promptTokenCostPer1M: 10,
+        completionTokenCostPer1M: 50,
+        cacheReadTokenCostPer1M: 0.25,
+        cacheWriteTokenCostPer1M: 12.5,
+      },
+      fastPricing: undefined,
+    },
+    {
+      label: 'Claude 5 Opus',
+      name: AxAIAnthropicModel.Claude5Opus,
+      pricing: {
+        promptTokenCostPer1M: 5,
+        completionTokenCostPer1M: 25,
+        cacheReadTokenCostPer1M: 0.5,
+        cacheWriteTokenCostPer1M: 6.25,
+      },
+      fastPricing: {
+        fastPromptTokenCostPer1M: 10,
+        fastCompletionTokenCostPer1M: 50,
+        fastCacheReadTokenCostPer1M: 1,
+        fastCacheWriteTokenCostPer1M: 12.5,
+      },
+    },
+    {
+      label: 'Claude 5 Fable',
+      name: AxAIAnthropicModel.Claude5Fable,
+      pricing: {
+        promptTokenCostPer1M: 10,
+        completionTokenCostPer1M: 50,
+        cacheReadTokenCostPer1M: 1,
+        cacheWriteTokenCostPer1M: 12.5,
+      },
+      fastPricing: undefined,
+    },
     {
       label: 'Claude 5 Sonnet',
       name: AxAIAnthropicModel.Claude5Sonnet,
@@ -338,6 +535,38 @@ describe('axGetSupportedAIModels', () => {
     }
   });
 
+  it('defaults Gemini to 3.6 Flash and types transcription models as audio', () => {
+    const providers = axGetSupportedAIModels();
+    const gemini = providers.find(
+      (provider) => provider.name === 'google-gemini'
+    );
+    expect(gemini?.defaultModel).toBe(AxAIGoogleGeminiModel.Gemini36Flash);
+    expect(
+      gemini?.models.find(
+        (model) => model.name === AxAIGoogleGeminiModel.Gemini36Flash
+      )?.isDefault
+    ).toBe(true);
+
+    const transcribe = gemini?.models.find(
+      (model) => model.name === AxAIGoogleGeminiModel.Gemini35Transcribe
+    );
+    expect(transcribe?.type).toBe('audio');
+    expect(transcribe?.capabilities).toMatchObject({
+      audioInput: true,
+      audioOutput: false,
+    });
+
+    const gptTranscribe = providers
+      .find((provider) => provider.name === 'openai')
+      ?.models.find((model) => model.name === AxAIOpenAIModel.GPTTranscribe);
+    expect(gptTranscribe?.type).toBe('audio');
+    expect(gptTranscribe?.capabilities).toMatchObject({
+      audioInput: true,
+      audioOutput: false,
+      serviceTiers: [],
+    });
+  });
+
   it('returns cloned metadata on each call', () => {
     const first = axGetSupportedAIModels();
     const firstOpenAI = first.find((provider) => provider.name === 'openai');
@@ -352,18 +581,22 @@ describe('axGetSupportedAIModels', () => {
       isDefault: false,
       capabilities: {
         thinkingBudget: false,
+        thinkingLevels: [],
         showThoughts: false,
         structuredOutputs: false,
         temperature: true,
         topP: true,
         audioInput: false,
         audioOutput: false,
+        serviceTiers: [],
       },
     });
     if (firstModel) {
       firstModel.promptTokenCostPer1M = 999;
       firstModel.capabilities.structuredOutputs = false;
+      firstModel.capabilities.serviceTiers.push('priority');
     }
+    firstOpenAI?.capabilities.serviceTiers.push('auto');
 
     const secondOpenAI = axGetSupportedAIModels().find(
       (provider) => provider.name === 'openai'
@@ -377,6 +610,16 @@ describe('axGetSupportedAIModels', () => {
     );
     expect(secondModel?.promptTokenCostPer1M).toBe(0.25);
     expect(secondModel?.capabilities.structuredOutputs).toBe(true);
+    expect(secondModel?.capabilities.serviceTiers).toEqual([
+      'standard',
+      'flex',
+      'priority',
+    ]);
+    expect(secondOpenAI?.capabilities.serviceTiers).toEqual([
+      'standard',
+      'flex',
+      'priority',
+    ]);
   });
 
   it('marks dynamic providers without inventing static pricing', () => {

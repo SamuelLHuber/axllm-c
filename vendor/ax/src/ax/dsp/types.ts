@@ -17,6 +17,12 @@ import type {
 import type { AxAIMemory } from '../mem/types.js';
 import type { AxUCPClient } from '../ucp/client.js';
 import type { AxAssertion, AxStreamingAssertion } from './asserts.js';
+import type {
+  AxBooleanEvidence,
+  AxBoxEvidence,
+  AxClassEvidence,
+  AxScoreEvidence,
+} from './decision.js';
 import type { AxInputFunctionType } from './functions.js';
 import type { AxGen } from './generate.js';
 import type { AxOptimizableComponent } from './optimizable.js';
@@ -113,8 +119,22 @@ export type AxFieldValue =
   | object
   | null
   | undefined
-  | { mimeType: string; data: string }
-  | { mimeType: string; data: string }[]
+  | {
+      mimeType: string;
+      data: string;
+      details?: 'high' | 'low' | 'auto';
+      cache?: boolean;
+      optimize?: 'quality' | 'size' | 'auto';
+      altText?: string;
+    }
+  | {
+      mimeType: string;
+      data: string;
+      details?: 'high' | 'low' | 'auto';
+      cache?: boolean;
+      optimize?: 'quality' | 'size' | 'auto';
+      altText?: string;
+    }[]
   | {
       format?: string;
       data?: string;
@@ -143,8 +163,26 @@ export type AxProgramTrace<IN, OUT> = {
   programId: string;
 };
 
+/**
+ * Evidence-bearing outputs may use labels in training examples without invented probabilities.
+ * @inline
+ */
+type EvidenceExampleValue<T> = T extends AxBooleanEvidence
+  ? T | boolean
+  : T extends AxClassEvidence<infer L>
+    ? T | L
+    : T extends AxBoxEvidence
+      ? T | T['value']
+      : T extends AxScoreEvidence
+        ? T | number
+        : T extends readonly unknown[]
+          ? { [K in keyof T]: EvidenceExampleValue<T[K]> }
+          : T extends object
+            ? { [K in keyof T]: EvidenceExampleValue<T[K]> }
+            : T;
+
 export type AxProgramDemos<IN, OUT, ID extends string = string> = {
-  traces: (OUT & Partial<IN>)[];
+  traces: ((OUT | EvidenceExampleValue<OUT>) & Partial<IN>)[];
   programId: ID;
 };
 
@@ -284,11 +322,12 @@ export type AxProgramStreamingForwardOptions<MODEL> = Omit<
 // Helper type to extract model type union from AxAIService (both TModel and TModelKey)
 export type AxAIServiceModelType<
   T extends Readonly<AxAIService<any, any, any>>,
-> = T extends Readonly<AxAIService<infer TModel, any, infer TModelKey>>
-  ? TModel extends unknown
-    ? TModelKey // For AxAI wrapper services, only use TModelKey since TModel is unknown
-    : TModel | TModelKey // For direct services, use both TModel and TModelKey
-  : never;
+> =
+  T extends Readonly<AxAIService<infer TModel, any, infer TModelKey>>
+    ? TModel extends unknown
+      ? TModelKey // For AxAI wrapper services, only use TModelKey since TModel is unknown
+      : TModel | TModelKey // For direct services, use both TModel and TModelKey
+    : never;
 
 // Clean forward options type that includes both TModel and model keys
 export type AxProgramForwardOptionsWithModels<
@@ -451,54 +490,57 @@ export type { ParseSignature } from './sigtypes.js';
 // - An AxSignature instance
 // - An AxSignatureBuilder instance (from f())
 // - A string signature (parsed via ParseSignature)
-export type AxExample<T> = T extends AxSignature<infer IN, infer OUT>
-  ? OUT & Partial<IN>
-  : T extends AxSignatureBuilder<infer IN2, infer OUT2>
-    ? OUT2 & Partial<IN2>
-    : T extends AxGen<infer IN4, infer OUT4>
-      ? OUT4 & Partial<IN4>
-      : T extends string
-        ? ParseSignature<T> extends {
-            inputs: infer IN3;
-            outputs: infer OUT3;
-          }
-          ? OUT3 & Partial<IN3>
-          : never
-        : never;
+export type AxExample<T> =
+  T extends AxSignature<infer IN, infer OUT>
+    ? OUT & Partial<IN>
+    : T extends AxSignatureBuilder<infer IN2, infer OUT2>
+      ? OUT2 & Partial<IN2>
+      : T extends AxGen<infer IN4, infer OUT4>
+        ? OUT4 & Partial<IN4>
+        : T extends string
+          ? ParseSignature<T> extends {
+              inputs: infer IN3;
+              outputs: infer OUT3;
+            }
+            ? OUT3 & Partial<IN3>
+            : never
+          : never;
 
 export type AxExamples<T> = ReadonlyArray<AxExample<T>>;
 
 // === AxGen Helper Types ===
 // Similar to AxExamples, these extract input/output types from AxGen signatures
-export type AxGenInput<T> = T extends AxGen<infer IN, any>
-  ? IN
-  : T extends AxSignature<infer IN2, any>
-    ? IN2
-    : T extends AxSignatureBuilder<infer IN3, any>
-      ? IN3
-      : T extends string
-        ? ParseSignature<T> extends {
-            inputs: infer IN4;
-            outputs: any;
-          }
-          ? IN4
-          : never
-        : never;
+export type AxGenInput<T> =
+  T extends AxGen<infer IN, any>
+    ? IN
+    : T extends AxSignature<infer IN2, any>
+      ? IN2
+      : T extends AxSignatureBuilder<infer IN3, any>
+        ? IN3
+        : T extends string
+          ? ParseSignature<T> extends {
+              inputs: infer IN4;
+              outputs: any;
+            }
+            ? IN4
+            : never
+          : never;
 
-export type AxGenOutput<T> = T extends AxGen<any, infer OUT>
-  ? OUT
-  : T extends AxSignature<any, infer OUT2>
-    ? OUT2
-    : T extends AxSignatureBuilder<any, infer OUT3>
-      ? OUT3
-      : T extends string
-        ? ParseSignature<T> extends {
-            inputs: any;
-            outputs: infer OUT4;
-          }
-          ? OUT4
-          : never
-        : never;
+export type AxGenOutput<T> =
+  T extends AxGen<any, infer OUT>
+    ? OUT
+    : T extends AxSignature<any, infer OUT2>
+      ? OUT2
+      : T extends AxSignatureBuilder<any, infer OUT3>
+        ? OUT3
+        : T extends string
+          ? ParseSignature<T> extends {
+              inputs: any;
+              outputs: infer OUT4;
+            }
+            ? OUT4
+            : never
+          : never;
 
 // =========================
 // Optimizer shared type defs

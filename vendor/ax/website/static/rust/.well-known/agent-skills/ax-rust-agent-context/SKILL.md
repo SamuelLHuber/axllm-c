@@ -1,7 +1,7 @@
 ---
 name: "ax-rust-agent-context"
 description: "Use when writing Rust code with `axllm` for deciding between context maps, trajectory context policy, offline optimization (ACE/GEPA), and memory recall for long-context agents."
-version: "24.0.14"
+version: "25.4.9"
 ---
 # AxAgent Context Selection For Rust
 
@@ -33,9 +33,9 @@ let out = helper.forward(&llm, inputs, None)?;
 
 ## Relevant API Surface
 
-- Agents And RLM: `agent`, `AxAgent`
+- Agents And RLM: `agent`, `AxAgent`, `AxAgent::with_child_agent`, `AxAgent::streaming_forward`
 - Runtime Profiles: `ProcessCodeRuntime`, `RuntimeCapabilities`, `RuntimeEnvelope`, `javascript-quickjs`
-- Optimizers: `optimize`, `playbook`, `AxPlaybook`, `AxBootstrapFewShot`, `AxGEPA`, `OptimizerEngine`, `OptimizerEvaluator`
+- Optimizers: `optimize`, `playbook`, `AxPlaybook`, `AxBootstrapFewShot`, `AxGEPA`, `OptimizerEngine`, `OptimizerEvaluator`, `optimize_with_client`
 
 ## Guardrails
 

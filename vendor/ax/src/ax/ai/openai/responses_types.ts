@@ -1,4 +1,7 @@
+import type { AxAPI } from '../../util/apicall.js';
 import type {
+  AxAIServiceOptions,
+  AxChatAudioConfig,
   AxChatRequest,
   AxChatResponseResult,
   AxModelConfig,
@@ -50,6 +53,11 @@ export enum AxAIOpenAIResponsesModel {
   GPT56Sol = 'gpt-5.6-sol',
   GPT56Terra = 'gpt-5.6-terra',
   GPT56Luna = 'gpt-5.6-luna',
+  // GPT-6 models
+  GPT6Astra = 'gpt-6-astra',
+  GPT6Sol = 'gpt-6-sol',
+  GPT6Luna = 'gpt-6-luna',
+  GPT61Sol = 'gpt-6.1-sol',
   // Reasoning models
   O1Pro = 'o1-pro',
   O1 = 'o1',
@@ -78,15 +86,36 @@ export interface ImageContentPart {
 export interface AudioContentPart {
   type: 'audio';
   data: string;
-  format?: 'wav';
+  format?: string;
   cache?: boolean;
+}
+
+export interface FileContentPart {
+  type: 'file';
+  data?: string;
+  fileUri?: string;
+  filename?: string;
+  mimeType: string;
+  cache?: boolean;
+  extractedText?: string;
+}
+
+export interface URLContentPart {
+  type: 'url';
+  url: string;
+  cache?: boolean;
+  cachedContent?: string;
+  title?: string;
+  description?: string;
 }
 
 // Union of all content part types
 export type UserMessageContentItem =
   | TextContentPart
   | ImageContentPart
-  | AudioContentPart;
+  | AudioContentPart
+  | FileContentPart
+  | URLContentPart;
 
 // export type  for function calls as defined in AxChatResponseResult
 export type FunctionCallType = NonNullable<
@@ -103,29 +132,39 @@ export type RequestFunctionDefinition = NonNullable<
 // Content parts for input messages
 export interface AxAIOpenAIResponsesInputTextContentPart {
   readonly type: 'input_text';
+  readonly prompt_cache_breakpoint?: { readonly mode: 'explicit' };
   text: string; // Made mutable for stream aggregation
+  readonly cache_control?: { readonly type: 'ephemeral' };
 }
 
 export interface AxAIOpenAIResponsesInputImageUrlContentPart {
   readonly type: 'input_image';
-  readonly image_url: {
-    readonly url: string;
-    readonly details?: 'low' | 'high' | 'auto';
-  };
+  readonly image_url: string;
+  readonly detail?: 'low' | 'high' | 'auto';
+  readonly cache_control?: { readonly type: 'ephemeral' };
 }
 
 export interface AxAIOpenAIResponsesInputAudioContentPart {
   readonly type: 'input_audio'; // This is an assumption based on compatibility needs
   readonly input_audio: {
     readonly data: string; // base64 encoded audio
-    readonly format?: string; // e.g., 'wav', 'mp3'
+    readonly format?: string; // e.g., 'wav', 'mp3', 'pcm16'
   };
+  readonly cache_control?: { readonly type: 'ephemeral' };
 }
 
 export interface AxAIOpenAIResponsesInputFileContentPart {
   readonly type: 'input_file';
-  readonly file_data: string;
+  readonly file_data?: string;
+  readonly file_url?: string;
   readonly filename?: string;
+  readonly cache_control?: { readonly type: 'ephemeral' };
+}
+
+export interface AxAIOpenAIResponsesInputVideoContentPart {
+  readonly type: 'input_video';
+  readonly video_url: string;
+  readonly cache_control?: { readonly type: 'ephemeral' };
 }
 
 export type AxAIOpenAIResponsesInputContentPart =
@@ -133,6 +172,7 @@ export type AxAIOpenAIResponsesInputContentPart =
   | AxAIOpenAIResponsesInputImageUrlContentPart
   | AxAIOpenAIResponsesInputAudioContentPart
   | AxAIOpenAIResponsesInputFileContentPart
+  | AxAIOpenAIResponsesInputVideoContentPart
   // Allow referencing prior assistant outputs in the input context
   | AxAIOpenAIResponsesOutputTextContentPart;
 
@@ -142,12 +182,14 @@ export interface AxAIOpenAIResponsesInputMessageItem {
   readonly role: 'system' | 'user' | 'assistant' | 'developer';
   readonly content: string | ReadonlyArray<AxAIOpenAIResponsesInputContentPart>;
   readonly name?: string; // Optional name for user/assistant messages
+  readonly phase?: 'commentary' | 'final_answer';
   // status?: 'in_progress' | 'completed' | 'incomplete' // Typically for response items
 }
 
 // Input Item: Function Call (representing a past call by the model)
 export interface AxAIOpenAIResponsesInputFunctionCallItem {
   readonly type: 'function_call';
+  readonly async?: boolean;
   readonly id?: string; // Optional unique ID of this item in the context
   readonly call_id: string; // The ID that links this call to its output
   readonly name: string;
@@ -170,9 +212,22 @@ export interface AxAIOpenAIResponsesInputFunctionCallOutputItem {
 // preserve Ax's canonical thought without adding a second input model.
 export interface AxAIOpenAIResponsesInputReasoningItem {
   readonly type: 'reasoning';
-  readonly content:
+  readonly id?: string;
+  readonly content?:
     | string
     | ReadonlyArray<AxAIOpenAIResponsesInputTextContentPart>;
+  readonly summary?: ReadonlyArray<{
+    readonly type: 'summary_text';
+    readonly text: string;
+  }>;
+  readonly encrypted_content?: string;
+}
+
+export interface AxAIOpenAIResponsesInputImageGenerationCallItem {
+  readonly type: 'image_generation_call';
+  readonly id: string;
+  readonly status?: 'completed';
+  readonly result?: string | null;
 }
 
 // Union of all possible input items
@@ -182,15 +237,32 @@ export type AxAIOpenAIResponsesInputItem =
   | AxAIOpenAIResponsesInputMessageItem
   | AxAIOpenAIResponsesInputFunctionCallItem
   | AxAIOpenAIResponsesInputFunctionCallOutputItem
-  | AxAIOpenAIResponsesInputReasoningItem;
+  | AxAIOpenAIResponsesOutputItem
+  | AxAIOpenAIResponsesInputReasoningItem
+  | AxAIOpenAIResponsesReasoningItem
+  | AxAIOpenAIResponsesConfigurationUpdate
+  | AxAIOpenAIResponsesCustomToolCall
+  | AxAIOpenAIResponsesCustomToolOutput
+  | AxAIOpenAIResponsesInputImageGenerationCallItem;
 
 // Tool Definitions
 export interface AxAIOpenAIResponsesDefineFunctionTool {
   readonly type: 'function';
+  readonly async?: boolean;
   readonly name: string;
   readonly description?: string;
   readonly parameters: object; // JSON schema
   readonly strict?: boolean; // Default true
+}
+
+export interface AxAIOpenAIResponsesDefineImageGenerationTool {
+  readonly type: 'image_generation';
+  readonly size?: `${number}x${number}` | 'auto';
+  readonly output_format?: 'png' | 'jpeg' | 'webp';
+  readonly enable_image_search?: boolean;
+  readonly enable_web_search?: boolean;
+  readonly enable_shell?: boolean;
+  readonly reasoning_strength?: 'low' | 'high';
 }
 
 // Add other tool definitions (FileSearch, WebSearch, etc.)
@@ -198,14 +270,16 @@ export interface AxAIOpenAIResponsesDefineFunctionTool {
 // export interface AxAIOpenAIResponsesDefineWebSearchTool { type: 'web_search_preview'; ... }
 
 export type AxAIOpenAIResponsesToolDefinition =
-  AxAIOpenAIResponsesDefineFunctionTool; // | AxAIOpenAIResponsesDefineFileSearchTool | ...
+  | AxAIOpenAIResponsesDefineFunctionTool
+  | AxAIOpenAIResponsesDefineCustomTool
+  | AxAIOpenAIResponsesDefineImageGenerationTool;
 
 // Tool Choice
 export type AxAIOpenAIResponsesToolChoice =
   | 'none'
   | 'auto'
   | 'required'
-  | { readonly type: 'function'; readonly name: string }
+  | { readonly type: 'function' | 'custom'; readonly name: string }
   | { readonly type: 'file_search' }; // And other hosted tools
 // | { type: 'web_search_preview' }
 // | { type: 'code_interpreter' }
@@ -214,6 +288,10 @@ export type AxAIOpenAIResponsesToolChoice =
 export interface AxAIOpenAIResponsesRequest<TModel = AxAIOpenAIResponsesModel> {
   readonly input: string | ReadonlyArray<AxAIOpenAIResponsesInputItem>;
   readonly model: TModel;
+  readonly prompt_cache_options?: {
+    readonly ttl?: '30m';
+    readonly mode?: 'implicit' | 'explicit';
+  };
   readonly background?: boolean | null;
   readonly include?: ReadonlyArray<
     | 'file_search_call.results'
@@ -248,7 +326,14 @@ export interface AxAIOpenAIResponsesRequest<TModel = AxAIOpenAIResponsesModel> {
     readonly format?:
       | { readonly type: 'text' }
       | { readonly type: 'json_object' } // Older JSON mode
-      | { readonly type: 'json_schema'; readonly json_schema?: object } // Structured Outputs
+      | {
+          readonly type: 'json_schema';
+          readonly name?: string;
+          readonly schema?: object;
+          readonly strict?: boolean;
+          readonly description?: string;
+          readonly json_schema?: object;
+        } // Structured Outputs
       | null;
   } | null;
   readonly tool_choice?: AxAIOpenAIResponsesToolChoice | null;
@@ -257,6 +342,8 @@ export interface AxAIOpenAIResponsesRequest<TModel = AxAIOpenAIResponsesModel> {
   readonly truncation?: 'auto' | 'disabled' | null; // How to handle context window overflow
   readonly user?: string | null; // User identifier for tracking/moderation
   readonly seed?: number | null; // Added seed from later in the code
+  readonly prompt_cache_key?: string;
+  readonly prompt_cache_retention?: 'in_memory' | '24h';
 }
 
 // --- AxAIOpenAI /v1/responses Specific Response Types ---
@@ -276,6 +363,7 @@ export interface AxAIOpenAIResponsesOutputMessageItem {
 
 // Output Item: Function Call (emitted by the model)
 export interface AxAIOpenAIResponsesFunctionCallItem {
+  async?: boolean;
   type: 'function_call'; // Mutable during construction
   id: string; // Mutable during construction
   call_id: string; // Mutable during construction
@@ -329,13 +417,24 @@ export type AxAIOpenAIResponsesOutputItem =
   | AxAIOpenAIResponsesCodeInterpreterToolCall
   | AxAIOpenAIResponsesImageGenerationToolCall
   | AxAIOpenAIResponsesLocalShellToolCall
-  | AxAIOpenAIResponsesMCPToolCall;
+  | AxAIOpenAIResponsesMCPToolCall
+  | AxAIOpenAIResponsesCustomToolCall;
 
 // Main Response from /v1/responses (non-streaming)
 export interface AxAIOpenAIResponsesResponse {
   readonly id: string; // Response ID
   readonly object: string; // e.g., "response"
-  readonly created: number; // Timestamp
+  readonly status?:
+    | 'queued'
+    | 'in_progress'
+    | 'completed'
+    | 'incomplete'
+    | 'failed'
+    | 'cancelled';
+  readonly incomplete_details?: { readonly reason: string };
+  readonly error?: { readonly code: string; readonly message: string } | null;
+  readonly created_at?: number;
+  readonly created?: number; // Timestamp
   readonly model: string; // Model ID used
   readonly service_tier?: string;
   readonly service_tier_used?: string;
@@ -795,6 +894,10 @@ export interface OpenAIResponsesResponseDelta {
   readonly id?: string; // Overall response ID, appears in first event usually
   readonly model?: string; // Model ID, might appear in first event
   readonly event?: string; // e.g., 'response.delta', 'response.item_delta', 'response.done'
+  /** Provider-supplied speaker label for realtime transcription deltas. */
+  readonly speaker?: string;
+  readonly audioProcessedMs?: number;
+  readonly transcript?: { text: string; isFinal: boolean };
 
   // If event is 'response.delta' or 'response.item_delta'
   readonly delta?: {
@@ -839,7 +942,10 @@ export interface OpenAIResponsesResponseDelta {
 export type ResponsesReqUpdater<
   TModel,
   TResponsesReq extends AxAIOpenAIResponsesRequest<TModel>,
-> = (req: Readonly<TResponsesReq>) => Readonly<TResponsesReq>;
+> = (
+  req: Readonly<TResponsesReq>,
+  options: Readonly<AxAIServiceOptions>
+) => Readonly<TResponsesReq>;
 
 // Utility export type  to make properties of T mutable
 export type Mutable<T> = { -readonly [P in keyof T]: T[P] };
@@ -872,6 +978,43 @@ export type AxAIOpenAIResponsesConfig<TModel, TEmbedModel> = Omit<
   parallelToolCalls?: boolean;
   seed?: number;
   responseFormat?: 'text' | 'json_object' | 'json_schema';
+  /** Built-in image generation invoked through the Responses transport. */
+  imageGeneration?: {
+    size?: `${number}x${number}` | 'auto';
+    outputFormat?: 'png' | 'jpeg' | 'webp';
+    enableImageSearch?: boolean;
+    enableWebSearch?: boolean;
+    enableShell?: boolean;
+    reasoningStrength?: 'low' | 'high';
+  };
+  /** @internal Default image encoding for a named Responses adapter. */
+  defaultImageOutputFormat?: 'png' | 'jpeg' | 'webp';
+  /** Ask the provider to return opaque reasoning state for stateless replay. */
+  includeEncryptedReasoning?: boolean;
+  /** Reject rather than silently omit an explicit `none` reasoning request. */
+  rejectReasoningNone?: boolean;
+  /** Provider ceiling for portable `highest` reasoning. */
+  highestReasoningEffort?: 'xhigh' | 'max';
+  /** Provider-specific portable reasoning ladder. */
+  reasoningEffortMap?: Partial<
+    Record<
+      'minimal' | 'low' | 'medium' | 'high' | 'highest',
+      'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+    >
+  >;
+  /** Provider performs prefix caching for compatible Responses inputs. */
+  promptCaching?: boolean;
+  /** Optional provider cache retention policy for compatible Responses APIs. */
+  promptCacheRetention?: 'in_memory' | '24h';
+  /** Realtime speech-recognition controls for compatible Responses profiles. */
+  realtimeTranscription?: {
+    mode?: 'push_to_talk' | 'endpointing' | 'diarization';
+    languageBias?: string[];
+    keywords?: string[];
+    partialMode?: 'cumulative' | 'delta';
+    emitAudioProgress?: boolean;
+    zdrOverride?: boolean;
+  };
   /** Portable values plus the legacy OpenAI `default` alias. */
   serviceTier?: AxServiceTier | 'default';
 };
@@ -882,6 +1025,24 @@ export interface AxAIOpenAIResponsesToolCallBase {
   type: string;
   status?: string;
 }
+
+export type AxAIOpenAIResponsesRealtimeRequest<TModel> = {
+  model: TModel;
+  request: AxAIOpenAIResponsesRequest<TModel>;
+  apiKey: string;
+  audio?: AxChatAudioConfig;
+  webSocket?: unknown;
+  abortSignal?: AbortSignal;
+  turnTimeoutMs?: number;
+  sessionId?: string;
+};
+
+export type AxAIOpenAIResponsesRealtimeAdapter<TModel> = {
+  shouldUse: (model: string) => boolean;
+  createApi: (
+    request: Readonly<AxAIOpenAIResponsesRealtimeRequest<TModel>>
+  ) => AxAPI;
+};
 
 export interface AxAIOpenAIResponsesFileSearchToolCall
   extends AxAIOpenAIResponsesToolCallBase {
@@ -945,4 +1106,99 @@ export type AxAIOpenAIResponsesToolCall =
   | AxAIOpenAIResponsesCodeInterpreterToolCall
   | AxAIOpenAIResponsesImageGenerationToolCall
   | AxAIOpenAIResponsesLocalShellToolCall
-  | AxAIOpenAIResponsesMCPToolCall;
+  | AxAIOpenAIResponsesMCPToolCall
+  | AxAIOpenAIResponsesCustomToolCall;
+
+/** Reasoning efforts accepted by Astra's native Responses API. */
+export type AxAIOpenAIAstraReasoningEffort =
+  | 'low'
+  | 'medium'
+  | 'high'
+  | 'xhigh'
+  | 'max';
+export interface AxAIOpenAIResponsesConfigurationUpdate {
+  readonly type: 'configuration_update';
+  readonly reasoning: { readonly effort: AxAIOpenAIAstraReasoningEffort };
+}
+export interface AxAIOpenAIResponsesDefineCustomTool {
+  readonly type: 'custom';
+  readonly name: string;
+  readonly description?: string;
+  readonly async?: boolean;
+  readonly format?:
+    | { readonly type: 'text' }
+    | {
+        readonly type: 'grammar';
+        readonly syntax: 'lark' | 'regex';
+        readonly definition: string;
+      };
+}
+export interface AxAIOpenAIResponsesCustomToolCall {
+  readonly type: 'custom_tool_call';
+  readonly id?: string;
+  readonly call_id: string;
+  readonly name: string;
+  readonly input: string;
+  readonly async?: boolean;
+}
+export interface AxAIOpenAIResponsesCustomToolOutput {
+  readonly type: 'custom_tool_call_output';
+  readonly call_id: string;
+  readonly output: string | ReadonlyArray<AxAIOpenAIResponsesInputContentPart>;
+}
+export interface AxAIOpenAIResponsesSteerRequest {
+  readonly previous_response_id: string;
+  readonly input:
+    | string
+    | ReadonlyArray<
+        AxAIOpenAIResponsesInputMessageItem & { readonly role: 'user' }
+      >;
+}
+export type AxAIOpenAIResponsesSessionEvent =
+  | AxAIOpenAIResponsesStreamEvent
+  | {
+      readonly type: 'response.steer.accepted';
+      readonly sequence_number: number;
+      readonly steer: {
+        readonly id: string;
+        readonly previous_response_id: string;
+      };
+    }
+  | {
+      readonly type: 'response.steer.pending';
+      readonly sequence_number: number;
+      readonly steer: {
+        readonly id: string;
+        readonly previous_response_id: string;
+      };
+      readonly reason: string;
+      readonly required_input: ReadonlyArray<{
+        readonly type: string;
+        readonly call_id?: string;
+        readonly name?: string;
+      }>;
+    }
+  | {
+      readonly type: 'response.steer.failed';
+      readonly sequence_number: number;
+      readonly steer: {
+        readonly id?: string;
+        readonly previous_response_id: string;
+        readonly input: AxAIOpenAIResponsesSteerRequest['input'];
+      };
+      readonly error: { readonly code: string; readonly message: string };
+    }
+  | {
+      readonly type: 'response.custom_tool_call_input.delta';
+      readonly sequence_number: number;
+      readonly item_id: string;
+      readonly output_index: number;
+      readonly delta: string;
+    }
+  | {
+      readonly type: 'response.custom_tool_call_input.done';
+      readonly sequence_number: number;
+      readonly item_id: string;
+      readonly output_index: number;
+      readonly input: string;
+    };

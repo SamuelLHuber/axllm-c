@@ -71,6 +71,7 @@ function normalizeNestedField(name: string, fieldType: any): Json {
       maximum: fieldType.maximum,
       pattern: fieldType.pattern,
       patternDescription: fieldType.patternDescription,
+      valueDescriptions: fieldType.valueDescriptions,
       format: fieldType.format,
       language: fieldType.language,
       description: fieldType.description,
@@ -89,7 +90,10 @@ function normalizeType(type: any): Json {
     name: type?.name ?? 'string',
     isArray: Boolean(type?.isArray),
   };
+  if (type?.valueDescriptions !== undefined)
+    out.valueDescriptions = type.valueDescriptions;
   if (type?.options) out.options = [...type.options];
+  if (type?.evidence) out.evidence = type.evidence;
   if (type?.description !== undefined) out.description = type.description;
   if (type?.fields) {
     out.fields = Object.fromEntries(
@@ -163,6 +167,23 @@ function errorCase(name: string, signature: string, expected: string): void {
 mkdirSync(outDir, { recursive: true });
 
 stringCase('default-string-type', 'question -> answer');
+stringCase(
+  'signature-description-quotes-and-backslashes',
+  String.raw`"Describe \"layer\" in C:\\reports" queryText:string -> answerText:string`
+);
+fluentCase(
+  'fluent-signature-description-quotes-and-backslashes',
+  {
+    description: 'Describe "layer" in C:\\reports',
+    inputs: { queryText: { type: 'string' } },
+    outputs: { answerText: { type: 'string' } },
+  },
+  f()
+    .input('queryText', f.string())
+    .output('answerText', f.string())
+    .description('Describe "layer" in C:\\reports')
+    .build()
+);
 stringCase(
   'descriptions-and-single-quotes',
   'question:string "double quote", context:string \'single quote\' -> answer:string "result"'
@@ -432,6 +453,13 @@ errorCase(
   'profileInfo:object{ id:string',
   'unbalanced "{" in object type'
 );
+// A field's unbalanced object type names the field; the message has a lone
+// brace, which string.format keeps.
+errorCase(
+  'error-object-unbalanced-field',
+  'userQuestion:string -> profileInfo:object{ name:string',
+  'Field "profileInfo": unbalanced "{" in object type'
+);
 errorCase(
   'error-object-empty',
   'profileInfo:object{} -> replyText:string',
@@ -446,4 +474,91 @@ errorCase(
   'error-object-duplicate-field',
   'profileInfo:object{ id:string, id:number } -> replyText:string',
   'duplicate object field name "id"'
+);
+
+stringCase(
+  'value-descriptions-boolean',
+  'ticket:string -> urgent:boolean(false "Routine request", true "Core task blocked") "Urgent?"'
+);
+stringCase(
+  'value-descriptions-class',
+  'ticket:string -> team:class "support, billing"(billing "Invoice problem", support "Product help") "Route ticket"'
+);
+stringCase(
+  'value-descriptions-quoted-label',
+  'ticket:string -> team:class "customer support, billing"("customer support" "Product help", billing "Invoice problem")'
+);
+stringCase(
+  'value-descriptions-nested-array',
+  'ticket:string -> analysis:object{ flags:boolean(true "Confirmed")[], team:class "support, billing"(support "Help") "Route" }'
+);
+errorCase(
+  'value-descriptions-duplicate-boolean',
+  'ticket:string -> urgent:boolean(true "A", true "B")',
+  'duplicate "true" modifier'
+);
+errorCase(
+  'value-descriptions-duplicate-class',
+  'ticket:string -> team:class "support, billing"(support "A", support "B")',
+  'duplicate description for "support"'
+);
+errorCase(
+  'value-descriptions-unknown-class',
+  'ticket:string -> team:class "support, billing"(sales "A")',
+  'unknown described value "sales"'
+);
+errorCase(
+  'value-descriptions-empty',
+  'ticket:string -> urgent:boolean(true " ")',
+  'requires a nonempty quoted description'
+);
+errorCase(
+  'value-descriptions-wrong-type',
+  'ticket:string -> reply:string(true "A")',
+  'value descriptions require a boolean field'
+);
+
+stringCase(
+  'value-descriptions-array',
+  'ticket:string -> flags:boolean(true "Confirmed")[] "Signals"'
+);
+
+fluentCase(
+  'value-descriptions-fluent',
+  {
+    inputs: { ticket: { type: 'string' } },
+    outputs: {
+      urgent: {
+        type: 'boolean',
+        valueDescriptions: { true: 'Blocked', false: 'Routine' },
+      },
+      team: {
+        type: 'class',
+        options: ['support', 'billing'],
+        valueDescriptions: { support: 'Help', billing: 'Invoice' },
+      },
+    },
+  },
+  f()
+    .input('ticket', f.string())
+    .output(
+      'urgent',
+      f.boolean().describeValues({ true: 'Blocked', false: 'Routine' })
+    )
+    .output(
+      'team',
+      f
+        .class(['support', 'billing'])
+        .describeValues({ support: 'Help', billing: 'Invoice' })
+    )
+    .build()
+);
+
+stringCase('box-plain', 'photo:image -> target:box');
+stringCase('box-evidence', 'photo:image -> target:box(evidence)');
+stringCase('box-optional-array', 'query:string -> targets?:box[]');
+errorCase(
+  'box-threshold',
+  'query:string -> target:box(evidence, threshold 0.7)',
+  'threshold'
 );

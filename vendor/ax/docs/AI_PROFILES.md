@@ -58,6 +58,56 @@ const custom = ai({
 Unknown profile names fail with the known profile IDs instead of silently
 falling back to the compatibility profile.
 
+## Meta Model API
+
+Meta has three explicit hosted profiles with shared bearer authentication and
+the `https://api.meta.ai/v1` base URL:
+
+- `meta` uses Responses and is the recommended default.
+- `meta-chat` uses OpenAI-compatible Chat Completions.
+- `meta-messages` uses Anthropic-compatible Messages.
+
+All default to `muse-spark-1.3`. The Responses profile also runs
+`muse-image-1.0` through `chat()`, returning generated or edited images in the
+normal `results[].images` field, and routes `muse-voice-transcribe-1.0` through
+`transcribe()` or realtime PCM `chat()`. Ax deliberately does not add direct
+Images, Files, Models, or Responses resource-management methods.
+
+The same profile descriptors, request/stream mappings, image results,
+transcription fields, and realtime event folding are generated for Python, Go,
+Rust, Java, and C++ from AxIR.
+
+Contributor model variants are cataloged with provider-training data-use
+metadata and are never defaults. Muse Glimmer remains self-hosted: use the
+existing `vllm`, `llama-cpp`, `ollama`, or `lm-studio` profile with a server you
+operate. Ax does not download or manage model weights.
+
+## Typesafe / Jev
+
+The `typesafe` deployment uses the native System One transport at
+`https://api.typesafe.ai`. Jev is its model family; both Ax interfaces default
+to `jev-latest`.
+
+- `ai({ name: 'typesafe', apiKey, trueThreshold: 0.9 })` supports ordinary Ax
+  programs with required boolean and class outputs. Value descriptions become
+  native criteria and remain readable prompt/schema descriptions with other
+  providers. Boolean conversion is `noul >= trueThreshold` (default `0.5`).
+- `typesafe({ apiKey }).systemOne({ state, questions })` exposes native Noul,
+  Choice, and Score answers. Structured criteria and fractional scoring remain
+  native; numeric signature bounds are validation constraints. Native
+  `listModels()` is separate from Ax's configured model aliases.
+
+Unsupported schemas and tools are excluded before requests, including router
+fallbacks with degradation enabled. Mixed pools require an already-supported
+schema for Typesafe eligibility; Typesafe-only pools propagate its schema
+requirement. Use an explicit generative second step for prose.
+
+The [Typesafe/Jev skill](../src/ax/skills/ax-typesafe.md) is the detailed usage
+guide, including transport settings, examples, and provider-specific limits.
+The adapter, native client, value descriptions, and routing validation are also
+generated for Python, Java, C++, Go, and Rust. Their packages include a dedicated
+Typesafe/Jev skill and provider-backed signature, native, and hybrid examples.
+
 ## Capability Resolution
 
 Capabilities resolve in this order:
@@ -83,6 +133,11 @@ required singleton string or code field can take the optimized `json_object`
 path when native schema is unavailable. An explicit mode must be advertised or
 Ax fails before network I/O. Custom clients that do not expose the new list keep
 the legacy capability heuristic.
+
+Declared tools do not change the rung `auto` picks, for any provider, and
+neither does a forced `functionCall`: Ax does not switch rungs to work around a
+provider's or model's JSON-mode problems. To have the model answer through
+`__axOutput` beside its tools, opt in with `structuredOutputMode: 'function'`.
 
 `structuredOutputs` remains the compatibility alias for native JSON Schema
 support. It does not imply `json_object`: direct `json_schema` and

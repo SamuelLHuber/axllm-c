@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -109,41 +110,46 @@ func EmitPython(model AxRuntimeModel, outDir string) error {
 		return err
 	}
 	files := map[string]string{
-		"pyproject.toml":                                        renderPackageTemplate(pyProjectToml, version),
-		"MANIFEST.in":                                           pyManifestIn,
-		"axllm/__init__.py":                                     pyInit,
-		"axllm/py.typed":                                        "",
-		"axllm/signature.py":                                    signature,
-		"axllm/schema.py":                                       schema,
-		"axllm/tool.py":                                         pyTool,
-		"axllm/runtime.py":                                      pyRuntime,
-		"axllm/runtime_quickjs.py":                              pyRuntimeQuickjs,
-		"axllm/prompt.py":                                       prompt,
-		"axllm/ai.py":                                           ai,
-		"axllm/gen.py":                                          gen,
-		"axllm/agent.py":                                        agent,
-		"axllm/flow.py":                                         flow,
-		"axllm/mcp.py":                                          mcpModule,
-		"axllm/conformance.py":                                  pyConformance,
-		"axllm/providers/__init__.py":                           pyProvidersInit,
-		"axllm/providers/openai.py":                             pyOpenAIProvider,
-		"axir-capabilities.json":                                mustCapabilityManifest(model, "python"),
-		"axir-api.json":                                         mustAPIReferenceManifest(model, "python"),
-		"conformance-coverage.json":                             mustConformanceCoverageManifest(model, "python"),
-		"examples/signature_schema.py":                          pySignatureSchemaExample,
-		"examples/axgen_scripted_client_tool.py":                pyAxGenScriptedClientToolExample,
-		"examples/axgen_openai_api.py":                          pyAxGenOpenAIExample,
-		"examples/vertex_gemini_api.py":                         pyVertexGeminiExample,
-		"examples/provider_mapping_no_key.py":                   pyProviderMappingNoKeyExample,
-		"examples/runtime_hooks_no_key.py":                      pyRuntimeHooksNoKeyExample,
-		"examples/adaptive_balancer_no_key.py":                  pyAdaptiveBalancerNoKeyExample,
-		"examples/provider_stream_no_key.py":                    pyProviderStreamNoKeyExample,
-		"examples/runtime_adapter.py":                           pyRuntimeAdapterExample,
-		"examples/runtime_protocol.py":                          pyRuntimeProtocolExample,
-		"examples/runtime_profiles/javascript_quickjs.py":       pyJavaScriptQuickJSProfilePythonExample,
-		"examples/runtime_profiles/python_pyodide.py":           pyPythonPyodideProfileExample,
-		"examples/runtime_profiles/pyodide-package.json":        pyodidePackageJSON,
-		"examples/runtime_profiles/pyodide-runtime-policy.json": pyodideRuntimePolicyJSON,
+		"pyproject.toml":                                              renderPackageTemplate(pyProjectToml, version),
+		"MANIFEST.in":                                                 pyManifestIn,
+		"axllm/__init__.py":                                           pyInit,
+		"axllm/py.typed":                                              "",
+		"axllm/signature.py":                                          signature,
+		"axllm/schema.py":                                             schema,
+		"axllm/tool.py":                                               pyTool,
+		"axllm/runtime.py":                                            pyRuntime,
+		"axllm/runtime_quickjs.py":                                    renderRuntimeHostNamespaces(pyRuntimeQuickjs, strconv.Quote),
+		"axllm/prompt.py":                                             prompt,
+		"axllm/ai.py":                                                 ai,
+		"axllm/gen.py":                                                gen,
+		"axllm/agent.py":                                              agent,
+		"axllm/flow.py":                                               flow,
+		"axllm/mcp.py":                                                mcpModule,
+		"axllm/conformance.py":                                        pyConformance,
+		"axllm/session.py":                                            pySession,
+		"tests/typesafe_mcp_test.py":                                  pyTypesafeMCPTest,
+		"tests/astra_session_test.py":                                 pySessionNoKeyExample,
+		"axllm/providers/__init__.py":                                 pyProvidersInit,
+		"axllm/providers/openai.py":                                   pyOpenAIProvider,
+		"axir-capabilities.json":                                      mustCapabilityManifest(model, "python"),
+		"axir-api.json":                                               mustAPIReferenceManifest(model, "python"),
+		"conformance-coverage.json":                                   mustConformanceCoverageManifest(model, "python"),
+		"examples/signature_schema.py":                                pySignatureSchemaExample,
+		"examples/model_catalog.py":                                   pyModelCatalogExample,
+		"examples/axgen_scripted_client_tool.py":                      pyAxGenScriptedClientToolExample,
+		"examples/axgen_openai_api.py":                                pyAxGenOpenAIExample,
+		"examples/vertex_gemini_api.py":                               pyVertexGeminiExample,
+		"examples/provider_mapping_no_key.py":                         pyProviderMappingNoKeyExample,
+		"examples/runtime_hooks_no_key.py":                            pyRuntimeHooksNoKeyExample,
+		"examples/adaptive_balancer_no_key.py":                        pyAdaptiveBalancerNoKeyExample,
+		"examples/provider_stream_no_key.py":                          pyProviderStreamNoKeyExample,
+		"examples/cancellation_no_key.py":                             pyCancellationNoKeyExample,
+		"examples/runtime_adapter.py":                                 pyRuntimeAdapterExample,
+		"examples/runtime_protocol.py":                                pyRuntimeProtocolExample,
+		"examples/runtime_profiles/javascript_quickjs.py":             pyJavaScriptQuickJSProfilePythonExample,
+		"examples/runtime_profiles/python_pyodide.py":                 pyPythonPyodideProfileExample,
+		"examples/runtime_profiles/pyodide-package.json":              pyodidePackageJSON,
+		"examples/runtime_profiles/pyodide-runtime-policy.json":       pyodideRuntimePolicyJSON,
 		"examples/runtime_profiles/resolve_pyodide_runtime_server.sh": pyodideRuntimeHelper,
 		"examples/runtime_profiles/README.md":                         pyodideProfileReadme,
 		"examples/axflow_program_graph.py":                            pyAxFlowProgramGraphExample,
@@ -152,6 +158,8 @@ func EmitPython(model AxRuntimeModel, outDir string) error {
 		"examples/audio_responses_mapping.py":                         pyAudioResponsesMappingExample,
 		"examples/audio_http_roundtrip.py":                            pyAudioHTTPRoundtripExample,
 		"examples/stream_http_roundtrip.py":                           pyStreamHTTPRoundtripExample,
+		"examples/timeout_http_roundtrip.py":                          pyTimeoutHTTPRoundtripExample,
+		"examples/transport_errors_http_roundtrip.py":                 pyTransportErrorsHTTPRoundtripExample,
 		"examples/realtime_audio_events.py":                           pyRealtimeAudioEventsExample,
 		"examples/realtime_audio_turn.py":                             pyRealtimeAudioTurnExample,
 		"examples/optimizer_artifact.py":                              pyOptimizerArtifactExample,
@@ -221,7 +229,10 @@ func EmitJava(model AxRuntimeModel, outDir string) error {
 		"dev/axllm/ax/AxInMemoryBalancerStatsStore.java":              javaAxInMemoryBalancerStatsStore,
 		"dev/axllm/ax/AxProviderRouter.java":                          javaAxProviderRouter,
 		"dev/axllm/ax/AxBaseAI.java":                                  javaAxBaseAI,
+		"dev/axllm/ax/AxGenerateError.java":                           javaAxGenerateError,
 		"dev/axllm/ax/AxAIServiceError.java":                          javaAxAIServiceError,
+		"dev/axllm/ax/AxAIServiceAbortedError.java":                   javaAxAIServiceAbortedError,
+		"dev/axllm/ax/AxCancellationToken.java":                       javaAxCancellationToken,
 		"dev/axllm/ax/AxMemory.java":                                  javaAxMemory,
 		"dev/axllm/ax/AxAgent.java":                                   javaAxAgent,
 		"dev/axllm/ax/AxFlow.java":                                    javaAxFlow,
@@ -232,6 +243,7 @@ func EmitJava(model AxRuntimeModel, outDir string) error {
 		"dev/axllm/ax/AxEventSource.java":                             javaAxEventSource,
 		"dev/axllm/ax/AxEventSink.java":                               javaAxEventSink,
 		"dev/axllm/ax/AxEventClock.java":                              javaAxEventClock,
+		"dev/axllm/ax/AxEventCancellationToken.java":                  javaAxEventCancellationToken,
 		"dev/axllm/ax/AxEventStore.java":                              javaAxEventStore,
 		"dev/axllm/ax/AxEventRuntime.java":                            javaAxEventRuntime,
 		"dev/axllm/ax/AxMCPEventSource.java":                          javaAxMCPEventSource,
@@ -241,6 +253,7 @@ func EmitJava(model AxRuntimeModel, outDir string) error {
 		"dev/axllm/ax/AxUCPClient.java":                               javaAxUCPClient,
 		"dev/axllm/ax/AxMCPTransport.java":                            javaAxMCPTransport,
 		"dev/axllm/ax/AxMCPStreamableHTTPTransport.java":              javaAxMCPStreamableHTTPTransport,
+		"dev/axllm/ax/AxMCPWebSocketTransport.java":                   javaAxMCPWebSocketTransport,
 		"dev/axllm/ax/AxMCPStdioTransport.java":                       javaAxMCPStdioTransport,
 		"dev/axllm/ax/AxMCPOAuthOptions.java":                         javaAxMCPOAuthOptions,
 		"dev/axllm/ax/AxMCPTokenSet.java":                             javaAxMCPTokenSet,
@@ -253,18 +266,31 @@ func EmitJava(model AxRuntimeModel, outDir string) error {
 		"dev/axllm/ax/AxProcessCodeRuntime.java":                      javaAxProcessCodeRuntime,
 		"dev/axllm/ax/AxProcessCodeSession.java":                      javaAxProcessCodeSession,
 		"dev/axllm/ax/runtime/quickjs/AxQuickJsCodeRuntime.java":      javaQuickJSCodeRuntime,
-		"dev/axllm/ax/runtime/quickjs/AxQuickJsCodeSession.java":      javaQuickJSCodeSession,
+		"dev/axllm/ax/runtime/quickjs/AxQuickJsCodeSession.java":      renderRuntimeHostNamespaces(javaQuickJSCodeSession, javaStringLiteral),
 		"dev/axllm/ax/runtime/quickjs/AxQuickJsHostCallable.java":     javaQuickJSHostCallable,
 		"dev/axllm/ax/runtime/quickjs/AxQuickJsProtocolServer.java":   javaQuickJSProtocolServer,
 		"dev/axllm/ax/OpenAICompatibleClient.java":                    javaOpenAI,
+		"dev/axllm/ax/AxAIOpenAIDecisionsClient.java":                 javaDecisions,
+		"dev/axllm/ax/AxAITypesafeClient.java":                        javaTypesafe,
 		"dev/axllm/ax/OpenAIResponsesClient.java":                     javaOpenAIResponses,
 		"dev/axllm/ax/GoogleGeminiClient.java":                        javaGoogleGemini,
 		"dev/axllm/ax/AnthropicClient.java":                           javaAnthropic,
 		"dev/axllm/ax/AxGen.java":                                     javaAxGen,
+		"dev/axllm/ax/AxGenDelta.java":                                javaAxGenDelta,
+		"dev/axllm/ax/AxGenDeltaStream.java":                          javaAxGenDeltaStream,
+		"dev/axllm/ax/AxFieldProcessor.java":                          javaAxFieldProcessor,
+		"dev/axllm/ax/AxFieldProcessorContext.java":                   javaAxFieldProcessorContext,
+		"dev/axllm/ax/AxFieldProcessorMode.java":                      javaAxFieldProcessorMode,
+		"dev/axllm/ax/AxStreamingAssertion.java":                      javaAxStreamingAssertion,
+		"dev/axllm/ax/AxCachingFunction.java":                         javaAxCachingFunction,
 		"dev/axllm/ax/AxBootstrapFewShot.java":                        javaAxBootstrapFewShot,
 		"dev/axllm/ax/AxACE.java":                                     javaAxACE,
 		"dev/axllm/ax/AxGEPA.java":                                    javaAxGEPA,
 		"dev/axllm/ax/AxPlaybook.java":                                javaAxPlaybook,
+		"dev/axllm/ax/AxRunControl.java":                              javaAxRunControl,
+		"dev/axllm/ax/AxChatSession.java":                             javaAxChatSession,
+		"dev/axllm/ax/ResponsesChatSession.java":                      javaResponsesChatSession,
+		"dev/axllm/ax/SessionRun.java":                                javaSessionRun,
 		"dev/axllm/ax/OptimizerEngine.java":                           javaOptimizerEngine,
 		"dev/axllm/ax/OptimizerEvaluator.java":                        javaOptimizerEvaluator,
 		"dev/axllm/ax/Json.java":                                      javaJson,
@@ -273,13 +299,18 @@ func EmitJava(model AxRuntimeModel, outDir string) error {
 		"axir-api.json":                                               mustAPIReferenceManifest(model, "java"),
 		"conformance-coverage.json":                                   mustConformanceCoverageManifest(model, "java"),
 		"examples/SignatureSchemaExample.java":                        javaSignatureSchemaExample,
+		"examples/ModelCatalogExample.java":                           javaModelCatalogExample,
+		"tests/TypesafeMCPTest.java":                                  javaTypesafeMCPTest,
+		"tests/AstraSessionTest.java":                                 javaAstraSessionNoKeyExample,
 		"examples/AxGenScriptedClientToolExample.java":                javaAxGenScriptedClientToolExample,
+		"examples/AxGenStreamingNoKeyExample.java":                    javaAxGenStreamingNoKeyExample,
 		"examples/AxGenOpenAIExample.java":                            javaAxGenOpenAIExample,
 		"examples/VertexGeminiExample.java":                           javaVertexGeminiExample,
 		"examples/ProviderMappingNoKeyExample.java":                   javaProviderMappingNoKeyExample,
 		"examples/RuntimeHooksNoKeyExample.java":                      javaRuntimeHooksNoKeyExample,
 		"examples/AdaptiveBalancerNoKeyExample.java":                  javaAdaptiveBalancerNoKeyExample,
 		"examples/ProviderStreamNoKeyExample.java":                    javaProviderStreamNoKeyExample,
+		"examples/CancellationNoKeyExample.java":                      javaCancellationNoKeyExample,
 		"examples/RuntimeAdapterExample.java":                         javaRuntimeAdapterExample,
 		"examples/RuntimeProtocolExample.java":                        javaRuntimeProtocolExample,
 		"examples/runtime_profiles/JavaScriptQuickJsExample.java":     javaJavaScriptQuickJSProfileExample,
@@ -298,6 +329,8 @@ func EmitJava(model AxRuntimeModel, outDir string) error {
 		"examples/AudioResponsesMappingExample.java":                  javaAudioResponsesMappingExample,
 		"examples/AudioHTTPRoundtripExample.java":                     javaAudioHTTPRoundtripExample,
 		"examples/StreamHTTPRoundtripExample.java":                    javaStreamHTTPRoundtripExample,
+		"examples/TimeoutHTTPRoundtripExample.java":                   javaTimeoutHTTPRoundtripExample,
+		"examples/TransportErrorsHTTPRoundtripExample.java":           javaTransportErrorsHTTPRoundtripExample,
 		"examples/RealtimeAudioEventsExample.java":                    javaRealtimeAudioEventsExample,
 		"examples/RealtimeAudioTurnExample.java":                      javaRealtimeAudioTurnExample,
 		"examples/OptimizerArtifactExample.java":                      javaOptimizerArtifactExample,
@@ -333,6 +366,9 @@ func EmitCpp(model AxRuntimeModel, outDir string) error {
 		"axllm/axllm.cpp":                                       core,
 		"axllm/axllm_c.h":                                       renderPackageTemplate(cppCHeader, version),
 		"axllm/axllm_c.cpp":                                     renderPackageTemplate(cppCSource, version),
+		"axllm/session.inc":                                     cppSession,
+		"tests/typesafe_mcp_test.cpp":                           cppTypesafeMCPTest,
+		"tests/astra_session_test.cpp":                          cppAstraSessionNoKeyExample,
 		"axllm/mcp.hpp":                                         cppMCPHeader,
 		"axllm/mcp.cpp":                                         cppMCPSource,
 		"conformance.cpp":                                       cppConformance,
@@ -341,17 +377,20 @@ func EmitCpp(model AxRuntimeModel, outDir string) error {
 		"conformance-coverage.json":                             mustConformanceCoverageManifest(model, "cpp"),
 		"examples/signature_schema.cpp":                         cppSignatureSchemaExample,
 		"examples/c_signature_schema.cpp":                       cppCSignatureSchemaExample,
+		"examples/model_catalog.cpp":                            cppModelCatalogExample,
 		"examples/axgen_scripted_client_tool.cpp":               cppAxGenScriptedClientToolExample,
+		"examples/axgen_streaming_no_key.cpp":                   cppAxGenStreamingNoKeyExample,
 		"examples/axgen_openai_api.cpp":                         cppAxGenOpenAIExample,
 		"examples/vertex_gemini_api.cpp":                        cppVertexGeminiExample,
 		"examples/provider_mapping_no_key.cpp":                  cppProviderMappingNoKeyExample,
 		"examples/runtime_hooks_no_key.cpp":                     cppRuntimeHooksNoKeyExample,
 		"examples/adaptive_balancer_no_key.cpp":                 cppAdaptiveBalancerNoKeyExample,
 		"examples/provider_stream_no_key.cpp":                   cppProviderStreamNoKeyExample,
+		"examples/cancellation_no_key.cpp":                      cppCancellationNoKeyExample,
 		"examples/runtime_adapter.cpp":                          cppRuntimeAdapterExample,
 		"examples/runtime_protocol.cpp":                         cppRuntimeProtocolExample,
 		"axllm/runtime/quickjs/quickjs_runtime.hpp":             cppQuickJSRuntimeHeader,
-		"axllm/runtime/quickjs/quickjs_runtime.cpp":             cppQuickJSRuntimeSource,
+		"axllm/runtime/quickjs/quickjs_runtime.cpp":             renderRuntimeHostNamespaces(cppQuickJSRuntimeSource, cppStringLiteral),
 		"examples/runtime_profiles/javascript_quickjs.cpp":      cppJavaScriptQuickJSProfileExample,
 		"examples/runtime_profiles/python_pyodide.cpp":          cppPythonPyodideProfileExample,
 		"examples/runtime_profiles/quickjs-runtime-policy.json": quickJSRuntimePolicyJSON,
@@ -363,6 +402,8 @@ func EmitCpp(model AxRuntimeModel, outDir string) error {
 		"examples/audio_responses_mapping.cpp":                  cppAudioResponsesMappingExample,
 		"examples/audio_http_roundtrip.cpp":                     cppAudioHTTPRoundtripExample,
 		"examples/stream_http_roundtrip.cpp":                    cppStreamHTTPRoundtripExample,
+		"examples/timeout_http_roundtrip.cpp":                   cppTimeoutHTTPRoundtripExample,
+		"examples/transport_errors_http_roundtrip.cpp":          cppTransportErrorsHTTPRoundtripExample,
 		"examples/realtime_audio_events.cpp":                    cppRealtimeAudioEventsExample,
 		"examples/realtime_audio_turn.cpp":                      cppRealtimeAudioTurnExample,
 		"examples/optimizer_artifact.cpp":                       cppOptimizerArtifactExample,
@@ -392,14 +433,19 @@ func EmitGo(model AxRuntimeModel, outDir string) error {
 		"go.sum":                            goSum,
 		"axllm.go":                          renderPackageTemplate(core, version),
 		"mcp.go":                            goMCP,
+		"session.go":                        goSession,
+		"typesafe_mcp_test.go":              goTypesafeMCPTest,
+		"session_test.go":                   goSessionTest,
 		"errors_test.go":                    goErrorBoundaryTest,
-		"runtime/goja/goja.go":              goGojaRuntime,
+		"ordered_values_test.go":            goOrderedValuesTest,
+		"runtime/goja/goja.go":              renderRuntimeHostNamespaces(goGojaRuntime, strconv.Quote),
 		"runtime/goja/goja_test.go":         goGojaRuntimeTest,
 		"axir-capabilities.json":            mustCapabilityManifest(model, "go"),
 		"axir-api.json":                     mustAPIReferenceManifest(model, "go"),
 		"conformance-coverage.json":         mustConformanceCoverageManifest(model, "go"),
 		"conformance/main.go":               goConformance,
 		"examples/signature_schema/main.go": goSignatureSchemaExample,
+		"examples/model_catalog/main.go":    goModelCatalogExample,
 		"examples/axgen_scripted_client_tool/main.go":       goAxGenScriptedClientToolExample,
 		"examples/axgen_openai_api/main.go":                 goAxGenOpenAIExample,
 		"examples/vertex_gemini_api/main.go":                goVertexGeminiExample,
@@ -408,6 +454,7 @@ func EmitGo(model AxRuntimeModel, outDir string) error {
 		"examples/runtime_hooks_no_key/main.go":             goRuntimeHooksNoKeyExample,
 		"examples/adaptive_balancer_no_key/main.go":         goAdaptiveBalancerNoKeyExample,
 		"examples/provider_stream_no_key/main.go":           goProviderStreamNoKeyExample,
+		"examples/cancellation_no_key/main.go":              goCancellationNoKeyExample,
 		"examples/runtime_adapter/main.go":                  goRuntimeAdapterExample,
 		"examples/runtime_protocol/main.go":                 goRuntimeProtocolExample,
 		"examples/runtime_profiles/javascript_goja/main.go": goJavaScriptGojaProfileExample,
@@ -417,6 +464,8 @@ func EmitGo(model AxRuntimeModel, outDir string) error {
 		"examples/audio_responses_mapping/main.go":          goAudioResponsesMappingExample,
 		"examples/audio_http_roundtrip/main.go":             goAudioHTTPRoundtripExample,
 		"examples/stream_http_roundtrip/main.go":            goStreamHTTPRoundtripExample,
+		"examples/timeout_http_roundtrip/main.go":           goTimeoutHTTPRoundtripExample,
+		"examples/transport_errors_http_roundtrip/main.go":  goTransportErrorsHTTPRoundtripExample,
 		"examples/realtime_audio_events/main.go":            goRealtimeAudioEventsExample,
 		"examples/realtime_audio_turn/main.go":              goRealtimeAudioTurnExample,
 		"examples/optimizer_artifact/main.go":               goOptimizerArtifactExample,
@@ -445,17 +494,21 @@ func EmitRust(model AxRuntimeModel, outDir string) error {
 		"Cargo.toml":                                      renderPackageTemplate(rustCargoToml, version),
 		"src/lib.rs":                                      renderPackageTemplate(core, version),
 		"src/mcp.rs":                                      rustMCP,
-		"src/runtime/quickjs.rs":                          rustQuickJSRuntime,
+		"src/session.rs":                                  rustSession,
+		"src/runtime/quickjs.rs":                          renderRuntimeHostNamespaces(rustQuickJSRuntime, rustStringLiteral),
 		"src/bin/axllm-conformance.rs":                    rustConformanceMain,
 		"axir-capabilities.json":                          mustCapabilityManifest(model, "rust"),
 		"axir-api.json":                                   mustAPIReferenceManifest(model, "rust"),
 		"conformance-coverage.json":                       mustConformanceCoverageManifest(model, "rust"),
 		"examples/signature_schema.rs":                    rustSignatureSchemaExample,
+		"examples/model_catalog.rs":                       rustModelCatalogExample,
 		"examples/provider_mapping_no_key.rs":             rustProviderMappingNoKeyExample,
 		"examples/runtime_hooks_no_key.rs":                rustRuntimeHooksNoKeyExample,
 		"examples/adaptive_balancer_no_key.rs":            rustAdaptiveBalancerNoKeyExample,
 		"examples/provider_stream_no_key.rs":              rustProviderStreamNoKeyExample,
+		"examples/cancellation_no_key.rs":                 rustCancellationNoKeyExample,
 		"examples/axgen_scripted_client_tool.rs":          rustAxGenScriptedClientToolExample,
+		"examples/axgen_streaming_no_key.rs":              rustAxGenStreamingNoKeyExample,
 		"examples/axgen_openai_api.rs":                    rustAxGenOpenAIExample,
 		"examples/vertex_gemini_api.rs":                   rustVertexGeminiExample,
 		"examples/axflow_program_graph.rs":                rustAxFlowProgramGraphExample,
@@ -464,6 +517,8 @@ func EmitRust(model AxRuntimeModel, outDir string) error {
 		"examples/audio_responses_mapping.rs":             rustAudioResponsesMappingExample,
 		"examples/audio_http_roundtrip.rs":                rustAudioHTTPRoundtripExample,
 		"examples/stream_http_roundtrip.rs":               rustStreamHTTPRoundtripExample,
+		"examples/timeout_http_roundtrip.rs":              rustTimeoutHTTPRoundtripExample,
+		"examples/transport_errors_http_roundtrip.rs":     rustTransportErrorsHTTPRoundtripExample,
 		"examples/realtime_audio_events.rs":               rustRealtimeAudioEventsExample,
 		"examples/realtime_audio_turn.rs":                 rustRealtimeAudioTurnExample,
 		"examples/runtime_adapter.rs":                     rustRuntimeAdapterExample,
@@ -742,6 +797,14 @@ func BuildCapabilityManifest(model AxRuntimeModel, target string) (CapabilityMan
 		UnsupportedCapabilities:  nil,
 		CoreOwnedFeatureGroups: targetCoreOwnedFeatureGroups(target, []string{
 			"signature",
+			"signature-value-descriptions",
+			"signature-decision-evidence",
+			"signature-box-fields",
+			"typesafe-images-and-box",
+			"wire-field-extraction",
+			"typesafe-native-and-signatures",
+			"openai-decisions-native-and-signatures",
+			"mcp-websocket-pending-cleanup",
 			"schema",
 			"validation",
 			"validation-url-array-items",
@@ -1026,12 +1089,33 @@ func ValidateAPIReferenceManifest(manifest APIReferenceManifest) error {
 			return fmt.Errorf("api reference missing section %q", id)
 		}
 	}
-	for _, canonical := range []string{"s", "ax", "ai", "AxCredentialRequest", "AxCredentialProvider", "AxUsageContext", "AxUsageEvent", "AxUsageObserver", "AxRuntimeHooks", "AxRateLimitInfo", "AxRateLimiter", "AxTracer", "AxMeter", "AxGlobals", "set_usage_observer", "set_rate_limiter", "set_tracer", "set_meter", "agent", "flow", "fn", "AxMCPClient", "OpenAICompatibleClient", "OpenAIResponsesClient", "GoogleGeminiClient", "AnthropicClient", "ProcessCodeRuntime", "RuntimeCapabilities", "RuntimeEnvelope", "optimize", "AxBootstrapFewShot", "AxGEPA", "OptimizerEngine"} {
+	for _, canonical := range []string{"s", "ax", "ai", "get_supported_ai_models", "AxCancellationToken", "AxAIServiceAbortedError", "AxCredentialRequest", "AxCredentialProvider", "AxUsageContext", "AxUsageEvent", "AxUsageObserver", "AxRuntimeHooks", "AxRateLimitInfo", "AxRateLimiter", "AxTracer", "AxMeter", "AxGlobals", "set_usage_observer", "set_rate_limiter", "set_tracer", "set_meter", "agent", "flow", "fn", "AxMCPClient", "OpenAICompatibleClient", "OpenAIResponsesClient", "GoogleGeminiClient", "AnthropicClient", "ProcessCodeRuntime", "RuntimeCapabilities", "RuntimeEnvelope", "optimize", "AxBootstrapFewShot", "AxGEPA", "OptimizerEngine"} {
 		if !symbols[canonical] {
 			return fmt.Errorf("api reference missing canonical symbol %q", canonical)
 		}
 	}
 	return nil
+}
+
+// mcpTaskHandlingDescription names a target's MCP task-handling calls, as
+// TypeScript's callTool taskHandling and callToolOutcome.
+func mcpTaskHandlingDescription(target string) string {
+	var calls string
+	switch target {
+	case "python":
+		calls = "`call_tool` waits for a modern server's task; `call_tool(..., task_handling=\"expose\")` returns it as its CreateTaskResult, and `call_tool_outcome` returns `{\"kind\": \"complete\", \"result\": ...}` or `{\"kind\": \"task\", \"task\": ...}`"
+	case "go":
+		calls = "`CallTool` waits for a modern server's task; `CallToolWithOptions(ctx, name, args, AxMCPToolCallOptions{TaskHandling: \"expose\"})` returns it as its CreateTaskResult, and `CallToolOutcome` returns an `AxMCPToolCallOutcome` with Kind \"complete\" (Result) or \"task\" (Task)"
+	case "java":
+		calls = "`callTool` waits for a modern server's task; `callTool(name, args, Map.of(\"taskHandling\", \"expose\"))` returns it as its CreateTaskResult, and `callToolOutcome` returns `{kind: complete, result}` or `{kind: task, task}`"
+	case "cpp":
+		calls = "`call_tool` waits for a modern server's task; `call_tool(name, args, {\"taskHandling\": \"expose\"})` returns it as its CreateTaskResult, and `call_tool_outcome` returns `{kind: complete, result}` or `{kind: task, task}`"
+	case "rust":
+		calls = "`call_tool` waits for a modern server's task; `call_tool_with_task_handling(name, args, AxMCPTaskHandling::Expose)` returns it as its CreateTaskResult, and `call_tool_outcome` returns `AxMCPToolCallOutcome::Complete` or `AxMCPToolCallOutcome::Task`"
+	default:
+		calls = "A tool call waits for a modern server's task by default, can expose it as its CreateTaskResult, or can return the call's outcome"
+	}
+	return calls + ", as TypeScript's callTool taskHandling and callToolOutcome. A legacy server's task-shaped result is a complete result."
 }
 
 func apiReferenceSectionsForTarget(target string) []APIReferenceSection {
@@ -1049,7 +1133,7 @@ func apiReferenceSectionsForTarget(target string) []APIReferenceSection {
 			Example:          apiReferenceExample(target, canonical),
 		}
 	}
-	return []APIReferenceSection{
+	sections := []APIReferenceSection{
 		{
 			ID:      "signatures",
 			Title:   "Signatures",
@@ -1065,8 +1149,13 @@ func apiReferenceSectionsForTarget(target string) []APIReferenceSection {
 			Title:   "AxGen",
 			Summary: "Run structured generation with Core-owned prompts, indexed multi-sampling, result selection, tool loops, retries, streaming folds, traces, usage, examples, and field processors.",
 			Symbols: []APIReferenceSymbol{
-				sym("ax", "function", "Create an AxGen program from a string or parsed signature.", []string{"functions", "examples", "demos", "sample count", "result picker", "modelConfig", "maxRetries", "streaming assertions", "field processors"}, "AxGen"),
+				sym("ax", "function", "Create an AxGen program from a string or parsed signature.", []string{"functions", "examples", "demos", "sample count", "result picker", "modelConfig", "maxRetries", "streaming assertions", "field processors", "control", "asyncMode"}, "AxGen"),
+				sym(mapTarget(target, "novel_f1_score", "Ax.novelF1Score", "axllm::novel_f1_score", "NovelF1Score", "novel_f1_score"), "function", "Score novel multiset token overlap after Unicode normalization and history/stopword exclusion. Two empty filtered answers score one; a single empty answer scores zero.", []string{"history", "prediction", "ground truth", "return recall"}, "score in [0, 1]"),
 				sym("AxGen", "type", "Structured generation program with indexed multi-sampling, winner selection, forward, streaming, optimization, trace, usage, and tool-call behavior.", []string{"signature", "functions", "examples", "demos", "sample count", "result picker", "memory", "prompt template"}, "program object"),
+				sym("run_control", "function", "Create a controller for scoped steering, reasoning updates, cancellation, and queued/applied lifecycle events. Pass it through forward options.", nil, "AxRunControl"),
+				sym("AxRunControl", "type", "Run control shared by active and future descendant programs. Cancellation reports unresolved work and does not undo external effects.", []string{"steer", "thinking token budget", "target path", "abort", "event listener"}, "run controller"),
+				sym("AxCachingFunction", "type", "TypeScript's cachingFunction: read and store finished AxGen outputs by key. The forward call's function comes first, then the program's, then the process-wide one, and a run control skips the cache.", []string{"read", "store", "SHA-256 key", "streamed hit as one delta"}, "stored output or miss"),
+				sym("set_caching_function", "function", "Register, replace, or clear the process-wide AxGen caching function.", []string{"caching function", "clear"}, "void"),
 			},
 		},
 		{
@@ -1075,8 +1164,17 @@ func apiReferenceSectionsForTarget(target string) []APIReferenceSection {
 			Summary: "Call supported providers through the shared provider descriptor registry, scripted transports, routers, and balancers.",
 			Symbols: []APIReferenceSymbol{
 				sym("ai", "function", "Create a provider client from a named deployment profile and options.", []string{"api key or credential provider", "model", "api URL", "headers", "transport"}, "AI client/service"),
+				sym("openai_decisions", "function", "Create the native OpenAI Decisions client for ordered predicate, choice and score questions. Default model: gpt-6-luna.", []string{"API key or credential provider", "inline images", "timeout", "retry", "cancellation"}, "AxAIOpenAIDecisionsClient"),
+				sym("AxAIOpenAIDecisionsClient", "type", "Native create requests preserve ordered answers, refusals, distributions, fractional scores and full usage. Signature adapters accept required boolean/class fields.", []string{"create / Create", "question names", "boolean or string choices", "safety_identifier"}, "native Decisions response JSON"),
+				sym("typesafe", "function", "Create the native Typesafe/Jev client separately from ordinary AI services. Default model: jev-latest.", []string{"api key or credential provider", "endpoint", "transport", "timeout", "retry"}, "AxAITypesafeClient"),
+				sym("AxAITypesafeClient", "type", "Native System One questions and model discovery. Returns typed Noul probabilities, Choice labels, fractional Score positions, model, and usage.", []string{"system_one / systemOne / SystemOne", "list_models / listModels / ListModels", "structured or null entries", "cancellation"}, "native Typesafe responses"),
+				sym("AxCancellationToken", "type", "Reusable one-shot cancellation for provider calls, streams, retries, and event-clock sleeps. Go uses context.Context.", []string{"first reason wins", "removable wake subscriptions", "non-retryable cancellation"}, "cancellation token or context"),
+				sym("AxAIServiceAbortedError", "error", "Terminal provider error raised when caller cancellation is observed.", []string{"reason preservation", "no retry", "no provider failover"}, "non-retryable provider error"),
+				sym("get_supported_ai_models", "function", "Return the AxIR-backed provider and model catalog, including dynamic named profiles and portable capability metadata.", []string{"type filter", "thinkingLevels", "serviceTiers", "isDynamic"}, "provider catalog entries"),
 				sym("AxCredentialRequest", "type", "Request metadata passed to a renewable credential callback for every transport attempt.", []string{"profile", "operation", "method", "URL"}, "credential request"),
 				sym("AxCredentialProvider", "interface", "Return fresh request headers that override static profile authentication.", []string{"chat", "stream", "embeddings", "Responses", "audio", "retries"}, "header map or credential error"),
+				sym("owned_client_factory", "method", "Optional factory for an independent client worker with preserved configuration, authentication and routing. Built-in providers supply it; custom services may omit it without changing chat compatibility.", []string{"owned configuration", "shared balancer accounting", "no borrowed client transfer"}, "worker factory or unavailable"),
+				sym("AxChatSession", "interface", "Optional normalized session capability for custom provider adapters. High-level programs own tool execution and continuation; chat-only services remain supported.", []string{"normalized events", "completed calls", "submit results", "steering", "reasoning updates", "close"}, "run-owned chat session"),
 				sym("AxProviderStream", "type", "Incremental, closeable provider event stream. Retry and failover stop once content is delivered.", []string{"next event", "terminal error", "consumer cancellation", "upstream close"}, "incremental chat events"),
 				sym("OpenAICompatibleClient", "type", "OpenAI-compatible chat, stream, embedding, audio, and realtime provider boundary.", []string{"api key", "model", "base URL", "transport"}, "provider client"),
 				sym("OpenAIResponsesClient", "type", "OpenAI Responses provider mapping using the same Core-owned request and response contract.", []string{"api key", "model", "audio", "realtime"}, "provider client"),
@@ -1103,6 +1201,7 @@ func apiReferenceSectionsForTarget(target string) []APIReferenceSection {
 				sym("update_balancer_route_stats", "function", "Purely reduce one success or failure observation into route statistics.", []string{"current stats", "observation"}, "route stats"),
 				sym("sample_balancer_route_health", "function", "Sample failure and deadline-miss probability for adaptive exploration.", []string{"route stats", "deadline"}, "sampled health"),
 				sym("MultiServiceRouter", "type", "Choose a service by capability or model routing policy.", []string{"services", "routing"}, "AI service"),
+				sym(mapTarget(target, "ProviderRouter.get_compatibility_report", "AxProviderRouter.getCompatibilityReport", "ProviderRouter::get_compatibility_report", "ProviderRouter.GetCompatibilityReport", "ProviderRouter::get_compatibility_report"), "method", "Rank request-compatible providers and summarize supported requirements, counting audio input and audio output independently.", []string{"request"}, "provider names, scores and compatibility summary"),
 				sym("ProviderRouter", "type", "Route requests by capability, preserving native media for supporting providers and degrading only when required.", []string{"providers", "routing", "processing"}, "AI service"),
 			},
 		},
@@ -1113,6 +1212,8 @@ func apiReferenceSectionsForTarget(target string) []APIReferenceSection {
 			Symbols: []APIReferenceSymbol{
 				sym("agent", "function", "Create an AxAgent from a signature and agent/runtime options.", []string{"name", "description", "runtime", "maxSteps", "context fields", "discovery", "recall", "functions", "skills", "skillsCatalog", "memoriesCatalog", "relevanceRanking", "load observers", "used observers", "citations", "playbook", "instruction", "instructionAddenda"}, "AxAgent"),
 				sym("AxAgent", "type", "RLM agent with Core-owned envelopes, complete runtime-state export/restore, traces, discovery, recall, loaded skills and memories, usage observers, delegation, validated citations, stage instructions, persistent run-end learning, and verified playbook evolution.", []string{"executor model", "runtime", "policy", "context", "skills", "memories", "relevance ranking", "observers", "runtime state", "optimizer metadata", "citations", "playbook"}, "agent program"),
+				sym("add_child_agent", "method", "Register an owned child agent for serialized delegation through the parent invocation boundary. Scoped controls use parent/namespace.name paths.", []string{"namespace", "name", "child", "independent conversation", "child usage"}, "parent agent"),
+				sym("agent_streaming_forward", "method", "Run the agent and stream the responder's deltas, as TypeScript's streamingForward does, after the distiller and executor run without streaming.", []string{"deltas", "versions", "hidden citations", "run control"}, "responder deltas"),
 			},
 		},
 		{
@@ -1122,6 +1223,7 @@ func apiReferenceSectionsForTarget(target string) []APIReferenceSection {
 			Symbols: []APIReferenceSymbol{
 				sym("flow", "function", "Create an AxFlow program graph or compile the portable Mermaid shorthand.", []string{"nodes", "execute mappers", "conditions", "cache", "returns", "Mermaid roundtrip"}, "AxFlow"),
 				sym("AxFlow", "type", "Workflow graph with Core-owned planning, cache keys, state merge, child aggregation, optimization, and returns projection.", []string{"steps", "state", "parallel groups", "returns"}, "flow program"),
+				sym("owned_program_factory", "method", "Optional factory for independent program state. Parallel groups require both client and program factories; otherwise the whole group runs serially with a fallback trace.", []string{"owned memory", "per-node controls", "deterministic result merge", "cooperative cancellation"}, "worker factory or unavailable"),
 			},
 		},
 		{
@@ -1129,7 +1231,7 @@ func apiReferenceSectionsForTarget(target string) []APIReferenceSection {
 			Title:   "Tools",
 			Summary: "Expose host functions to AxGen and AxAgent with typed argument and return schemas.",
 			Symbols: []APIReferenceSymbol{
-				sym("fn", "function", "Build a typed function tool. Rust uses `tool` because `fn` is reserved.", []string{"name", "description", "args", "returns", "handler"}, "tool builder or Tool"),
+				sym("fn", "function", "Build a typed function tool. Rust uses `tool` because `fn` is reserved.", []string{"name", "description", "args", "returns", "handler", "execution: blocking or background", "cancellation-aware handler"}, "tool builder or Tool"),
 				sym("Tool", "type", "Callable tool descriptor with JSON-schema-compatible parameters and a host handler.", []string{"parameters", "returns", "handler"}, "tool descriptor"),
 			},
 		},
@@ -1138,8 +1240,9 @@ func apiReferenceSectionsForTarget(target string) []APIReferenceSection {
 			Title:   "MCP",
 			Summary: "Use MCP clients and transports while keeping JSON-RPC lifecycle, tools, prompts, resources, OAuth, cancellation, and SSRF checks aligned.",
 			Symbols: []APIReferenceSymbol{
-				sym("AxMCPClient", "type", "MCP client that lists tools/prompts/resources and converts MCP tools to Ax functions.", []string{"transport", "client info", "roots", "tool overrides"}, "MCP client"),
+				sym("AxMCPClient", "type", "MCP client that lists tools/prompts/resources and converts MCP tools to Ax functions. "+mcpTaskHandlingDescription(target), []string{"transport", "client info", "roots", "tool overrides", "host tool authorization", "task handling (await or expose)", "tool call outcome"}, "MCP client"),
 				sym("AxMCPStreamableHTTPTransport", "type", "Streamable HTTP transport with session headers, OAuth options, and SSRF protection.", []string{"endpoint", "headers", "OAuth", "SSRF protection"}, "MCP transport"),
+				sym("AxMCPWebSocketTransport", "type", "WebSocket transport with request-local pending ownership, send failure cleanup, cancellation, and close settlement. Batching requires MCP 2025-03-26.", []string{"URL", "socket factory", "protocol version"}, "MCP transport"),
 				sym("AxMCPStdioTransport", "type", "Stdio transport with JSON-RPC framing for local MCP servers.", []string{"command", "args", "env"}, "MCP transport"),
 			},
 		},
@@ -1162,7 +1265,7 @@ func apiReferenceSectionsForTarget(target string) []APIReferenceSection {
 				sym("playbook", "function", "Bind an ACE-backed playbook to a program; agents also expose an agent-bound playbook handle.", []string{"student/client", "teacher", "seed snapshot", "online updates", "verification budget"}, "AxPlaybook"),
 				sym("AxPlaybook", "type", "Persistent playbook with render/update/snapshot operations and agent-bound verified evolve over train/validation task sets.", []string{"verify", "minHeldInGain", "epsilon", "runsPerTask", "maxMetricCalls", "maxProposals"}, "playbook handle"),
 				sym("AxBootstrapFewShot", "type", "Few-shot demonstration optimizer that selects successful evaluator rollouts before prompt/component evolution.", []string{"quality threshold", "max demos", "max rounds", "batch size"}, "optimizer engine"),
-				sym("AxGEPA", "type", "Generated GEPA optimizer engine with Core-owned reflection, Pareto, bootstrap, and selector-state behavior.", []string{"reflection client", "budget", "metric", "candidate count"}, "optimizer engine"),
+				sym("AxGEPA", "type", "GEPA engine with Core-owned reflection, Pareto and bootstrap behavior. Artifacts report original-program baselineScore/baselineScores at the top level and in metadata, independently of the final frontier.", []string{"reflection client", "budget", "metric", "candidate count", "baselineScore", "baselineScores"}, "optimizer engine"),
 				sym("OptimizerEngine", "interface", "Optimizer boundary consumed by AxGen, AxAgent, and AxFlow optimization helpers.", []string{"request", "evaluator"}, "optimized artifact"),
 				sym("OptimizerEvaluator", "interface", "Evaluator callback boundary used by generated optimizers.", []string{"dataset rows", "candidate map", "evidence"}, "score/evidence result"),
 			},
@@ -1172,11 +1275,21 @@ func apiReferenceSectionsForTarget(target string) []APIReferenceSection {
 			Title:   "Errors And Values",
 			Summary: "Handle target-native errors and dynamic values at Ax host boundaries.",
 			Symbols: []APIReferenceSymbol{
+				sym("AxDecisionRefusalError", "type", "Terminal decision-field refusal; retains field path and provider provenance.", []string{"fieldPath", "provenance"}, "error"),
+				sym("AxGenerateError", "type", "Generation boundary failure retaining the original cause; cancellation propagates unchanged.", []string{"message", "cause"}, "error"),
 				sym("AxError", "type", "Target-native error envelope for validation, provider, runtime, MCP, and optimizer failures.", []string{"category", "message", "status", "code", "retryable"}, "error"),
 				sym("Value", "type", "Dynamic JSON-like value boundary used by generated package APIs, tools, providers, MCP, and runtime sessions.", []string{"string", "number", "boolean", "object", "array", "null"}, "dynamic value"),
 			},
 		},
 	}
+	if target == "rust" {
+		for i := range sections {
+			if sections[i].ID == "optimizers" {
+				sections[i].Symbols = append(sections[i].Symbols, sym("optimize_with_client", "function", "Run BootstrapFewShot and GEPA against a live student client. Reports the original baseline before bootstrap. The client-free optimize helper requires pre-scored tasks.", []string{"Rc<RefCell<Client>>", "examples", "validationExamples", "bootstrap", "maxMetricCalls"}, "AxResult<OptimizedArtifact>"))
+			}
+		}
+	}
+	return sections
 }
 
 func apiRuntimeProfileSymbols(target string) []APIReferenceSymbol {
@@ -1205,14 +1318,40 @@ func apiRuntimeProfileSymbols(target string) []APIReferenceSymbol {
 
 func apiReferencePublicName(target, canonical string) string {
 	switch canonical {
+	case "AxDecisionRefusalError":
+		return mapTarget(target, "AxDecisionRefusalError", "AxGen.AxDecisionRefusalError", "AxDecisionRefusalError", "AxDecisionRefusalError", "AxError (error_type: AxDecisionRefusalError)")
 	case "s":
 		return mapTarget(target, "s", "Ax.s", "axllm::s", "axllm.S", "s")
 	case "f":
 		return mapTarget(target, "f", "Ax.f", "axllm::FieldType", "axllm.FieldType", "f")
+	case "run_control":
+		return mapTarget(target, "run_control", "Ax.runControl", "axllm::run_control", "axllm.RunControl", "run_control")
+	case "AxChatSession":
+		return mapTarget(target, "AxChatSession", "AxChatSession", "axllm::AxChatSession", "axllm.AxChatSession", "AxChatSession")
+	case "owned_client_factory":
+		return mapTarget(target, "AIClient.owned_worker_factory", "AiClient.ownedWorkerFactory", "axllm::AIClient::owned_worker_factory", "AxOwnedClientFactory.OwnedWorkerFactory", "AxAIClient::owned_worker_factory")
+	case "add_child_agent":
+		return mapTarget(target, "AxAgent.add_child_agent", "AxAgent.addChildAgent", "axllm::AxAgent::add_child_agent", "AxAgent.AddChildAgent", "AxAgent::with_child_agent")
+	case "agent_streaming_forward":
+		return mapTarget(target, "AxAgent.streaming_forward", "AxAgent.streamingForward", "axllm::AxAgent::streaming_forward", "AxAgent.StreamingForward", "AxAgent::streaming_forward")
+	case "owned_program_factory":
+		return mapTarget(target, "AxProgram.owned_worker_factory", "AxProgram.ownedWorkerFactory", "axllm::AxProgram::owned_worker_factory", "AxOwnedProgramFactory.OwnedWorkerFactory", "AxExecutableProgram::owned_worker_factory")
+	case "AxRunControl":
+		return mapTarget(target, "AxRunControl", "AxRunControl", "axllm::AxRunControl", "axllm.AxRunControl", "AxRunControl")
+	case "AxCachingFunction":
+		return mapTarget(target, "Callable[[str, dict | None], dict | None]", "AxCachingFunction", "axllm::AxCachingFunction", "axllm.AxCachingFunction", "AxCachingFunction")
+	case "set_caching_function":
+		return mapTarget(target, "set_caching_function", "AxGlobals.setCachingFunction", "axllm::set_caching_function", "axllm.SetCachingFunction", "set_caching_function")
 	case "ax":
 		return mapTarget(target, "ax", "Ax.ax", "axllm::ax", "axllm.NewAx", "ax")
+	case "openai_decisions":
+		return mapTarget(target, "openai_decisions", "Ax.openaiDecisions", "axllm::openai_decisions", "axllm.OpenAIDecisions", "openai_decisions")
+	case "typesafe":
+		return mapTarget(target, "typesafe", "Ax.typesafe", "axllm::typesafe", "axllm.Typesafe", "typesafe")
 	case "ai":
 		return mapTarget(target, "ai", "Ax.ai", "axllm::ai", "axllm.NewAI", "ai")
+	case "get_supported_ai_models":
+		return mapTarget(target, "get_supported_ai_models", "Ax.getSupportedAIModels", "axllm::get_supported_ai_models", "axllm.GetSupportedAIModels", "get_supported_ai_models")
 	case "agent":
 		return mapTarget(target, "agent", "Ax.agent", "axllm::agent", "axllm.NewAgent", "agent")
 	case "flow":
@@ -1233,6 +1372,10 @@ func apiReferencePublicName(target, canonical string) string {
 		return mapTarget(target, "Callable[[dict[str, str]], dict[str, str]]", "OpenAICompatibleClient.CredentialProvider", "axllm::AxCredentialProvider", "axllm.AxCredentialProvider", "AxCredentialProvider")
 	case "AxProviderStream":
 		return mapTarget(target, "closable generator", "AxChatStream", "axllm::AxStreamHandler", "axllm.AxChatStream", "AxChatStream")
+	case "AxCancellationToken":
+		return mapTarget(target, "AxCancellationToken", "AxCancellationToken", "axllm::AxCancellationToken", "context.Context", "AxCancellationToken")
+	case "AxAIServiceAbortedError":
+		return mapTarget(target, "AxAIServiceAbortedError", "AxAIServiceAbortedError", "axllm::AxAIServiceAbortedError", "axllm.AxAIServiceAbortedError", "AxAIServiceAbortedError")
 	case "AxRuntimeHooks", "AxRateLimitInfo", "AxRateLimiter", "AxTracer", "AxMeter", "AxGlobals":
 		return apiReferenceQualifiedName(target, canonical)
 	case "set_usage_observer":
@@ -1290,18 +1433,36 @@ func apiReferenceQualifiedName(target, name string) string {
 
 func apiReferenceForm(target, canonical, publicName string) string {
 	switch canonical {
+	case "typesafe":
+		return publicName + "(options)"
+	case "AxMCPWebSocketTransport":
+		return mapTarget(target, "AxMCPWebSocketTransport(url, web_socket_factory=None)", "new AxMCPWebSocketTransport(url)", "axllm::AxMCPWebSocketTransport(url, socket_factory)", "axllm.NewAxMCPWebSocketTransport(url, options)", "AxMCPWebSocketTransport::new(url)")
+	case "owned_client_factory", "owned_program_factory":
+		return publicName + "()"
 	case "s":
 		return mapTarget(target, "s(signature: str)", "Ax.s(String signature)", "axllm::s(const std::string& signature)", "axllm.S(signature string)", "s(spec: &str)")
 	case "f":
 		return mapTarget(target, "f().input(...).output(...).build()", "Ax.f().input(...).output(...)", "FieldType / Field descriptors", "FieldType and Field descriptors", "f().input(...).output(...).build()")
 	case "AxSignature":
 		return mapTarget(target, "AxSignature", "AxSignature", "axllm::Value signature", "axllm.AxSignature", "AxSignature")
+	case "add_child_agent":
+		return apiReferencePublicName(target, canonical) + "(namespace, name, child)"
+	case "agent_streaming_forward":
+		return mapTarget(target, "AxAgent.streaming_forward(client, values, options=None)", "AxAgent.streamingForward(client, values, options)", "axllm::AxAgent::streaming_forward(client, values, options, handler)", "(*AxAgent).StreamingForward(ctx, client, values, options)", "AxAgent::streaming_forward(&mut client, input, options, on_delta)")
+	case "run_control":
+		return apiReferencePublicName(target, canonical) + "()"
+	case "AxCachingFunction":
+		return mapTarget(target, "caching_function(key, output=None)", "Map<String, Object> apply(String key, Map<String, Object> value)", "std::optional<Value>(const std::string& key, const Value* value)", "func(key string, value map[string]Value) (map[string]Value, error)", "Arc<dyn Fn(&str, Option<&Value>) -> AxResult<Option<Value>> + Send + Sync>")
+	case "set_caching_function":
+		return mapTarget(target, "set_caching_function(fn)", "AxGlobals.setCachingFunction(fn)", "axllm::set_caching_function(fn)", "axllm.SetCachingFunction(fn)", "set_caching_function(Some(fn))")
 	case "ax":
 		return mapTarget(target, "ax(signature, options=None)", "Ax.ax(signature)", "axllm::ax(signature, options)", "axllm.NewAx(signature, options)", "ax(spec: &str)")
 	case "AxGen":
 		return mapTarget(target, "AxGen(signature, options=None)", "new AxGen(signature)", "axllm::AxGen(signature, options)", "axllm.NewGen(signature, options)", "AxGen")
 	case "ai":
 		return mapTarget(target, "ai(provider='openai', **options)", "Ax.ai(provider, options)", "axllm::ai(provider, options)", "axllm.NewAI(provider, options)", "ai(provider, options)")
+	case "get_supported_ai_models":
+		return mapTarget(target, "get_supported_ai_models(model_type=None)", "Ax.getSupportedAIModels(type)", "axllm::get_supported_ai_models(options)", "axllm.GetSupportedAIModels(options)", "get_supported_ai_models() / get_supported_ai_models_with_options(options)")
 	case "AxUsageContext":
 		return mapTarget(target, "dict[str, object]", "Map<String, Object>", "axllm::AxUsageContext", "axllm.AxUsageContext", "AxUsageContext")
 	case "AxCredentialRequest":
@@ -1310,6 +1471,10 @@ func apiReferenceForm(target, canonical, publicName string) string {
 		return mapTarget(target, "Callable[[dict[str, str]], dict[str, str]]", "OpenAICompatibleClient.CredentialProvider", "axllm::AxCredentialProvider", "axllm.AxCredentialProvider", "dyn AxCredentialProvider")
 	case "AxProviderStream":
 		return mapTarget(target, "client.stream(request)", "client.openStream(request)", "client.stream_each(request, handler)", "client.StreamEvents(ctx, request, options)", "client.stream_iter(request)")
+	case "AxCancellationToken":
+		return mapTarget(target, "AxCancellationToken()", "new AxCancellationToken()", "axllm::AxCancellationToken", "context.WithCancelCause(ctx)", "AxCancellationToken::default()")
+	case "AxAIServiceAbortedError":
+		return mapTarget(target, "AxAIServiceAbortedError(reason)", "new AxAIServiceAbortedError(reason)", "axllm::AxAIServiceAbortedError(reason)", "axllm.AxAIServiceAbortedError", "AxError with error_type AxAIServiceAbortedError")
 	case "AxUsageEvent":
 		return mapTarget(target, "AxUsageEvent", "AxUsageEvent", "axllm::AxUsageEvent", "axllm.AxUsageEvent", "AxUsageEvent")
 	case "AxUsageObserver":
@@ -1359,11 +1524,13 @@ func apiReferenceForm(target, canonical, publicName string) string {
 	case "RuntimeEnvelope":
 		return mapTarget(target, "RuntimeEnvelope.from_result(...)", "AxRuntimeEnvelope", "axllm::RuntimeEnvelope", "runtime envelope map", "RuntimeEnvelope")
 	case "AxGEPA":
-		return mapTarget(target, "AxGEPA(reflection, **options)", "new AxGEPA(reflection, options)", "axllm::AxGEPA(reflection, options)", "axllm.NewGEPA(reflection, options)", "AxGEPA::new(reflection, options)")
+		return mapTarget(target, "AxGEPA(reflection, **options)", "new AxGEPA(reflection, options)", "axllm::AxGEPA(reflection, options)", "axllm.NewGEPA(reflection, options)", "AxGEPA::new().with_reflection_client(reflection)")
 	case "AxBootstrapFewShot":
 		return mapTarget(target, "AxBootstrapFewShot(**options)", "new AxBootstrapFewShot(options)", "axllm::AxBootstrapFewShot(options)", "axllm.NewBootstrapFewShot(options)", "AxBootstrapFewShot::new(options)")
 	case "optimize":
 		return mapTarget(target, "optimize(program, examples, options=None)", "Ax.optimize(program, examples, options)", "axllm::optimize(program, student, examples, options, teacher)", "axllm.Optimize(program, examples, options)", "optimize(program, examples, options)")
+	case "optimize_with_client":
+		return "optimize_with_client(&mut program, Rc<RefCell<Client>>, examples, options)"
 	case "playbook":
 		return mapTarget(target, "playbook(program, options=None)", "Ax.playbook(program, options)", "axllm::playbook(program, student, options)", "axllm.Playbook(program, options)", "playbook(program, student, teacher, options)")
 	case "AxPlaybook":
@@ -1407,6 +1574,8 @@ func apiReferenceReturns(target, canonical, fallback string) string {
 			return "AxResult<AxGen>"
 		case "ai":
 			return "AxResult<OpenAICompatibleClient>"
+		case "get_supported_ai_models":
+			return "AxResult<Vec<serde_json::Value>>"
 		case "agent":
 			return "AxResult<AxAgent>"
 		case "fn":
@@ -1444,6 +1613,18 @@ func apiReferenceExample(target, canonical string) string {
 			`sig := axllm.S("question:string -> answer:string")`,
 			`let sig = s("question:string -> answer:string")?;`,
 		)
+	case "run_control":
+		return mapTarget(target, "control = run_control()", "var control = Ax.runControl();", "auto control = axllm::run_control();", "control := axllm.RunControl()", "let control = run_control();")
+	case "AxCachingFunction":
+		return mapTarget(target,
+			`qa = ax("question:string -> answer:string", {"caching_function": cache})`,
+			`AxGen qa = new AxGen(Ax.s("question:string -> answer:string"), Map.of("cachingFunction", cache));`,
+			`auto qa = axllm::ax("question:string -> answer:string"); qa.set_caching_function(cache);`,
+			`qa := axllm.NewAx("question:string -> answer:string", map[string]axllm.Value{"cachingFunction": cache})`,
+			`let qa = ax("question:string -> answer:string")?.with_caching_function(cache);`,
+		)
+	case "set_caching_function":
+		return mapTarget(target, `set_caching_function(cache)`, `AxGlobals.setCachingFunction(cache);`, `axllm::set_caching_function(cache);`, `axllm.SetCachingFunction(cache)`, `set_caching_function(Some(cache));`)
 	case "ax":
 		return mapTarget(target,
 			`qa = ax("question:string -> answer:string")`,
@@ -1459,6 +1640,14 @@ func apiReferenceExample(target, canonical string) string {
 			`auto client = axllm::ai("openai", axllm::object({{"apiKey", std::getenv("OPENAI_API_KEY")}}));`,
 			`client := axllm.NewAI("openai", map[string]axllm.Value{"apiKey": os.Getenv("OPENAI_API_KEY")})`,
 			`let client = ai("openai", json!({"apiKey": std::env::var("OPENAI_API_KEY")?}))?;`,
+		)
+	case "get_supported_ai_models":
+		return mapTarget(target,
+			`catalog = get_supported_ai_models()`,
+			`List<Object> catalog = Ax.getSupportedAIModels();`,
+			`auto catalog = axllm::get_supported_ai_models();`,
+			`catalog := axllm.GetSupportedAIModels(map[string]axllm.Value{})`,
+			`let catalog = get_supported_ai_models()?;`,
 		)
 	case "AxProviderStream":
 		return mapTarget(target,
@@ -1554,6 +1743,8 @@ func apiReferenceExample(target, canonical string) string {
 			`artifact, err := axllm.Optimize(qa, train, map[string]axllm.Value{"studentAI": client})`,
 			`let artifact = optimize(&mut qa, train, json!({"maxMetricCalls": 100}))?;`,
 		)
+	case "optimize_with_client":
+		return `let artifact = optimize_with_client(&mut qa, student.clone(), train, json!({"maxMetricCalls": 100}))?;`
 	case "playbook":
 		return mapTarget(target,
 			`pb = playbook(program, {"studentAI": client})`,
@@ -1807,9 +1998,18 @@ func BuildConformanceCoverageManifest(model AxRuntimeModel, target string) (Conf
 		{"prompt", "template", "", "semantic"},
 		{"prompt", "template_error", "", "validation-error"},
 		{"prompt", "template_validate", "", "semantic"},
+		{"prompt", "number_format", "", "semantic"},
 		{"axgen", "forward", "", "semantic"},
+		{"axgen", "date_field_value", "", "semantic"},
+		{"axgen", "date_input", "", "semantic"},
 		{"axgen", "stream", "", "semantic"},
+		{"axgen", "eval_novel_f1", "", "semantic"},
 		{"axai", "ai_chat", "", "transport-boundary"},
+		{"axai", "ai_responses_validation", "", "semantic"},
+		{"axai", "ai_typesafe_native", "", "transport-boundary"},
+		{"axai", "ai_decisions_native", "", "transport-boundary"},
+		{"axai", "ai_session_events", "", "semantic"},
+		{"axai", "ai_session_state", "", "semantic"},
 		{"axai", "ai_stream", "", "transport-boundary"},
 		{"axai", "ai_embed", "", "transport-boundary"},
 		{"axai", "ai_usage_observer", "", "semantic"},
@@ -1827,6 +2027,7 @@ func BuildConformanceCoverageManifest(model AxRuntimeModel, target string) (Conf
 		{"axai", "ai_error", "", "validation-error"},
 		{"axai", "ai_unsupported", "", "validation-error"},
 		{"axagent", "agent_forward", "", "semantic"},
+		{"axagent", "agent_streaming_forward", "", "semantic"},
 		{"axagent", "agent_runtime_adapter", "", "semantic"},
 		{"axagent", "agent_runtime_policy", "", "semantic"},
 		{"axagent", "agent_runtime_protocol", "", "transport-boundary"},
@@ -1872,8 +2073,11 @@ func BuildConformanceCoverageManifest(model AxRuntimeModel, target string) (Conf
 		{"axmcp", "mcp", "server_requests_legacy", "transport-boundary"},
 		{"axmcp", "mcp", "mrtr_roots", "transport-boundary"},
 		{"axmcp", "mcp", "mrtr_elicitation", "transport-boundary"},
+		{"axmcp", "mcp", "tool_authorization", "transport-boundary"},
+		{"axmcp", "mcp", "tool_task_handling", "transport-boundary"},
 		{"axmcp", "mcp", "mrtr_violations", "semantic"},
 		{"axmcp", "mcp", "subscriptions_listen", "transport-boundary"},
+		{"axmcp", "mcp", "task_listen_restart", "transport-boundary"},
 		{"axmcp", "mcp", "ping", "transport-boundary"},
 		{"axmcp", "mcp", "tools", "semantic"},
 		{"axmcp", "mcp", "prompts_resources", "semantic"},
@@ -2192,9 +2396,13 @@ func packageREADME(model AxRuntimeModel, target string) string {
 		"- AxGen: run structured generation with retries, tool calls, field processors, assertions, traces, usage, and provider-backed output parsing.",
 		"- AxAI: select named deployment profiles independently from model IDs, resolve model-aware structured-output modes, and attach renewable request credentials through one provider boundary.",
 		"- Audio and realtime: `.chat()` accepts `input_audio` content parts, `transcribe()`/`speak()` do batch speech-to-text and text-to-speech, and realtime-capable models stream audio over a WebSocket — transparently through `chat()` or via the productized `realtime_chat()` driver (Go: `RealtimeChat`).",
+		"- Meta Muse: `meta` (Responses), `meta-chat` (Chat Completions), and `meta-messages` (Messages) default to `muse-spark-1.3` with `MODEL_API_KEY`. Muse Image uses chat and `results[].images`; Muse Voice uses batch transcription or realtime streaming chat. Contributor models expose provider-training data-use metadata and are never defaults. Glimmer uses the existing self-hosted profiles; Ax does not manage weights.",
+		"- Jev and OpenAI Decisions: use required boolean/class/rubric score signatures with (evidence) to retain probabilities, native values, optional confidence, and trusted provenance through AxGen. Generative models use the same contract with elicited evidence. Rerank query/document pairs by the continuous rubric score while preserving candidate IDs.",
+		"- Native decision clients: use explicit provider request shapes for advanced criteria, structured state, ordered questions, and provider-specific media. Normal evidence-bearing signatures support scores and answered/refused outcomes without calling these clients directly.",
 		"- AxAgent and RLM: let an agent plan and execute actor-code steps while Ax keeps envelopes, state, logs, traces, context, discovery, recall, and final typed responses aligned.",
 		"- AxFlow: compose AxGen, AxAgent, and nested flows into a portable program graph.",
 		"- Optimizers: save, load, apply, and evaluate optimizer artifacts, including the generated GEPA engine.",
+		"- Evaluation: "+mapTarget(target, "novel_f1_score", "Ax.novelF1Score", "axllm::novel_f1_score", "NovelF1Score", "novel_f1_score")+" scores multiset word overlap after excluding history and stopwords, with matching Unicode normalization and finite empty-input scores.",
 		"",
 		"## Package Shape",
 		"",
@@ -2270,12 +2478,14 @@ func packageReadmeConfigForTarget(target string, network string) packageReadmeCo
 			),
 			NoKeyExamples: readmeLines(
 				"- `python examples/signature_schema.py`: signature parsing and JSON schema generation",
-				"- `python examples/axgen_scripted_client_tool.py`: AxGen with a scripted client and tool",
+				"- `python examples/model_catalog.py`: model catalog, named profiles, thinking levels, and service tiers",
+				"- `python examples/axgen_scripted_client_tool.py`: AxGen with a scripted client, a tool, and a caching function",
 				"- `python examples/provider_mapping_no_key.py`: provider mapping through a scripted transport",
 				"- `python examples/runtime_hooks_no_key.py`: runtime-hook globals and typed program surfaces through a scripted transport",
 				"- `python examples/adaptive_balancer_no_key.py`: adaptive balancer state, scoring, and stable route keys without a provider key",
 				"- `python examples/provider_stream_no_key.py`: provider streaming through a scripted SSE transport",
-				"- `python examples/axflow_program_graph.py`: AxFlow program graph",
+				"- `python examples/cancellation_no_key.py`: one-shot provider cancellation with no transport attempt",
+				"- `python examples/axflow_program_graph.py`: AxFlow program graph and a caching function, whose hits run no node and record no span",
 				"- `python examples/flow_mermaid.py`: portable Mermaid flow parsing and canonical round-trip",
 				"- `python examples/audio_responses_mapping.py`: OpenAI Responses speak/transcribe mapping through a scripted transport",
 				"- `python examples/realtime_audio_events.py`: Grok/Gemini realtime audio setup, input, and event folding",
@@ -2347,12 +2557,15 @@ func packageReadmeConfigForTarget(target string, network string) packageReadmeCo
 			),
 			NoKeyExamples: readmeLines(
 				"- `examples/SignatureSchemaExample.java`: signature parsing and JSON schema generation",
+				"- `examples/ModelCatalogExample.java`: model catalog, named profiles, thinking levels, and service tiers",
 				"- `examples/AxGenScriptedClientToolExample.java`: AxGen with a scripted client and tool",
+				"- `examples/AxGenStreamingNoKeyExample.java`: `streamingForward` deltas with streaming assertions, streaming and feedback field processors, transforms, early close, and cancellation through a scripted streaming client and a scripted OpenAI SSE transport, and `AxCachingFunction` hits, which send no request and record no span or metric, from the constructor, the forward call and `AxGlobals.setCachingFunction`",
 				"- `examples/ProviderMappingNoKeyExample.java`: provider mapping through a scripted transport",
 				"- `examples/RuntimeHooksNoKeyExample.java`: runtime-hook globals and typed program surfaces through a scripted transport",
 				"- `examples/AdaptiveBalancerNoKeyExample.java`: adaptive balancer state, scoring, and stable route keys without a provider key",
 				"- `examples/ProviderStreamNoKeyExample.java`: provider streaming through a scripted SSE transport",
-				"- `examples/AxFlowProgramGraphExample.java`: AxFlow program graph",
+				"- `examples/CancellationNoKeyExample.java`: one-shot provider cancellation with no transport attempt",
+				"- `examples/AxFlowProgramGraphExample.java`: AxFlow program graph and a caching function, whose hits run no node and record no span",
 				"- `examples/FlowMermaidExample.java`: portable Mermaid flow parsing and canonical round-trip",
 				"- `examples/AudioResponsesMappingExample.java`: OpenAI Responses speak/transcribe mapping through a scripted transport",
 				"- `examples/RealtimeAudioEventsExample.java`: Grok/Gemini realtime audio setup, input, and event folding",
@@ -2419,11 +2632,14 @@ func packageReadmeConfigForTarget(target string, network string) packageReadmeCo
 			),
 			NoKeyExamples: readmeLines(
 				"- `examples/signature_schema.cpp`: signature parsing and JSON schema generation",
+				"- `examples/model_catalog.cpp`: model catalog, named profiles, thinking levels, and service tiers",
 				"- `examples/axgen_scripted_client_tool.cpp`: AxGen with a scripted client and tool",
+				"- `examples/axgen_streaming_no_key.cpp`: `streaming_forward` field deltas with a streaming assertion, feedback, streaming and transform field processors, stopping, cancellation, and run control through a scripted SSE transport, and `AxCachingFunction` hits from the generator, a per-call `caching_function` handle and `set_caching_function`",
 				"- `examples/provider_mapping_no_key.cpp`: provider mapping through a scripted transport",
 				"- `examples/runtime_hooks_no_key.cpp`: runtime-hook globals and typed program surfaces through a scripted transport",
 				"- `examples/adaptive_balancer_no_key.cpp`: adaptive balancer state, scoring, and stable route keys without a provider key",
 				"- `examples/provider_stream_no_key.cpp`: provider streaming through a scripted SSE transport",
+				"- `examples/cancellation_no_key.cpp`: one-shot provider cancellation with no transport attempt",
 				"- `examples/axflow_program_graph.cpp`: AxFlow program graph",
 				"- `examples/flow_mermaid.cpp`: portable Mermaid flow parsing and canonical round-trip",
 				"- `examples/audio_responses_mapping.cpp`: OpenAI Responses speak/transcribe mapping through a scripted transport",
@@ -2488,12 +2704,14 @@ func packageReadmeConfigForTarget(target string, network string) packageReadmeCo
 			),
 			NoKeyExamples: readmeLines(
 				"- `go run ./examples/signature_schema`: signature parsing and JSON schema generation",
+				"- `go run ./examples/model_catalog`: model catalog, named profiles, thinking levels, and service tiers",
 				"- `go run ./examples/axgen_scripted_client_tool`: AxGen with a scripted client and tool",
 				"- `go run ./examples/provider_mapping_no_key`: provider mapping through a scripted transport",
 				"- `go run ./examples/runtime_hooks_no_key`: runtime-hook globals and typed program surfaces through a scripted transport",
 				"- `go run ./examples/vertex_gemma_maas_no_key`: Vertex Gemma MaaS JSON-object, thinking, reasoning replay, and renewable-header mapping through a scripted transport",
 				"- `go run ./examples/adaptive_balancer_no_key`: adaptive balancer state, scoring, and stable route keys without a provider key",
 				"- `go run ./examples/provider_stream_no_key`: provider streaming through a scripted SSE transport",
+				"- `go run ./examples/cancellation_no_key`: context cancellation with no transport attempt",
 				"- `go run ./examples/axflow_program_graph`: AxFlow program graph",
 				"- `go run ./examples/flow_mermaid`: portable Mermaid flow parsing and canonical round-trip",
 				"- `go run ./examples/audio_responses_mapping`: OpenAI Responses speak/transcribe mapping through a scripted transport",
@@ -2566,12 +2784,15 @@ func packageReadmeConfigForTarget(target string, network string) packageReadmeCo
 			),
 			NoKeyExamples: readmeLines(
 				"- `cargo run --example signature_schema`: signature parsing and JSON schema generation",
+				"- `cargo run --example model_catalog`: model catalog, named profiles, thinking levels, and service tiers",
 				"- `cargo run --example provider_mapping_no_key`: provider mapping through a scripted transport",
 				"- `cargo run --example runtime_hooks_no_key`: runtime-hook globals and typed program surfaces through a scripted transport",
 				"- `cargo run --example adaptive_balancer_no_key`: adaptive balancer state, scoring, and stable route keys without a provider key",
 				"- `cargo run --example provider_stream_no_key`: provider streaming through a scripted SSE transport",
+				"- `cargo run --example cancellation_no_key`: one-shot provider cancellation with no transport attempt",
 				"- `cargo run --example axgen_scripted_client_tool`: AxGen with a scripted client and tool",
-				"- `cargo run --example axflow_program_graph`: AxFlow program graph",
+				"- `cargo run --example axgen_streaming_no_key`: `streaming_forward` field deltas, streaming assertions, field processor feedback, field transforms, and `AxFlow::streaming_forward` through a scripted streaming client",
+				"- `cargo run --example axflow_program_graph`: AxFlow program graph and a caching function, whose hits run no node and record no span",
 				"- `cargo run --example flow_mermaid`: portable Mermaid flow parsing and canonical round-trip",
 				"- `cargo run --example audio_responses_mapping`: OpenAI Responses speak/transcribe mapping through a scripted transport",
 				"- `cargo run --example realtime_audio_events`: Grok/Gemini realtime audio setup, input, and event folding",
@@ -2618,4 +2839,13 @@ func packageReadmeConfigForTarget(target string, network string) packageReadmeCo
 
 func readmeLines(lines ...string) string {
 	return strings.Join(lines, "\n")
+}
+
+func renderRuntimeHostNamespaces(template string, quoteString func(string) string) string {
+	template = strings.ReplaceAll(template, "{{AX_HOST_NAMESPACES_RAW}}", runtimeHostNamespaces)
+	template = strings.ReplaceAll(template, "{{AX_HOST_NAMESPACES_QUOTED}}", quoteString(runtimeHostNamespaces))
+	// The JS runtimes' shared support (scripts/axir-runtime-support.mjs):
+	// TypeScript's action-log code analysis and snapshot entries.
+	template = strings.ReplaceAll(template, "{{AX_RUNTIME_SUPPORT_RAW}}", runtimeSupport)
+	return strings.ReplaceAll(template, "{{AX_RUNTIME_SUPPORT_QUOTED}}", quoteString(runtimeSupport))
 }

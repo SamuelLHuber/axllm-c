@@ -1,7 +1,7 @@
 ---
 name: "ax-python-agent-rlm"
 description: "Use when writing Python code with `axllm` for RLM executor loops, AxCodeRuntime sessions, runtime envelopes, process runtimes, and optional runtime profiles."
-version: "24.0.14"
+version: "25.4.9"
 ---
 # AxAgent RLM Runtime For Python
 
@@ -35,7 +35,7 @@ out = helper.forward(llm, {"question": "How should I proceed?"})
 
 ## Relevant API Surface
 
-- Agents And RLM: `agent`, `AxAgent`
+- Agents And RLM: `agent`, `AxAgent`, `AxAgent.add_child_agent`, `AxAgent.streaming_forward`
 - Runtime Profiles: `ProcessCodeRuntime`, `RuntimeCapabilities`, `RuntimeEnvelope`, `javascript-quickjs`, `python-pyodide`
 
 ## Guardrails

@@ -1,6 +1,10 @@
 import type { AxAIServiceOptions } from '../types.js';
 import type { AxAIOpenAIChatRequest } from './chat_types.js';
-import { axIsGPT56Family } from './model_family.js';
+import {
+  axIsGPT6Family,
+  axIsGPT56Family,
+  axRequiresOpenAIReasoning,
+} from './model_family.js';
 import type { AxAIOpenAIResponsesRequest } from './responses_types.js';
 
 /**
@@ -87,12 +91,32 @@ const LEGACY_LADDER: EffortLadder<AxAIOpenAIChatReasoningEffort> = {
 };
 
 /**
- * GPT-5.6 defaults an omitted effort to `medium`, so disabling reasoning
- * requires an explicit `none`. Every other model and OpenAI-compatible provider
- * keeps the historical omission.
+ * GPT-5.6 and GPT-6 default an omitted effort to `medium`, so disabling
+ * reasoning requires an explicit `none`. Every other model and
+ * OpenAI-compatible provider keeps the historical omission. (Astra and
+ * GPT-6.1 Sol refuse `none` outright; the resolvers below throw before
+ * reaching here.)
  */
 function resolveNone(model: unknown): 'none' | undefined {
-  return axIsGPT56Family(model) ? 'none' : undefined;
+  return usesGPT56Ladder(model) ? 'none' : undefined;
+}
+
+/**
+ * GPT-6 kept GPT-5.6's effort vocabulary on both surfaces — Chat Completions
+ * still refuses `minimal` and `max`, Responses still serves `max` — so the
+ * whole family shares the 5.6 ladders.
+ */
+function usesGPT56Ladder(model: unknown): boolean {
+  return axIsGPT56Family(model) || axIsGPT6Family(model);
+}
+
+/** Throws for a model that refuses `reasoning_effort: none`. */
+function assertCanDisableReasoning(model: unknown): void {
+  if (axRequiresOpenAIReasoning(model)) {
+    throw new Error(
+      `${String(model)} does not support disabling reasoning; use low or higher`
+    );
+  }
 }
 
 /**
@@ -104,9 +128,10 @@ export function axResolveOpenAIChatReasoningEffort(
   budget: ThinkingTokenBudget
 ): AxAIOpenAIChatReasoningEffort | undefined {
   if (budget === 'none') {
+    assertCanDisableReasoning(model);
     return resolveNone(model);
   }
-  return axIsGPT56Family(model)
+  return usesGPT56Ladder(model)
     ? GPT56_CHAT_LADDER[budget]
     : LEGACY_LADDER[budget];
 }
@@ -121,9 +146,10 @@ export function axResolveOpenAIResponsesReasoningEffort(
   budget: ThinkingTokenBudget
 ): AxAIOpenAIResponsesReasoningEffort | undefined {
   if (budget === 'none') {
+    assertCanDisableReasoning(model);
     return resolveNone(model);
   }
-  return axIsGPT56Family(model)
+  return usesGPT56Ladder(model)
     ? GPT56_RESPONSES_LADDER[budget]
     : LEGACY_LADDER[budget];
 }

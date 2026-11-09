@@ -56,6 +56,8 @@ const allowedTransports = new Set([
   'anthropic-messages',
   'gemini-generate-content',
   'webllm',
+  'typesafe-system-one',
+  'openai-decisions',
 ]);
 const allowedDialects = new Set([
   ...allowedTransports,
@@ -65,17 +67,15 @@ const allowedDialects = new Set([
   'openai-speech',
   'openai-transcription',
   'mistral-speech',
+  'meta-realtime',
+  'meta-transcription',
   'xai-realtime',
   'xai-speech',
   'xai-transcription',
 ]);
-const allowedAuth = new Set([
-  'bearer',
-  'api-key-header',
-  'api-key-query',
-  'x-api-key',
-  'none',
-]);
+// 'api-key-query' is not allowed: it would put the API key in request URLs,
+// which end up in errors and logs. No port implements it.
+const allowedAuth = new Set(['bearer', 'api-key-header', 'x-api-key', 'none']);
 const ruleRank = { exact: 0, prefix: 1, contains: 2 };
 const allowedStructuredOutputModes = new Set([
   'native',
@@ -85,6 +85,7 @@ const allowedStructuredOutputModes = new Set([
 const allowedRequestRuleKeys = new Set([
   'reasoning',
   'toolChoice',
+  'functionToolsRequireEffort',
   'defaultThinkingLevel',
   'effortMap',
   'unsupportedThinkingLevels',
@@ -150,9 +151,17 @@ const validateRequestRules = (rules, context) => {
   }
   if (
     rules.toolChoice &&
-    !['supported', 'unforced'].includes(rules.toolChoice)
+    !['supported', 'unforced', 'no-named'].includes(rules.toolChoice)
   ) {
     throw new Error(`${context} has invalid tool choice rule`);
+  }
+  if (
+    rules.functionToolsRequireEffort !== undefined &&
+    rules.functionToolsRequireEffort !== 'none'
+  ) {
+    throw new Error(
+      `${context} has invalid function tool reasoning requirement`
+    );
   }
   if (
     rules.defaultThinkingLevel &&
@@ -257,7 +266,12 @@ for (const [id, profile] of Object.entries(resolvedProfiles)) {
   if (!allowedTransports.has(profile.transport))
     throw new Error(`profile ${id} has invalid transport ${profile.transport}`);
   if (!allowedAuth.has(profile.auth?.type))
-    throw new Error(`profile ${id} has invalid auth type`);
+    throw new Error(
+      `profile ${id} has invalid auth type ${profile.auth?.type}` +
+        (profile.auth?.type === 'api-key-query'
+          ? ': query-key auth puts the API key in request URLs'
+          : '')
+    );
   if (profile.auth.type === 'none' && profile.auth.required)
     throw new Error(`profile ${id} cannot require no authentication`);
   if (profile.auth.type === 'api-key-header' && !profile.auth.header)
@@ -349,6 +363,8 @@ const transportClient = {
   'anthropic-messages': 'AnthropicClient',
   'gemini-generate-content': 'GoogleGeminiClient',
   webllm: null,
+  'typesafe-system-one': 'AxAITypesafeClient',
+  'openai-decisions': 'AxAIOpenAIDecisionsClient',
 };
 const registry = {
   registryVersion: source.schemaVersion,
@@ -362,7 +378,7 @@ const registry = {
         transport: profile.transport,
         generatedClient: transportClient[profile.transport],
         catalogStatus:
-          profile.transport === 'webllm'
+          transportClient[profile.transport] === null
             ? 'typescript-only'
             : 'descriptor-covered',
       },
@@ -370,15 +386,20 @@ const registry = {
   ),
   deferredCatalogProviderIds: [],
 };
-const operationDescriptor = (name, operation) => ({
-  ...operation,
-  method: name === 'realtime' ? 'WS' : 'POST',
-  path: operation.path,
-  body: name === 'transcribe' ? 'multipart' : 'json',
-  stream: name === 'stream_chat' || name === 'realtime',
-  ...(name === 'speak' ? { response: 'binary' } : {}),
-  dialect: operation.dialect,
-});
+const operationDescriptor = (name, operation) => {
+  // Transcription uploads are multipart and speech responses binary unless the
+  // profile says otherwise, as Gemini's JSON generateContent endpoints do.
+  const response = operation.response ?? (name === 'speak' ? 'binary' : null);
+  return {
+    ...operation,
+    method: name === 'realtime' ? 'WS' : 'POST',
+    path: operation.path,
+    body: operation.body ?? (name === 'transcribe' ? 'multipart' : 'json'),
+    stream: name === 'stream_chat' || name === 'realtime',
+    ...(response ? { response } : {}),
+    dialect: operation.dialect,
+  };
+};
 const descriptors = Object.fromEntries(
   Object.entries(resolvedProfiles).map(([id, profile]) => {
     const operations = Object.fromEntries(
@@ -387,7 +408,11 @@ const descriptors = Object.fromEntries(
         operationDescriptor(name, operation),
       ])
     );
-    if (operations.chat && !operations.stream_chat) {
+    if (
+      operations.chat &&
+      !operations.stream_chat &&
+      profile.capabilities.streaming
+    ) {
       operations.stream_chat = {
         ...operations.chat,
         stream: true,
@@ -396,9 +421,7 @@ const descriptors = Object.fromEntries(
     const authType =
       profile.auth.type === 'api-key-header'
         ? 'api_key_header'
-        : profile.auth.type === 'api-key-query'
-          ? 'api_key_query'
-          : profile.auth.type;
+        : profile.auth.type;
     return [
       id,
       {
@@ -408,9 +431,6 @@ const descriptors = Object.fromEntries(
         auth: authType,
         authRequired: profile.auth.required,
         ...(profile.auth.header ? { apiKeyHeader: profile.auth.header } : {}),
-        ...(profile.auth.type === 'api-key-query'
-          ? { apiKeyQuery: profile.auth.query ?? 'key' }
-          : {}),
         ...(profile.endpoint?.apiVersionField
           ? {
               apiVersion:
@@ -428,6 +448,9 @@ const descriptors = Object.fromEntries(
           streaming: profile.capabilities.streaming,
           structured_outputs: profile.capabilities.structuredOutputs,
           structured_output_modes: profile.capabilities.structuredOutputModes,
+          ...(profile.capabilities.requiresStructuredOutput
+            ? { requires_structured_output: true }
+            : {}),
           thinking: profile.capabilities.thinking,
           multi_turn: profile.capabilities.multiTurn,
           service_tiers: profile.capabilities.serviceTiers ?? [],
@@ -501,8 +524,13 @@ const modelRuleCaveat = (rule) => {
   if (rule.request?.defaultThinkingLevel) {
     details.push(`default thinking \`${rule.request.defaultThinkingLevel}\``);
   }
+  if (rule.request?.functionToolsRequireEffort) {
+    details.push('function tools require disabled reasoning');
+  }
   if (rule.request?.toolChoice === 'unforced') {
     details.push('no forced tool choice');
+  } else if (rule.request?.toolChoice === 'no-named') {
+    details.push('no explicitly named tool choice');
   }
   return details.length ? `${selector}: ${details.join(', ')}` : selector;
 };

@@ -33,6 +33,32 @@ console.log(result.sentiment); // "positive" ✨
 **That's it.** No prompt engineering. No trial and error. It works with GPT-4,
 Claude, Gemini, or any LLM.
 
+## Decision Evidence and Reranking
+
+Use Jev or OpenAI Decisions through normal Ax signatures and AxGen. Add
+`(evidence)` or fluent `.withEvidence()` to boolean/class fields, and declare
+ordered rubric scores with `score`. Native probabilities, selected values,
+continuous scores, and optional confidence stay in the result; Ax attaches
+provider/model provenance. Generative models use the same signature with
+estimates marked `elicited`, without native confidence. Shared result shapes
+do not imply comparable confidence calibration across models.
+
+```typescript
+const judge = ax(
+  'query:string, document:string -> relevant:boolean(evidence, threshold 0.7), relevance:score "Irrelevant, Related, Partial answer, Direct answer"(evidence)',
+);
+const decisions = ai({ name: 'openai-decisions', apiKey: process.env.OPENAI_APIKEY! });
+const result = await judge.forward(decisions, {
+  query: 'How do I request a refund?',
+  document: 'Request a refund through your account billing page.',
+});
+console.log(result.relevance.value, result.relevant.probability);
+```
+
+For reranking, keep candidate IDs in application code and sort results by
+`relevance.value`. See [signatures and decision evidence](https://axllm.dev/typescript/concepts/signatures/)
+for thresholds, result shapes, and refusal handling.
+
 ## Why Thousands of Developers Choose Ax
 
 ### 🎯 **Define Once, Run Anywhere**
@@ -130,6 +156,35 @@ const analyzer = ax(`
 ```bash
 npm install @ax-llm/ax
 ```
+
+Outside CI, installation sets up one Claude Code skill, `ax-llm`, with a compact
+index and bundled guides your agent reads as needed. To disable future automatic
+setup, run `npx @ax-llm/ax skills-auto-install off` from your project root. This
+saves `ax.skills.autoInstall: false` in your project's `package.json`; commit
+that setting to share it with your team. Use `skills-auto-install on` to re-enable
+automatic setup on future installs. Set `AX_SKIP_SKILL_INSTALL=1` to skip setup
+for a single installation; CI and this environment variable take precedence over
+the saved setting.
+
+You can also set the preference before installing Ax for the first time:
+
+```json
+{
+  "ax": {
+    "skills": {
+      "autoInstall": false
+    }
+  }
+}
+```
+
+Merge this field into your existing `package.json`. Manual
+`npx @ax-llm/ax setup-claude` works even when automatic setup is disabled;
+add `--all` to register every specialist or `--skill ax-ai` to install only one.
+Changing the preference leaves installed skills in place, and manual setup or
+removal preserves the saved preference.
+Existing specialists remain installed; use `remove-claude` followed by
+`setup-claude` to switch an older full installation to the compact bundle.
 
 ### Your First AI Feature (2 minutes)
 

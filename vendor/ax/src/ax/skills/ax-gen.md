@@ -46,7 +46,7 @@ const gen3 = ax('input -> output', {
   description: 'A helpful assistant',
   maxRetries: 3,
   maxSteps: 10,
-  temperature: 0.7,
+  modelConfig: { temperature: 0.7 },
 });
 
 const result = await gen.forward(llm, { input: 'Hello world' });
@@ -160,6 +160,11 @@ for await (const chunk of stream) {
 }
 ```
 
+- Each chunk is `{ version, index, delta }`. Merge deltas per `index` (strings and arrays append, other values replace), and discard what you merged when `version` changes.
+- A new version starts on a validation or refusal retry, and when a later step replaces output an earlier step already emitted (for example after a field processor's feedback); the thought so far is re-emitted in the new version. Versions never decrease.
+- In TypeScript, partial JSON repair preserves string text such as `, t`, `, n`, trailing punctuation, and commas before brackets inside strings. Structural repair applies outside strings so these fragments do not change into literals or repeat in merged deltas.
+- A streamed `code` field drops its fences wherever the chunks split: a fence that may still be incomplete is held back, as a partial label is, so the merged deltas equal the non-streaming value.
+
 ## Stopping And Cancellation
 
 ```typescript
@@ -218,7 +223,7 @@ gen.addStreamingAssert(
 Rules:
 
 - Schema validation retries with parser/constraint feedback.
-- `addAssert(...)` checks the complete parsed output after validation/processors and retries with correction feedback on failure.
+- `addAssert(...)` checks the complete parsed output after validation/processors and retries with correction feedback on failure. Assertions and field processors run on the step that answers, not on a step that calls tools.
 - `bestOfN(...)` scores complete candidates and returns the highest reward or first threshold hit.
 - `refine(...)` runs rounds and can feed reward-derived advice into instruction components between rounds.
 - `addStreamingAssert(...)` targets a string/code output field and receives partial text so far.
@@ -227,23 +232,32 @@ Rules:
 ## Field Processors
 
 ```typescript
-// Post-processing after generation
-gen.addFieldProcessor('summary', (value, context) => value.toUpperCase());
+// Runs once the field is complete; a returned string is feedback for
+// another step.
+gen.addFieldProcessor('summary', (value) =>
+  String(value).length > 200 ? 'Keep the summary under 200 characters.' : null
+);
 
-// Streaming field processor (called on each chunk)
-gen.addStreamingFieldProcessor('content', (partialValue, context) => {
-  console.log(`Received ${partialValue.length} chars`);
-  return partialValue;
-});
+// Runs on each streamed chunk of the field.
+gen.addStreamingFieldProcessor('content', (partialValue) =>
+  String(partialValue).includes('TODO') ? 'Finish every section.' : null
+);
 ```
 
 Rules:
 
 - `addFieldProcessor` runs once after the field is fully generated.
 - `addStreamingFieldProcessor` runs on each streaming chunk for the target field.
-- Both must return the (possibly transformed) value.
+- A processor's result is feedback, not a new field value. Unless it is `undefined`, `null`, `''` or the text `"null"` or `"undefined"`, it goes back to the model as a user message with one text part, and the run takes another step whose answer replaces the earlier one.
+- A streaming processor's feedback waits for the end of the step: it follows the full answer and comes before the final processors' feedback.
+- A streamed delta never ends in half of a surrogate pair; a trailing high surrogate waits for its low half.
 
 ## Function Calling
+
+An unregistered tool name is answered with an error result for that call alone,
+including the available names. Other calls in the batch still run. The error
+text bypasses the result formatter; the model can choose a registered tool on
+its next step. This applies to both `forward()` and `streamingForward()`.
 
 ```typescript
 const result = await gen.forward(llm, { question: '...' }, {
@@ -255,8 +269,11 @@ const result = await gen.forward(llm, { question: '...' }, {
 
 Rules:
 
-- `functionCallMode` can be `'auto'`, `'none'`, or a specific function name to force.
+- `functionCallMode` selects how tools reach the model: `'auto'` (default), `'native'`, or `'prompt'` (prompt-based emulation).
+- `functionCall` sets the tool choice: `'auto'`, `'none'`, `'required'`, or `{ type: 'function', function: { name: 'search' } }` to force one function.
+- A forced call (`'required'` or a named function) applies to the first step only. Later steps drop it together with the tools so the model can answer. With the `function` structured-output rung, `__axOutput` is left out of the forced step, so the forcing reaches a user tool.
 - `stopFunction` accepts a string or string[] to halt multi-step on specific function calls.
+- A stop function ends the run without an answer; the output keeps the thought of every step, the stop step's included, streamed or not.
 - Multi-step continues until all outputs filled, stop function called, or `maxSteps` reached.
 
 ## Caching
@@ -285,12 +302,29 @@ const result = await gen.forward(llm, { question: '...' }, {
 
 Rules:
 
-- `cachingFunction` acts as a get/set: called with `(key)` to read, `(key, value)` to write.
+- `cachingFunction` acts as a get/set: called with `(key)` to read, `(key, value)` to write. `forward` and `streamingForward` both store the finished result, with or without a result picker.
 - `contextCache` enables AI provider-level prompt caching for long context.
 - Provider-facing forward options are merged with constructor defaults before
   the chat call. This includes `promptCacheKey`, `sessionId`, and
   `contextCache` in TypeScript and every generated language package; per-call
   values take precedence.
+- Forward options given to the `AxGen` constructor are defaults for every call,
+  and a value the call gives wins. This covers `model`, `modelConfig`,
+  `sampleCount`, `showThoughts`, `thinkingTokenBudget`, `stepHooks`,
+  `onFunctionCall`, `disableMemoryCleanup`, `selfTuning`, `asyncMode`,
+  `resultPicker` and `strictMode`, as well as the options that always had a
+  fallback, such as `maxRetries` and `maxSteps`. It also covers:
+  - the run options `control`, `stream`, `sessionId`, `abortSignal`,
+    `timeout`, `fetch`, `webSocket`, `traceContext`, `executionPath`,
+    `eventContext` and `speech`;
+  - the service options `serviceTier`, `verbose`, `beta`, `corsProxy`,
+    `includeRequestBodyInErrors`, `promptCacheRetention` and
+    `excludeContentFromTrace`, which reach the provider's chat call.
+
+  `modelConfig` and `customLabels` merge key by key: the constructor's
+  `{ temperature: 0.2 }` with the call's `{ maxTokens: 500 }` sends both.
+- A run `control` given to the constructor applies to every forward of that
+  `AxGen` and, like a call's control, skips the cache.
 
 ## Sampling And Result Picker
 
@@ -329,6 +363,18 @@ Rules:
 
 ## Structured Outputs
 
+In TypeScript, providers advertising `requiresStructuredOutput` (such as
+Typesafe) automatically receive a schema for scalar-only signatures too.
+Ax renders JSON instructions/examples and parses the resulting object without
+changing the program's signature. Typesafe and OpenAI Decisions accept required
+boolean, class, and ordered rubric score outputs. Add `(evidence)` or
+`.withEvidence()` to retain probabilities and native values in AxGen. Boolean/class
+value descriptions map to native criteria, while conventional providers receive
+readable descriptions in prompts and schemas. See the
+[ax-typesafe skill](https://github.com/ax-llm/ax/blob/main/src/ax/skills/ax-typesafe.md)
+for native questions, thresholds, and hybrid text generation. Providers that disable both native functions and
+`functionEmulation` reject tool-bearing programs before prompt rendering.
+
 ```typescript
 const sig = f()
   .input('text', f.string())
@@ -345,14 +391,18 @@ Rules:
 - `structuredOutputMode: 'auto'` follows the selected profile/model's ordered `structuredOutputModes` capability list. Exact caller `modelInfo` overrides win over profile model rules and defaults.
 - Without native schema support, one required non-array `string` or `code` output can use `json_object` plus an exact-shape prompt, client-side validation, and bounded correction retries. This optimized path is provider-neutral and does not require provider-visible tools.
 - Richer shapes use the first advertised rung. A `json_object` selection sends no synthetic `__axOutput`; Ax keeps the exact-shape prompt, strict parsing, and correction retry.
+- Declared tools and a forced `functionCall` do not change the rung `auto` picks, for any provider. To answer through `__axOutput` beside tools, opt in with `structuredOutputMode: 'function'`.
 - Ax advertises only `__axOutput`. It accepts legacy inbound `__finalResult` calls so stored trajectories remain replayable, and rejects user functions that collide with either reserved name.
 - Use `structuredOutputMode: 'native'` to require native schema enforcement; Ax reports an error instead of silently weakening that requirement.
 - Use `structuredOutputMode: 'function'` to require the function-argument path; Ax reports an error before sending a request when function calling is unavailable.
+- Meta profiles require the sole Ax output tool with an unnamed choice; this does not enable unsupported caller-named tool choices.
 - Use `structuredOutputMode: 'json_object'` to require JSON object mode for rich or singleton output; Ax reports an error before transport when the selected profile/model has not verified it.
 - Direct `json_schema` and `json_object` chat requests validate their corresponding capabilities independently. `structuredOutputs` remains the compatibility alias for native JSON Schema only.
 - Chat-log provenance records the selected path at `providerMetadata.ax.structured_output_rung` (`native`, `function`, or `json_object`).
 - Native structured-output schemas list every object property in `required`, set `additionalProperties: false` on objects, and express optional fields as nullable types.
 - Flexible `json` fields and unshaped `object` fields are sent as JSON-encoded strings for native structured outputs, then parsed back into normal JavaScript values.
+- Structured JSON values must have their declared types. As in the text contract, a numeric string becomes a number and `"true"`/`"false"` a boolean; any other mismatch (a number for a string, a string for an array, a value outside a class's options) is a validation error with a correction retry.
+- Streaming programs reject error and token-limit terminal results even when the final chunk has no content and earlier chunks already form valid output.
 
 ## Step Hooks
 
@@ -438,7 +488,11 @@ try {
 Rules:
 
 - `AxGenerateError` includes `details` with `model` and `signature` for debugging.
+- A failed forward throws `AxGenerateError` with the message `Generate failed: <reason>` and the error it wraps as its `cause`. Exhausted validation, assertion or refusal retries give `Generate failed: Unable to fix validation error: <last error>`, ending with `LLM Output:` and the last attempt's answer (each sample's, joined with `---`). A response cut off at its token limit gives `Generate failed: Max tokens reached before completion`, streamed or not.
+- A refusal retry sends the request again without the refused turn, even when the refusal arrived mid-stream after content was already streamed, so the retried request ends on the same user or function-result message.
+- Errors are wrapped by type: a `ValidationError` or `AxAssertionError` outside the retries surfaces as it is, and any other failure is wrapped, whatever its message says.
 - `AxAIServiceAbortedError` is thrown on cancellation via `stop()` or `abortSignal`.
+- `strictMode: true`, given to the constructor or to the call (the call wins), requires an answer to open with its first required field's label: an unlabeled answer is retried with a correction instead of being read as a single-field answer.
 
 ## Chat Log and Usage
 
@@ -561,3 +615,37 @@ first model call; mapper exceptions become non-retryable
 - Do not use streaming assertions as reward/refine mechanisms; they enforce hard partial-output invariants and retry with correction.
 - Do not mutate step hook context expecting immediate effect; mutations are pending until the next step.
 - Do not assume multi-step stops after one LLM call; it continues until outputs are filled, a stop function fires, or `maxSteps` is reached.
+
+## Automatic sessions (TypeScript)
+
+Declare independent host tools with `.execution('background')`. AxGen automatically uses supported async sessions, submits results, and validates the final answer after pending work. Use `asyncMode: 'off'` for the ordinary loop. Attach `runControl()` through `{ control }` for steering, reasoning updates, and cancellation. Streamed session output is provisional until the run completes. Each session response streams like a plain stream of the same chunks, and a later response (after tool results) or a correction starts a new version. Reset accumulated output when its `version` changes; the final output still passes assertions and field validation. Streaming assertions run before provisional text is emitted, and their correction's prompt keeps the partial answer, as in a plain stream. An assertion may trigger a correction before tools start; after host work starts, a mid-stream assertion fails the run without replaying that work.
+
+For automatic tool runs and controller-attached runs, routers and balancers resolve a provider before execution and pin it for the run. Mixed balancers use sessions only when the selected provider supports them. Providers implementing only `.chat()` continue through the ordinary loop.
+
+Generated-language status: C++ session tools with raw JSON schemas validate
+required properties and argument types before their handlers start. Invalid
+arguments enter the correction loop; exhausting the step limit fails the run.
+This does not establish support for every JSON Schema constraint. Generated
+session parity remains open; see `docs/COMPILER.md`.
+
+## Decision model outputs
+
+Use boolean/class `.withEvidence()` or a rubric `f.score(levels).withEvidence()`
+to retain probabilities and native confidence through `forward()`. String equivalents
+are `boolean(evidence)` and `score "Low, Medium, High"(evidence)`. See
+[decision evidence](ax-typesafe.md#decision-evidence-and-reranking) for result shapes,
+provenance, refusal policy, and reranking. These are normal program outputs;
+processors, assertions, result selection, traces, and caches receive decoded evidence.
+
+## Novel F1 evaluation
+
+`AxEvalUtil.novelF1ScoreOptimized(history, prediction, groundTruth, returnRecall)`
+normalizes text, excludes stopwords and history tokens, and measures multiset
+word overlap. Repeated words count at most as often as they occur in the ground
+truth. The default returns F1; `returnRecall: true` returns recall. Two empty
+filtered inputs score `1`; a single empty filtered input scores `0`.
+
+Generated Python, C++, and Rust expose `novel_f1_score`; Go exposes
+`NovelF1Score`; Java exposes `Ax.novelF1Score`. They share the same Core metric,
+including Unicode normalization and finite empty-input scores. The optimization
+examples show scoring a rationale returned by a real provider.

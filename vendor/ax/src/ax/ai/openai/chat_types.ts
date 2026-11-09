@@ -13,8 +13,12 @@ export enum AxAIOpenAIModel {
   GPTAudio15 = 'gpt-audio-1.5',
   GPTRealtime15 = 'gpt-realtime-1.5',
   GPTRealtime2 = 'gpt-realtime-2',
+  GPTRealtime21 = 'gpt-realtime-2.1',
+  GPTRealtime21Mini = 'gpt-realtime-2.1-mini',
   GPTRealtimeWhisper = 'gpt-realtime-whisper',
   GPTRealtimeTranslate = 'gpt-realtime-translate',
+  // Speech-to-text for `transcribe()` (billed per minute of audio).
+  GPTTranscribe = 'gpt-transcribe',
   GPT4ChatGPT4O = 'chatgpt-4o-latest',
   GPT4Turbo = 'gpt-4-turbo',
   GPT35Turbo = 'gpt-3.5-turbo',
@@ -51,6 +55,11 @@ export enum AxAIOpenAIModel {
   GPT56Sol = 'gpt-5.6-sol',
   GPT56Terra = 'gpt-5.6-terra',
   GPT56Luna = 'gpt-5.6-luna',
+  // GPT-6 models
+  GPT6Astra = 'gpt-6-astra',
+  GPT6Sol = 'gpt-6-sol',
+  GPT6Luna = 'gpt-6-luna',
+  GPT61Sol = 'gpt-6.1-sol',
   // Reasoning models
   O1 = 'o1',
   O1Mini = 'o1-mini',
@@ -155,7 +164,11 @@ export type AxAIOpenAIChatContentPart = (
     }
   | {
       type: 'image_url';
-      image_url: { url: string; details?: 'high' | 'low' | 'auto' };
+      image_url: {
+        url: string;
+        detail?: 'high' | 'low' | 'auto';
+        details?: 'high' | 'low' | 'auto';
+      };
     }
   | {
       type: 'input_audio';
@@ -170,9 +183,14 @@ export type AxAIOpenAIChatContentPart = (
   | {
       type: 'file';
       file: {
-        file_data: string;
-        filename: string;
+        file_data?: string;
+        file_url?: string;
+        filename?: string;
       };
+    }
+  | {
+      type: 'video_url';
+      video_url: { url: string };
     }
 ) & {
   prompt_cache_breakpoint?: AxAIOpenAIPromptCacheBreakpoint;
@@ -210,7 +228,7 @@ export type AxAIOpenAIChatRequest<TModel> = {
    * `implicit` (the default) also places a breakpoint at the newest user or tool
    * message; `explicit` uses only caller-provided breakpoints.
    */
-  prompt_cache_options?: { mode?: 'implicit' | 'explicit' };
+  prompt_cache_options?: { mode?: 'implicit' | 'explicit'; ttl?: '30m' };
   store?: boolean;
   modalities?: readonly ('text' | 'audio')[];
   audio?: {

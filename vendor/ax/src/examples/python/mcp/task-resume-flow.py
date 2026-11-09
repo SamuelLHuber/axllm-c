@@ -21,7 +21,7 @@ from axllm import (
     AxMCPEventSource,
     AxMCPStreamableHTTPTransport,
     AxPushEventSource,
-    OpenAICompatibleClient,
+    ai,
     ax,
     flow,
 )
@@ -48,7 +48,7 @@ mcp = AxMCPEventSource(
     client, "inventory", identity_scope="tenant:demo", trust="authenticated"
 )
 started = AxPushEventSource("task-started")
-llm = OpenAICompatibleClient(api_key=api_key, model="gpt-5.4-mini")
+llm = ai("openai", api_key=api_key, model="gpt-5.4-mini")
 step = ax("taskId:string -> status:string")
 program = (
     flow({"id": "reindex-flow"}).execute("status", step).returns({"status": "status"})
@@ -60,6 +60,7 @@ calls = 0
 def invoke(input, _context):
     global calls
     output = program.forward(llm, input)
+    assert output.get("status"), output
     calls += 1
     print(output)
     if calls >= 2:
@@ -91,7 +92,12 @@ runtime = AxEventRuntime(
     {"targets": [target], "sources": [started, mcp]},
 )
 runtime.start()
-task_id = client.call_tool("start_reindex", {"scope": "all"})["task"]["taskId"]
+# A modern server answers with a task; a legacy server returns it inside a
+# complete result.
+outcome = client.call_tool_outcome("start_reindex", {"scope": "all"})
+task = outcome["task"] if outcome["kind"] == "task" else outcome["result"].get("task")
+assert task is not None, "start_reindex did not start an MCP task"
+task_id = task["taskId"]
 target.waitFor[0]["metadata"] = {"taskId": task_id}
 started.publish(
     AxEventEnvelope(

@@ -1,4 +1,5 @@
 import { assertAssertions } from '../asserts.js';
+import { decodeDecisionValues, hasDecisionFields } from '../decision.js';
 import { ValidationError } from '../errors.js';
 import { extractValues } from '../extract.js';
 import { processFieldProcessors } from '../fieldProcessor.js';
@@ -40,6 +41,8 @@ export async function* processResponse<OUT extends AxGenOut>({
   onFunctionCall,
   mcpExecutionContext,
   eventContext,
+  control,
+  executionPath,
 }: ProcessResponseBaseArgs): AsyncGenDeltaOut<OUT> {
   const results = res.results ?? [];
   const treatAllFieldsOptional = signatureToolCallingManager !== undefined;
@@ -56,6 +59,14 @@ export async function* processResponse<OUT extends AxGenOut>({
     debugPromptMetrics,
   });
 
+  // Each sample's answer, which an exhausted-retries error reports.
+  for (const result of results) {
+    const state = states[result.index];
+    if (state) {
+      state.content = result.content ?? '';
+    }
+  }
+
   for (const result of results) {
     const state = states[result.index];
 
@@ -63,6 +74,7 @@ export async function* processResponse<OUT extends AxGenOut>({
       throw new Error(`No state found for result (index: ${result.index})`);
     }
 
+    let promptToolStep = false;
     if (signatureToolCallingManager && result.content) {
       if (result.thought && result.thought.length > 0) {
         state.values[thoughtFieldName] = result.thought;
@@ -84,6 +96,7 @@ export async function* processResponse<OUT extends AxGenOut>({
       }));
 
       if (functionCalls && functionCalls.length > 0) {
+        promptToolStep = true;
         mem.updateResult(
           {
             name: result.name,
@@ -99,6 +112,15 @@ export async function* processResponse<OUT extends AxGenOut>({
     if (result.thought && result.thought.length > 0) {
       state.values[thoughtFieldName] = result.thought;
     }
+
+    state.decisionContext = result.decisionContext ?? {
+      provenance: {
+        source: 'elicited',
+        provider: res.modelUsage?.ai ?? ai.getName(),
+        model:
+          res.modelUsage?.model ?? String(ai.getLastUsedChatModel?.() ?? ''),
+      },
+    };
 
     if (result.functionCalls?.length) {
       const funcs = parseFunctionCalls(ai, result.functionCalls, state.values);
@@ -130,6 +152,8 @@ export async function* processResponse<OUT extends AxGenOut>({
             onFunctionCall,
             mcpExecutionContext,
             eventContext,
+            control,
+            executionPath,
           });
         } catch (e) {
           mem.addRequest(
@@ -149,7 +173,7 @@ export async function* processResponse<OUT extends AxGenOut>({
         state.functionsExecuted = new Set([...state.functionsExecuted, ...fx]);
       }
     } else if (result.content) {
-      if (signature.hasComplexFields()) {
+      if (signature.hasComplexFields() || strictStructuredJson) {
         try {
           const json = parseStructuredFinal(
             signature,
@@ -183,12 +207,27 @@ export async function* processResponse<OUT extends AxGenOut>({
       }
     }
 
+    if (
+      hasDecisionFields(signature.getOutputFields()) &&
+      !result.functionCalls?.length &&
+      !promptToolStep
+    )
+      decodeDecisionValues(
+        signature.getOutputFields(),
+        state.values,
+        state.decisionContext
+      );
+
     if (!disableMemoryCleanup) {
       mem.removeByTag('correction', sessionId);
       mem.removeByTag('error', sessionId);
     }
 
-    if (fieldProcessors.length) {
+    // Field processors and asserts check the answer, so, as in a stream, they
+    // skip a step that calls tools and has no answer yet.
+    const toolStep = promptToolStep || (result.functionCalls?.length ?? 0) > 0;
+
+    if (fieldProcessors.length && !toolStep) {
       await processFieldProcessors(
         fieldProcessors,
         state.values,
@@ -197,7 +236,7 @@ export async function* processResponse<OUT extends AxGenOut>({
       );
     }
 
-    if (asserts.length) {
+    if (asserts.length && !toolStep) {
       await assertAssertions(asserts, state.values);
     }
 

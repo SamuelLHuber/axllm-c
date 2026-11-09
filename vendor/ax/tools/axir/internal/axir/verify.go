@@ -54,6 +54,7 @@ type VerifyStep struct {
 }
 
 func Verify(rootFile string, opts VerifyOptions) (VerifyReport, error) {
+	rootFile = absoluteRootFile(rootFile)
 	targets := normalizeVerifyTargets(opts.Targets)
 	mode, err := normalizeVerifyMode(opts.Mode)
 	if err != nil {
@@ -447,13 +448,17 @@ func verifyGoTarget(report VerifyTargetReport, conformanceRoot string) (VerifyTa
 	}
 	for _, example := range []string{
 		"signature_schema",
+		"model_catalog",
 		"axgen_scripted_client_tool",
 		"provider_mapping_no_key",
 		"adaptive_balancer_no_key",
 		"provider_stream_no_key",
+		"cancellation_no_key",
 		"audio_responses_mapping",
 		"audio_http_roundtrip",
 		"stream_http_roundtrip",
+		"timeout_http_roundtrip",
+		"transport_errors_http_roundtrip",
 		"realtime_audio_events",
 		"realtime_audio_turn",
 		"runtime_adapter",
@@ -473,8 +478,14 @@ func verifyGoTarget(report VerifyTargetReport, conformanceRoot string) (VerifyTa
 			return report, err
 		}
 	}
-	args := append([]string{"run", "./conformance"}, conformanceSuitePaths(conformanceRoot)...)
-	if err := runVerifyCommand(&report, "conformance", report.OutDir, env, goTool, args...); err != nil {
+	conformanceBin := filepath.Join(report.OutDir, "conformance_bin")
+	if err := runVerifyCommand(&report, "build conformance", report.OutDir, env, goTool, "build", "-o", conformanceBin, "./conformance"); err != nil {
+		return report, err
+	}
+	if err := runConformanceVerifyCommand(&report, conformanceRoot, report.OutDir, env, conformanceBin); err != nil {
+		return report, err
+	}
+	if err := requireConformanceFixtures(&report); err != nil {
 		return report, err
 	}
 	if report.releaseMode() {
@@ -541,13 +552,18 @@ func verifyRustTarget(report VerifyTargetReport, conformanceRoot string) (Verify
 	}
 	for _, example := range []string{
 		"signature_schema",
+		"model_catalog",
 		"provider_mapping_no_key",
 		"adaptive_balancer_no_key",
 		"provider_stream_no_key",
+		"cancellation_no_key",
 		"axgen_scripted_client_tool",
+		"axgen_streaming_no_key",
 		"audio_responses_mapping",
 		"audio_http_roundtrip",
 		"stream_http_roundtrip",
+		"timeout_http_roundtrip",
+		"transport_errors_http_roundtrip",
 		"realtime_audio_events",
 		"realtime_audio_turn",
 		"runtime_adapter",
@@ -567,8 +583,24 @@ func verifyRustTarget(report VerifyTargetReport, conformanceRoot string) (Verify
 			return report, err
 		}
 	}
-	args := append([]string{"run", "--quiet", "--manifest-path", filepath.Join(report.OutDir, "Cargo.toml"), "--bin", "axllm-conformance", "--"}, conformanceSuitePaths(conformanceRoot)...)
-	if err := runCargoVerifyCommand(&report, "conformance", report.OutDir, env, cargo, args...); err != nil {
+	if err := runCargoVerifyCommand(&report, "build conformance", report.OutDir, env, cargo, "build", "--quiet", "--manifest-path", filepath.Join(report.OutDir, "Cargo.toml"), "--bin", "axllm-conformance"); err != nil {
+		return report, err
+	}
+	targetDir := os.Getenv("CARGO_TARGET_DIR")
+	if targetDir == "" {
+		targetDir = "target"
+	}
+	if !filepath.IsAbs(targetDir) {
+		targetDir = filepath.Join(report.OutDir, targetDir)
+	}
+	conformanceBin := filepath.Join(targetDir, "debug", "axllm-conformance")
+	if runtime.GOOS == "windows" {
+		conformanceBin += ".exe"
+	}
+	if err := runConformanceVerifyCommand(&report, conformanceRoot, report.OutDir, env, conformanceBin); err != nil {
+		return report, err
+	}
+	if err := requireConformanceFixtures(&report); err != nil {
 		return report, err
 	}
 	if report.releaseMode() {
@@ -612,6 +644,48 @@ fn main() -> AxResult<()> {
 		return err
 	}
 	return runCargoVerifyCommand(report, "package rust consumer", consumerDir, scrubbedEnviron(), cargo, "run", "--quiet", "--manifest-path", filepath.Join(consumerDir, "Cargo.toml"))
+}
+
+// absoluteRootFile resolves a relative root file against the working directory.
+// Targets run their conformance from their generated package directories, so a
+// relative root would hand those runs suite paths that do not exist there.
+func absoluteRootFile(rootFile string) string {
+	if abs, err := filepath.Abs(rootFile); err == nil {
+		return abs
+	}
+	return rootFile
+}
+
+// requireConformanceFixtures fails a target whose conformance step ran no
+// fixtures. Every runner prints one "ok <name>" line per fixture, and a runner
+// given suite paths that do not exist exits 0 without checking anything.
+func requireConformanceFixtures(report *VerifyTargetReport) error {
+	start := report.startStep("conformance fixtures")
+	ran := 0
+	for index := len(report.Steps) - 1; index >= 0; index-- {
+		if report.Steps[index].Name == "conformance" {
+			ran = countConformanceFixtures(report.Steps[index].Message)
+			break
+		}
+	}
+	if ran == 0 {
+		message := "conformance ran 0 fixtures; check that the conformance root exists"
+		report.finishStep("conformance fixtures", "fail", message, start)
+		return fmt.Errorf("conformance fixtures failed: %s", message)
+	}
+	report.finishStep("conformance fixtures", "ok", fmt.Sprintf("%d fixtures", ran), start)
+	return nil
+}
+
+// countConformanceFixtures counts the "ok <name>" lines a runner prints.
+func countConformanceFixtures(output string) int {
+	count := 0
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "ok ") {
+			count++
+		}
+	}
+	return count
 }
 
 func conformanceRootFor(rootFile string) string {
@@ -681,18 +755,28 @@ func verifyPythonTarget(report VerifyTargetReport, conformanceRoot string) (Veri
 		return report, nil
 	}
 	env := runtimeProtocolEnv(conformanceRoot, append(scrubbedEnviron(), "PYTHONPATH="+report.OutDir))
+	if err := runVerifyCommand(&report, "Typesafe and MCP WebSocket tests", "", env, python, filepath.Join(report.OutDir, "tests", "typesafe_mcp_test.py")); err != nil {
+		return report, err
+	}
+	if err := runVerifyCommand(&report, "Astra session tests", "", env, python, filepath.Join(report.OutDir, "tests", "astra_session_test.py")); err != nil {
+		return report, err
+	}
 	if err := runVerifyCommand(&report, "compileall", "", env, python, "-m", "compileall", "-q", filepath.Join(report.OutDir, "axllm")); err != nil {
 		return report, err
 	}
 	for _, example := range []string{
 		"signature_schema.py",
+		"model_catalog.py",
 		"axgen_scripted_client_tool.py",
 		"provider_mapping_no_key.py",
 		"adaptive_balancer_no_key.py",
 		"provider_stream_no_key.py",
+		"cancellation_no_key.py",
 		"audio_responses_mapping.py",
 		"audio_http_roundtrip.py",
 		"stream_http_roundtrip.py",
+		"timeout_http_roundtrip.py",
+		"transport_errors_http_roundtrip.py",
 		"realtime_audio_events.py",
 		"realtime_audio_turn.py",
 		"runtime_adapter.py",
@@ -712,8 +796,10 @@ func verifyPythonTarget(report VerifyTargetReport, conformanceRoot string) (Veri
 			return report, err
 		}
 	}
-	args := append([]string{"-m", "axllm.conformance"}, conformanceSuitePaths(conformanceRoot)...)
-	if err := runVerifyCommand(&report, "conformance", "", env, python, args...); err != nil {
+	if err := runConformanceVerifyCommand(&report, conformanceRoot, "", env, python, "-m", "axllm.conformance"); err != nil {
+		return report, err
+	}
+	if err := requireConformanceFixtures(&report); err != nil {
 		return report, err
 	}
 	if report.releaseMode() {
@@ -817,21 +903,33 @@ func verifyJavaTarget(report VerifyTargetReport, conformanceRoot string) (Verify
 		return report, err
 	}
 	files = append(files, examples...)
+	files = append(files, filepath.Join(report.OutDir, "tests", "AstraSessionTest.java"), filepath.Join(report.OutDir, "tests", "TypesafeMCPTest.java"))
 	sort.Strings(files)
 	args := append([]string{"-cp", report.OutDir, "-d", report.OutDir}, files...)
 	env := runtimeProtocolEnv(conformanceRoot, scrubbedEnviron())
 	if err := runVerifyCommand(&report, "javac", "", env, javac, args...); err != nil {
 		return report, err
 	}
+	if err := runVerifyCommand(&report, "Typesafe and MCP WebSocket tests", "", env, java, "-cp", report.OutDir, "TypesafeMCPTest"); err != nil {
+		return report, err
+	}
+	if err := runVerifyCommand(&report, "Astra session tests", "", env, java, "-cp", report.OutDir, "AstraSessionTest"); err != nil {
+		return report, err
+	}
 	for _, className := range []string{
 		"SignatureSchemaExample",
+		"ModelCatalogExample",
 		"AxGenScriptedClientToolExample",
+		"AxGenStreamingNoKeyExample",
 		"ProviderMappingNoKeyExample",
 		"AdaptiveBalancerNoKeyExample",
 		"ProviderStreamNoKeyExample",
+		"CancellationNoKeyExample",
 		"AudioResponsesMappingExample",
 		"AudioHTTPRoundtripExample",
 		"StreamHTTPRoundtripExample",
+		"TimeoutHTTPRoundtripExample",
+		"TransportErrorsHTTPRoundtripExample",
 		"RealtimeAudioEventsExample",
 		"RealtimeAudioTurnExample",
 		"RuntimeAdapterExample",
@@ -851,8 +949,10 @@ func verifyJavaTarget(report VerifyTargetReport, conformanceRoot string) (Verify
 			return report, err
 		}
 	}
-	args = append([]string{"-cp", report.OutDir, "dev.axllm.ax.Conformance"}, conformanceSuitePaths(conformanceRoot)...)
-	if err := runVerifyCommand(&report, "conformance", "", nil, java, args...); err != nil {
+	if err := runConformanceVerifyCommand(&report, conformanceRoot, "", env, java, "-cp", report.OutDir, "dev.axllm.ax.Conformance"); err != nil {
+		return report, err
+	}
+	if err := requireConformanceFixtures(&report); err != nil {
 		return report, err
 	}
 	if report.releaseMode() {
@@ -1190,12 +1290,30 @@ func verifyCppTarget(report VerifyTargetReport, conformanceRoot string) (VerifyT
 	if err := runVerifyCommand(&report, "compile mcp.cpp", "", nil, cpp, "-std=c++17", "-I", report.OutDir, "-c", mcpSource, "-o", mcpObj); err != nil {
 		return report, err
 	}
+	// Scripted agent payloads belong in regression tests, not user-facing examples.
+	parityTest := filepath.Join(buildDir, "typesafe_mcp_test")
+	if err := runVerifyCommand(&report, "compile Typesafe and MCP tests", "", nil, cpp, "-std=c++17", "-I", report.OutDir, filepath.Join(report.OutDir, "tests", "typesafe_mcp_test.cpp"), axObj, mcpObj, "-o", parityTest); err != nil {
+		return report, err
+	}
+	if err := runVerifyCommand(&report, "Typesafe and MCP WebSocket tests", "", nil, parityTest); err != nil {
+		return report, err
+	}
+	sessionTest := filepath.Join(buildDir, "astra_session_test")
+	if err := runVerifyCommand(&report, "compile Astra session tests", "", nil, cpp, "-std=c++17", "-I", report.OutDir, filepath.Join(report.OutDir, "tests", "astra_session_test.cpp"), axObj, mcpObj, "-o", sessionTest); err != nil {
+		return report, err
+	}
+	if err := runVerifyCommand(&report, "Astra session tests", "", nil, sessionTest); err != nil {
+		return report, err
+	}
 	examples := []string{
 		"signature_schema",
+		"model_catalog",
 		"axgen_scripted_client_tool",
+		"axgen_streaming_no_key",
 		"provider_mapping_no_key",
 		"adaptive_balancer_no_key",
 		"provider_stream_no_key",
+		"cancellation_no_key",
 		"audio_responses_mapping",
 		"realtime_audio_events",
 		"realtime_audio_turn",
@@ -1225,14 +1343,25 @@ func verifyCppTarget(report VerifyTargetReport, conformanceRoot string) (VerifyT
 			return report, err
 		}
 	}
-	// audio_http_roundtrip, stream_http_roundtrip, mcp_modern_roundtrip, and mcp_sse_roundtrip drive
+	// audio_http_roundtrip, stream_http_roundtrip, timeout_http_roundtrip, transport_errors_http_roundtrip, mcp_modern_roundtrip, and mcp_sse_roundtrip drive
 	// the real libcurl transport against a loopback server, so they need a
 	// curl-enabled axllm.o + libcurl (mcp_sse_roundtrip also links mcp.o). Skip
 	// them when libcurl is unavailable rather than failing the whole target.
-	curlExamples := []string{"audio_http_roundtrip", "stream_http_roundtrip", "mcp_modern_roundtrip", "mcp_sse_roundtrip"}
+	curlExamples := []string{"audio_http_roundtrip", "stream_http_roundtrip", "timeout_http_roundtrip", "transport_errors_http_roundtrip", "mcp_modern_roundtrip", "mcp_sse_roundtrip"}
 	if cppLibcurlAvailable(cpp) {
 		curlObj := filepath.Join(buildDir, "axllm_curl.o")
 		if err := runVerifyCommand(&report, "compile axllm.cpp (curl)", "", nil, cpp, "-std=c++17", "-DAXLLM_ENABLE_CURL=1", "-I", report.OutDir, "-c", axSource, "-o", curlObj); err != nil {
+			return report, err
+		}
+		curlMCPObj := filepath.Join(buildDir, "mcp_curl.o")
+		if err := runVerifyCommand(&report, "compile mcp.cpp (curl)", "", nil, cpp, "-std=c++17", "-DAXLLM_ENABLE_CURL=1", "-I", report.OutDir, "-c", mcpSource, "-o", curlMCPObj); err != nil {
+			return report, err
+		}
+		curlSessionTest := filepath.Join(buildDir, "astra_session_test_curl")
+		if err := runVerifyCommand(&report, "compile Astra HTTP session tests", "", nil, cpp, "-std=c++17", "-DAXLLM_ENABLE_CURL=1", "-I", report.OutDir, filepath.Join(report.OutDir, "tests", "astra_session_test.cpp"), curlObj, curlMCPObj, "-lcurl", "-o", curlSessionTest); err != nil {
+			return report, err
+		}
+		if err := runVerifyCommand(&report, "Astra HTTP session tests", "", nil, curlSessionTest); err != nil {
 			return report, err
 		}
 		for _, example := range curlExamples {
@@ -1240,7 +1369,7 @@ func verifyCppTarget(report VerifyTargetReport, conformanceRoot string) (VerifyT
 			bin := filepath.Join(report.OutDir, example)
 			compileArgs := []string{"-std=c++17", "-I", report.OutDir, source, curlObj}
 			if example == "mcp_modern_roundtrip" || example == "mcp_sse_roundtrip" {
-				compileArgs = append(compileArgs, mcpObj)
+				compileArgs = append(compileArgs, curlMCPObj)
 			}
 			compileArgs = append(compileArgs, "-lcurl", "-o", bin)
 			if err := runVerifyCommand(&report, "compile example "+example, "", nil, cpp, compileArgs...); err != nil {
@@ -1251,6 +1380,7 @@ func verifyCppTarget(report VerifyTargetReport, conformanceRoot string) (VerifyT
 			}
 		}
 	} else {
+		report.Steps = append(report.Steps, VerifyStep{Name: "Astra HTTP session tests", Status: "skip", Message: "libcurl unavailable"})
 		for _, example := range curlExamples {
 			report.Steps = append(report.Steps, VerifyStep{Name: "example " + example, Status: "skip", Message: "libcurl unavailable"})
 		}
@@ -1259,8 +1389,10 @@ func verifyCppTarget(report VerifyTargetReport, conformanceRoot string) (VerifyT
 	if err := runVerifyCommand(&report, "compile conformance", "", nil, cpp, "-std=c++17", "-I", report.OutDir, filepath.Join(report.OutDir, "conformance.cpp"), axObj, mcpObj, "-o", conformanceBin); err != nil {
 		return report, err
 	}
-	args := append([]string{}, conformanceSuitePaths(conformanceRoot)...)
-	if err := runVerifyCommand(&report, "conformance", "", nil, conformanceBin, args...); err != nil {
+	if err := runConformanceVerifyCommand(&report, conformanceRoot, "", runtimeProtocolEnv(conformanceRoot, scrubbedEnviron()), conformanceBin); err != nil {
+		return report, err
+	}
+	if err := requireConformanceFixtures(&report); err != nil {
 		return report, err
 	}
 	if report.releaseMode() {

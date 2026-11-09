@@ -9,6 +9,49 @@ TypeScript runtime and write small conformance fixtures under `ir/conformance/`.
 The compiler source of truth is the `.axir` bundle under `ir/axcore/`, plus the
 fixtures and specs under `ir/spec/`.
 
+## Astra Session Implementation Status
+
+Astra and automatic sessions are partially implemented in the five generated
+languages. Applications use their existing generation, agent, and flow APIs;
+the Responses transport stays internal. Existing chat-only services remain
+supported. Both Astra backlog entries stay open until the full behavioral scope
+is implemented and verified.
+
+Completed raw arguments now pass a shared validator in every target before a
+handler starts. Its TypeScript-derived fixtures cover references, unions, nested
+objects and arrays, additional properties, and scalar constraints. Native MCP
+tools retain the original schema and use the existing protocol invocation path.
+WebSocket adapters track transport activity independently of buffered events, so
+late parent events cannot reactivate completed responses or replace successors.
+
+Independent flow nodes use owned client and program factories. The host dispatches
+workers and Core merges reports in plan order. Custom implementations without
+factories use the existing serial loop and emit `flow_parallel_fallback` traces.
+Rust keeps borrowed clients and Core `Rc` values on their owner thread without
+adding Send/Sync requirements to the client trait. Adaptive balancer workers
+share their accounting store. Group failures retain completed diagnostics and
+return before noncooperative work finishes; late results are discarded.
+
+Each AxGen model request opens its own native session with the whole prompt,
+as TypeScript's `axRunChatSession` does, and closes it once that request's
+response completes. A correction or a later step opens a fresh session whose
+prompt carries the earlier sessions' tool calls, results and continued
+responses, and every session applies the run's updates again. A streamed request
+hands Core the session's partial events, continued responses and final response.
+Core streams each response like a plain stream on its own state, starts a new
+version for each later response, and sends only what the partial events did not.
+TypeScript-derived `*native-session*` fixtures pin the session log, prompts,
+control events, deltas and output in all five targets.
+
+Coordinated native tests prove overlap and failure isolation in all five
+languages. Provider-backed generation, agent, dependent-flow, concurrent-flow,
+and cancellation examples have also run successfully against Astra. These are
+behavior-specific evidence, not a blanket parity claim. Remaining agent
+invocation/targeting, advanced-pattern compatibility, and final acceptance gates
+are tracked in [the session contract](../ir/axcore/session.md) and
+[the AxIR backlog](AXIR_BACKLOG.md). The two Astra entries remain open until their
+complete acceptance criteria pass.
+
 ## Pipeline
 
 ```mermaid
@@ -42,6 +85,19 @@ The lowering stages are:
 `axir verify` is the product gate. It compiles generated targets, runs examples,
 executes fixture conformance, validates capability manifests, and smoke-tests
 package metadata for Python, Java, C++, Go, and Rust.
+
+### String literals
+
+Quoted AxIR strings decode `\a`, `\b`, `\f`, `\n`, `\r`, `\t`, `\v`, `\"`,
+and `\\`, three-digit octal escapes, two-digit `\x` byte escapes, and
+four/eight-digit `\u`/`\U` Unicode escapes. Invalid escapes and unterminated
+strings produce a diagnostic with the source file and line. Triple-quoted
+strings keep their contents literal, including backslashes.
+
+Formatting and reparsing preserve string values. Each backend emits its own
+language's string syntax; generated literals preserve control characters,
+Unicode, and embedded NULs. Agent newline normalization preserves identifiers
+ending in `r` and handles CRLF code fences in actor and distiller code.
 
 ## Layers
 
@@ -143,8 +199,31 @@ target is executable. `API.md` and `axir-api.json` are emitted from
 compiler-owned API metadata so package docs, future docs-site pages, and agent
 docs can consume the same source without scraping generated code.
 
-The npm-installed Claude Code skills in `@ax-llm/ax` stay focused on the
-TypeScript package. Generated Python, Java, C++, Go, and Rust API docs ship with
+The npm-installed Claude Code skill in `@ax-llm/ax` stays focused on the
+TypeScript package: automatic setup runs only when the consumer's `package.json`
+lists Ax in `dependencies`, `devDependencies`, or `optionalDependencies`.
+It registers only `ax-llm`, whose compact index links to bundled local reference
+guides. From the consumer project root,
+`npx @ax-llm/ax skills-auto-install off` saves `ax.skills.autoInstall: false`
+in `package.json` to disable future automatic setup; `skills-auto-install on`
+restores it. The same setting can be added before the first installation.
+`AX_SKIP_SKILL_INSTALL=1` skips automatic setup for a single installation;
+CI environments and global installs skip it even if the saved setting is enabled.
+Transitive dependency installs never write skills into the consumer project.
+Manual `setup-claude` defaults to the same bundle, with `--all` or
+`--skill <name>` for optional
+specialists. Existing specialist installations are preserved and upgraded
+alongside the entry point; automatic setup adds no new specialist entries.
+Changing the preference leaves installed skills in place. Manual setup and
+removal work independently of the saved automatic setup preference.
+
+Each generated language similarly ships an `ax-<language>-llm` entry point
+with ordinary `references/*.md` guides and separately installable specialist
+skills. The compiler emits both from the same documentation. Website discovery
+indexes publish bundles as digest-verified archives so reference files travel
+with the entry point. Default website install commands select that one skill.
+
+Generated Python, Java, C++, Go, and Rust API docs ship with
 their package trees instead of being auto-installed into user projects as npm
 skills. The committed package output lives under `packages/python`,
 `packages/java`, `packages/cpp`, `packages/go`, and `packages/rust`; AxIR
@@ -244,6 +323,17 @@ configurable runtimes are named deployment profiles resolved from the shared
 manifest rather than provider-specific target templates. See
 [`docs/AI_PROFILES.md`](./AI_PROFILES.md).
 
+Core owns the OpenAI Decisions request and response validation, ordered predicate,
+choice, and score questions, inline images, full usage, and boolean/class/score
+signature conversion. All five generated languages expose a native JSON client as well as
+the `openai-decisions` provider. Numeric signature fields never imply score rubrics.
+Native probabilities remain unchanged; refusal handling is explicit. The shared
+`evidence.axir` module owns evidence schemas, validation, local thresholds, value
+derivation for generative models, provenance, terminal refusals, and recursive
+array/nested decoding. AxGen decodes evidence before processors, assertions,
+traces, and caching, and emits complete evidence when streaming. Transport
+wrappers refresh credentials per retry and merge header names case-insensitively.
+
 Core also owns Vertex routing for Gemini and Anthropic. Generated clients accept
 project, region, and optional endpoint identifiers; resolve `global`, `us`,
 `eu`, and regional hosts; preserve explicit base-URL precedence; and use the
@@ -306,6 +396,29 @@ engine API and still owns reflection, selection, Pareto metadata, bootstrapping,
 selector state, metric budgets, and descendant component optimization while
 reusing the shared optimizer evaluator/artifact boundary.
 
+GEPA artifacts retain `baselineScore` and `baselineScores` at the top level and
+in `metadata`, measured on the original program before bootstrap. Core owns the
+validation cap, objective averaging, scalarization, and helper budget sizing.
+Baseline and seeded validation consume `maxMetricCalls`; bootstrap generation
+has separate limits. Fresh training inputs and outputs form demonstrations,
+excluding retained validation or inactive-child traces. Rust's
+`optimize_with_client(...)` runs live student evaluations; its client-free
+`optimize(...)` requires explicitly pre-scored tasks.
+
+## Text In Core Messages
+
+`intrinsic.string.format(template, args...)` and `intrinsic.string.str(value)`
+write text as JavaScript does in every port, so a Core message reads as the
+TypeScript template literal it mirrors. Each `{}` takes the next argument's
+text: a string as is (even one that contains `{}`), `null` as `null`, a
+boolean as `true` or `false`, a number as JavaScript's `String(n)`, and a list
+or object as compact `JSON.stringify` in key order. `{{` and `}}` write one
+brace, any other brace is kept, and a `{}` past the last argument stays `{}`.
+`string.str` writes one value the same way. To show a value as TypeScript's
+`JSON.stringify(value, null, 2)` does, pass `intrinsic.json.pretty(value)` as
+the argument. The TS golden `ir/conformance/prompt/string-format-cases.json`
+pins these rules in all five runners.
+
 ## Adding Or Changing Semantics
 
 New portable behavior should follow this loop:
@@ -364,3 +477,8 @@ For generated-backend integrity, use the three verification instruments in
 [`docs/AXIR_VERIFICATION.md`](./AXIR_VERIFICATION.md): provenance confirms the
 functions are emitted from IR, coverage confirms conformance executes them, and
 perturbation confirms runners reject changed expected values.
+
+Typesafe/Jev parity includes native System One and model discovery, configurable
+boolean conversion, signature value descriptions, and schema-aware request eligibility
+in Python, Java, C++, Go, and Rust. Verification also exercises MCP WebSocket pending
+cleanup on send failure, cancellation, close, batch requests, and request-ID reuse.

@@ -68,29 +68,39 @@ const wf = flow<InputType, OutputType>({ autoParallel: true, batchSize: 5 });
 
 State grows with each executed node. Results are stored as `${nodeName}Result`:
 
+In the excerpts below, `wf` is a flow instance created with `flow()`, with any
+referenced nodes and input fields already defined. The imported `flow` is the
+factory; call methods on its returned instance.
+
 ```typescript
 // Initial state: { userInput: 'Hello' }
-flow.execute('processor', (state) => ({ input: state.userInput }));
+wf.execute('processor', (state) => ({ input: state.userInput }));
 // State: { userInput: 'Hello', processorResult: { output: '...' } }
 
-flow.execute('analyzer', (state) => ({ text: state.processorResult.output }));
+wf.execute('analyzer', (state) => ({ text: state.processorResult.output }));
 // State: { ..., analyzerResult: { sentiment: '...', confidence: 0.8 } }
 ```
 
 ## Node Definition
 
+For a Typesafe/Jev decision node, use required boolean/class outputs and pass
+its results to a later generative step when prose is needed. Native scoring
+requires an explicit rubric through `typesafe(...).systemOne(...)`. See the
+[ax-typesafe skill](https://github.com/ax-llm/ax/blob/main/src/ax/skills/ax-typesafe.md)
+for the TypeScript integration and a two-program hybrid example.
+
 ```typescript
 // String signature (creates AxGen automatically)
-flow.node('processor', 'input:string -> output:string');
+wf.node('processor', 'input:string -> output:string');
 
 // Multiple outputs
-flow.node('analyzer', 'text:string -> sentiment:string, confidence:number');
+wf.node('analyzer', 'text:string -> sentiment:string, confidence:number');
 
 // Array outputs
-flow.node('extractor', 'documentText:string -> entities:string[]');
+wf.node('extractor', 'documentText:string -> entities:string[]');
 
 // Short alias
-flow.n('processor', 'input:string -> output:string');
+wf.n('processorAlias', 'input:string -> output:string');
 ```
 
 ### Rich Node Contracts (String Grammar)
@@ -98,7 +108,7 @@ flow.n('processor', 'input:string -> output:string');
 Node signatures accept the full extended string grammar — constraint bags, class decisions, optional fields, and nested objects (full modifier table in the ax-signature skill):
 
 ```typescript
-flow
+wf
   .node('triage', 'ticketText:string -> ticketClass:class "bug, billing, question", severityScore:number(min 1, max 5)')
   .node('draft', 'ticketText:string, ticketClass:string, severityScore:number -> replyText:string(max 400)')
   .node('audit', 'replyText:string -> approved:boolean, flaggedSpans:object{ spanText:string, reasonNote:string }[]');
@@ -115,21 +125,23 @@ Add fields to a base signature without rewriting it:
 ```typescript
 import { f, flow } from '@ax-llm/ax';
 
+const wf = flow();
+
 // Chain-of-thought reasoning
-flow.nx('reasoner', 'question:string -> answer:string', {
+wf.nx('reasoner', 'question:string -> answer:string', {
   prependOutputs: [
-    { name: 'reasoning', type: f.internal(f.string('Step-by-step reasoning')) },
+    { name: 'reasoning', type: f.string('Step-by-step reasoning').internal() },
   ],
 });
 
 // Add confidence scoring
-flow.nx('analyzer', 'input:string -> result:string', {
+wf.nx('analyzer', 'input:string -> result:string', {
   appendOutputs: [{ name: 'confidence', type: f.number('Confidence 0-1') }],
 });
 
 // Add optional context input
-flow.nx('processor', 'query:string -> response:string', {
-  appendInputs: [{ name: 'context', type: f.optional(f.string('Extra context')) }],
+wf.nx('processor', 'query:string -> response:string', {
+  appendInputs: [{ name: 'context', type: f.string('Extra context').optional() }],
 });
 ```
 
@@ -138,10 +150,10 @@ Extension options: `prependInputs`, `appendInputs`, `prependOutputs`, `appendOut
 ## Execute With Input Mapping
 
 ```typescript
-flow.execute('summarizer', (state) => ({ documentText: state.document }));
+wf.execute('summarizer', (state) => ({ documentText: state.document }));
 
 // With AI override (use a different model for this node)
-flow.execute('processor', (state) => ({ input: state.data }), { ai: alternativeAI });
+wf.execute('processor', (state) => ({ input: state.data }), { ai: alternativeAI });
 ```
 
 ## Map (State Transformation)
@@ -150,16 +162,16 @@ Use `map()` for data shaping without AI calls:
 
 ```typescript
 // Sync
-flow.map((state) => ({ ...state, upperText: state.rawText.toUpperCase() }));
+wf.map((state) => ({ ...state, upperText: state.rawText.toUpperCase() }));
 
 // Async
-flow.map(async (state) => {
+wf.map(async (state) => {
   const data = await fetchFromAPI(state.query);
   return { ...state, enrichedData: data };
 });
 
 // Parallel async transforms
-flow.map([
+wf.map([
   async (state) => ({ ...state, result1: await api1(state.data) }),
   async (state) => ({ ...state, result2: await api2(state.data) }),
 ], { parallel: true });
@@ -218,6 +230,7 @@ Planner rules:
 - Independent `.execute()` and `.derive()` steps may parallelize.
 - `.map()`, `.returns()`, `.branch()`, `.while()`, `.feedback()`, and explicit `.parallel()` are barriers.
 - Branch, while, and feedback bodies still use the same planner internally.
+- A parallel group ends as running its steps one after another would: each step's changes merge into the state in step order.
 - Use `autoParallel: false` when you need strict sequential execution.
 
 Disable auto-parallel:
@@ -293,7 +306,7 @@ Rules:
 ## Explicit Parallel Sub-Flows
 
 ```typescript
-flow
+wf
   .parallel([
     (sub) => sub.execute('analyzer1', (state) => ({ text: state.input })),
     (sub) => sub.execute('analyzer2', (state) => ({ text: state.input })),
@@ -320,7 +333,9 @@ const wf = flow<{ items: string[] }, { processed: string[] }>({ batchSize: 3 })
 Route nodes to different AI providers:
 
 ```typescript
-const fast = ai({ name: 'openai', apiKey: '...', config: { model: 'gpt-5.4-mini' } });
+import { ai, flow, AxAIOpenAIModel } from '@ax-llm/ax';
+
+const fast = ai({ name: 'openai', apiKey: '...', config: { model: AxAIOpenAIModel.GPT6Luna } });
 const smart = ai({ name: 'anthropic', apiKey: '...' });
 
 const wf = flow<{ text: string }, { out: string }>()
@@ -419,6 +434,28 @@ for (const entry of log) {
 }
 ```
 
+## Result Caching
+
+Pass `cachingFunction` in `forward()` options, or set
+`axGlobals.cachingFunction`; the flow's factory options take none. The flow
+stores its returned output under a key of its signature and input values, and
+a stored output comes back without running any node. The flow ignores errors
+from its own cache reads and writes. The same function reaches AxGen nodes
+through the forward options, so each node caches its own output too, and a
+node's read error fails the run as AxGen `forward` does. A run with a
+`control` bypasses the cache. `streamingForward` returns a stored output as
+its single update.
+
+```typescript
+const cache = new Map<string, unknown>();
+const result = await wf.forward(llm, input, {
+  cachingFunction: async (key, value) => {
+    if (value === undefined) return cache.get(key);
+    cache.set(key, value);
+  },
+});
+```
+
 ## Error Handling
 
 ```typescript
@@ -447,8 +484,12 @@ Set `mcp`/`ucp` on the flow or a node. Sequential nodes reuse sessions; parallel
 ```typescript
 const wf = flow({ mcp: [inventory], ucp: [merchant] })
   .node('lookup', lookupProgram)
-  .node('checkout', checkoutProgram, { mcpInheritance: ['merchant'] });
+  .node('checkout', checkoutProgram);
 ```
+
+`.node(name, program)` accepts two arguments. Put node-specific `mcp`/`ucp`
+and inheritance options on the program when constructing it, or use the
+`options` property in `.execute(name, mapper, { options: { mcpInheritance } })`.
 
 ## Mermaid Source (Author or Serialize Flows)
 
@@ -684,3 +725,24 @@ expiry.
 - Do not create loop conditions that can never change.
 - Do not add unnecessary dependencies between executes (kills auto-parallelism).
 - Do not forget to use optional chaining on branch results after `.merge()`.
+
+## Automatic sessions (TypeScript)
+
+Pass `{ control: runControl() }` to `forward()`. Each node receives its own `root/<nodeName>` scope and conversation. Target that path to restrict an update; root updates also apply to future nodes. Completed nodes are not rerun and controller-attached runs bypass result caching.
+
+
+Runnable TypeScript examples under `src/examples/typescript/flows/`:
+
+- `astra-parallel-tools.ts`: independent background lookups with isolated node results and automatic parallel scheduling.
+- `astra-targeted-control.ts`: steering and reasoning changes scoped to a review node, preserving the completed baseline.
+- `astra-cancel-pending.ts`: cancellation while both branches have host tools pending; the example verifies rejection rather than successful completion.
+
+Deterministic coverage lives in `src/ax/flow/flow.sessions.test.ts`, including both automatic and explicit parallel execution, delayed results, active/future root updates, targeted updates, cache bypass, cancellation, and chat-only provider fallback. These session examples and tests are TypeScript-only.
+
+Python, Go, Java, C++, and Rust dispatch independent Core-planned nodes through
+owned client and program workers. Built-in providers, routers, and balancers
+provide the capability automatically; unsupported custom implementations run the
+group serially and emit a `flow_parallel_fallback` trace. Each node owns its
+conversation, pending calls, and control path; successful results merge in plan
+order. Native tests and provider-backed `flows/astra_parallel` examples cover
+coordinated overlap. Full session acceptance remains tracked in the AxIR backlog.

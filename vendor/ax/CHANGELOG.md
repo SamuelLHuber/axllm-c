@@ -1,5 +1,487 @@
 # Changelog
 
+## [25.4.9](https://github.com/ax-llm/ax/compare/25.4.8...25.4.9) (2026-11-06)
+
+### Features
+
+* **examples:** add authenticated local Sem MCP lookup ([#880](https://github.com/ax-llm/ax/issues/880)) ([e311879](https://github.com/ax-llm/ax/commit/e31187998320e91b4bde725a43a4b5145591f979))
+
+### Bug Fixes
+
+* **anthropic:** omit empty text from thinking replay ([#876](https://github.com/ax-llm/ax/issues/876)) ([bf7bca1](https://github.com/ax-llm/ax/commit/bf7bca1b16b9a069b65d8b0884ec844712fe33ab))
+* **axir:** match unknown-tool results and thinking replay caching ([#883](https://github.com/ax-llm/ax/issues/883)) ([6bf6997](https://github.com/ax-llm/ax/commit/6bf699777923f91e19e5dd3e5048b348a2292c17))
+* **skills:** skip automatic setup for transitive and global installs ([#881](https://github.com/ax-llm/ax/issues/881)) ([60d8b7b](https://github.com/ax-llm/ax/commit/60d8b7b102d44ae4bfbf09a16f23916ccabf0fee))
+
+## [25.4.8](https://github.com/ax-llm/ax/compare/25.4.7...25.4.8) (2026-11-03)
+
+### Bug Fixes
+
+* **dsp:** answer an unknown tool name with a per-call error result ([#878](https://github.com/ax-llm/ax/issues/878)) ([761c5ae](https://github.com/ax-llm/ax/commit/761c5ae611a29b509ce627d5d63e225a1be91c54))
+
+## [25.4.8](https://github.com/ax-llm/ax/compare/25.4.7...25.4.8) (2026-11-03)
+
+### Bug Fixes
+
+* **Function calling:** Answer a call to an unregistered tool name with an error result for that call alone, listing the available functions, instead of abandoning the batch. The other calls in the batch still run and keep their results, and every call is answered before the model tries again, so providers that require a result for each tool call, such as Anthropic, no longer reject the retried request ([#878](https://github.com/ax-llm/ax/pull/878)).
+
+### Generated-language parity
+
+* Add the open backlog entry for the unknown-tool error result. Python, Java, C++, Go, and Rust keep the previous raise-and-retry behavior until it is ported ([#878](https://github.com/ax-llm/ax/pull/878)).
+
+## [25.4.7](https://github.com/ax-llm/ax/compare/25.4.6...25.4.7) (2026-10-29)
+
+### Features
+
+* **Optimization:** Report `baselineScore` and `baselineScores` for the original program before bootstrap, using the same held-out validation subset and scoring rules as the final result. Apply this behavior to TypeScript, Python, Java, C++, Go, and Rust ([#869](https://github.com/ax-llm/ax/issues/869), [#872](https://github.com/ax-llm/ax/pull/872)).
+* **Generated optimizers:** Evaluate native Go programs in `Optimize`, and add Rust `optimize_with_client` for provider-backed evaluation. Keep validation budgets, training demonstrations, public examples, and language documentation synchronized ([#872](https://github.com/ax-llm/ax/pull/872)).
+
+### Bug Fixes
+
+* **Generation:** Remove provisional refused content and thinking before retrying while retaining completed tool turns. Verify forward and streaming behavior across all six languages ([#871](https://github.com/ax-llm/ax/pull/871), [#872](https://github.com/ax-llm/ax/pull/872)).
+* **Windows MCP:** Start `.cmd` and `.bat` stdio servers, including `npx`, using the child environment's PATH and PATHEXT ([#870](https://github.com/ax-llm/ax/pull/870)).
+
+### Generated-language parity
+
+* Complete the optimizer baseline and refusal retry backlog entries with TypeScript-derived conformance tests. The AxIR backlog has no open entries ([#872](https://github.com/ax-llm/ax/pull/872)).
+
+## [25.4.6](https://github.com/ax-llm/ax/compare/25.4.5...25.4.6) (2026-10-26)
+
+### Features
+
+* **Bedrock:** Add Claude Haiku 5.5 to the AWS Bedrock provider ([#865](https://github.com/ax-llm/ax/pull/865)).
+
+### Bug Fixes
+
+* **Go agents:** Preserve `AxGenerateError`, nested provider causes, HTTP status, and request metadata through forward and streaming calls ([#831](https://github.com/ax-llm/ax/issues/831), [#866](https://github.com/ax-llm/ax/pull/866)).
+* **Bedrock OpenAI:** Apply model-specific reasoning and native structured-output rules, reject unsupported function-tool combinations, and validate service tiers in TypeScript and all five generated languages ([#679](https://github.com/ax-llm/ax/issues/679), [#866](https://github.com/ax-llm/ax/pull/866)).
+
+### Documentation
+
+* Reconcile the implemented G1 real-engine checks and G5 behavioral-parity ledger with their current CI wiring ([#807](https://github.com/ax-llm/ax/issues/807)).
+
+## [25.4.5](https://github.com/ax-llm/ax/compare/25.4.4...25.4.5) (2026-10-21)
+
+### Generated-language parity
+
+* Preserve quoted text, escaped quotes, and punctuation while repairing partial streamed JSON in Python, Java, C++, Go, and Rust.
+* Route audio-output requests using output capabilities, merge supported output formats, and report input and output requirements separately.
+* Interrupt MCP reconnect waits promptly when closing generated transports.
+* Add a shared novel F1/recall metric with token-overlap counting, Unicode normalization, and finite scores for empty filtered inputs.
+* Cover Gemini context-cache instruction ordering across all five generated languages, including instructions after the cache breakpoint.
+
+All five AxIR backlog entries are complete; there are no open entries. Public package APIs, runnable examples, and language documentation are updated together ([#862](https://github.com/ax-llm/ax/pull/862)).
+
+## [25.4.4](https://github.com/ax-llm/ax/compare/25.4.3...25.4.4) (2026-10-20)
+
+### Bug Fixes
+
+* **gemini:** preserve every system message in context caches ([#851](https://github.com/ax-llm/ax/issues/851)) ([98ab9bd](https://github.com/ax-llm/ax/commit/98ab9bd4be327180fbaf2e43c8e9e596422f8f80))
+
+## [25.4.4](https://github.com/ax-llm/ax/compare/25.4.3...25.4.4) (2026-10-21)
+
+### Bug Fixes
+
+* **gemini:** preserve every system message in context caches, matching uncached requests and retaining instructions on both sides of the cache breakpoint ([#851](https://github.com/ax-llm/ax/pull/851)).
+
+### Tests
+
+* Cover abort-signal fallback listener cleanup and first-abort reason preservation ([#859](https://github.com/ax-llm/ax/pull/859)).
+* Cover decoder-polyfill UTF-8 buffering and final incomplete-sequence flushing ([#860](https://github.com/ax-llm/ax/pull/860)).
+
+The Gemini fix applies to TypeScript. Generated-language parity remains tracked in the AxIR backlog; existing provider caches need expiry or recreation to receive the corrected instructions.
+
+## [25.4.3](https://github.com/ax-llm/ax/compare/25.4.2...25.4.3) (2026-10-18)
+
+### Bug Fixes
+
+* **ai:** honor generated-audio output routing and compatibility accounting, and aggregate formats only from output-capable providers ([#857](https://github.com/ax-llm/ax/pull/857)).
+* **eval:** compute novel F1 token overlap and finite empty-input scores ([#856](https://github.com/ax-llm/ax/pull/856)).
+* **mcp:** clear ping timeout timers and remove completed listening-delay abort listeners ([#847](https://github.com/ax-llm/ax/pull/847)).
+* **util:** preserve string text while repairing partial streamed JSON ([#846](https://github.com/ax-llm/ax/pull/846)).
+
+The fixes above apply to TypeScript. Generated-language follow-ups are recorded in the AxIR backlog.
+
+## [25.4.2](https://github.com/ax-llm/ax/compare/25.4.1...25.4.2) (2026-10-17)
+
+### Features
+
+* **skills:** bundle guides behind one entry point and persist install preferences ([#854](https://github.com/ax-llm/ax/pull/854)) ([3758f79](https://github.com/ax-llm/ax/commit/3758f7917fb4bb4d72ee53df277550c63b0489cf))
+
+## [25.4.1](https://github.com/ax-llm/ax/compare/25.4.0...25.4.1) (2026-10-15)
+
+### Features
+
+* **axir:** complete Jev image and Box parity ([#852](https://github.com/ax-llm/ax/pull/852)) ([be70f22](https://github.com/ax-llm/ax/commit/be70f220740ec7458a9af28525ac4fdf18fe250d))
+
+## [25.4.0](https://github.com/ax-llm/ax/compare/25.3.2...25.4.0) (2026-10-15)
+
+### Features
+
+* **typesafe:** support Jev images and box signatures in TypeScript ([#848](https://github.com/ax-llm/ax/pull/848)) ([e62bbce](https://github.com/ax-llm/ax/commit/e62bbcef83d7fd5b8a0069ef043e03b0fee123c2))
+
+## [25.3.2](https://github.com/ax-llm/ax/compare/25.3.1...25.3.2) (2026-10-13)
+
+### Features
+
+* **examples:** add keyless Parallel Search MCP example ([#829](https://github.com/ax-llm/ax/pull/829)) ([9d7225e](https://github.com/ax-llm/ax/commit/9d7225e0fe9e7ef9480e336c98c59722d5dc3132))
+
+### Bug Fixes
+
+* **ai:** complete GPT-6.1 Sol and Bedrock provider parity ([#840](https://github.com/ax-llm/ax/pull/840)) ([ee43f3e](https://github.com/ax-llm/ax/commit/ee43f3e4026457411e516307a6b804199627e286)), closes [#836](https://github.com/ax-llm/ax/pull/836) [#838](https://github.com/ax-llm/ax/pull/838)
+* **anthropic:** retain cumulative streamed input and cache usage ([#842](https://github.com/ax-llm/ax/pull/842)) ([1982a12](https://github.com/ax-llm/ax/commit/1982a12d5f080cfc35795ccd092f27867c0ca7c7))
+* **axir:** complete provider stream usage parity across languages ([#844](https://github.com/ax-llm/ax/pull/844)) ([00e7b0c](https://github.com/ax-llm/ax/commit/00e7b0cbc05a6fc9a510e5a50b65021f10a30266))
+* **openai:** clear Responses usage when a new stream starts ([#843](https://github.com/ax-llm/ax/pull/843)) ([80d7a3f](https://github.com/ax-llm/ax/commit/80d7a3f6d0c4023063c12e788b5622ab6e2c5b1d))
+* **openai:** map incomplete Responses by reason and retain usage ([#841](https://github.com/ax-llm/ax/pull/841)) ([3b706b2](https://github.com/ax-llm/ax/commit/3b706b201c7fb1e06f58c76d2359103d24aeaa22))
+
+## [25.3.1](https://github.com/ax-llm/ax/compare/25.3.0...25.3.1) (2026-10-13)
+
+### Bug Fixes
+
+* preserve code and string literals across generated languages ([#837](https://github.com/ax-llm/ax/pull/837)) ([898a8f8](https://github.com/ax-llm/ax/commit/898a8f8102505218235c8eb8c24aaf1009cf9ee8))
+
+## [25.3.0](https://github.com/ax-llm/ax/compare/25.2.1...25.3.0) (2026-10-11)
+
+### Features
+
+* add decision evidence and rubric scores to Ax signatures ([#832](https://github.com/ax-llm/ax/issues/832)) ([5c2b83f](https://github.com/ax-llm/ax/commit/5c2b83f1718db934f432f804cf09a674c419481e))
+
+## [25.3.0](https://github.com/ax-llm/ax/compare/25.2.1...25.3.0) (2026-10-11)
+
+### Features
+
+* add decision evidence and rubric scores to Ax signatures ([#832](https://github.com/ax-llm/ax/pull/832)) ([5c2b83f](https://github.com/ax-llm/ax/commit/5c2b83f1718db934f432f804cf09a674c419481e))
+
+## [25.2.1](https://github.com/ax-llm/ax/compare/25.2.0...25.2.1) (2026-10-08)
+
+### Features
+
+* support Claude Haiku 5.5 across all languages ([#827](https://github.com/ax-llm/ax/pull/827)) ([baa8adf](https://github.com/ax-llm/ax/commit/baa8adf616706e10a79fe91c743c6b58640fbbd0))
+
+## [25.2.0](https://github.com/ax-llm/ax/compare/25.1.1...25.2.0) (2026-10-07)
+
+### Features
+
+* **axir:** support OpenAI Decisions in all five generated languages ([#825](https://github.com/ax-llm/ax/issues/825)) ([b32f50f](https://github.com/ax-llm/ax/commit/b32f50f5ed7df4e6e92047e74813d88bf58b0f6e))
+
+## [25.2.0](https://github.com/ax-llm/ax/compare/25.1.1...25.2.0) (2026-10-07)
+
+### Features
+
+* **axir:** support OpenAI Decisions in all five generated languages ([#825](https://github.com/ax-llm/ax/pull/825)) ([b32f50f](https://github.com/ax-llm/ax/commit/b32f50f5ed7df4e6e92047e74813d88bf58b0f6e))
+
+## [25.1.1](https://github.com/ax-llm/ax/compare/25.1.0...25.1.1) (2026-10-07)
+
+### Bug Fixes
+
+* **ai:** merge refreshed credential headers case-insensitively ([#823](https://github.com/ax-llm/ax/pull/823)) ([d08f1b9](https://github.com/ax-llm/ax/commit/d08f1b9ccb0859f4f3952da083ea0dc1a9edecbb))
+
+## [25.1.0](https://github.com/ax-llm/ax/compare/25.0.1...25.1.0) (2026-10-07)
+
+### Features
+
+* **ai:** add OpenAI Decisions provider and native client ([#820](https://github.com/ax-llm/ax/pull/820)) ([c34653a](https://github.com/ax-llm/ax/commit/c34653ab97c5f06e35a7f26e8d1612e3dcdbd832))
+
+### Bug Fixes
+
+* **release:** pin Maven and recover Java from release tags ([#819](https://github.com/ax-llm/ax/pull/819)) ([458f273](https://github.com/ax-llm/ax/commit/458f27373c72edf7505410bc40b7f925826f9af1))
+
+## [25.0.1](https://github.com/ax-llm/ax/compare/25.0.0...25.0.1) (2026-10-06)
+
+### Features
+
+* **ai:** add Claude Sonnet 5.5 ([6bd317e](https://github.com/ax-llm/ax/commit/6bd317e840328e25c91267da7f92bb80e852f814))
+* **ai:** add TypeScript-only Chrome Built-in AI provider ([#794](https://github.com/ax-llm/ax/issues/794)) ([e0ff075](https://github.com/ax-llm/ax/commit/e0ff075c3ba572bfe94cf277336a00479d51206d))
+* **bedrock:** add Claude Sonnet 5.5 and GPT-6.1 Sol to AxAIBedrock ([#813](https://github.com/ax-llm/ax/issues/813)) ([ab0a8d9](https://github.com/ax-llm/ax/commit/ab0a8d9d9d7b28b19c8333bd23cd7550f341bd41))
+
+### Bug Fixes
+
+* **anthropic:** preserve signed thinking and append-only Sonnet history ([06a1561](https://github.com/ax-llm/ax/commit/06a156189b54a22a4cfbe3b45d6101f0f02396fa))
+* **axir:** port Sonnet 5.5 across generated clients ([#817](https://github.com/ax-llm/ax/issues/817)) ([f1c036c](https://github.com/ax-llm/ax/commit/f1c036c7ede4af99eb3118e8a11bf068c45ed7b9))
+* **axir:** refresh Sonnet 5.5 catalog data and generated packages ([43cae59](https://github.com/ax-llm/ax/commit/43cae59f9c825ceca4662e83da9fd3e69a81ab2d))
+* **event:** recheck dedupe after waiting for inbox capacity ([#811](https://github.com/ax-llm/ax/issues/811)) ([cd27701](https://github.com/ax-llm/ax/commit/cd27701d9bed98422d57a6946200df7c44b8eadb))
+* **memory:** keep opaque replay blocks separate ([5edc31f](https://github.com/ax-llm/ax/commit/5edc31fd54e77e50a162b6c668ca1d125583b9ec))
+
+* **bedrock:** fix Titan embedding batches ([#808](https://github.com/ax-llm/ax/pull/808)).
+* **aisdk:** preserve file parts in the AI SDK adapter ([#809](https://github.com/ax-llm/ax/pull/809)).
+* **mcp:** settle pending stdio calls when the child process exits ([#810](https://github.com/ax-llm/ax/pull/810)).
+
+### Performance Improvements
+
+* **ci:** shorten full CI with parallel conformance and isolated mutations ([#798](https://github.com/ax-llm/ax/issues/798)) ([16514d9](https://github.com/ax-llm/ax/commit/16514d982f49a5448da6d6fdd0b07d642d42bed7))
+
+## [25.0.0](https://github.com/ax-llm/ax/compare/24.0.24...25.0.0) (2026-09-30)
+
+### ⚠ BREAKING CHANGES
+
+* Ax 25 changes generated-language defaults and removes deprecated compatibility surfaces. Upgrade instructions for all 19 queued changes and the held agent/tool-result changes are in the [Ax 25 migration guide](docs/MIGRATION_25.md).
+* **rust:** add native causes and forward-option caches (#782)
+* **ai:** remove responseFormatWithFunctions from feature objects
+and select structuredOutputMode on the program when necessary. Provider
+profiles must use a supported authentication method.
+* **axir:** complete held agent parity and audit follow-ups for Ax 25 (#780)
+* **axir:** reject malformed function calls by default (#776)
+* **axir:** match TypeScript tool-result formatting across ports (#774)
+
+### Features
+
+* **ai:** remove ignored provider options for Ax 25 ([#773](https://github.com/ax-llm/ax/issues/773)) ([6165d13](https://github.com/ax-llm/ax/commit/6165d13a1050587dd525a6de7a8efcc75fc60362))
+* **axir:** complete held agent parity and audit follow-ups for Ax 25 ([#780](https://github.com/ax-llm/ax/issues/780)) ([7278845](https://github.com/ax-llm/ax/commit/72788456546f95dc07e5cf4ae210ea5a8b747b6f))
+* **axir:** match TypeScript tool-result formatting across ports ([#774](https://github.com/ax-llm/ax/issues/774)) ([9084e4a](https://github.com/ax-llm/ax/commit/9084e4a920e78106bc8634dfb366bb5caad16a22))
+* **axir:** reject malformed function calls by default ([#776](https://github.com/ax-llm/ax/issues/776)) ([c0b8631](https://github.com/ax-llm/ax/commit/c0b863180c85bd8bfe9dbb92913ce6fe1c522178))
+* enable Ax 25 breaking defaults across languages ([#791](https://github.com/ax-llm/ax/issues/791)) ([0bc7d91](https://github.com/ax-llm/ax/commit/0bc7d9146418cb421042cb3d2bdcb146f8f807c5))
+* **rust:** add native causes and forward-option caches ([#782](https://github.com/ax-llm/ax/issues/782)) ([d72e4f0](https://github.com/ax-llm/ax/commit/d72e4f00b88dd422985623e6e87318a58d50a080))
+
+### Bug Fixes
+
+* **ai:** preserve embedding router keys across all languages ([#783](https://github.com/ax-llm/ax/issues/783)) ([cc2f4b2](https://github.com/ax-llm/ax/commit/cc2f4b255d672d35dd60dddc7098dc6584f00ec4))
+* **axir:** match native-session response budgets to TypeScript ([#772](https://github.com/ax-llm/ax/issues/772)) ([55ec191](https://github.com/ax-llm/ax/commit/55ec191747cc92ed5a0bed13db7f341058f88ba9))
+* **axir:** match TypeScript request-layer retries across ports ([#775](https://github.com/ax-llm/ax/issues/775)) ([234a289](https://github.com/ax-llm/ax/commit/234a289a1418ea4829d40d17ec4eea604abb8a0d))
+* **axir:** split cached and dynamic actor prompts ([#784](https://github.com/ax-llm/ax/issues/784)) ([41886d7](https://github.com/ax-llm/ax/commit/41886d7369e2d92914eb18c8b08724f422ea8e6a))
+
+## [24.0.24](https://github.com/ax-llm/ax/compare/24.0.23...24.0.24) (2026-09-27)
+
+### Features
+
+* **axir:** AxAgent streamingForward in all five ports; streamingForward reports per-stage run-control paths (3a) ([#738](https://github.com/ax-llm/ax/issues/738)) ([b74e75f](https://github.com/ax-llm/ax/commit/b74e75f7174edbe7dd49554b49c20d0c7cde56d8)), closes [#737](https://github.com/ax-llm/ax/issues/737)
+* **axir:** AxFlow cachingFunction in all five ports; a flow cache hit records no span; TS keys a node-less flow the same on every call (2d2) ([#740](https://github.com/ax-llm/ax/issues/740)) ([1a0abc8](https://github.com/ax-llm/ax/commit/1a0abc8e901ddb47219cfd7210fdc8dc3c3ae119))
+* **axir:** AxGen audio outputs render through speak() behind renderAudio in all five ports ([#736](https://github.com/ax-llm/ax/issues/736)) ([d023f67](https://github.com/ax-llm/ax/commit/d023f6756754927bbdeda17825b5b691b8a315fc))
+* **axir:** media inputs, speak() and agent audio outputs match TypeScript in all five ports; TS image detail, file filename, pcm and input_audio fixes (5b) ([#743](https://github.com/ax-llm/ax/issues/743)) ([4e8772b](https://github.com/ax-llm/ax/commit/4e8772b23d9c8b29dc34c6b5fb4932c82ff3aa84))
+* **axir:** opt-in TypeScript date parsing (parseDates) in the ports; time-zone abbreviations at literal offsets ([#734](https://github.com/ax-llm/ax/issues/734)) ([9de72ce](https://github.com/ax-llm/ax/commit/9de72cef37a7503777968051a6d9750ae45b02d5)), closes [86-#89](https://github.com/ax-llm/86-/issues/89)
+* **axir:** public streaming and field-processor APIs for Java, C++ and Rust; early stop reports aborted ([#730](https://github.com/ax-llm/ax/issues/730)) ([a88d66f](https://github.com/ax-llm/ax/commit/a88d66ffa9e2ff01cfab4530a32b889d588e67e7)), closes [#729](https://github.com/ax-llm/ax/issues/729)
+* **axir:** TypeScript AxGen streaming deltas in all five ports ([#724](https://github.com/ax-llm/ax/issues/724)) ([737f263](https://github.com/ax-llm/ax/commit/737f263c6b72edd66b19e73694fad66c48f45a52))
+* **axir:** TypeScript's AxGen cachingFunction in all five ports; a cache hit records no span (2d) ([#733](https://github.com/ax-llm/ax/issues/733)) ([da28673](https://github.com/ax-llm/ax/commit/da28673f86fca97bbd69a2315d7d0d5479f7b9dd))
+* **rust:** name the agent playbook student; stream_http_roundtrip checks order, not timing (2f4a) ([#745](https://github.com/ax-llm/ax/issues/745)) ([36219ec](https://github.com/ax-llm/ax/commit/36219ec0ed3b4deb23a858ad60f20b762ccf9ca6))
+
+### Bug Fixes
+
+* **ai,axir:** Anthropic and Gemini sampling follow the probed APIs, temperature 1 where it is the only value, warn instead of dropping silently (6b) ([#750](https://github.com/ax-llm/ax/issues/750)) ([dbb2903](https://github.com/ax-llm/ax/commit/dbb2903f38124f9d57895b861652b67326cff6db)), closes [#738](https://github.com/ax-llm/ax/issues/738) [735/#739](https://github.com/735/ax/issues/739)
+* **ai,axir:** one JS text spec for string.format/str; chat messages and nameless calls fail as in TS (2f5) ([#754](https://github.com/ax-llm/ax/issues/754)) ([7d36daf](https://github.com/ax-llm/ax/commit/7d36daf9275a71493fc6081389e825470870d398))
+* **ai,axir:** per-call timeoutMs, per-call Vertex beta and Responses prompt_cache_key in the ports; TS keeps the service cache key on GPT-6 (audit follow-ups) ([#761](https://github.com/ax-llm/ax/issues/761)) ([ccee3bd](https://github.com/ax-llm/ax/commit/ccee3bda236e6ee3a0295db26dec084dc0b4e2fd))
+* **ai,axir:** send explicit sampling values the model accepts, warn when dropping; keep credentials with their provider (6) ([#741](https://github.com/ax-llm/ax/issues/741)) ([6a81fa0](https://github.com/ax-llm/ax/commit/6a81fa0f1280b15b8732ec19ae163b93e35529fd))
+* **ai:** keep the deprecated responseFormatWithFunctions flag source-compatible ([#721](https://github.com/ax-llm/ax/issues/721)) ([b837d2f](https://github.com/ax-llm/ax/commit/b837d2fa6672d9b92cceb546f3612dcf1fbe7b98)), closes [#717](https://github.com/ax-llm/ax/issues/717)
+* **ai:** sort context-cache stableStringify keys by code point ([#764](https://github.com/ax-llm/ax/issues/764)) ([730ca7b](https://github.com/ax-llm/ax/commit/730ca7b3f4eb0908928c248fde915dc37835fa00))
+* AxGen failure messages, validation, strictMode and functionCot parity (TypeScript fixes, ports follow) ([#729](https://github.com/ax-llm/ax/issues/729)) ([cf4d697](https://github.com/ax-llm/ax/commit/cf4d6979b215a9481f6ca389a7a2b943057899b3))
+* AxGen stream and non-stream parity (TypeScript fixes, ports follow) ([#725](https://github.com/ax-llm/ax/issues/725)) ([167d58d](https://github.com/ax-llm/ax/commit/167d58d44dbacb6cf29d34103fc1da21911ebf92))
+* **axgen:** let a later step replace earlier output and keep delta versions monotonic ([#720](https://github.com/ax-llm/ax/issues/720)) ([e803438](https://github.com/ax-llm/ax/commit/e803438d334604eaabc13efca9de13e12d4699c1))
+* **axir:** a native chat session per AxGen request, and streaming deltas under sessions, in the ports (3b-2) ([#769](https://github.com/ax-llm/ax/issues/769)) ([eb76af7](https://github.com/ax-llm/ax/commit/eb76af7c3b3545211ccbcd96ab49dafa7276804a))
+* **axir:** a pending run control update continues the AxGen step loop in the ports (2g) ([#737](https://github.com/ax-llm/ax/issues/737)) ([b76af5f](https://github.com/ax-llm/ax/commit/b76af5f48b09367f0a88d66343a6529fa20671e5))
+* **axir:** ACE teacher prompts, required inputs, Rust titles and the Rust agent playbook seed match TypeScript ([#732](https://github.com/ax-llm/ax/issues/732)) ([b959f84](https://github.com/ax-llm/ax/commit/b959f844443e1351ec40ff1caf06dabc13bc3e5d))
+* **axir:** an agent's stages follow each run's runtime (constructor, else forward call) ([#746](https://github.com/ax-llm/ax/issues/746)) ([bc8d9d0](https://github.com/ax-llm/ax/commit/bc8d9d0dc0e28e56c18070148115035d56c50b0a))
+* **axir:** AxGen constructor run and service options apply to every forward in TS and all five ports; Rust AxGen::with_control (audit) ([#744](https://github.com/ax-llm/ax/issues/744)) ([98e5718](https://github.com/ax-llm/ax/commit/98e57186ab3012f6beef14b4a77767b01b447ee4))
+* **axir:** embed gemini-embedding-2 on Vertex through global :embedContent ([#718](https://github.com/ax-llm/ax/issues/718)) ([3cf10a6](https://github.com/ax-llm/ax/commit/3cf10a6e022146b06dda420f5b2bd9227e1ad20f))
+* **axir:** escape control characters in Go, C++ and Java wire JSON ([#722](https://github.com/ax-llm/ax/issues/722)) ([b4934a3](https://github.com/ax-llm/ax/commit/b4934a3b755f9ed7d10dfd66fb1e69cdac8046f6))
+* **axir:** evaluated agent predictions carry the run's function calls, tool errors and turns; Rust eval fixtures run the agent (2f4b) ([#749](https://github.com/ax-llm/ax/issues/749)) ([15030d7](https://github.com/ax-llm/ax/commit/15030d75894567084a2049e78f419860154398cf))
+* **axir:** fail verify on relative roots and empty runs; render prompt JSON as TS does ([#723](https://github.com/ax-llm/ax/issues/723)) ([0f401c8](https://github.com/ax-llm/ax/commit/0f401c8c7976a5432e73af1343baa6b437564ad0))
+* **axir:** field titles, ACE clock, agent playbook binding, miner prompts and flat tool calls match TypeScript (2f2) ([#735](https://github.com/ax-llm/ax/issues/735)) ([ad131d5](https://github.com/ax-llm/ax/commit/ad131d58820184d78bde3fd77b79686b5fc47c50))
+* **axir:** flow steps without reads or writes plan from their program's signature ([#751](https://github.com/ax-llm/ax/issues/751)) ([7c396c2](https://github.com/ax-llm/ax/commit/7c396c268f37df492723529207082f9a3c6e6a51))
+* **axir:** Go and Rust keep a surrogate pair a provider splits across stream events ([#760](https://github.com/ax-llm/ax/issues/760)) ([82e23ef](https://github.com/ax-llm/ax/commit/82e23ef667483798e356e760b2b3f063ee889b67))
+* **axir:** json.stringify and the JSON writers match TS's JSON.stringify in every port (own-key order, null as null) ([#759](https://github.com/ax-llm/ax/issues/759)) ([002911e](https://github.com/ax-llm/ax/commit/002911ef3c1821d15ce4f7b0aff32131eaa52e12)), closes [#764](https://github.com/ax-llm/ax/issues/764)
+* **axir:** keep credentials out of provider errors in the ports; honor includeRequestBodyInErrors ([#742](https://github.com/ax-llm/ax/issues/742)) ([ec97376](https://github.com/ax-llm/ax/commit/ec97376d15248953888877aa0003ac0f82aaa958))
+* **axir:** keep Go's key-order lists out of outputs and prompts; stop echoing Python ai() configs ([#719](https://github.com/ax-llm/ax/issues/719)) ([9171ae0](https://github.com/ax-llm/ax/commit/9171ae0bb3161168920bed7bb3b3b0e38b14a057))
+* **axir:** MCP tool task handling in the ports: outcome call, expose, task-ID listen filters ([#757](https://github.com/ax-llm/ax/issues/757)) ([c14f3d8](https://github.com/ax-llm/ax/commit/c14f3d834656e966a2cc100e8ae9be53ebfa3ec0))
+* **axir:** playbook evolve replays run on the runtime passed to evolve; examples stop when a replay fails ([#755](https://github.com/ax-llm/ax/issues/755)) ([f32c50c](https://github.com/ax-llm/ax/commit/f32c50cbcfe7a5fa537aebeea03f73966f5fa2a4)), closes [#750](https://github.com/ax-llm/ax/issues/750)
+* **axir:** ports' playbook reflector and curator get TypeScript's inputs ([#727](https://github.com/ax-llm/ax/issues/727)) ([22958b8](https://github.com/ax-llm/ax/commit/22958b8ff495055b60788e2e59559c8d05346588))
+* **axir:** provider errors, part 2: Core-owned error request view, TS body out of serialization, Go/C++ url and body ([#747](https://github.com/ax-llm/ax/issues/747)) ([0a2c467](https://github.com/ax-llm/ax/commit/0a2c467d45cbf24fa9a76a40b5cd4d41e3a9e346))
+* **axir:** real HTTP timeouts and connection failures raise TypeScript's typed errors in every port ([#767](https://github.com/ax-llm/ax/issues/767)) ([5c4fe20](https://github.com/ax-llm/ax/commit/5c4fe2040da83ec35a09ae62b94a7b49df87bf91)), closes [703/#707](https://github.com/703/ax/issues/707)
+* **axir:** the AxGen structured-output contract goes in the system prompt in the ports; requiresStructuredOutput selects by mode (2h) ([#748](https://github.com/ax-llm/ax/issues/748)) ([d691dd6](https://github.com/ax-llm/ax/commit/d691dd63fb7f6ec665309a3c354322e6320f229d))
+* **axir:** TS playbook seed shape, miner user message, tool-field titles and string format in the ports (2f3) ([#739](https://github.com/ax-llm/ax/issues/739)) ([06404e0](https://github.com/ax-llm/ax/commit/06404e07963013d00a2603df6b59f3e4d6a7efdf))
+* **axir:** TypeScript's structured-output validation messages in the ports ([#768](https://github.com/ax-llm/ax/issues/768)) ([1c83032](https://github.com/ax-llm/ax/commit/1c83032daba575846bae2d85eb88e74a4605b6ed))
+* **axir:** UTF-16 string lengths and re-parse cadence, JavaScript trim, and TypeScript's retry messages in the ports (2e2) ([#758](https://github.com/ax-llm/ax/issues/758)) ([3b03f7c](https://github.com/ax-llm/ax/commit/3b03f7c109dbc9faab10c975d792ccae21233ec6))
+* **axir:** write numbers as JavaScript does in prompts and wire JSON in every port ([#728](https://github.com/ax-llm/ax/issues/728)) ([b45ee9c](https://github.com/ax-llm/ax/commit/b45ee9cfbcc88a37f31002680c5202cc107c321c))
+* drop the Gemini __axOutput workaround and return thought on every rung in all languages ([#717](https://github.com/ax-llm/ax/issues/717)) ([d38c258](https://github.com/ax-llm/ax/commit/d38c258fa822e37a13f50b0ad3afa682ebf6b11b)), closes [#686](https://github.com/ax-llm/ax/issues/686) [#697](https://github.com/ax-llm/ax/issues/697)
+* **dsp,axir:** mid-stream processor feedback continues the step, feedback is a text part, and streamed deltas never split a surrogate pair (2e) ([#752](https://github.com/ax-llm/ax/issues/752)) ([446ed7e](https://github.com/ax-llm/ax/commit/446ed7e2497f573ad8e7fc54dcf430ca87f66073))
+* **dsp:** AxGen constructor options are defaults for every forward; modelConfig merges key by key ([#731](https://github.com/ax-llm/ax/issues/731)) ([ef9876d](https://github.com/ax-llm/ax/commit/ef9876dc6e41e98390f9aef05fc61b805fba0d72))
+* **dsp:** stream a chat session's response like a plain stream ([#762](https://github.com/ax-llm/ax/issues/762)) ([d325cfc](https://github.com/ax-llm/ax/commit/d325cfc747f0002ff97d8c8cf4c321b4fc621dd1))
+* **examples:** flow examples return real state keys and assert their outputs ([#753](https://github.com/ax-llm/ax/issues/753)) ([0728027](https://github.com/ax-llm/ax/commit/0728027689965bf4ba0f49556dc6c93650f043ff))
+* **examples:** the data-analyst examples wire their warehouse tools as the TS twin does ([#765](https://github.com/ax-llm/ax/issues/765)) ([08b2ab2](https://github.com/ax-llm/ax/commit/08b2ab2fc5b1938003221011e95b4cd852637e17))
+* **flow:** a parallel group merges each step's changes, in TS and all five ports ([#756](https://github.com/ax-llm/ax/issues/756)) ([58123b3](https://github.com/ax-llm/ax/commit/58123b3867e8d4d3835b9a555984f5c41704120d))
+* **util:** createHash('sha256') computes real SHA-256 (cache-key collisions) ([#726](https://github.com/ax-llm/ax/issues/726)) ([3f64c66](https://github.com/ax-llm/ax/commit/3f64c663fb11ccde81009af661e1e6937d11672c))
+
+## [24.0.24](https://github.com/ax-llm/ax/compare/24.0.23...24.0.24) (2026-09-27)
+
+### Features
+
+* **axir:** AxAgent streamingForward in all five ports; streamingForward reports per-stage run-control paths (3a) ([#738](https://github.com/ax-llm/ax/issues/738)) ([b74e75f](https://github.com/ax-llm/ax/commit/b74e75f7174edbe7dd49554b49c20d0c7cde56d8)), closes [#737](https://github.com/ax-llm/ax/issues/737)
+* **axir:** AxFlow cachingFunction in all five ports; a flow cache hit records no span; TS keys a node-less flow the same on every call (2d2) ([#740](https://github.com/ax-llm/ax/issues/740)) ([1a0abc8](https://github.com/ax-llm/ax/commit/1a0abc8e901ddb47219cfd7210fdc8dc3c3ae119))
+* **axir:** AxGen audio outputs render through speak() behind renderAudio in all five ports ([#736](https://github.com/ax-llm/ax/issues/736)) ([d023f67](https://github.com/ax-llm/ax/commit/d023f6756754927bbdeda17825b5b691b8a315fc))
+* **axir:** media inputs, speak() and agent audio outputs match TypeScript in all five ports; TS image detail, file filename, pcm and input_audio fixes (5b) ([#743](https://github.com/ax-llm/ax/issues/743)) ([4e8772b](https://github.com/ax-llm/ax/commit/4e8772b23d9c8b29dc34c6b5fb4932c82ff3aa84))
+* **axir:** opt-in TypeScript date parsing (parseDates) in the ports; time-zone abbreviations at literal offsets ([#734](https://github.com/ax-llm/ax/issues/734)) ([9de72ce](https://github.com/ax-llm/ax/commit/9de72cef37a7503777968051a6d9750ae45b02d5))
+* **axir:** public streaming and field-processor APIs for Java, C++ and Rust; early stop reports aborted ([#730](https://github.com/ax-llm/ax/issues/730)) ([a88d66f](https://github.com/ax-llm/ax/commit/a88d66ffa9e2ff01cfab4530a32b889d588e67e7)), closes [#729](https://github.com/ax-llm/ax/issues/729)
+* **axir:** TypeScript AxGen streaming deltas in all five ports ([#724](https://github.com/ax-llm/ax/issues/724)) ([737f263](https://github.com/ax-llm/ax/commit/737f263c6b72edd66b19e73694fad66c48f45a52))
+* **axir:** TypeScript's AxGen cachingFunction in all five ports; a cache hit records no span (2d) ([#733](https://github.com/ax-llm/ax/issues/733)) ([da28673](https://github.com/ax-llm/ax/commit/da28673f86fca97bbd69a2315d7d0d5479f7b9dd))
+* **rust:** name the agent playbook student; stream_http_roundtrip checks order, not timing (2f4a) ([#745](https://github.com/ax-llm/ax/issues/745)) ([36219ec](https://github.com/ax-llm/ax/commit/36219ec0ed3b4deb23a858ad60f20b762ccf9ca6))
+
+### Bug Fixes
+
+* **ai,axir:** Anthropic and Gemini sampling follow the probed APIs, temperature 1 where it is the only value, warn instead of dropping silently (6b) ([#750](https://github.com/ax-llm/ax/issues/750)) ([dbb2903](https://github.com/ax-llm/ax/commit/dbb2903f38124f9d57895b861652b67326cff6db)), closes [#738](https://github.com/ax-llm/ax/issues/738) [735/#739](https://github.com/735/ax/issues/739)
+* **ai,axir:** one JS text spec for string.format/str; chat messages and nameless calls fail as in TS (2f5) ([#754](https://github.com/ax-llm/ax/issues/754)) ([7d36daf](https://github.com/ax-llm/ax/commit/7d36daf9275a71493fc6081389e825470870d398))
+* **ai,axir:** per-call timeoutMs, per-call Vertex beta and Responses prompt_cache_key in the ports; TS keeps the service cache key on GPT-6 (audit follow-ups) ([#761](https://github.com/ax-llm/ax/issues/761)) ([ccee3bd](https://github.com/ax-llm/ax/commit/ccee3bda236e6ee3a0295db26dec084dc0b4e2fd))
+* **ai,axir:** send explicit sampling values the model accepts, warn when dropping; keep credentials with their provider (6) ([#741](https://github.com/ax-llm/ax/issues/741)) ([6a81fa0](https://github.com/ax-llm/ax/commit/6a81fa0f1280b15b8732ec19ae163b93e35529fd))
+* **ai:** keep the deprecated responseFormatWithFunctions flag source-compatible ([#721](https://github.com/ax-llm/ax/issues/721)) ([b837d2f](https://github.com/ax-llm/ax/commit/b837d2fa6672d9b92cceb546f3612dcf1fbe7b98)), closes [#717](https://github.com/ax-llm/ax/issues/717)
+* **ai:** sort context-cache stableStringify keys by code point ([#764](https://github.com/ax-llm/ax/issues/764)) ([730ca7b](https://github.com/ax-llm/ax/commit/730ca7b3f4eb0908928c248fde915dc37835fa00))
+* AxGen failure messages, validation, strictMode and functionCot parity (TypeScript fixes, ports follow) ([#729](https://github.com/ax-llm/ax/issues/729)) ([cf4d697](https://github.com/ax-llm/ax/commit/cf4d6979b215a9481f6ca389a7a2b943057899b3))
+* AxGen stream and non-stream parity (TypeScript fixes, ports follow) ([#725](https://github.com/ax-llm/ax/issues/725)) ([167d58d](https://github.com/ax-llm/ax/commit/167d58d44dbacb6cf29d34103fc1da21911ebf92))
+* **axgen:** let a later step replace earlier output and keep delta versions monotonic ([#720](https://github.com/ax-llm/ax/issues/720)) ([e803438](https://github.com/ax-llm/ax/commit/e803438d334604eaabc13efca9de13e12d4699c1))
+* **axir:** a native chat session per AxGen request, and streaming deltas under sessions, in the ports (3b-2) ([#769](https://github.com/ax-llm/ax/issues/769)) ([eb76af7](https://github.com/ax-llm/ax/commit/eb76af7c3b3545211ccbcd96ab49dafa7276804a))
+* **axir:** a pending run control update continues the AxGen step loop in the ports (2g) ([#737](https://github.com/ax-llm/ax/issues/737)) ([b76af5f](https://github.com/ax-llm/ax/commit/b76af5f48b09367f0a88d66343a6529fa20671e5))
+* **axir:** ACE teacher prompts, required inputs, Rust titles and the Rust agent playbook seed match TypeScript ([#732](https://github.com/ax-llm/ax/issues/732)) ([b959f84](https://github.com/ax-llm/ax/commit/b959f844443e1351ec40ff1caf06dabc13bc3e5d))
+* **axir:** an agent's stages follow each run's runtime (constructor, else forward call) ([#746](https://github.com/ax-llm/ax/issues/746)) ([bc8d9d0](https://github.com/ax-llm/ax/commit/bc8d9d0dc0e28e56c18070148115035d56c50b0a))
+* **axir:** AxGen constructor run and service options apply to every forward in TS and all five ports; Rust AxGen::with_control (audit) ([#744](https://github.com/ax-llm/ax/issues/744)) ([98e5718](https://github.com/ax-llm/ax/commit/98e57186ab3012f6beef14b4a77767b01b447ee4))
+* **axir:** embed gemini-embedding-2 on Vertex through global :embedContent ([#718](https://github.com/ax-llm/ax/issues/718)) ([3cf10a6](https://github.com/ax-llm/ax/commit/3cf10a6e022146b06dda420f5b2bd9227e1ad20f))
+* **axir:** escape control characters in Go, C++ and Java wire JSON ([#722](https://github.com/ax-llm/ax/issues/722)) ([b4934a3](https://github.com/ax-llm/ax/commit/b4934a3b755f9ed7d10dfd66fb1e69cdac8046f6))
+* **axir:** evaluated agent predictions carry the run's function calls, tool errors and turns; Rust eval fixtures run the agent (2f4b) ([#749](https://github.com/ax-llm/ax/issues/749)) ([15030d7](https://github.com/ax-llm/ax/commit/15030d75894567084a2049e78f419860154398cf))
+* **axir:** fail verify on relative roots and empty runs; render prompt JSON as TS does ([#723](https://github.com/ax-llm/ax/issues/723)) ([0f401c8](https://github.com/ax-llm/ax/commit/0f401c8c7976a5432e73af1343baa6b437564ad0))
+* **axir:** field titles, ACE clock, agent playbook binding, miner prompts and flat tool calls match TypeScript (2f2) ([#735](https://github.com/ax-llm/ax/issues/735)) ([ad131d5](https://github.com/ax-llm/ax/commit/ad131d58820184d78bde3fd77b79686b5fc47c50))
+* **axir:** flow steps without reads or writes plan from their program's signature ([#751](https://github.com/ax-llm/ax/issues/751)) ([7c396c2](https://github.com/ax-llm/ax/commit/7c396c268f37df492723529207082f9a3c6e6a51))
+* **axir:** Go and Rust keep a surrogate pair a provider splits across stream events ([#760](https://github.com/ax-llm/ax/issues/760)) ([82e23ef](https://github.com/ax-llm/ax/commit/82e23ef667483798e356e760b2b3f063ee889b67))
+* **axir:** json.stringify and the JSON writers match TS's JSON.stringify in every port (own-key order, null as null) ([#759](https://github.com/ax-llm/ax/issues/759)) ([002911e](https://github.com/ax-llm/ax/commit/002911ef3c1821d15ce4f7b0aff32131eaa52e12)), closes [#764](https://github.com/ax-llm/ax/issues/764)
+* **axir:** keep credentials out of provider errors in the ports; honor includeRequestBodyInErrors ([#742](https://github.com/ax-llm/ax/issues/742)) ([ec97376](https://github.com/ax-llm/ax/commit/ec97376d15248953888877aa0003ac0f82aaa958))
+* **axir:** keep Go's key-order lists out of outputs and prompts; stop echoing Python ai() configs ([#719](https://github.com/ax-llm/ax/issues/719)) ([9171ae0](https://github.com/ax-llm/ax/commit/9171ae0bb3161168920bed7bb3b3b0e38b14a057))
+* **axir:** MCP tool task handling in the ports: outcome call, expose, task-ID listen filters ([#757](https://github.com/ax-llm/ax/issues/757)) ([c14f3d8](https://github.com/ax-llm/ax/commit/c14f3d834656e966a2cc100e8ae9be53ebfa3ec0))
+* **axir:** playbook evolve replays run on the runtime passed to evolve; examples stop when a replay fails ([#755](https://github.com/ax-llm/ax/issues/755)) ([f32c50c](https://github.com/ax-llm/ax/commit/f32c50cbcfe7a5fa537aebeea03f73966f5fa2a4)), closes [#750](https://github.com/ax-llm/ax/issues/750)
+* **axir:** ports' playbook reflector and curator get TypeScript's inputs ([#727](https://github.com/ax-llm/ax/issues/727)) ([22958b8](https://github.com/ax-llm/ax/commit/22958b8ff495055b60788e2e59559c8d05346588))
+* **axir:** provider errors, part 2: Core-owned error request view, TS body out of serialization, Go/C++ url and body ([#747](https://github.com/ax-llm/ax/issues/747)) ([0a2c467](https://github.com/ax-llm/ax/commit/0a2c467d45cbf24fa9a76a40b5cd4d41e3a9e346))
+* **axir:** real HTTP timeouts and connection failures raise TypeScript's typed errors in every port ([#767](https://github.com/ax-llm/ax/issues/767)) ([5c4fe20](https://github.com/ax-llm/ax/commit/5c4fe2040da83ec35a09ae62b94a7b49df87bf91))
+* **axir:** the AxGen structured-output contract goes in the system prompt in the ports; requiresStructuredOutput selects by mode (2h) ([#748](https://github.com/ax-llm/ax/issues/748)) ([d691dd6](https://github.com/ax-llm/ax/commit/d691dd63fb7f6ec665309a3c354322e6320f229d))
+* **axir:** TS playbook seed shape, miner user message, tool-field titles and string format in the ports (2f3) ([#739](https://github.com/ax-llm/ax/issues/739)) ([06404e0](https://github.com/ax-llm/ax/commit/06404e07963013d00a2603df6b59f3e4d6a7efdf))
+* **axir:** TypeScript's structured-output validation messages in the ports ([#768](https://github.com/ax-llm/ax/issues/768)) ([1c83032](https://github.com/ax-llm/ax/commit/1c83032daba575846bae2d85eb88e74a4605b6ed))
+* **axir:** UTF-16 string lengths and re-parse cadence, JavaScript trim, and TypeScript's retry messages in the ports (2e2) ([#758](https://github.com/ax-llm/ax/issues/758)) ([3b03f7c](https://github.com/ax-llm/ax/commit/3b03f7c109dbc9faab10c975d792ccae21233ec6))
+* **axir:** write numbers as JavaScript does in prompts and wire JSON in every port ([#728](https://github.com/ax-llm/ax/issues/728)) ([b45ee9c](https://github.com/ax-llm/ax/commit/b45ee9cfbcc88a37f31002680c5202cc107c321c))
+* drop the Gemini __axOutput workaround and return thought on every rung in all languages ([#717](https://github.com/ax-llm/ax/issues/717)) ([d38c258](https://github.com/ax-llm/ax/commit/d38c258fa822e37a13f50b0ad3afa682ebf6b11b)), closes [#686](https://github.com/ax-llm/ax/issues/686) [#697](https://github.com/ax-llm/ax/issues/697)
+* **dsp,axir:** mid-stream processor feedback continues the step, feedback is a text part, and streamed deltas never split a surrogate pair (2e) ([#752](https://github.com/ax-llm/ax/issues/752)) ([446ed7e](https://github.com/ax-llm/ax/commit/446ed7e2497f573ad8e7fc54dcf430ca87f66073))
+* **dsp:** AxGen constructor options are defaults for every forward; modelConfig merges key by key ([#731](https://github.com/ax-llm/ax/issues/731)) ([ef9876d](https://github.com/ax-llm/ax/commit/ef9876dc6e41e98390f9aef05fc61b805fba0d72))
+* **dsp:** stream a chat session's response like a plain stream ([#762](https://github.com/ax-llm/ax/issues/762)) ([d325cfc](https://github.com/ax-llm/ax/commit/d325cfc747f0002ff97d8c8cf4c321b4fc621dd1))
+* **examples:** flow examples return real state keys and assert their outputs ([#753](https://github.com/ax-llm/ax/issues/753)) ([0728027](https://github.com/ax-llm/ax/commit/0728027689965bf4ba0f49556dc6c93650f043ff))
+* **examples:** the data-analyst examples wire their warehouse tools as the TS twin does ([#765](https://github.com/ax-llm/ax/issues/765)) ([08b2ab2](https://github.com/ax-llm/ax/commit/08b2ab2fc5b1938003221011e95b4cd852637e17))
+* **flow:** a parallel group merges each step's changes, in TS and all five ports ([#756](https://github.com/ax-llm/ax/issues/756)) ([58123b3](https://github.com/ax-llm/ax/commit/58123b3867e8d4d3835b9a555984f5c41704120d))
+* **util:** createHash('sha256') computes real SHA-256 (cache-key collisions) ([#726](https://github.com/ax-llm/ax/issues/726)) ([3f64c66](https://github.com/ax-llm/ax/commit/3f64c663fb11ccde81009af661e1e6937d11672c))
+
+## [24.0.23](https://github.com/ax-llm/ax/compare/24.0.22...24.0.23) (2026-09-25)
+
+### Bug Fixes
+
+* **gemini:** embed gemini-embedding-2 on Vertex through global :embedContent ([#715](https://github.com/ax-llm/ax/issues/715)) ([193f2ba](https://github.com/ax-llm/ax/commit/193f2ba165a758d84dfb49b2a10b7ba5cbe7fbbc))
+
+## [24.0.22](https://github.com/ax-llm/ax/compare/24.0.21...24.0.22) (2026-09-25)
+
+### Features
+
+* **ai:** add Sept-2026 OpenAI, Anthropic and Gemini models; fix broken defaults ([#670](https://github.com/ax-llm/ax/issues/670)) ([77652db](https://github.com/ax-llm/ax/commit/77652db26a29f9be2da973eaedf9d293aea4eddc))
+* **axir:** add python-parity RuntimeEnvelope constructors to the Rust port ([#682](https://github.com/ax-llm/ax/issues/682)) ([3e2e407](https://github.com/ax-llm/ax/commit/3e2e407c66d22cb19ec0b080c4644fcfa7f0a3b6))
+* **axir:** port the expensive-model gate and teacherOptions to all five ports ([#702](https://github.com/ax-llm/ax/issues/702)) ([19d6384](https://github.com/ax-llm/ax/commit/19d63844ec849b5cc69a0ba6540d04aad274dba7))
+* **bedrock:** add Claude Opus 5.5 (structured output without forced tool_choice) ([#668](https://github.com/ax-llm/ax/issues/668)) ([fc288a2](https://github.com/ax-llm/ax/commit/fc288a25c02dc1bef122f9f6e6915a7281a9752d))
+* **bedrock:** add OpenAI GPT-6 Sol, Luna, and Astra to AxAIBedrock ([#676](https://github.com/ax-llm/ax/issues/676)) ([8aaa662](https://github.com/ax-llm/ax/commit/8aaa662f842261d76c3c40477d3a3a9379e32e62))
+
+### Bug Fixes
+
+* **agent:** tag runtime-reported JS errors as error turns ([#674](https://github.com/ax-llm/ax/issues/674)) ([bf2aa72](https://github.com/ax-llm/ax/commit/bf2aa7213f7e6bda5eebe643b444cebcf85751aa))
+* **ai:** read Gemini Live's binary WebSocket frames ([#692](https://github.com/ax-llm/ax/issues/692)) ([de461b2](https://github.com/ax-llm/ax/commit/de461b288a5495445672b47b1ac05daa11ead2c1))
+* **axir:** align the AxGen validation budget with TypeScript maxRetries ([#706](https://github.com/ax-llm/ax/issues/706)) ([54cb407](https://github.com/ax-llm/ax/commit/54cb4074079188e739242edabcfff272708d3adc))
+* **axir:** cap AxGen tool steps and use the text contract beside tools ([#684](https://github.com/ax-llm/ax/issues/684)) ([0b5d390](https://github.com/ax-llm/ax/commit/0b5d3908c500d04ae438b256cd4f484e1df84007))
+* **axir:** check expected_request_contains in Go forward runner ([#695](https://github.com/ax-llm/ax/issues/695)) ([32cc7d2](https://github.com/ax-llm/ax/commit/32cc7d2126ac1cac320497ebb2bdfcb3be8583c6))
+* **axir:** enforce chat-prompt, trace and function-trace checks in Go forward runner ([#698](https://github.com/ax-llm/ax/issues/698)) ([df82ec9](https://github.com/ax-llm/ax/commit/df82ec98ef14036a16de77e66ff3063b24f031e1))
+* **axir:** keep quoted strings starting with @ or % distinct from refs ([#712](https://github.com/ax-llm/ax/issues/712)) ([325548a](https://github.com/ax-llm/ax/commit/325548aab649c117673670a033bb285c5f21c90f))
+* **axir:** keep the __axOutput call on AxGen structured-output retries ([#713](https://github.com/ax-llm/ax/issues/713)) ([5fde198](https://github.com/ax-llm/ax/commit/5fde19882eac04ee3375af544042abc8c881adb9))
+* **axir:** nest AxGen infrastructure retries around the validation loop ([#707](https://github.com/ax-llm/ax/issues/707)) ([4f56e6e](https://github.com/ax-llm/ax/commit/4f56e6ef96afbb597c8f469a07b42c80e57968a5))
+* **axir:** port first-step-only functionCall, the Gemini output rung and the simple-signature text contract ([#701](https://github.com/ax-llm/ax/issues/701)) ([78de31b](https://github.com/ax-llm/ax/commit/78de31b0b5b2b67a897fbfaafdaf1bff6c810800)), closes [#684](https://github.com/ax-llm/ax/issues/684) [#686](https://github.com/ax-llm/ax/issues/686) [#697](https://github.com/ax-llm/ax/issues/697) [#684](https://github.com/ax-llm/ax/issues/684)
+* **axir:** port Gemini Live turn continuation and raw-PCM speak parameters ([#700](https://github.com/ax-llm/ax/issues/700)) ([9b967c7](https://github.com/ax-llm/ax/commit/9b967c7de2b9a8b4b3afffc4cfb56f47fecd0d43))
+* **axir:** port TypeScript AxGen retry classification to the ports ([#703](https://github.com/ax-llm/ax/issues/703)) ([5debd12](https://github.com/ax-llm/ax/commit/5debd12d19b90be27bd2035a9f131295a2cb36a9))
+* **axir:** resolve model keys on single AI clients in the ports ([#704](https://github.com/ax-llm/ax/issues/704)) ([7070756](https://github.com/ax-llm/ax/commit/70707564fe473dfff0a7a0e9f76ed19a638886d3))
+* **axir:** send the Gemini embedding task type under each API's own key ([#710](https://github.com/ax-llm/ax/issues/710)) ([e85a650](https://github.com/ax-llm/ax/commit/e85a650dd588983b7874f13e811d33436e10fc3f))
+* **axir:** stop Rust RuntimeEnvelope::final_payload double-wrapping ([#688](https://github.com/ax-llm/ax/issues/688)) ([74928f5](https://github.com/ax-llm/ax/commit/74928f5ac28b00197ce7ad240a8befb4123269e0))
+* **axir:** stop the C++ axevent lifecycle fixture from hanging CI ([#696](https://github.com/ax-llm/ax/issues/696)) ([875c69e](https://github.com/ax-llm/ax/commit/875c69e0842f472d866536d94768d81f636319d9))
+* **axir:** surface message-less AxGen assertion failures without retrying ([#711](https://github.com/ax-llm/ax/issues/711)) ([48100c5](https://github.com/ax-llm/ax/commit/48100c563798830887a043c04b679410c2903f75))
+* **axir:** tag Rust RuntimeEnvelope::timeout as an error envelope ([#680](https://github.com/ax-llm/ax/issues/680)) ([f9c22e4](https://github.com/ax-llm/ax/commit/f9c22e4f9e635170d1f720161da45336c5a289ac))
+* **dsp,agent:** let optimizer and playbook teacher calls use expensive models (re-land [#671](https://github.com/ax-llm/ax/issues/671) + [#672](https://github.com/ax-llm/ax/issues/672)) ([#694](https://github.com/ax-llm/ax/issues/694)) ([ce766d3](https://github.com/ax-llm/ax/commit/ce766d3dd36225cdd52bd918727bd4cd1128cfbe))
+* **dsp:** answer a forced functionCall through __axOutput on Gemini ([#697](https://github.com/ax-llm/ax/issues/697)) ([5477658](https://github.com/ax-llm/ax/commit/5477658b88ea4ee839b78c37a3c930bfbfa5a2b2)), closes [#686](https://github.com/ax-llm/ax/issues/686) [#691](https://github.com/ax-llm/ax/issues/691)
+* **dsp:** answer through __axOutput beside Gemini tools instead of JSON mode ([#686](https://github.com/ax-llm/ax/issues/686)) ([f2aa1f6](https://github.com/ax-llm/ax/commit/f2aa1f64afb89a9a5105d5921a6c023cb6f3ed07))
+* **dsp:** force a named functionCall on the first AxGen step only ([#691](https://github.com/ax-llm/ax/issues/691)) ([62536e4](https://github.com/ax-llm/ax/commit/62536e4190c27756076b5de875764fe053dcc609)), closes [#684](https://github.com/ax-llm/ax/issues/684) [#686](https://github.com/ax-llm/ax/issues/686)
+* **dsp:** forward useExpensiveModel from AxGen to ai.chat ([#669](https://github.com/ax-llm/ax/issues/669)) ([393e256](https://github.com/ax-llm/ax/commit/393e2568662f67cde9b4c5d474bf4a1c22b8c55c))
+* **gemini:** send the Vertex embedding task type as task_type ([#708](https://github.com/ax-llm/ax/issues/708)) ([daa2b38](https://github.com/ax-llm/ax/commit/daa2b38ad435333f5fb7dd392a319bda41a6dbf9))
+* **gemini:** send tool schemas as parametersJsonSchema and round-trip thought signatures in ports ([#690](https://github.com/ax-llm/ax/issues/690)) ([676fc82](https://github.com/ax-llm/ax/commit/676fc8249bd50eca41c3f6cb74b48190c7e55127))
+* **mcp:** accept JSON-RPC in binary WebSocket frames ([#673](https://github.com/ax-llm/ax/issues/673)) ([ad09ce0](https://github.com/ax-llm/ax/commit/ad09ce0b8df9c43e99eb6ecda7a773f9606bb737))
+* **openai:** pass apiURL through in AxAIOpenAIResponses ([#678](https://github.com/ax-llm/ax/issues/678)) ([ab5f720](https://github.com/ax-llm/ax/commit/ab5f72075aca7079259771c2e1d404d2d81438d5))
+* **openai:** recognize Amazon Bedrock's OpenAI model IDs ([#683](https://github.com/ax-llm/ax/issues/683)) ([33cd535](https://github.com/ax-llm/ax/commit/33cd5357da3b1b6162f00600297aba3f17df2549))
+
+## [24.0.21](https://github.com/ax-llm/ax/compare/24.0.20...24.0.21) (2026-09-22)
+
+### Bug Fixes
+
+* **typesafe:** accept rounded probability tolerance boundaries ([#665](https://github.com/ax-llm/ax/issues/665)) ([5647a96](https://github.com/ax-llm/ax/commit/5647a96c5dcfba38abdef355ff485d6f440e8fac))
+
+## [24.0.20](https://github.com/ax-llm/ax/compare/24.0.19...24.0.20) (2026-09-18)
+
+### Features
+
+* **axir:** add Typesafe parity and complete MCP WebSocket support ([#663](https://github.com/ax-llm/ax/issues/663)) ([a95d736](https://github.com/ax-llm/ax/commit/a95d73643ba20ed2e9657b7d4276655670689176))
+
+## [24.0.19](https://github.com/ax-llm/ax/compare/24.0.18...24.0.19) (2026-09-17)
+
+### Features
+
+* **typesafe:** support Jev decisions, native scoring, and value descriptions ([#661](https://github.com/ax-llm/ax/issues/661)) ([e58a9ed](https://github.com/ax-llm/ax/commit/e58a9ed7e7f2c5415327586b31d35c72135ecb8a))
+
+### Bug Fixes
+
+* **mcp:** clean pending WebSocket requests ([#654](https://github.com/ax-llm/ax/issues/654)) ([259bccf](https://github.com/ax-llm/ax/commit/259bccfd8f681969a3d134ea4f5920757f22278f))
+
+## [24.0.18](https://github.com/ax-llm/ax/compare/24.0.17...24.0.18) (2026-09-09)
+
+### Features
+
+* add Astra sessions and begin AxIR parity ([#651](https://github.com/ax-llm/ax/issues/651)) ([48eec33](https://github.com/ax-llm/ax/commit/48eec33e09d19704209f4de2c0aa387033e37c0a))
+* **ai:** add Gemini 3.8 Flash and preserve tool-call IDs ([#650](https://github.com/ax-llm/ax/issues/650)) ([5f0e470](https://github.com/ax-llm/ax/commit/5f0e470b6cab98304e445c7568a8891ebb97e8ac))
+* **ai:** add Meta Muse support through existing Ax APIs ([#649](https://github.com/ax-llm/ax/issues/649)) ([3e5fd36](https://github.com/ax-llm/ax/commit/3e5fd36537e9049c18c0920845ba96db4c74bba1))
+* extend AxIR Astra sessions and concurrent flows ([#653](https://github.com/ax-llm/ax/issues/653)) ([0a943e2](https://github.com/ax-llm/ax/commit/0a943e28cb7aa43b7cf7f0c3c8109ad290357d2f))
+* preserve native files through AxIR provider routing ([#652](https://github.com/ax-llm/ax/issues/652)) ([4590b14](https://github.com/ax-llm/ax/commit/4590b147b84a6c43ae3e01371cbb65648630edec))
+
+### Bug Fixes
+
+* **apicall:** remove user abort listener on all non-abort exit paths ([#645](https://github.com/ax-llm/ax/issues/645)) ([2034b04](https://github.com/ax-llm/ax/commit/2034b04f688bcfe64ffd8f728a4efccaa8045aff)), closes [#632](https://github.com/ax-llm/ax/issues/632)
+* complete Astra session parity across generated languages ([#657](https://github.com/ax-llm/ax/issues/657)) ([5ef03af](https://github.com/ax-llm/ax/commit/5ef03af8658c5aafc9122208412e4e93bbe7cac0))
+* **event:** clear timer and remove abort listener on normal sleep path ([#647](https://github.com/ax-llm/ax/issues/647)) ([039f1d7](https://github.com/ax-llm/ax/commit/039f1d7e36fc0dd05817d340350264376dd98e75))
+* preserve MCP contexts through child agents across languages ([#655](https://github.com/ax-llm/ax/issues/655)) ([27b8e31](https://github.com/ax-llm/ax/commit/27b8e3149c41edee0ff14a4f563cba7a28d409d5))
+* propagate MCP invocation cancellation across generated runtimes ([#656](https://github.com/ax-llm/ax/issues/656)) ([db7ce0c](https://github.com/ax-llm/ax/commit/db7ce0cbab8e29fbcc4872da0fc06dcf4c48bf7c))
+* **security:** redact sensitive headers in verbose API request logs ([#646](https://github.com/ax-llm/ax/issues/646)) ([b2d974b](https://github.com/ax-llm/ax/commit/b2d974b86fc4282f0da0165ec0421e1db469e7e4))
+
+## [24.0.18](https://github.com/ax-llm/ax/compare/24.0.16...24.0.17) (2026-09-09)
+
+### Features
+
+* add Astra sessions and begin AxIR parity ([#651](https://github.com/ax-llm/ax/issues/651)) ([48eec33](https://github.com/ax-llm/ax/commit/48eec33e09d19704209f4de2c0aa387033e37c0a))
+* **ai:** add Gemini 3.8 Flash and preserve tool-call IDs ([#650](https://github.com/ax-llm/ax/issues/650)) ([5f0e470](https://github.com/ax-llm/ax/commit/5f0e470b6cab98304e445c7568a8891ebb97e8ac))
+* **ai:** add Meta Muse support through existing Ax APIs ([#649](https://github.com/ax-llm/ax/issues/649)) ([3e5fd36](https://github.com/ax-llm/ax/commit/3e5fd36537e9049c18c0920845ba96db4c74bba1))
+* extend AxIR Astra sessions and concurrent flows ([#653](https://github.com/ax-llm/ax/issues/653)) ([0a943e2](https://github.com/ax-llm/ax/commit/0a943e28cb7aa43b7cf7f0c3c8109ad290357d2f))
+* preserve native files through AxIR provider routing ([#652](https://github.com/ax-llm/ax/issues/652)) ([4590b14](https://github.com/ax-llm/ax/commit/4590b147b84a6c43ae3e01371cbb65648630edec))
+
+### Bug Fixes
+
+* **apicall:** remove user abort listener on all non-abort exit paths ([#645](https://github.com/ax-llm/ax/issues/645)) ([2034b04](https://github.com/ax-llm/ax/commit/2034b04f688bcfe64ffd8f728a4efccaa8045aff)), closes [#632](https://github.com/ax-llm/ax/issues/632)
+* complete Astra session parity across generated languages ([#657](https://github.com/ax-llm/ax/issues/657)) ([5ef03af](https://github.com/ax-llm/ax/commit/5ef03af8658c5aafc9122208412e4e93bbe7cac0))
+* **event:** clear timer and remove abort listener on normal sleep path ([#647](https://github.com/ax-llm/ax/issues/647)) ([039f1d7](https://github.com/ax-llm/ax/commit/039f1d7e36fc0dd05817d340350264376dd98e75))
+* preserve MCP contexts through child agents across languages ([#655](https://github.com/ax-llm/ax/issues/655)) ([27b8e31](https://github.com/ax-llm/ax/commit/27b8e3149c41edee0ff14a4f563cba7a28d409d5))
+* propagate MCP invocation cancellation across generated runtimes ([#656](https://github.com/ax-llm/ax/issues/656)) ([db7ce0c](https://github.com/ax-llm/ax/commit/db7ce0cbab8e29fbcc4872da0fc06dcf4c48bf7c))
+* **security:** redact sensitive headers in verbose API request logs ([#646](https://github.com/ax-llm/ax/issues/646)) ([b2d974b](https://github.com/ax-llm/ax/commit/b2d974b86fc4282f0da0165ec0421e1db469e7e4))
+
+## [24.0.17](https://github.com/ax-llm/ax/compare/24.0.16...24.0.17) (2026-09-01)
+
+### Features
+
+* **bedrock:** add native Converse capabilities ([#642](https://github.com/ax-llm/ax/issues/642)) ([d480062](https://github.com/ax-llm/ax/commit/d480062291e677056615b2938f36bd20f9557784))
+
+## [24.0.17](https://github.com/ax-llm/ax/compare/24.0.16...24.0.17) (2026-09-01)
+
+### Features
+
+* **bedrock:** add native Converse capabilities ([#642](https://github.com/ax-llm/ax/issues/642)) ([d480062](https://github.com/ax-llm/ax/commit/d480062291e677056615b2938f36bd20f9557784))
+* **axir:** expose the model catalog across backend languages ([#643](https://github.com/ax-llm/ax/issues/643)) ([1c9877b](https://github.com/ax-llm/ax/commit/1c9877be0124e57f290be62a646a2a9eb80ea37c))
+
+## [24.0.16](https://github.com/ax-llm/ax/compare/24.0.15...24.0.16) (2026-08-31)
+
+### Features
+
+* **ai:** expose catalog thinking and service tiers ([#639](https://github.com/ax-llm/ax/issues/639)) ([dec4f9e](https://github.com/ax-llm/ax/commit/dec4f9e8b1a81df0b7c1c69c313f0b03ad35b9fc))
+
 ## [24.0.15](https://github.com/ax-llm/ax/compare/24.0.13...24.0.14) (2026-08-30)
 
 ### Features
@@ -245,6 +727,8 @@
 
 ## Next major
 
+- Breaking changes planned for the next major now live in
+  [docs/NEXT_MAJOR.md](docs/NEXT_MAJOR.md). The list below is the 24.0.0 one.
 - Added named deployment profiles, `AxAIProfileId`, `AxAIProfileSummary`,
   `axAIProfiles()`, and `axGetAIProfile()`. The deployment name now owns endpoint,
   authentication, capabilities, and model rules; model IDs never select another

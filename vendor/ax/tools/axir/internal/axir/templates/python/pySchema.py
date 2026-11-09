@@ -4,6 +4,7 @@ import os
 import copy
 import re
 from typing import Any
+from .signature import _js_date_millis, _js_number_text, _js_format
 # AXIR_CORE_IMPORTS
 
 
@@ -51,6 +52,12 @@ def _core_contains(container, item):
     if container is None:
         return False
     return item in container
+
+
+def _core_string_utf16_units(value):
+    # A string's UTF-16 code units, as TS counts String.prototype.length.
+    raw = str(value).encode("utf-16-le", "surrogatepass")
+    return [raw[index] + 256 * raw[index + 1] for index in range(0, len(raw), 2)]
 
 
 def _core_len(value):
@@ -116,6 +123,10 @@ def _core_type_is(value, type_name):
         return value is None
     if type_name == "json":
         return value is None or isinstance(value, (dict, list, str, int, float, bool))
+    if type_name == "date":
+        # A native date or time value, which a date or datetime field takes
+        # where TypeScript takes a Date.
+        return _js_date_millis(value) is not None
     return False
 
 
@@ -165,7 +176,7 @@ def _core_string_lower(value):
 
 
 def _core_string_format(template, *args):
-    return str(template).format(*args)
+    return _js_format(template, args)
 
 
 def _core_description_append(base, hint):
@@ -188,6 +199,20 @@ def _core_validation_error(message):
 
 
 def _core_field_item(field):
+    if isinstance(field, dict):
+        # A nested object field the IR builds as a map; its type is a
+        # FieldType or a map.
+        item_field = dict(field)
+        field_type = item_field.get("type")
+        if isinstance(field_type, dict):
+            field_type = dict(field_type)
+            field_type.pop("isArray", None)
+            field_type["is_array"] = False
+        elif field_type is not None:
+            field_type = copy.deepcopy(field_type)
+            field_type.is_array = False
+        item_field["type"] = field_type
+        return item_field
     item_field = copy.deepcopy(field)
     item_field.type.is_array = False
     return item_field
@@ -217,6 +242,8 @@ def _nested_field(name, item):
             maximum=item.get("maximum"),
             pattern=item.get("pattern"),
             pattern_description=item.get("patternDescription", item.get("pattern_description")),
+            value_descriptions=item.get("valueDescriptions", item.get("value_descriptions")),
+            evidence=item.get("evidence"),
             format=item.get("format"),
             description=item.get("description"),
         )
@@ -249,3 +276,11 @@ def _valid_url_shape(value):
 
 
 # AXIR_CORE_SCHEMA_FUNCTIONS
+
+
+def _core_math_is_finite(value):
+    import math
+    return math.isfinite(value)
+
+
+def _core_add(a, b): return a + b

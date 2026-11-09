@@ -82,6 +82,24 @@ Cohere, and Grok share Core request/response normalization. Grok Voice and
 Gemini Live use reusable realtime-audio grammar profiles. Targets still own
 real HTTP, SSE, WebSocket, auth, retry, and binary media transport.
 
+Typesafe/Jev and OpenAI Decisions have adapters in TypeScript and all five
+generated languages for required boolean, class, and ordered rubric score
+signatures. Their native clients support advanced provider request features.
+Evidence modifiers keep probabilities, values, native confidence, and provenance
+in ordinary AxGen results. Generative estimates are marked `elicited`; native
+evidence is marked `native`. The shared shape does not imply shared calibration.
+The native methods stay outside the common AI/program interfaces. Signature
+value descriptions become native criteria for Typesafe and readable descriptions
+for conventional providers. Request validation excludes incompatible schemas
+before provider selection or fallback; numeric bounds never imply a Score rubric.
+See the [Typesafe/Jev skill](../src/ax/skills/ax-typesafe.md) for TypeScript usage and each generated package’s Typesafe skill for native APIs.
+Core owns question/schema validation, criteria, conversion, and response contracts;
+target bindings own transport, credentials, cancellation, and native result types.
+Choice and Score distributions retain their native probabilities and accept
+totals within an inclusive `0.01` of one, allowing for floating-point summation
+error at `0.99` and `1.01`. Each probability must still be finite and in `[0, 1]`,
+and the distribution must match the criteria keys.
+
 ## Signatures And AxGen
 
 Signatures describe program inputs and outputs:

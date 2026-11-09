@@ -4,6 +4,8 @@ import os
 import json
 import re
 from typing import Any
+from .signature import _evidence_is_type_impl, _evidence_placeholder_impl
+from .signature import _core_gt, _core_type_is, _core_record_new, _js_date_prompt_text, _js_json_dumps, _js_number_text, _signature_describe_field_values_impl, _signature_nested_value_descriptions_impl, _js_format
 
 
 PROMPT_FEATURES = {
@@ -92,7 +94,7 @@ def _core_get(target, key, default=None):
 
 
 def _core_string_format(template, *args):
-    return str(template).format(*args)
+    return _js_format(template, args)
 
 
 def _core_string_join(sep, values):
@@ -124,7 +126,7 @@ def _core_sorted_strings(values):
 
 
 def _core_json_pretty(value):
-    return json.dumps(value, indent=2)
+    return _js_json_dumps(value, indent=2)
 
 
 def _core_template_error_message(context: str, source: str, index: int, message: str) -> str:
@@ -313,9 +315,11 @@ def _core_prompt_is_provided_value(value) -> bool:
     return True
 
 
-def _core_prompt_input_fields_for_values(signature, values=None):
+def _core_prompt_input_fields_for_values(signature, values=None, include_optional=False):
     fields = sorted(_core_prompt_get_input_fields(signature), key=lambda field: 0 if getattr(field, "is_cached", False) else 1)
-    if not isinstance(values, dict):
+    # TS includeOptionalInputFieldsInSystemPrompt: the system prompt lists
+    # every input field, provided or not.
+    if include_optional or not isinstance(values, dict):
         return fields
     return [field for field in fields if not field.is_optional or _core_prompt_is_provided_value(values.get(field.name))]
 
@@ -394,9 +398,11 @@ def _core_prompt_render_input_fields(fields, field_map: dict[str, str]) -> str:
     rows = []
     for field in fields:
         description = ""
-        if field.description:
-            description = " " + _core_prompt_format_field_references(_core_prompt_format_description(field.description), field_map)
+        field_description = _signature_describe_field_values_impl(field)
+        if field_description:
+            description = " " + _core_prompt_format_field_references((field_description if field.type.value_descriptions else _core_prompt_format_description(field_description)), field_map)
         rows.append((field.title + ":" + description).strip())
+        rows.extend(_signature_nested_value_descriptions_impl(field.type.fields, field.name))
     return "\n".join(rows)
 
 
@@ -410,14 +416,16 @@ def _core_prompt_render_output_fields(fields, field_map: dict[str, str]) -> str:
             else f"This {type_text} field must be included"
         )
         description = ""
-        if field.description:
-            value = field.description if field.type and field.type.name == "class" else _core_prompt_format_description(field.description)
+        field_description = _signature_describe_field_values_impl(field)
+        if field_description:
+            value = field_description if field.type and (field.type.name == "class" or field.type.value_descriptions) else (field_description if field.type.value_descriptions else _core_prompt_format_description(field_description))
             description = " " + _core_prompt_format_field_references(value, field_map)
         if field.type and field.type.options:
             if description:
                 description += ". "
             description += "Allowed values: " + ", ".join(field.type.options)
         rows.append((field.title + f" (wire key: {BT}{field.name}{BT}): ({required})" + description).strip())
+        rows.extend(_signature_nested_value_descriptions_impl(field.type.fields, field.name))
     return "\n".join(rows)
 
 
@@ -435,8 +443,8 @@ def _core_prompt_render_functions_section(funcs) -> str:
     return "\n".join(f"- {BT}{item['name']}{BT}: {_core_prompt_format_description(item.get('description') or '')}" for item in funcs)
 
 
-def _core_prompt_identity_section(signature, values=None) -> str:
-    in_args = _core_prompt_render_desc_fields(_core_prompt_input_fields_for_values(signature, values))
+def _core_prompt_identity_section(signature, values=None, include_optional=False) -> str:
+    in_args = _core_prompt_render_desc_fields(_core_prompt_input_fields_for_values(signature, values, include_optional))
     out_args = _core_prompt_render_desc_fields(_core_prompt_get_output_fields(signature))
     return f"You will be provided with the following fields: {in_args}. Your task is to generate new fields: {out_args}."
 
@@ -454,22 +462,25 @@ def _core_prompt_task_definition_section(signature, options=None) -> str:
     )
 
 
-def _core_prompt_input_fields_section(signature, values=None) -> str:
-    fields = _core_prompt_render_input_fields(_core_prompt_input_fields_for_values(signature, values), _core_prompt_field_name_to_title(signature))
+def _core_prompt_input_fields_section(signature, values=None, include_optional=False) -> str:
+    fields = _core_prompt_render_input_fields(_core_prompt_input_fields_for_values(signature, values, include_optional), _core_prompt_field_name_to_title(signature))
     return "**Input Fields**: The following fields will be provided to you:\n\n" + fields
 
 
-def _core_prompt_output_fields_section(signature) -> str:
+def _core_prompt_output_fields_section(signature, structured=None) -> str:
     output_fields = _core_prompt_get_output_fields(signature)
     fields = _core_prompt_render_output_fields(output_fields, _core_prompt_field_name_to_title(signature))
     shape = ""
-    if _core_prompt_has_complex_fields(signature):
+    if structured is None:
+        structured = _core_prompt_has_complex_fields(signature)
+    if structured:
         value = {field.name: _core_prompt_output_type_placeholder(field.type) for field in output_fields}
-        shape = "\n\n**Exact JSON shape**: " + BT + json.dumps(value, separators=(",", ":")) + BT
+        shape = "\n\n**Exact JSON shape**: " + BT + _js_json_dumps(value) + BT
     return "**Output Fields**: You must generate the following fields:\n\n" + fields + shape
 
 
 def _core_prompt_output_type_placeholder(field_type):
+    if _evidence_is_type_impl(field_type): return _evidence_placeholder_impl(field_type)
     name = getattr(field_type, "name", "string")
     if name == "number": value = 0
     elif name == "boolean": value = True
@@ -494,9 +505,13 @@ def _core_prompt_output_type_placeholder(field_type):
 def _core_prompt_structured(signature, values, functions, options) -> str:
     values = values or {}
     options = options or {}
-    has_complex_fields = _core_prompt_has_complex_fields(signature)
+    # As TS's structuredOutput option: AxGen renders with it set when a
+    # structured-output rung is selected; otherwise the signature decides.
+    structured = options.get("structured_output", options.get("structuredOutput"))
+    has_complex_fields = _core_prompt_has_complex_fields(signature) if structured is None else bool(structured)
     task_definition = _core_prompt_task_definition_section(signature, options)
     funcs = _core_prompt_function_descriptors(functions)
+    include_optional = bool(options.get("include_optional_input_fields_in_system_prompt", options.get("includeOptionalInputFieldsInSystemPrompt", False)))
     template_vars = {
         "hasFunctions": len(funcs) > 0,
         "hasTaskDefinition": bool(task_definition),
@@ -504,11 +519,11 @@ def _core_prompt_structured(signature, values, functions, options) -> str:
         "hasOutputFields": bool(_core_prompt_get_output_fields(signature)),
         "hasComplexFields": has_complex_fields,
         "hasStructuredOutputFunction": bool(has_complex_fields and options.get("structured_output_function_name")),
-        "identityText": _core_prompt_identity_section(signature, values),
+        "identityText": _core_prompt_identity_section(signature, values, include_optional),
         "taskDefinitionText": task_definition,
         "functionsList": _core_prompt_render_functions_section(funcs) if funcs else "",
-        "inputFieldsSection": _core_prompt_input_fields_section(signature, values),
-        "outputFieldsSection": _core_prompt_output_fields_section(signature),
+        "inputFieldsSection": _core_prompt_input_fields_section(signature, values, include_optional),
+        "outputFieldsSection": _core_prompt_output_fields_section(signature, has_complex_fields),
         "structuredOutputFunctionName": options.get("structured_output_function_name") or "",
     }
     source = options.get("custom_template")
@@ -520,24 +535,167 @@ def _core_prompt_structured(signature, values, functions, options) -> str:
 
 
 def _core_prompt_process_value(field, value):
+    # A native date in a date-typed field reads as TS renders a Date.
+    dated = _js_date_prompt_text(field.type.name if field.type else "string", value)
+    if dated is not None:
+        return dated
     if isinstance(value, str):
         return value
-    if field.type and field.type.name in ("image", "audio", "file", "url") and isinstance(value, dict):
+    if field.type and field.type.name == "audio":
+        # As TS processValue: an audio object with a transcript (what an
+        # AxGen audio output renders to) reaches the model as that text.
+        if isinstance(value, dict) and isinstance(value.get("transcript"), str):
+            return value["transcript"]
+        if isinstance(value, (dict, list)):
+            return value
+    # As TS processValue: image, file and url objects (and arrays of them)
+    # reach the field renderer as they are.
+    if field.type and field.type.name in ("image", "file", "url") and isinstance(value, (dict, list)):
         return value
-    return json.dumps(value, indent=2)
+    # JSON.stringify(value, null, 2): non-ASCII text stays UTF-8 and numbers
+    # read as JavaScript writes them.
+    return _js_json_dumps(value, indent=2)
+
+
+def _core_prompt_js_falsy(value):
+    # JavaScript's !value for a JSON value: objects and arrays are truthy.
+    if value is None or value is False or value == "":
+        return True
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and (value == 0 or value != value)
+
+
+# The snake_case aliases the provider mappings read, per media part type:
+# they become the declared camelCase keys (a camelCase key wins), so inputs
+# written with them keep working.
+_CORE_PROMPT_MEDIA_ALIASES = {
+    "image": (("mime_type", "mimeType"),),
+    "audio": (("audio", "data"), ("mime_type", "mimeType"), ("sample_rate", "sampleRate")),
+    "file": (("mime_type", "mimeType"), ("file_uri", "fileUri"), ("extracted_text", "extractedText")),
+    "url": (("cached_content", "cachedContent"),),
+}
+
+
+def _core_prompt_media_aliases(value, kind):
+    if not isinstance(value, dict):
+        return value
+    out = value
+    for alias, key in _CORE_PROMPT_MEDIA_ALIASES[kind]:
+        if alias in value and key not in value:
+            if out is value:
+                out = dict(value)
+            out[key] = value[alias]
+    return out
+
+
+def _core_prompt_audio_part(value):
+    # TS defaultRenderInField: an audio part carries only its format (wav when
+    # it has none) and its data.
+    value = _core_prompt_media_aliases(value, "audio")
+    if _core_prompt_js_falsy(value):
+        raise ValueError("Audio field value is required.")
+    if not isinstance(value, (dict, list)):
+        raise ValueError("Audio field value must be an object.")
+    if not isinstance(value, dict) or "data" not in value:
+        raise ValueError("Audio field must have data")
+    audio_format = value.get("format")
+    part = {"type": "audio", "format": "wav" if audio_format is None else audio_format, "data": value["data"]}
+    return _core_prompt_declared_keys(part, value, ("mimeType", "sampleRate", "channels", "cache", "transcription", "duration"))
+
+
+def _core_prompt_declared_keys(part, value, keys):
+    # The optional keys a media part type declares (TS AxChatRequest) that the
+    # value sets go on the part, so the provider or router that reads them
+    # gets them; other keys stay behind.
+    for key in keys:
+        if key in value:
+            part[key] = value[key]
+    return part
+
+
+def _core_prompt_image_part(value):
+    # TS defaultRenderInField: an image part carries the mime type, the data as
+    # `image`, and the image part's declared keys (details, which OpenAI reads
+    # as its image detail, cache, optimize and altText).
+    value = _core_prompt_media_aliases(value, "image")
+    if _core_prompt_js_falsy(value):
+        raise ValueError("Image field value is required.")
+    if not isinstance(value, (dict, list)):
+        raise ValueError("Image field value must be an object.")
+    if not isinstance(value, dict) or "mimeType" not in value:
+        raise ValueError("Image field must have mimeType")
+    if "data" not in value:
+        raise ValueError("Image field must have data")
+    part = {"type": "image", "mimeType": value["mimeType"], "image": value["data"]}
+    return _core_prompt_declared_keys(part, value, ("details", "cache", "optimize", "altText"))
+
+
+def _core_prompt_file_part(value):
+    # TS defaultRenderInField: a file part carries the mime type and either its
+    # data or its fileUri.
+    value = _core_prompt_media_aliases(value, "file")
+    if _core_prompt_js_falsy(value):
+        raise ValueError("File field value is required.")
+    if not isinstance(value, (dict, list)):
+        raise ValueError("File field value must be an object.")
+    if not isinstance(value, dict) or "mimeType" not in value:
+        raise ValueError("File field must have mimeType")
+    has_data = "data" in value
+    has_file_uri = "fileUri" in value
+    if not has_data and not has_file_uri:
+        raise ValueError("File field must have either data or fileUri")
+    if has_data and has_file_uri:
+        raise ValueError("File field cannot have both data and fileUri")
+    if has_file_uri:
+        part = {"type": "file", "mimeType": value["mimeType"], "fileUri": value["fileUri"]}
+    else:
+        part = {"type": "file", "mimeType": value["mimeType"], "data": value["data"]}
+    return _core_prompt_declared_keys(part, value, ("filename", "cache", "extractedText"))
+
+
+def _core_prompt_url_part(value):
+    # TS defaultRenderInField: a url part carries the url, and the title and
+    # description when they are set; a plain string is the url.
+    value = _core_prompt_media_aliases(value, "url")
+    if _core_prompt_js_falsy(value):
+        raise ValueError("URL field value is required.")
+    if isinstance(value, str):
+        value = {"url": value}
+    elif not isinstance(value, (dict, list)):
+        raise ValueError("URL field value must be a string or object.")
+    elif not isinstance(value, dict) or "url" not in value:
+        raise ValueError("URL field must have url property")
+    part = {"type": "url", "url": value["url"]}
+    if not _core_prompt_js_falsy(value.get("title")):
+        part["title"] = value["title"]
+    if not _core_prompt_js_falsy(value.get("description")):
+        part["description"] = value["description"]
+    return _core_prompt_declared_keys(part, value, ("cachedContent", "cache"))
+
+
+def _core_prompt_media_parts(field, value, build, kind):
+    # The field's title as a text part, then one media part per value.
+    parts = [{"type": "text", "text": f"{field.title}: "}]
+    if field.type.is_array:
+        if not isinstance(value, list):
+            raise ValueError(f"{kind} field value must be an array.")
+        parts.extend(build(item) for item in value)
+    else:
+        parts.append(build(value))
+    return parts
 
 
 def _core_prompt_default_render_in_field(field, value):
     typ = field.type.name if field.type else "string"
-    if typ in ("image", "audio", "file", "url"):
-        if isinstance(value, list):
-            parts = [{"type": "text", "text": f"{field.title}: "}]
-            parts.extend(value)
-            return parts
-        if isinstance(value, dict):
-            part = dict(value)
-            part.setdefault("type", typ)
-            return [{"type": "text", "text": f"{field.title}: "}, part]
+    if typ == "image":
+        return _core_prompt_media_parts(field, value, _core_prompt_image_part, "Image")
+    if typ == "audio" and not isinstance(value, str):
+        # A string (a plain one, or an audio object's transcript) renders as
+        # text below, like any text field.
+        return _core_prompt_media_parts(field, value, _core_prompt_audio_part, "Audio")
+    if typ == "file":
+        return _core_prompt_media_parts(field, value, _core_prompt_file_part, "File")
+    if typ == "url":
+        return _core_prompt_media_parts(field, value, _core_prompt_url_part, "URL")
     part = {"type": "text", "text": f"{field.title}: {value}"}
     if getattr(field, "is_cached", False):
         part["cache"] = True
@@ -566,10 +724,14 @@ def _core_prompt_user_parts(signature, values: dict):
 
 
 def _core_prompt_combine_consecutive_text(parts, separator: str):
+    # TS combineConsecutiveStrings: a run of text parts becomes one, which is
+    # cached when any of them is.
     out = []
     for part in parts:
         if part.get("type") == "text" and out and out[-1].get("type") == "text":
             out[-1]["text"] = out[-1].get("text", "") + separator + part.get("text", "")
+            if part.get("cache"):
+                out[-1]["cache"] = True
         else:
             out.append(part)
     return out
@@ -577,7 +739,7 @@ def _core_prompt_combine_consecutive_text(parts, separator: str):
 
 def _core_prompt_user_content(signature, values):
     parts = _core_prompt_user_parts(signature, values or {})
-    if all(part.get("type") == "text" and not part.get("cache") for part in parts):
+    if all(part.get("type") == "text" for part in parts):
         return "\n".join(part.get("text", "") for part in parts)
     return _core_prompt_combine_consecutive_text(parts, "\n")
 
@@ -630,9 +792,93 @@ def _template_validate_impl(source: str, context: str, required_variables: Any) 
 def render_prompt(signature: AxSignature, values: Any, functions: list[Any], options: Any = None) -> list[Any]:
     _core_coverage_mark("render_prompt")
     system_content = _prompt_structured_impl(signature, values, functions, options)
+    none = _core_none()
+    cache_snake = _core_get(options, "context_cache", none)
+    cache = _core_get(options, "contextCache", cache_snake)
+    cache_object = _core_type_is(cache, "object")
+    cache_truthy = _core_truthy(cache)
+    cache_enabled = _core_or(cache_object, cache_truthy)
+    breakpoint_snake = _core_get(cache, "cache_breakpoint", "after-examples")
+    breakpoint = _core_get(cache, "cacheBreakpoint", breakpoint_snake)
+    system_only = _core_eq(breakpoint, "system")
+    functions_only = _core_eq(breakpoint, "after-functions")
+    early_breakpoint = _core_or(system_only, functions_only)
+    split_allowed = _core_not(early_breakpoint)
+    ignore = _core_get(options, "ignoreBreakpoints", False)
+    split_allowed = _core_or(split_allowed, ignore)
+    split_allowed = _core_and(split_allowed, cache_enabled)
+    cached = []
+    dynamic = []
+    fields = _core_get(signature, "input_fields", None)
+    for field in fields:
+        is_cached = _core_get(field, "is_cached", False)
+        if is_cached:
+            cached.append(field)
+        else:
+            dynamic.append(field)
+    cached_count = _core_len(cached)
+    dynamic_count = _core_len(dynamic)
+    has_cached = _core_gt(cached_count, 0)
+    has_dynamic = _core_gt(dynamic_count, 0)
+    split = _core_and(split_allowed, has_cached)
+    split = _core_and(split, has_dynamic)
+    if split:
+        messages = []
+        system_message = {}
+        system_message["role"] = "system"
+        system_message["content"] = system_content
+        system_message["cache"] = True
+        messages.append(system_message)
+        cached_content = _prompt_field_group_content_impl(signature, values, cached)
+        has_cached_content = _core_truthy(cached_content)
+        if has_cached_content:
+            cached_message = {}
+            cached_message["role"] = "user"
+            cached_message["content"] = cached_content
+            cached_message["cache"] = True
+            messages.append(cached_message)
+        else:
+            pass
+        dynamic_content = _prompt_field_group_content_impl(signature, values, dynamic)
+        has_dynamic_content = _core_truthy(dynamic_content)
+        if has_dynamic_content:
+            dynamic_message = {}
+            dynamic_message["role"] = "user"
+            dynamic_message["content"] = dynamic_content
+            messages.append(dynamic_message)
+        else:
+            pass
+        return messages
+    else:
+        pass
     user_content = _prompt_user_content_impl(signature, values)
     messages = _prompt_messages_impl(system_content, user_content)
+    first = 0
+    system_message = _core_get(messages, first, None)
+    system_message["cache"] = cache_enabled
+    no_dynamic = _core_not(has_dynamic)
+    all_cached = _core_and(has_cached, no_dynamic)
+    all_cached = _core_and(all_cached, cache_enabled)
+    if all_cached:
+        second = 1
+        user_message = _core_get(messages, second, None)
+        user_message["cache"] = True
+    else:
+        pass
     return messages
+
+
+def _prompt_field_group_content_impl(signature: AxSignature, values: Any, fields: list[Any]) -> Any:
+    _core_coverage_mark("_prompt_field_group_content_impl")
+    attrs = {}
+    attrs["inputs"] = fields
+    outputs = _core_get(signature, "output_fields", None)
+    attrs["outputs"] = outputs
+    description = _core_get(signature, "description", None)
+    attrs["description"] = description
+    group = _core_record_new("AxSignature", attrs)
+    content = _prompt_user_content_impl(group, values)
+    return content
 
 
 def _prompt_structured_impl(signature: AxSignature, values: Any, functions: list[Any], options: Any) -> str:
@@ -673,6 +919,7 @@ class AxPromptTemplate:
         thought_field_name: str = "thought",
         structured_output_function_name: str | None = None,
         custom_template: str | None = None,
+        include_optional_input_fields_in_system_prompt: bool = False,
         **kwargs,
     ):
         self.signature = signature
@@ -680,6 +927,7 @@ class AxPromptTemplate:
         self.thought_field_name = kwargs.get("thoughtFieldName", thought_field_name)
         self.structured_output_function_name = kwargs.get("structuredOutputFunctionName", structured_output_function_name)
         self.custom_template = kwargs.get("customTemplate", custom_template)
+        self.include_optional_input_fields_in_system_prompt = bool(kwargs.get("includeOptionalInputFieldsInSystemPrompt", include_optional_input_fields_in_system_prompt))
         self.instruction = None
 
     def set_instruction(self, instruction: str):
@@ -692,11 +940,18 @@ class AxPromptTemplate:
         self.instruction = None
 
     def render(self, values: dict, options: dict | None = None):
+        # A render's own options (AxGen passes the selected rung's) win over
+        # the template's.
         render_options = dict(options or {})
         if self.instruction is not None:
             render_options["instruction"] = self.instruction
         if self.structured_output_function_name is not None:
-            render_options["structured_output_function_name"] = self.structured_output_function_name
+            render_options.setdefault("structured_output_function_name", self.structured_output_function_name)
         if self.custom_template is not None:
             render_options["custom_template"] = self.custom_template
-        return render_prompt(self.signature, values or {}, self.functions, render_options)
+        if self.include_optional_input_fields_in_system_prompt:
+            render_options.setdefault("include_optional_input_fields_in_system_prompt", True)
+        # extra_functions are listed after the template's own, as TS lists
+        # the __axOutput function of the function rung.
+        functions = list(self.functions) + list(render_options.pop("extra_functions", None) or [])
+        return render_prompt(self.signature, values or {}, functions, render_options)

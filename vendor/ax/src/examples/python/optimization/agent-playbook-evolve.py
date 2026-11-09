@@ -10,16 +10,17 @@
 import json
 import os
 
-from axllm import OpenAICompatibleClient, agent
+from axllm import agent, ai
 from axllm.runtime_quickjs import AxQuickJsCodeRuntime
 
 api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_APIKEY")
 if not api_key:
     raise SystemExit("Set OPENAI_API_KEY or OPENAI_APIKEY to run this example.")
 
-client = OpenAICompatibleClient(
+client = ai(
+    "openai",
     api_key=api_key,
-    model=os.getenv("AX_OPENAI_MODEL", "gpt-5.4-mini"),
+    model=os.getenv("AX_OPENAI_MODEL", "gpt-6-luna"),
 )
 
 seed = {
@@ -51,7 +52,7 @@ assistant = agent(
         "ai": client,
         "contextFields": [],
         "runtime": {"language": "JavaScript"},
-        "playbook": {"seed": seed, "onUpdate": playbook_updates.append},
+        "playbook": {"playbook": seed, "seed": 7, "onUpdate": playbook_updates.append},
         "citations": {
             "surface": "hidden",
             "onCitations": observed_citations.append,
@@ -83,7 +84,15 @@ evolution = assistant.playbook().evolve(
     {"verify": True, "maxProposals": 1, "runtime": runtime},
 )
 
+# Each train task replays on the runtime. A replay that fails scores 0 and
+# would be mined as the weakness, so stop instead.
+for record in evolution["records"]:
+    prediction = record.get("prediction") or {}
+    if record.get("error") or prediction.get("completionType") == "error":
+        raise SystemExit(f"evolve replay failed: {record.get('error') or prediction.get('error')}")
+
 print(json.dumps(answer, indent=2, sort_keys=True))
+print("replays:", [(record.get("prediction") or {}).get("completionType") for record in evolution["records"]])
 print("citations:", observed_citations[-1] if observed_citations else [])
 print("run-end updates:", len(playbook_updates))
 print("outcomes:", evolution["outcomes"])

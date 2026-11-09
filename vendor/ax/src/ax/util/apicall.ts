@@ -48,7 +48,7 @@ export interface AxAPI {
   url?: string | URL;
   headers?: Record<string, string>;
   /** HTTP method for JSON API requests. Defaults to POST. */
-  method?: 'POST' | 'PUT' | 'PATCH';
+  method?: 'GET' | 'POST' | 'PUT' | 'PATCH';
   /** @deprecated Use `method: 'PUT'` instead. */
   put?: boolean;
   localCall?: <TRequest, TResponse>(
@@ -79,7 +79,7 @@ export interface AxAPIConfig
     url: string;
     retryCount: number;
   }) => Promise<Record<string, string>>;
-  /** Whether to include request body in error messages. Defaults to true. Set to false when request may contain sensitive data or large base64 content. */
+  /** Whether to include request body in error messages and serialization. Defaults to true. Set to false when request may contain sensitive data or large base64 content; `error.requestBody` still returns it. */
   includeRequestBodyInErrors?: boolean;
 }
 
@@ -116,6 +116,12 @@ export class AxAIServiceError extends Error {
     this.errorId = randomUUID();
     this.context = context;
     this.includeRequestBodyInErrors = includeRequestBodyInErrors;
+    if (!includeRequestBodyInErrors) {
+      // error.requestBody stays readable, but a non-enumerable property is
+      // left out of JSON.stringify, object spread and Object.keys, which is
+      // how loggers and error reporters serialize an error.
+      Object.defineProperty(this, 'requestBody', { enumerable: false });
+    }
 
     this.stack = this.toString();
   }
@@ -511,6 +517,41 @@ export class AxContentProcessingError extends Error {
 }
 
 // Utility Functions
+// Header names whose values carry credentials and must never be logged.
+const SENSITIVE_HEADER_NAMES = new Set([
+  'authorization',
+  'proxy-authorization',
+  'x-api-key',
+  'api-key',
+  'apikey',
+  'x-goog-api-key',
+  'x-amz-security-token',
+  'cookie',
+  'set-cookie',
+]);
+
+/**
+ * Return a shallow copy of `headers` with the values of sensitive keys masked,
+ * for safe logging. Header-name matching is case-insensitive. The original
+ * headers object is never mutated, so the real credentials are still sent.
+ *
+ * Sensitive values are masked in full. Preserving a prefix is unsafe for
+ * headers such as Cookie, whose first value commonly appears before a space.
+ */
+function redactHeaders(
+  headers: Record<string, string>
+): Record<string, string> {
+  const redacted: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (SENSITIVE_HEADER_NAMES.has(key.toLowerCase())) {
+      redacted[key] = '***';
+    } else {
+      redacted[key] = value;
+    }
+  }
+  return redacted;
+}
+
 async function safeReadResponseBody(response: Response) {
   try {
     if (response.headers.get('content-type')?.includes('application/json')) {
@@ -660,6 +701,19 @@ export const apiCall = async <TRequest = unknown, TResponse = unknown>(
     // Combine user abort signal with timeout signal
     const combinedAbortController = new AbortController();
 
+    // Idempotent removal of the user abort listener. Defined per attempt so
+    // every exit path (success, non-abort error, and each retry `continue`)
+    // can detach the listener it registered on the long-lived caller signal.
+    // `removeEventListener` is a no-op when the listener is already gone, so
+    // calling this more than once is safe.
+    let removeUserAbortHandler: (() => void) | undefined;
+
+    // The streaming response is consumed after this function returns, so the
+    // listener must outlive the outer `finally` and is instead detached by the
+    // stream's own teardown (its `finally`/`cancel`). This flag tells the outer
+    // `finally` to leave the listener in place for that case only.
+    let abortHandlerOwnedByStream = false;
+
     // Handle user abort signal
     if (api.abortSignal) {
       if (api.abortSignal.aborted) {
@@ -680,13 +734,16 @@ export const apiCall = async <TRequest = unknown, TResponse = unknown>(
       api.abortSignal.addEventListener('abort', userAbortHandler, {
         once: true,
       });
+      removeUserAbortHandler = () => {
+        api.abortSignal!.removeEventListener('abort', userAbortHandler);
+      };
 
       // Clean up listener if we complete before abort
       const originalAbort = combinedAbortController.abort.bind(
         combinedAbortController
       );
       combinedAbortController.abort = (reason?: string) => {
-        api.abortSignal!.removeEventListener('abort', userAbortHandler);
+        removeUserAbortHandler?.();
         originalAbort(reason);
       };
     }
@@ -707,12 +764,12 @@ export const apiCall = async <TRequest = unknown, TResponse = unknown>(
           `Method: ${method}\n`,
           `Headers:`,
           JSON.stringify(
-            {
+            redactHeaders({
               'Content-Type': 'application/json',
               'X-Request-ID': requestId,
               'X-Retry-Count': attempt.toString(),
               ...requestHeaders,
-            },
+            }),
             null,
             2
           ),
@@ -730,7 +787,7 @@ export const apiCall = async <TRequest = unknown, TResponse = unknown>(
           'X-Retry-Count': attempt.toString(),
           ...requestHeaders,
         },
-        body: JSON.stringify(json),
+        body: method === 'GET' ? undefined : JSON.stringify(json),
         signal: combinedAbortController.signal,
       });
 
@@ -934,6 +991,10 @@ export const apiCall = async <TRequest = unknown, TResponse = unknown>(
       let streamReader: ReadableStreamDefaultReader<TResponse> | undefined;
 
       // Enhanced wrapped stream
+      // The listener must stay attached while the stream is consumed (a user
+      // abort during streaming still needs to reach the fetch signal), so
+      // ownership transfers to the stream teardown below.
+      abortHandlerOwnedByStream = true;
       return new ReadableStream<TResponse>({
         start(controller) {
           const reader = res
@@ -1042,6 +1103,7 @@ export const apiCall = async <TRequest = unknown, TResponse = unknown>(
               if (timeoutId) {
                 clearTimeout(timeoutId);
               }
+              removeUserAbortHandler?.();
               reader.releaseLock();
               if (streamReader === reader) streamReader = undefined;
             }
@@ -1052,11 +1114,15 @@ export const apiCall = async <TRequest = unknown, TResponse = unknown>(
         // When the consumer cancels the stream, set our flag to stop processing further.
         cancel(reason) {
           closed = true;
+          removeUserAbortHandler?.();
           return streamReader?.cancel(reason);
         },
       });
     } catch (error) {
-      if (error instanceof Error && error.name === 'AbortError') {
+      if (
+        combinedAbortController.signal.aborted ||
+        (error instanceof Error && error.name === 'AbortError')
+      ) {
         // Check if this was a user abort or timeout
         if (api.abortSignal?.aborted) {
           throw new AxAIServiceAbortedError(
@@ -1128,6 +1194,15 @@ export const apiCall = async <TRequest = unknown, TResponse = unknown>(
     } finally {
       if (timeoutId !== undefined) {
         clearTimeout(timeoutId);
+      }
+      // Detach the user abort listener on every non-streaming exit path
+      // (success, non-abort error, and each retry `continue`). Without this the
+      // `{ once: true }` listener registered above only ever detaches on an
+      // actual abort, so a long-lived caller signal accumulates one listener
+      // per attempt (MaxListenersExceededWarning at 11, then unbounded). For a
+      // streamed response the stream teardown owns the listener instead.
+      if (!abortHandlerOwnedByStream) {
+        removeUserAbortHandler?.();
       }
     }
   }

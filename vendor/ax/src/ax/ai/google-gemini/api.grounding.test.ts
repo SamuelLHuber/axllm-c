@@ -114,6 +114,27 @@ describe('Gemini deprecation flags', () => {
     );
   });
 
+  it.each([
+    [AxAIGoogleGeminiModel.Gemini3FlashLite, '2026-05-25'],
+    [AxAIGoogleGeminiModel.GeminiRoboticsER16, '2026-08-31'],
+  ])('marks shut-down %s as deprecated on %s', (model, date) => {
+    const entry = axModelInfoGoogleGemini.find((m) => m.name === model);
+    expect(entry?.isDeprecated).toBe(true);
+    expect(entry?.deprecatedOn).toBe(date);
+  });
+
+  it.each([
+    AxAIGoogleGeminiModel.Gemini20ProExp,
+    AxAIGoogleGeminiModel.Gemini20FlashThinkingExp,
+    AxAIGoogleGeminiModel.Gemini15Flash,
+    AxAIGoogleGeminiModel.Gemini15Flash8B,
+    AxAIGoogleGeminiModel.Gemini15Pro,
+    AxAIGoogleGeminiModel.Gemini1Pro,
+  ])('marks retired %s as deprecated', (model) => {
+    const entry = axModelInfoGoogleGemini.find((m) => m.name === model);
+    expect(entry?.isDeprecated).toBe(true);
+  });
+
   it('exposes gemini-embedding-2 in the embed enum', async () => {
     const { AxAIGoogleGeminiEmbedModel } = await import('./types.js');
     expect(AxAIGoogleGeminiEmbedModel.GeminiEmbedding2).toBe(
@@ -124,14 +145,30 @@ describe('Gemini deprecation flags', () => {
 
 describe('Gemini new model catalog entries', () => {
   it('exposes the new GA model IDs', () => {
+    expect(AxAIGoogleGeminiModel.Gemini38Flash).toBe('gemini-3.8-flash');
     expect(AxAIGoogleGeminiModel.Gemini37Flash).toBe('gemini-3.7-flash');
     expect(AxAIGoogleGeminiModel.Gemini36Flash).toBe('gemini-3.6-flash');
     expect(AxAIGoogleGeminiModel.Gemini35FlashLite).toBe(
       'gemini-3.5-flash-lite'
     );
+    expect(AxAIGoogleGeminiModel.Gemini38FlashTTS).toBe('gemini-3.8-flash-tts');
+    expect(AxAIGoogleGeminiModel.Gemini38FlashLiteTTS).toBe(
+      'gemini-3.8-flash-lite-tts'
+    );
+    expect(AxAIGoogleGeminiModel.Gemini35Transcribe).toBe(
+      'gemini-3.5-transcribe'
+    );
+    expect(AxAIGoogleGeminiModel.Gemini38Live).toBe('gemini-3.8-live');
+    expect(AxAIGoogleGeminiModel.Gemini38LiveExtendedThinking).toBe(
+      'gemini-3.8-live-extended-thinking'
+    );
+    expect(AxAIGoogleGeminiModel.Gemini31FlashLiteImage).toBe(
+      'gemini-3.1-flash-lite-image'
+    );
   });
 
   it.each([
+    AxAIGoogleGeminiModel.Gemini38Flash,
     AxAIGoogleGeminiModel.Gemini37Flash,
     AxAIGoogleGeminiModel.Gemini36Flash,
     AxAIGoogleGeminiModel.Gemini35FlashLite,
@@ -140,6 +177,7 @@ describe('Gemini new model catalog entries', () => {
   });
 
   it.each([
+    AxAIGoogleGeminiModel.Gemini38Flash,
     AxAIGoogleGeminiModel.Gemini36Flash,
     AxAIGoogleGeminiModel.Gemini35Flash,
     AxAIGoogleGeminiModel.Gemini35FlashLite,
@@ -147,6 +185,13 @@ describe('Gemini new model catalog entries', () => {
     AxAIGoogleGeminiModel.Gemini31FlashImage,
     AxAIGoogleGeminiModel.Gemini31FlashLive,
     AxAIGoogleGeminiModel.Gemini31FlashTTS,
+    AxAIGoogleGeminiModel.Gemini38FlashTTS,
+    AxAIGoogleGeminiModel.Gemini38FlashLiteTTS,
+    AxAIGoogleGeminiModel.Gemini35Transcribe,
+    AxAIGoogleGeminiModel.Gemini38Live,
+    AxAIGoogleGeminiModel.Gemini38LiveExtendedThinking,
+    AxAIGoogleGeminiModel.Gemini31FlashLiteImage,
+    AxAIGoogleGeminiModel.Gemini3ProImage,
     AxAIGoogleGeminiModel.NanoBanana2,
     AxAIGoogleGeminiModel.GeminiRoboticsER16,
   ])('has %s in info catalog', (model) => {
@@ -155,6 +200,11 @@ describe('Gemini new model catalog entries', () => {
   });
 
   it.each([
+    {
+      model: AxAIGoogleGeminiModel.Gemini38Flash,
+      inputCost: 1.5,
+      outputCost: 7.5,
+    },
     {
       model: AxAIGoogleGeminiModel.Gemini37Flash,
       inputCost: 1.5,
@@ -186,6 +236,22 @@ describe('Gemini new model catalog entries', () => {
         structuredOutputs: true,
       },
       notSupported: { temperature: true, topP: true },
+    });
+  });
+});
+
+describe('Gemini speech-to-text catalog entry', () => {
+  it('describes gemini-3.5-transcribe as a transcription-only model', () => {
+    const entry = axModelInfoGoogleGemini.find(
+      (m) => m.name === AxAIGoogleGeminiModel.Gemini35Transcribe
+    );
+    expect(entry).toMatchObject({
+      promptTokenCostPer1M: 2,
+      completionTokenCostPer1M: 12,
+      contextWindow: 98_304,
+      maxTokens: 32_768,
+      audio: { input: true, output: false },
+      supported: { operations: ['transcribe'] },
     });
   });
 });

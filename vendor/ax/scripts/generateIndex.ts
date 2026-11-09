@@ -23,12 +23,35 @@ interface ExportInfo {
  * Checks if a symbol name starts with the expected prefixes (ax or Ax) or is a special case
  */
 const internalExportNames = new Set([
+  'AxNativeDecision',
+  'AxDecisionContext',
+  'AxDecisionField',
   // Renamed when the GPT-5.6 reasoning surfaces were split; the old single name
   // is kept so this list still covers what it was written to cover.
   'AxAIOpenAIReasoningEffort',
   'AxAIOpenAIChatReasoningEffort',
   'AxAIOpenAIResponsesReasoningEffort',
   'AxAIOpenAIResponsesImpl',
+  'AxOpenAIChatSession',
+  'AxAIOpenAIAstraReasoningEffort',
+  'AxAIOpenAIResponsesConfigurationUpdate',
+  'AxAIOpenAIResponsesCustomToolCall',
+  'AxAIOpenAIResponsesCustomToolOutput',
+  'AxAIOpenAIResponsesDefineCustomTool',
+  'AxAIOpenAIResponsesSessionEvent',
+  'AxAIOpenAIResponsesSteerRequest',
+  'AxRunUpdate',
+  'AxAIOpenAIResponsesClient',
+  'AxAIOpenAIResponsesClientConfig',
+  'AxAIOpenAIResponsesSocket',
+  'AxAIOpenAIResponsesOptions',
+  'AxAIOpenAIResponseCreateRequest',
+  'AxAIOpenAIResponsesSession',
+  'axRunChatSession',
+  'axValidateToolArguments',
+  'AxAIOpenAIResponsesRealtimeAdapter',
+  'AxAIOpenAIResponsesRealtimeRequest',
+  'AxAIAnthropicProfile',
   'AxAgentInternalCompletionPayload',
   'AxAppliedProposal',
   'AxFlowDependencyAnalyzer',
@@ -62,12 +85,22 @@ const internalExportNames = new Set([
   'axResolveOpenAIReasoningEffort',
   'axResolveOpenAIChatReasoningEffort',
   'axResolveOpenAIResponsesReasoningEffort',
+  'axCreateMetaRealtimeApi',
+  'axFetchMetaTranscription',
+  'axNormalizeMetaTranscriptionResponse',
   // OpenAI prompt-caching internals. The breakpoint marker and content-part
   // types stay public because AxAIOpenAIChatRequest is built out of them.
   'axApplyOpenAIPromptCacheBreakpoints',
   'axIsOpenAIPromptCachingEnabled',
   'axResolveOpenAIPromptCacheKey',
   'axIsGPT56Family',
+  'axIsGPT6Astra',
+  'axIsGPT6Family',
+  'axRefusesOpenAIChatTools',
+  'axRequiresOpenAIReasoning',
+  'axSupportsOpenAIBreakpointCaching',
+  'axSupportsOpenAIChatSessions',
+  'axValidateOpenAIResponseRequest',
 ]);
 
 function hasValidPrefix(name: string): boolean {
@@ -77,8 +110,11 @@ function hasValidPrefix(name: string): boolean {
       name.startsWith('Ax') ||
       name === 'f' ||
       name === 'fn' ||
+      name === 'runControl' ||
       name === 's' ||
       name === 'ai' ||
+      name === 'typesafe' ||
+      name === 'openaiDecisions' ||
       name === 'agent' ||
       name === 'flow' ||
       name === 'eventRuntime' ||
@@ -180,10 +216,7 @@ function processDeclaration(
 function processVariableStatement(node: ts.VariableStatement): ExportInfo[] {
   const exports: ExportInfo[] = [];
   // Check if the variable statement has an export modifier
-  if (
-    !node.modifiers ||
-    !node.modifiers.some((m) => m.kind === ts.SyntaxKind.ExportKeyword)
-  ) {
+  if (!node.modifiers?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword)) {
     return exports;
   }
 

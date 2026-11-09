@@ -11,7 +11,8 @@
     }
   ],
   "expected_output": {
-    "answer": "kept"
+    "answer": "kept",
+    "thought": "I should preserve this summary."
   },
   "expected_request_count": 1,
   "input": {
@@ -28,7 +29,7 @@
       },
       "results": [
         {
-          "content": "{\"answer\":\"kept\"}",
+          "content": "Answer: kept",
           "index": 0,
           "thought": "I should preserve this summary.",
           "thought_blocks": [

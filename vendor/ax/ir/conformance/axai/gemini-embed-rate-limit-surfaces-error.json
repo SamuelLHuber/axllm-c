@@ -7,7 +7,14 @@
   "name": "gemini-embed-rate-limit-surfaces-error",
   "provider": "google-gemini",
   "request": {
-    "texts": ["one"]
+    "texts": [
+      "one"
+    ]
+  },
+  "service_options": {
+    "retry": {
+      "maxRetries": 0
+    }
   },
   "transport_responses": [
     {

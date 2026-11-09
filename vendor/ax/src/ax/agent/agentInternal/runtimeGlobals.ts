@@ -135,7 +135,13 @@ export function wrapFunction(
   functionCallRecorder?: AxAgentFunctionCallRecorder,
   kind: 'internal' | 'external' = 'external',
   onFunctionCall?: AxAgentOnFunctionCall,
-  eventContext?: import('../../event/types.js').AxEventContext
+  eventContext?: import('../../event/types.js').AxEventContext,
+  runOptions?: Pick<
+    import('../../ai/types.js').AxAIServiceOptions,
+    'control' | 'executionPath'
+  > & {
+    _mcpExecutionContext?: import('../../mcp/execution.js').AxMCPExecutionContext;
+  }
 ): (...args: unknown[]) => Promise<unknown> {
   return async (...args: unknown[]) => {
     let callArgs: Record<string, unknown>;
@@ -177,6 +183,9 @@ export function wrapFunction(
         ai,
         protocol,
         eventContext,
+        _mcpExecutionContext: runOptions?._mcpExecutionContext,
+        control: runOptions?.control,
+        executionPath: `${runOptions?.executionPath ?? 'root'}/${normalizedQualifiedName}`,
       });
       functionCallRecorder?.({
         qualifiedName: normalizedQualifiedName,
@@ -233,7 +242,11 @@ export function buildRuntimeGlobals(
    * Forwarded to `onMemoriesSearch` so the callback can skip re-fetching
    * entries the actor already has in scope.
    */
-  getCurrentMemories?: () => readonly AxAgentMemoryResult[]
+  getCurrentMemories?: () => readonly AxAgentMemoryResult[],
+  runOptions?: Pick<
+    import('../../ai/types.js').AxAIServiceOptions,
+    'control' | 'executionPath'
+  >
 ): Record<string, unknown> {
   const fireInternal = async (
     name: string,
@@ -305,7 +318,8 @@ export function buildRuntimeGlobals(
           functionCallRecorder,
           agentFn._kind ?? 'external',
           onFunctionCall,
-          eventContext
+          eventContext,
+          { ...runOptions, _mcpExecutionContext: s._activeMCPExecutionContext }
         )
       : buildStageToolStub(qualifiedName);
     if (agentFn._alwaysInclude !== true) {
@@ -346,7 +360,11 @@ export function buildRuntimeGlobals(
               functionCallRecorder,
               'external',
               onFunctionCall,
-              eventContext
+              eventContext,
+              {
+                ...runOptions,
+                _mcpExecutionContext: s._activeMCPExecutionContext,
+              }
             )
           : buildStageToolStub(qualifiedName);
         registerCallable(
@@ -433,7 +451,11 @@ export function buildRuntimeGlobals(
               functionCallRecorder,
               'external',
               onFunctionCall,
-              eventContext
+              eventContext,
+              {
+                ...runOptions,
+                _mcpExecutionContext: s._activeMCPExecutionContext,
+              }
             )
           : buildStageToolStub(qualifiedName);
         registerCallable(

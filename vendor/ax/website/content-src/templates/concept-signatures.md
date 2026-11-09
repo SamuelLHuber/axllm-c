@@ -47,12 +47,86 @@ boolean.
 
 {{signatureStringExample}}
 
+## Per-value descriptions
+
+Boolean fields can describe their outcomes with
+`urgent:boolean(true "Core task blocked", false "Routine request") "Urgent?"`.
+Class fields can describe labels after their allowed-value list:
+`team:class "support, billing"(support "Usage help", billing "Invoice question")`.
+Use `.describeValues({ true: "Core task blocked", false: "Routine request" })`
+or `.describeValues({ support: "Usage help", billing: "Invoice question" })`
+with the corresponding fluent fields.
+
+These descriptions preserve the existing output types. Conventional providers
+receive combined text descriptions in prompts and JSON schemas. Typesafe maps
+them to native criteria. Descriptions survive signature round-tripping, and
+rendering does not modify the original signature. These semantics also apply in
+Python, Java, C++, Go, and Rust. Fluent field helpers use the language’s usual
+`describe_values`, `describeValues`, or `DescribeValues` naming.
+
+Per-field value guidance belongs in the signature. Scalar boolean conversion
+uses the provider threshold; evidence fields can specify their own local threshold.
+
+
+## Decision evidence and reranking
+
+Use signature fields to access decision metadata with Jev, OpenAI Decisions,
+or a generative provider:
+
+```text
+query:string, document:string ->
+  relevant:boolean(evidence, threshold 0.7),
+  category:class "support, billing"(evidence),
+  relevance:score "Irrelevant, Related, Partial answer, Direct answer"(evidence)
+```
+
+Boolean evidence contains `value`, `probability`, `threshold`, and `provenance`.
+Class evidence contains `value`, a complete label-to-probability map, and
+`provenance`. Score evidence contains a continuous `value` from zero to the last
+rubric index, ordered `levels`, ordered `probabilities`, and `provenance`.
+Native class and score results can also contain the provider's `confidence`.
+A score without `(evidence)` returns only its numeric value. Existing scalar
+boolean and class fields keep their existing behavior.
+
+Ax preserves a native provider's selected class, continuous score, probabilities,
+and confidence. A native value can differ from the probability argmax or weighted
+mean. With generative models, Ax requests probabilities, derives the boolean or
+class locally, and calculates a score as the probability-weighted rubric index.
+It preserves the supplied probabilities and never invents confidence.
+
+`provenance.source` distinguishes `native` from `elicited`; `provider` and, when
+available, `model` describe the actual response. These fields come from Ax, not
+generated output. The common result shape does not make probabilities or
+confidence equally calibrated across providers or models. Evaluate thresholds
+and ranking quality on your own data. A score's meaning depends on its declared
+rubric; it is not a probability of correctness.
+
+For reranking, evaluate each query/document pair, retain the candidate ID in your
+application, and sort by `relevance.value` within the same rubric and model.
+Ordinary Ax processors, assertions, result selection, traces, and caches receive
+the decoded result. Streaming waits for complete evidence before emitting it.
+
+{{decisionEvidenceExample}}
+
+Use `boolean(evidence, refusal return)` (or an evidence field with `refusal return`)
+to receive `{status: "answered", ...evidence}` or `{status: "refused", provenance}`.
+By default, a refusal raises `AxDecisionRefusalError` and stops correction retries.
+
+Generative providers support nested, optional, and array evidence fields. Native
+Jev and OpenAI Decisions signatures require flat, required scalar fields; Ax
+rejects unsupported shapes before transport. For advanced structured criteria
+or native request features, the direct provider client remains available.
+Label-only examples are accepted without manufactured distributions. Examples
+containing actual evidence preserve it while omitting runtime-owned result metadata
+from the inference demonstration.
+
 ## Field Types
 
 | Type | Example | Notes |
 | --- | --- | --- |
 | `string` | `question:string` | General text |
 | `number` | `score:number` | Parsed numeric value |
+| `score` | `relevance:score "Low, Medium, High"` | Continuous index on a declared rubric |
 | `boolean` | `approved:boolean` | True/false |
 | `json` | `metadata:json` | Structured object |
 | `date` / `datetime` | `dueDate:date` | Strict date-like values |
@@ -105,6 +179,10 @@ Validation happens after parsing complete fields. For streaming generation, stre
 ## Media, Cache, And Internal Fields
 
 Media fields let a program receive images, audio, or files when the provider supports them. In agent flows, audio inputs are usually transcribed before planner/executor/responder stages; direct `ax(...)` programs can pass native media to compatible providers.
+
+An image input is `{ mimeType, data }`, a file input carries `mimeType` and either `data` or `fileUri`, and a url input is a string or `{ url, title, description }`. Each also carries the optional keys its chat part declares to the provider or router: an image's `details` (`high`, `low`, or `auto`; OpenAI's image detail), `cache`, `optimize`, and `altText`; a file's `filename` (OpenAI rejects inline file data without one), `cache`, and `extractedText`; a url's `cachedContent` and `cache`; and an audio input's `mimeType`, `sampleRate`, `channels`, `cache`, `transcription`, and `duration`. Other keys stay behind. OpenAI and Anthropic-style providers read a url input as text: its cached content, or else its title, description, and url, each on its own line.
+
+{{audioFieldsSection}}
 
 Cache hints mark stable context so provider prefix caching can reuse expensive prompt regions. Internal fields let a program ask the model to produce private scratch structure without exposing it in the final typed output.
 
@@ -187,3 +265,21 @@ filingText:string(cache) -> revenueByPeriod:object{ periodLabel:string, amountUs
 - Treat generated JSON schema as a public contract when tools, SDKs, or external callers rely on it.
 
 See [Tools]({{langRoot}}/concepts/tools/), [s() signatures]({{langRoot}}/subsystems/s/), and [s() API]({{langRoot}}/api/s/).
+
+## Image localization with Box
+
+Use `photo:image -> target:box` for normalized bounding-box coordinates:
+`{ top, bottom, left, right }`, all in `[0, 1]` with ordered edges.
+`target:box(evidence)` adds native confidence when available and provider
+provenance around the coordinates in `value`. TypeScript and Python use
+`f.box()`, Java uses `Ax.f().box()`, Go uses `Box()`, and Rust uses
+`FieldType::box_()`. Evidence is optional.
+
+Jev 1.14 uses its experimental native Box primitive. Generative vision providers
+use a validated JSON schema; elicited results do not invent native confidence.
+OpenAI Decisions accepts image inputs for its boolean/class/score questions but
+does not expose a native Box primitive. Pair Box with a presence boolean because
+Jev returns a box even when the requested target is absent.
+
+Runnable image localization examples are available under each language’s
+`src/examples/<language>/generation/` directory, alongside the native Jev examples.

@@ -13,15 +13,22 @@ import {
   formatDateTimeRange,
   formatDateWithTimezone,
 } from './datetime.js';
+import { decisionExampleValues, hasDecisionFields } from './decision.js';
 import type { AxInputFunctionType } from './functions.js';
 import type { AxField, AxFieldType, AxIField, AxSignature } from './sig.js';
 import type { AxFieldValue } from './types.js';
 import { validateValue } from './util.js';
+import {
+  describeFieldValues,
+  describeNestedFieldValues,
+} from './valueDescriptions.js';
 
 type Writeable<T> = { -readonly [P in keyof T]: T[P] };
 
 // Define options type for AxPromptTemplate constructor
 export interface AxPromptTemplateOptions {
+  /** Render JSON output instructions and examples even for scalar signatures. */
+  structuredOutput?: boolean;
   functions?: Readonly<AxInputFunctionType>;
   thoughtFieldName?: string;
   contextCache?: AxContextCacheOptions;
@@ -110,6 +117,11 @@ export class AxPromptTemplate {
   private readonly ignoreBreakpoints: boolean;
   private readonly structuredOutputFunctionName?: string;
   private readonly customTemplate?: string;
+  private readonly structuredOutputOverride?: boolean;
+
+  private get structuredOutput(): boolean {
+    return this.structuredOutputOverride ?? this.sig.hasComplexFields();
+  }
 
   constructor(
     sig: Readonly<AxSignature>,
@@ -117,6 +129,7 @@ export class AxPromptTemplate {
     fieldTemplates?: Record<string, AxFieldTemplateFn>
   ) {
     this.sig = sig;
+    this.structuredOutputOverride = options?.structuredOutput;
     this.fieldTemplates = fieldTemplates;
     this.thoughtFieldName = options?.thoughtFieldName ?? 'thought';
     this.functions = options?.functions;
@@ -176,7 +189,7 @@ export class AxPromptTemplate {
     type: 'text';
     text: string;
   } {
-    const hasComplexFields = this.sig.hasComplexFields();
+    const hasComplexFields = this.structuredOutput;
     const outputFields = this.sig
       .getOutputFields()
       .filter((field) => !field.isInternal);
@@ -301,7 +314,7 @@ export class AxPromptTemplate {
       this.sig.getOutputFields().filter((field) => !field.isInternal),
       fieldMap
     );
-    const jsonShape = this.sig.hasComplexFields()
+    const jsonShape = this.structuredOutput
       ? `\n\n**Exact JSON shape**: \`${renderOutputJsonShape(
           this.sig.getOutputFields().filter((field) => !field.isInternal)
         )}\``
@@ -588,7 +601,7 @@ export class AxPromptTemplate {
 
     // When hasComplexFields is true, the entire output is JSON, so we should not add
     // field-specific instructions to return only error-corrected fields
-    const _hasComplexFields = this.sig.hasComplexFields();
+    const _hasComplexFields = this.structuredOutput;
 
     const formattedGroupedFields = Object.entries(groupedFields)
       .map(([title, fields]) => {
@@ -624,6 +637,8 @@ export class AxPromptTemplate {
             description: valuesList,
           };
         }
+
+        return undefined;
       })
       .filter(Boolean) as AxIField[];
 
@@ -641,7 +656,7 @@ export class AxPromptTemplate {
       isExample: true,
     };
 
-    const hasComplexFields = this.sig.hasComplexFields();
+    const hasComplexFields = this.structuredOutput;
 
     for (const [index, item] of data.entries()) {
       if (hasComplexFields) {
@@ -747,7 +762,7 @@ export class AxPromptTemplate {
       isExample: true,
     };
 
-    const hasComplexFields = this.sig.hasComplexFields();
+    const hasComplexFields = this.structuredOutput;
 
     for (const item of data) {
       if (hasComplexFields) {
@@ -832,7 +847,7 @@ export class AxPromptTemplate {
   ): DemoMessagePair[] => {
     const pairs: DemoMessagePair[] = [];
     const exampleContext = { isExample: true };
-    const hasComplexFields = this.sig.hasComplexFields();
+    const hasComplexFields = this.structuredOutput;
 
     for (const item of data) {
       // Render INPUT fields as user message content (cached fields first for cache efficiency)
@@ -888,7 +903,10 @@ export class AxPromptTemplate {
                 type: 'function',
                 function: {
                   name: this.structuredOutputFunctionName,
-                  params: outputValues,
+                  params: decisionExampleValues(
+                    this.sig.getOutputFields(),
+                    outputValues
+                  ),
                 },
               },
             ],
@@ -911,7 +929,11 @@ export class AxPromptTemplate {
             outputValues[field.name] = (item as any)[field.name];
           }
         }
-        outputContent = JSON.stringify(outputValues, null, 2);
+        outputContent = JSON.stringify(
+          decisionExampleValues(this.sig.getOutputFields(), outputValues),
+          null,
+          2
+        );
       } else {
         // For plain text outputs, render as field: value pairs
         const outputItems = this.sig
@@ -1012,9 +1034,15 @@ export class AxPromptTemplate {
     value: Readonly<AxFieldValue>
   ): ChatRequestUserMessage => {
     if (field.type?.name === 'image') {
-      const validateImage = (
-        value: Readonly<AxFieldValue>
-      ): { mimeType: string; data: string } => {
+      type ImageValue = {
+        mimeType: string;
+        data: string;
+        details?: 'high' | 'low' | 'auto';
+        cache?: boolean;
+        optimize?: 'quality' | 'size' | 'auto';
+        altText?: string;
+      };
+      const validateImage = (value: Readonly<AxFieldValue>): ImageValue => {
         if (!value) {
           throw new Error('Image field value is required.');
         }
@@ -1028,8 +1056,21 @@ export class AxPromptTemplate {
         if (!('data' in value)) {
           throw new Error('Image field must have data');
         }
-        return value as { mimeType: string; data: string };
+        return value as ImageValue;
       };
+      // The part keeps the image part's declared keys the value sets, such
+      // as details, which the provider reads (OpenAI's image detail).
+      const imagePart = (validated: ImageValue) => ({
+        type: 'image' as const,
+        mimeType: validated.mimeType,
+        image: validated.data,
+        ...declaredPartKeys(validated, [
+          'details',
+          'cache',
+          'optimize',
+          'altText',
+        ]),
+      });
 
       let result: ChatRequestUserMessage = [
         { type: 'text', text: `${field.title}: ` as string },
@@ -1040,31 +1081,24 @@ export class AxPromptTemplate {
           throw new Error('Image field value must be an array.');
         }
         result = result.concat(
-          (value as unknown[]).map((v) => {
+          (value as unknown[]).map((v) =>
             // Cast to unknown[] before map
-            const validated = validateImage(v as AxFieldValue);
-            return {
-              type: 'image',
-              mimeType: validated.mimeType,
-              image: validated.data,
-            };
-          })
+            imagePart(validateImage(v as AxFieldValue))
+          )
         );
       } else {
-        const validated = validateImage(value);
-        result.push({
-          type: 'image',
-          mimeType: validated.mimeType,
-          image: validated.data,
-        });
+        result.push(imagePart(validateImage(value)));
       }
       return result;
     }
 
-    if (field.type?.name === 'audio') {
+    // A plain string, and an audio object with a transcript (processValue
+    // hands its transcript over), go to the model as text, like any text
+    // field. Audio without a transcript goes as an audio part.
+    if (field.type?.name === 'audio' && typeof value !== 'string') {
       const validateAudio = (
         value: Readonly<AxFieldValue>
-      ): { format?: 'wav'; data: string } => {
+      ): { format?: 'wav'; data: string } & Record<string, unknown> => {
         if (!value) {
           throw new Error('Audio field value is required.');
         }
@@ -1075,8 +1109,19 @@ export class AxPromptTemplate {
         if (!('data' in value)) {
           throw new Error('Audio field must have data');
         }
-        return value as { format?: 'wav'; data: string };
+        return value as { format?: 'wav'; data: string } & Record<
+          string,
+          unknown
+        >;
       };
+      const audioKeys = [
+        'mimeType',
+        'sampleRate',
+        'channels',
+        'cache',
+        'transcription',
+        'duration',
+      ] as const;
 
       let result: ChatRequestUserMessage = [
         { type: 'text', text: `${field.title}: ` as string },
@@ -1094,6 +1139,7 @@ export class AxPromptTemplate {
               type: 'audio',
               format: validated.format ?? 'wav',
               data: validated.data,
+              ...declaredPartKeys(validated, audioKeys),
             };
           })
         );
@@ -1103,6 +1149,7 @@ export class AxPromptTemplate {
           type: 'audio',
           format: validated.format ?? 'wav',
           data: validated.data,
+          ...declaredPartKeys(validated, audioKeys),
         });
       }
       return result;
@@ -1139,6 +1186,32 @@ export class AxPromptTemplate {
           | { mimeType: string; data: string }
           | { mimeType: string; fileUri: string };
       };
+      // The part keeps the file part's declared keys the value sets, such as
+      // filename: OpenAI rejects inline file data without one.
+      const filePart = (
+        validated:
+          | { mimeType: string; data: string }
+          | { mimeType: string; fileUri: string }
+      ) => {
+        const keys = declaredPartKeys(validated, [
+          'filename',
+          'cache',
+          'extractedText',
+        ]);
+        return 'fileUri' in validated
+          ? {
+              type: 'file' as const,
+              mimeType: validated.mimeType,
+              fileUri: validated.fileUri,
+              ...keys,
+            }
+          : {
+              type: 'file' as const,
+              mimeType: validated.mimeType,
+              data: validated.data,
+              ...keys,
+            };
+      };
       let result: ChatRequestUserMessage = [
         { type: 'text', text: `${field.title}: ` as string },
       ];
@@ -1147,44 +1220,25 @@ export class AxPromptTemplate {
           throw new Error('File field value must be an array.');
         }
         result = result.concat(
-          (value as unknown[]).map((v) => {
-            const validated = validateFile(v as AxFieldValue);
-            return 'fileUri' in validated
-              ? {
-                  type: 'file',
-                  mimeType: validated.mimeType,
-                  fileUri: validated.fileUri,
-                }
-              : {
-                  type: 'file',
-                  mimeType: validated.mimeType,
-                  data: validated.data,
-                };
-          })
+          (value as unknown[]).map((v) =>
+            filePart(validateFile(v as AxFieldValue))
+          )
         );
       } else {
-        const validated = validateFile(value);
-        result.push(
-          'fileUri' in validated
-            ? {
-                type: 'file',
-                mimeType: validated.mimeType,
-                fileUri: validated.fileUri,
-              }
-            : {
-                type: 'file',
-                mimeType: validated.mimeType,
-                data: validated.data,
-              }
-        );
+        result.push(filePart(validateFile(value)));
       }
       return result;
     }
 
     if (field.type?.name === 'url') {
-      const validateUrl = (
-        value: Readonly<AxFieldValue>
-      ): { url: string; title?: string; description?: string } => {
+      type UrlValue = {
+        url: string;
+        title?: string;
+        description?: string;
+        cachedContent?: string;
+        cache?: boolean;
+      };
+      const validateUrl = (value: Readonly<AxFieldValue>): UrlValue => {
         if (!value) {
           throw new Error('URL field value is required.');
         }
@@ -1197,8 +1251,20 @@ export class AxPromptTemplate {
         if (!('url' in value)) {
           throw new Error('URL field must have url property');
         }
-        return value as { url: string; title?: string; description?: string };
+        return value as UrlValue;
       };
+      // The part keeps the url, its title and description when they are set,
+      // and the url part's other declared keys the value sets, such as
+      // cachedContent, which the provider sends in place of the page.
+      const urlPart = (validated: UrlValue) => ({
+        type: 'url' as const,
+        url: validated.url,
+        ...(validated.title ? { title: validated.title } : {}),
+        ...(validated.description
+          ? { description: validated.description }
+          : {}),
+        ...declaredPartKeys(validated, ['cachedContent', 'cache']),
+      });
       let result: ChatRequestUserMessage = [
         { type: 'text', text: `${field.title}: ` as string },
       ];
@@ -1207,28 +1273,12 @@ export class AxPromptTemplate {
           throw new Error('URL field value must be an array.');
         }
         result = result.concat(
-          (value as unknown[]).map((v) => {
-            const validated = validateUrl(v as AxFieldValue);
-            return {
-              type: 'url',
-              url: validated.url,
-              ...(validated.title ? { title: validated.title } : {}),
-              ...(validated.description
-                ? { description: validated.description }
-                : {}),
-            };
-          })
+          (value as unknown[]).map((v) =>
+            urlPart(validateUrl(v as AxFieldValue))
+          )
         );
       } else {
-        const validated = validateUrl(value);
-        result.push({
-          type: 'url',
-          url: validated.url,
-          ...(validated.title ? { title: validated.title } : {}),
-          ...(validated.description
-            ? { description: validated.description }
-            : {}),
-        });
+        result.push(urlPart(validateUrl(value)));
       }
       return result;
     }
@@ -1256,15 +1306,19 @@ const renderInputFields = (
     const name = field.title;
 
     let description = '';
-    if (field.description) {
-      let formatted = formatDescription(field.description);
+    const fieldDescription = describeFieldValues(field);
+    if (fieldDescription) {
+      let formatted = field.type?.valueDescriptions
+        ? fieldDescription
+        : formatDescription(fieldDescription);
       if (fieldNameToTitle) {
         formatted = formatFieldReferences(formatted, fieldNameToTitle);
       }
       description = ` ${formatted}`;
     }
 
-    return `${name}:${description}`.trim();
+    const nested = describeNestedFieldValues(field.type?.fields, field.name);
+    return [`${name}:${description}`.trim(), ...nested].join('\n');
   });
 
   return rows.join('\n');
@@ -1284,11 +1338,12 @@ const renderOutputFields = (
 
     let description = '';
 
-    if (field.description && field.description.length > 0) {
+    const fieldDescription = describeFieldValues(field);
+    if (fieldDescription && fieldDescription.length > 0) {
       let value =
-        field.type?.name === 'class'
-          ? field.description
-          : formatDescription(field.description);
+        field.type?.name === 'class' || field.type?.valueDescriptions
+          ? fieldDescription
+          : formatDescription(fieldDescription);
       if (fieldNameToTitle) {
         value = formatFieldReferences(value, fieldNameToTitle);
       }
@@ -1302,7 +1357,11 @@ const renderOutputFields = (
       description += `Allowed values: ${field.type.options.join(', ')}`;
     }
 
-    return `${name}: (${requiredMsg})${description}`.trim();
+    const nested = describeNestedFieldValues(field.type?.fields, field.name);
+    return [
+      `${name}: (${requiredMsg})${description}${hasDecisionFields([field]) ? '. Provide only the requested evidence keys. Values, thresholds, confidence and provenance are attached by Ax. Some demonstrations contain labels only; infer evidence when answering.' : ''}`.trim(),
+      ...nested,
+    ].join('\n');
   });
 
   return rows.join('\n');
@@ -1320,6 +1379,41 @@ const renderOutputJsonShape = (fields: readonly AxField[]): string =>
 
 const renderNestedTypePlaceholder = (type: Readonly<AxFieldType>): unknown => {
   const value = (() => {
+    if (type.type === 'box') {
+      const box = {
+        top: '<top, 0 to 1>',
+        bottom: '<bottom, greater than top>',
+        left: '<left, 0 to 1>',
+        right: '<right, greater than left>',
+      };
+      return type.evidence
+        ? {
+            box,
+            ...(type.evidence.onRefusal === 'return'
+              ? { status: 'answered' }
+              : {}),
+          }
+        : box;
+    }
+    if (type.evidence !== undefined || type.type === 'score')
+      return {
+        ...(type.evidence?.onRefusal === 'return'
+          ? { status: 'answered' }
+          : {}),
+        ...(type.type === 'boolean'
+          ? { probability: '<probability of true, 0 to 1>' }
+          : {
+              probabilities:
+                type.type === 'score'
+                  ? type.options?.map(() => '<probability, 0 to 1>')
+                  : Object.fromEntries(
+                      (type.options ?? []).map((label) => [
+                        label,
+                        '<probability, 0 to 1>',
+                      ])
+                    ),
+            }),
+      };
     switch (type.type) {
       case 'number':
         return 0;
@@ -1372,6 +1466,7 @@ const renderOutputTypePlaceholder = (
     isArray: type.isArray,
     fields: type.fields,
     options: type.options,
+    evidence: type.evidence,
   });
 };
 
@@ -1443,6 +1538,17 @@ function formatObjectStructure(
 }
 
 export const toFieldType = (type: Readonly<AxField['type']>) => {
+  if (type?.name === 'box')
+    return `${type.isArray ? 'array of ' : ''}${type.evidence ? 'box evidence objects containing a box with' : 'bounding boxes with'} normalized top, bottom, left and right edges in [0, 1]; top < bottom and left < right`;
+  if (type && (type.evidence !== undefined || type.name === 'score')) {
+    const hint =
+      type.name === 'boolean'
+        ? 'probability of true'
+        : type.name === 'score'
+          ? `probabilities over rubric levels, in this order: ${type.options?.join(', ')}`
+          : 'probabilities for every class';
+    return `${type.isArray ? 'array of ' : ''}decision evidence objects (${hint}; probabilities must sum to one for classes and scores)`;
+  }
   const baseType = (() => {
     switch (type?.name) {
       case 'string':
@@ -1481,6 +1587,22 @@ export const toFieldType = (type: Readonly<AxField['type']>) => {
   })();
 
   return type?.isArray ? `json array of ${baseType} items` : baseType;
+};
+
+// The optional keys a media part type declares (AxChatRequest's user content)
+// that a media input value may set: they go on the part when the value has
+// them, so the provider or router that reads them gets them.
+const declaredPartKeys = (
+  value: Readonly<Record<string, unknown>>,
+  keys: readonly string[]
+): Record<string, unknown> => {
+  const out: Record<string, unknown> = {};
+  for (const key of keys) {
+    if (value[key] !== undefined) {
+      out[key] = value[key];
+    }
+  }
+  return out;
 };
 
 function combineConsecutiveStrings(separator: string) {

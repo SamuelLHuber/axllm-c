@@ -1,0 +1,182 @@
+# Chat sessions and run controls
+
+Applications use generation, agent, and flow entrypoints. Raw Responses requests
+and sockets are internal adapters. Existing chat-only services and ordinary
+blocking tools remain supported. Astra selects Responses automatically;
+`asyncMode: off` retains the ordinary tool loop.
+
+## Ownership and completion
+
+`session.axir` owns pending calls, response boundaries, control ordering,
+duplicate suppression, output versions, usage accounting, and continuation
+choices. Each conversation has its own registry, so identical call IDs in
+separate nodes do not collide. Host adapters own transport and tool workers.
+Workers deliver results to the run dispatcher; they do not mutate Core state,
+conversation history, memory, or action logs.
+
+Each AxGen model request runs in its own native session, as in TypeScript:
+the session opens with the request's whole prompt and closes once its response
+completes. A correction or a later step opens a fresh session. Its prompt
+includes the earlier sessions' turns (continued responses and tool results),
+which the state records for the request that follows. Every session applies the
+run's updates again. A forward does not run streaming assertions; a streamed
+request passes the session's partial events, continued responses and final
+response to the streaming forward, which extracts each response as a plain
+stream does, starts a new version for each later response, and sends only what
+the partial events did not. A streaming assertion that fails on a partial event
+retries in a fresh session with the partial answer in its prompt, unless the
+session has started a tool; then the run fails instead of replaying it.
+
+A boundary decision is `wait`, `submit`, `continue`, `validate`, or `closed`.
+`submit` carries ready results without acknowledging them. The adapter records
+submission only after transport acceptance. Intermediate answers remain
+provisional while work is pending. `validate` permits final validation; it does
+not declare success. Step exhaustion and failed validation cannot return a
+successful final answer. Closing a run retains unresolved call IDs and rejects
+late deliveries. Cancellation requests cooperative termination and never implies
+that an external action was undone.
+
+Completed native tool arguments pass the shared validator before a handler
+starts. The validator follows the supported TypeScript contract: local JSON
+Pointer references, a depth limit of 64, allOf/anyOf/oneOf, nullable type unions,
+integers, type- and order-preserving enum/const comparison, nested properties and items, required and additional
+properties, numeric bounds, Unicode code-point string lengths, patterns, and
+array lengths. External and unresolved references are rejected. Partial argument
+events cannot start a handler. Native MCP schemas retain their original
+references and constraints through provider request construction and agent tool
+renaming. Native actor calls use the imported MCP handler, preserving modern
+request metadata and raw structured results. Discovery controls exposure; an
+invalid call is corrected before the MCP handler runs. The responder sees the
+incorporated result, and the action log records the qualified name and call ID.
+Actor code cannot execute the same native callable again. MCP host authorization
+runs through the imported handler before a tool request is sent. Its context
+retains the client, namespace, tool schema, and arguments. A false decision
+rejects the call; an absent decision permits it. Invalid model arguments never
+reach the authorization callback. Ordinary
+non-session tool invocation keeps its existing validation behavior.
+
+Raw schema patterns use the shared [ECMAScript matcher](regex.md), including
+UTF-16 semantics, lookarounds, named captures, and backreferences. Invalid patterns
+fail validation before a handler starts. This matches the flagless TypeScript
+validator without depending on a target language's regular-expression engine.
+
+MCP inheritance selection is shared in `mcp.axir`. It preserves selected client
+order within MCP and UCP groups, rejects unknown or duplicate namespaces, and
+treats both `none` and an empty allowlist as no inherited clients. Derived
+contexts retain the original client handles. Agent attachment initializes the
+selected catalogs and preserves ordinary tools under their existing `tools`
+namespace. Child registration uses the same Core module composition rule.
+Filtering or initializing a child
+must not remove access to the parent's other clients. TypeScript-derived request
+fixtures exercise child selection, tool results, and subsequent parent requests
+in all five targets. Actual parent/child generation fixtures also exercise all, none, empty, and
+namespace-filtered inheritance, plus an explicitly configured child's clients.
+Parent stages retain their own clients; inherited handles are selected only at
+delegation. Each run refreshes callable inventory and removes stale protocol
+modules. Explicit child configuration takes precedence. Live client handles stay
+out of model and runtime wire options. C++ core-only programs retain their
+independent build; an optional owned context interface bridges MCP when attached.
+Imported MCP tool invocations carry cancellation into their transport, including
+version retries and task polling. Built-in HTTP requests close on cancellation;
+custom transports can implement the optional context-aware send method. Legacy
+custom transports retain their old method with cancellation checks before and
+after it. A noncooperative custom transport may finish later; the run discards
+its delivery. Cancellation also reaches an MCP tool started by a delegated child.
+The parent retains child failure usage and a single failed child action; closed
+parent callbacks reject later invocations.
+
+## Routing, controls, and transport
+
+Routing and model aliases resolve before session creation. The selected client
+is pinned for that run. A disconnection does not reconnect and replay accepted
+steering or started tools. HTTP streaming supports background tools without a
+WebSocket dependency. Optional WebSocket adapters support native steering;
+otherwise controls apply at a later response boundary and report that timing.
+
+Child registration retains the child's program and signature schema. The shared
+invocation boundary validates inputs, runs the child serially, and assigns paths
+such as `root/team.researcher/executor`. Root controls reach future child stages;
+child-targeted controls do not change parent stages. Each child owns its history.
+The parent records the child's result in its next prompt and retains usage under
+`children`, including usage incurred before a failed delegation. C++ rejects
+transitive ownership cycles at registration. Exported action logs preserve call
+IDs. Failures clear active client
+bindings and close the parent code session. Recursive delegation into an active
+agent is rejected. Registered children and tools are bound automatically into namespaced actor calls,
+such as `team.researcher({ question })`, in each native JavaScript runtime.
+The invocation checks discovery and validation before calling a handler. Calls
+remain on the owning run thread; Java pumps host callbacks through its owning
+dispatcher while QuickJS4J executes guest code separately. Runtime sessions retain
+their callback snapshot. Run closure invalidates retained callbacks, including
+`llmQuery`, after success or cancellation. Rust captures console output in runtime
+feedback and clears it between actor turns.
+
+Queued updates and applied updates are distinct. Root updates propagate to
+matching descendant paths. Reasoning configuration updates retain conversation
+order and the original cache prefix. The provider event adapter suppresses
+repeated call completions, response completions, and acknowledgements. A separate
+transport cursor prevents buffered parent events from replacing an active
+successor response ID.
+
+Owned flow workers preserve per-node program state and send events and results
+to a serialized dispatcher. Unsupported custom factories select a traced serial
+group. Group failure retains completed-node diagnostics, cancels active siblings,
+and discards late work. Balancer workers share synchronized failure counters and the adaptive statistics
+store. Python provider workers also share synchronized latency/error metrics.
+Closed dispatchers reject late worker deliveries. C++ MCP tool workers retain
+shared invocation state after the public client handle is destroyed. Transport
+callbacks use weak ownership to avoid a client/transport cycle. C++ tool
+registration uses synchronized lookups and unique IDs so concurrent construction
+cannot replace another worker's handler.
+
+Rust keeps borrowed clients and non-Send Core values on their owning thread.
+Python, Java, C++, Go, and Rust cancellation tests cover stalled HTTP responses
+and noncooperative tools. A noncooperative handler can finish after cancellation;
+its eventual delivery is discarded by a closed run. Started calls still running at
+closure receive an `unresolved` tool trace, which native agent invocation records
+in the action log. No fabricated tool result is added to conversation memory.
+
+## Evidence and remaining acceptance
+
+The TypeScript source is `8c138f108c02d3f000d4ac9c03e078770b0c813c`
+(the prior PR copy is `b83d294b39df41d60c725e0bcaf27f142b0e1127`).
+Behavioral fixtures live in `ir/conformance/axai/` and `ir/conformance/axmcp/`.
+Scripted agent fixtures belong under package tests, not public examples.
+
+| Behavior | Shared evidence | Native evidence |
+| --- | --- | --- |
+| Raw schema validation | `session-raw-argument-validation.json` and `session-ecmascript-pattern-validation.json`, evaluated against TypeScript | Invalid calls, correction requests, unchanged call IDs, and step exhaustion in all five session suites |
+| MCP inheritance and attachment | `execution-context-inheritance.json`, `execution-context-inheritance-requests.json`, and `execution-context-agent-attachment.json` | Selected namespace order, invalid selections, exact MCP requests through agent invocation, retained ordinary tools, and subsequent parent requests in all five targets |
+| Child MCP execution | `owned-child-mcp-inheritance-{all,none,allowlist,empty,child-config,reuse}.json`; TypeScript `src/ax/mcp/execution.test.ts` | Actual parent and child forwards, selected MCP requests, denied namespaces, parent continuation, child configuration precedence, actor request filtering, and removal of inherited clients on a later run of the same child in all five targets |
+| Ordinary tools with owned children | `owned-child-delegation-preserves-existing-tools.json` | Existing tool invocation, child invocation, both action-log records, and final output across all five targets |
+| Native MCP schemas and modern continuation | `native-tools-modern-roundtrip.json` | All-five native agent tests assert discovery boundaries, exact schemas, invalid-argument correction, overlap, raw result continuation, responder output, action logs, and duplicate prevention |
+| Owned child delegation | `owned-child-delegation-through-parent-runtime.json` | All-five native session tests assert parent continuation input, isolated histories, scoped controls, cache prefixes, child usage, and cancellation cleanup |
+| Real actor child calls | `axagent-real/agent-runtime-real-owned-child-delegation.json` | All five real engines execute parent and child actor code and assert the result, action log, and parent continuation. Native suites reject retained callbacks after success and cancellation. Live `astra_child_agent` / `AstraChildAgentExample` runs passed in all five languages with child-scoped controls |
+| MCP invocation cancellation | Native HTTP tests in all five session suites | Stalled response bodies close on abort; configured headers and arguments survive (including C++ constructor headers); pre-cancelled calls do not send or replay. Python/Go/Rust actor invocation tests and a Java high-level agent test exercise controller propagation. Rust also retains a generator's own configured clients with `mcpInheritance: none`, including result history and continuation. C++ release verification runs an additional libcurl-enabled session binary so the actual HTTP fixture cannot be mistaken for core-only coverage |
+| MCP host authorization | `native-tool-host-authorization.json`, extracted by calling the TypeScript MCP client | All-five native agent tests exercise denied and allowed calls, retained context, no transport call after denial, and no authorization after invalid arguments or actor replay |
+| Completed calls and pending work | `astra-session-completed-calls-and-response-boundaries.json`, `astra-pending-results-out-of-order.json` | Delayed tools, blocking barriers, partial arguments, and provisional answers |
+| Steering and reasoning history | `astra-native-steering-successor-no-replay.json`, `astra-native-late-pending-input.json`, `astra-session-transport-cursor.json` | Scripted sockets and delayed HTTP cleanup |
+| Scope and cancellation | `astra-scoped-updates-and-cancellation.json` | Root/future-node controls, per-node histories, noncooperative handlers, and aborts; all-five native agent tests assert stage-specific steering and reasoning continuations |
+| Concurrent flow groups | `flow.axir` dispatch and deterministic merge contract; `owned-workers-custom-client-serial-fallback.json` | All-five coordinated overlap and failure tests; Go and C++ race detection; Rust nested/custom non-Send programs; live parallel examples |
+| Delegated MCP cancellation | Native owned-child tests in all five session suites | Abort after the child starts an imported background MCP tool; assert one request, cooperative settlement, parent runtime closure, failed child action, retained usage, and rejection of late callbacks |
+
+Native session suites:
+
+- Python: `packages/python/tests/astra_session_test.py`
+- Go: `packages/go/session_test.go`
+- Java: `packages/java/tests/AstraSessionTest.java`
+- C++: `packages/cpp/tests/astra_session_test.cpp`
+- Rust: tests in `packages/rust/src/session.rs`
+
+Public provider-backed examples are under each language's `generation`,
+`short-agents`, and `flows` directories in `src/examples/`. All 30 live scenarios
+passed across the five languages; optional Rust native WebSocket steering also
+passed. Corrected Go examples and the final C++ package were rerun successfully.
+
+The two Astra entries are complete in [PR #657](https://github.com/ax-llm/ax/pull/657).
+The implementation source is `1771913118be0ea8a6be950ba4a011a7648e3c2a`. The full all-target compiler/release
+suite, final C++ release follow-up, race checks, package freshness, conformance,
+public type checks, generated examples, profiles, build, style, and website gates
+passed. See [the verification record](session-verification.md) for commands,
+live scenarios, and the issues discovered during acceptance. Package publication
+is outside this delivery.

@@ -1,0 +1,341 @@
+import concurrent.futures
+import json
+import queue
+import threading
+import unittest
+from axllm import ai, ax, typesafe, AxBalancer, ProviderRouter, AxCancellationToken, AxMCPWebSocketTransport
+
+class Socket:
+    def __init__(self):
+        self.inbound, self.sent = queue.Queue(), queue.Queue()
+        self.failure = None
+    def send(self, text):
+        if self.failure: raise RuntimeError(self.failure)
+        self.sent.put(json.loads(text))
+    def recv(self): return self.inbound.get(timeout=3)
+    def close(self): self.inbound.put(None)
+    def respond(self, id, value): self.inbound.put(json.dumps({'jsonrpc':'2.0','id':id,'result':value}))
+
+class ParityTests(unittest.TestCase):
+    def test_box_native_types_and_utf8_limits(self):
+        from axllm import f, AxBox, TypesafeImageAsset, TypesafeRequest
+        from axllm.ai import typesafe_validate_request
+        box: AxBox = dict(top=0.2, bottom=0.8, left=0.1, right=0.7)
+        image: TypesafeImageAsset = dict(format="png", data_base64="AAAA")
+        request: TypesafeRequest = dict(state="photo", assets={"photo":image}, questions={"target":dict(type="box",instructions="Find it in photo")})
+        def transport(call):
+            self.assertEqual(call["headers"]["TypeSafe-Danger-Zone-Images"], "true")
+            return dict(model="jev-1.14.0",answers={"target":dict(type="box",box=box,confidence=0)},usage=dict(input_tokens=1,output_tokens=1))
+        answer = typesafe(api_key="test",transport=transport).system_one(request)["answers"]["target"]
+        self.assertEqual((answer["box"],answer["confidence"]),(box,0))
+        self.assertEqual(f.box().with_evidence().type.name,"box")
+        for count in (256,257):
+            key="😀"*count
+            candidate=dict(model="jev-1.14.0",state=key,assets={key:image},questions=request["questions"])
+            if count==256: typesafe_validate_request(candidate)
+            else:
+                with self.assertRaisesRegex(Exception,"reference length"): typesafe_validate_request(candidate)
+        # A large image exercises large base64 validation, without network IO.
+        image["data_base64"]="AAAA"*(4*1024*1024)
+        typesafe_validate_request(dict(request,model="jev-1.14.0"))
+
+    def test_decisions_credentials_retry_snapshot_and_cancellation(self):
+        from axllm import openai_decisions
+        response = {'model':'gpt-6-luna','answers':[{'type':'predicate','name':'flag','probability':0.8}],
+                    'usage':{'input_tokens':1,'output_tokens':0,'total_tokens':1,
+                             'input_tokens_details':{'cached_tokens':0,'cache_write_tokens':0},
+                             'output_tokens_details':{'reasoning_tokens':0}}}
+        native_request = {'input':'A red package.','questions':[{'type':'predicate','name':'flag','instructions':'Is this red?'}]}
+        chat_request = {'chatPrompt':[{'role':'user','content':'A red package.'}],
+                        'responseFormat':{'type':'json_schema','schema':{'name':'output','schema':{'type':'object','properties':{'flag':{'type':'boolean'}},'required':['flag']}}}}
+        for native in (True,False):
+            calls, credentials = [], []
+            inherited, per_call = AxCancellationToken(), AxCancellationToken()
+            def credential(request):
+                credentials.append(request)
+                self.assertEqual((request['profile'],request['operation']),('openai-decisions','chat'))
+                return {'authorization':f'Bearer fresh-{len(credentials)}'}
+            def transport(request):
+                calls.append(request)
+                auth = [(key,value) for key,value in request['headers'].items() if key.lower()=='authorization']
+                self.assertEqual(auth,[('authorization',f'Bearer fresh-{len(calls)}')])
+                self.assertEqual(request['headers']['x-trace'],'kept')
+                self.assertEqual(request['url'],'https://api.openai.com/v1/decisions')
+                if native:
+                    self.assertEqual(request['json']['questions'][0]['name'],'flag')
+                    native_request['questions'][0]['name']='caller-mutated'
+                return {'status':429,'json':{'error':'retry'}} if len(calls)==1 else response
+            options = dict(api_key='static',headers={'AUTHORIZATION':'Bearer custom','x-trace':'kept'},
+                           credential_provider=credential,transport=transport,cancellation=inherited,
+                           retry={'maxRetries':1,'initialDelayMs':1})
+            client = openai_decisions(**options) if native else ai('openai-decisions',**options)
+            call = lambda opts: client.create(native_request,opts) if native else client.chat(chat_request,opts)
+            native_request['questions'][0]['name']='flag'
+            result = call({'cancellation':per_call})
+            self.assertEqual(len(calls),2)
+            self.assertEqual((inherited.subscription_count,per_call.subscription_count),(0,0))
+            if native: self.assertEqual(result,response)
+            else: self.assertEqual(json.loads(result['results'][0]['content']),{'flag':True})
+            inherited.cancel('stop Decisions')
+            with self.assertRaisesRegex(Exception,'stop Decisions'):call({'cancellation':per_call})
+            self.assertEqual(len(calls),2)
+            self.assertEqual(len(credentials),2)
+
+    def test_native_noul_accepts_null_criteria_type(self):
+        from typing import get_args, get_type_hints
+        from axllm import TypesafeQuestion
+        self.assertIn(type(None), get_args(get_type_hints(TypesafeQuestion)['criteria']))
+
+    def test_native_combines_cancellation_and_disposes_subscriptions(self):
+        parent, per_call = AxCancellationToken(), AxCancellationToken()
+        calls = []
+        def transport(request):
+            calls.append(request)
+            return {'models': []}
+        client = typesafe(api_key='test', cancellation=parent, transport=transport)
+        self.assertEqual(client.list_models({'cancellation_token': per_call}), [])
+        self.assertEqual((parent.subscription_count, per_call.subscription_count), (0, 0))
+        parent.cancel('instance cancelled')
+        with self.assertRaisesRegex(Exception, 'instance cancelled'):
+            client.list_models({'cancellation': per_call})
+        self.assertEqual(len(calls), 1)
+
+        for cancel_parent in (True, False):
+            parent, per_call = AxCancellationToken(), AxCancellationToken()
+            started = threading.Event()
+            calls = []
+            def retrying(request):
+                calls.append(request)
+                started.set()
+                return {'status': 429, 'json': {'error': 'retry'}} if len(calls) == 1 else {'models': []}
+            client = typesafe(api_key='test', cancellation=parent, transport=retrying,
+                              retry={'maxRetries': 1, 'initialDelayMs': 5000})
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                task = pool.submit(client.list_models, {'cancellation': per_call})
+                self.assertTrue(started.wait(2))
+                (parent if cancel_parent else per_call).cancel('cancel pending retry')
+                with self.assertRaisesRegex(Exception, 'cancel pending retry'):
+                    task.result(2)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual((parent.subscription_count, per_call.subscription_count), (0, 0))
+            if not cancel_parent:
+                self.assertFalse(parent.cancelled)
+                self.assertEqual(client.list_models(), [])
+
+    def test_provider_credentials_are_isolated(self):
+        from unittest.mock import patch
+        import os
+        with patch.dict(os.environ, {"OPENAI_API_KEY":"unrelated", "OPENAI_BASE_URL":"https://unrelated.example"}, clear=True):
+            for factory in [lambda: ai("typesafe"), typesafe]:
+                with self.assertRaisesRegex(Exception,"requires api_key"): factory()
+            model=ai("typesafe", apiKey="typesafe-test")
+            self.assertEqual(model.api_key,"typesafe-test")
+            self.assertEqual(model.base_url,"https://api.typesafe.ai")
+
+    def test_mcp_close_wakes_reconnect_delay(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from axllm import AxMCPStreamableHTTPTransport
+        import time
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args): pass
+            def do_GET(self):
+                self.send_response(200); self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('Content-Length', '0'); self.end_headers()
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        worker = threading.Thread(target=server.serve_forever, daemon=True); worker.start()
+        ended = threading.Event()
+        transport = AxMCPStreamableHTTPTransport(f'http://127.0.0.1:{server.server_port}', {'reconnectDelay': 5, 'ssrfProtection': {'requireHttps': False, 'allowLocalhost': True, 'allowPrivateNetworks': True}})
+        transport.set_lifecycle_handler(lambda event: ended.set() if event == 'disconnected' else None)
+        try:
+            transport.start_listening()
+            self.assertTrue(ended.wait(2))
+            started = time.monotonic(); transport.close()
+            self.assertLess(time.monotonic() - started, .5)
+            self.assertTrue(transport._listen_thread is None or not transport._listen_thread.is_alive())
+        finally:
+            transport.close(); server.shutdown(); server.server_close(); worker.join(2)
+
+    def test_websocket_cleanup(self):
+        socket=Socket()
+        transport=AxMCPWebSocketTransport('ws://example.test',web_socket_factory=lambda *args:socket)
+        transport.set_protocol_version('2025-03-26')
+        request={'jsonrpc':'2.0','id':1,'method':'ping'}
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            try:
+                socket.failure='send failed'
+                with self.assertRaisesRegex(RuntimeError,'send failed'): transport.send(request)
+                with self.assertRaisesRegex(RuntimeError,'send failed'): transport.send_batch([request,{**request,'id':2}])
+                self.assertEqual(transport._pending,{})
+                socket.failure=None
+                old=AxCancellationToken()
+                first=pool.submit(transport.send_with_context,request,None,{'cancellation':old})
+                socket.sent.get(timeout=2);socket.respond(1,'first')
+                self.assertEqual(first.result(2)['result'],'first')
+                second=pool.submit(transport.send,request)
+                socket.sent.get(timeout=2)
+                old.cancel('obsolete request')
+                with self.assertRaisesRegex(Exception,'already pending'): transport.send(request)
+                socket.respond(1,'second');self.assertEqual(second.result(2)['result'],'second')
+                cancel=AxCancellationToken()
+                aborted=pool.submit(transport.send_batch,[request,{**request,'id':2}],{'cancellation':cancel})
+                socket.sent.get(timeout=2);cancel.cancel('stop batch')
+                with self.assertRaisesRegex(Exception,'stop batch'): aborted.result(2)
+                self.assertEqual(transport._pending,{})
+                closed=pool.submit(transport.send_batch,[request,{**request,'id':2}])
+                socket.sent.get(timeout=2);transport.close()
+                with self.assertRaisesRegex(Exception,'closed'): closed.result(2)
+                self.assertEqual(transport._pending,{})
+            finally: transport.close()
+
+    def test_websocket_late_server_reply_does_not_reconnect(self):
+        sockets = []
+        def factory(*args):
+            socket = Socket(); sockets.append(socket); return socket
+        transport = AxMCPWebSocketTransport('ws://example.test', web_socket_factory=factory)
+        started = queue.Queue(); release = threading.Event()
+        def handler(message):
+            started.put(threading.current_thread())
+            release.wait(2)
+            return {'jsonrpc': '2.0', 'id': message['id'], 'result': {}}
+        transport.set_request_handler(handler)
+        try:
+            transport.start_listening()
+            sockets[0].inbound.put(json.dumps({'id': 'server-1', 'method': 'roots/list'}))
+            worker = started.get(timeout=2)
+            transport.close(); release.set(); worker.join(2)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(sockets), 1)
+            self.assertTrue(sockets[0].sent.empty())
+        finally:
+            release.set(); transport.close()
+
+    def test_thresholds_native_and_concurrency(self):
+        calls=[]
+        def transport(request):
+            calls.append(request)
+            payload=request['json']
+            return {'model':payload['model'],'answers':{key:{'type':'noul','noul':payload['state'].get('probability',0.9)} for key in payload['questions']},'usage':{'input_tokens':2,'output_tokens':1}}
+        program=ax('ticket:string -> urgent:boolean(true "Outage", false "Routine") "Urgent?"')
+        for threshold,expected in [(0,True),(0.9,True),(1,False)]:
+            model=ai('typesafe',api_key='test',transport=transport,true_threshold=threshold)
+            self.assertEqual(program.forward(model,{'ticket':'Outage'})['urgent'],expected)
+            self.assertNotIn('trueThreshold',calls[-1]['json'])
+            self.assertEqual(calls[-1]['json']['questions']['urgent']['criteria'],{'true':'Outage','false':'Routine'})
+            self.assertNotIn('pair per line',calls[-1]['json']['state']['messages'][0]['content'])
+        for value in [-0.1,1.1,float('nan'),float('inf'),'0.5']:
+            with self.assertRaises(Exception):ai('typesafe',api_key='test',true_threshold=value)
+        client=typesafe(api_key='test',transport=transport)
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            def call(index):
+                key=f'question{index}'
+                response=client.system_one({'state':{'probability':index/10},'questions':{key:{'type':'noul','instructions':None}}})
+                self.assertEqual(response['answers'],{key:{'type':'noul','noul':index/10}})
+            list(pool.map(call,range(10)))
+
+    def test_routing_and_nonstreaming(self):
+        typed_calls=[]; normal_calls=[]
+        def typed(request):
+            typed_calls.append(request)
+            return {'model':'jev-latest','answers':{'urgent':{'type':'noul','noul':0.9}},'usage':{'input_tokens':1,'output_tokens':1}}
+        def normal(request):
+            normal_calls.append(request)
+            return {'model':'gpt-5.4-mini','choices':[{'index':0,'message':{'role':'assistant','content':'Answer: hello'},'finish_reason':'stop'}],'usage':{'prompt_tokens':1,'completion_tokens':1,'total_tokens':2}}
+        decision=ai('typesafe',api_key='test',transport=typed,models=None)
+        generative=ai('openai',api_key='test',model='gpt-5.4-mini',transport=normal,models=None)
+        only=AxBalancer([decision]); mixed=AxBalancer([decision,generative])
+        self.assertTrue(only.get_features().get('requiresStructuredOutput'))
+        self.assertFalse(mixed.get_features().get('requiresStructuredOutput',False))
+        nested=AxBalancer([only, generative])
+        only.validate_chat_request({"chat_prompt":[{"role":"user","content":"outage"}], "response_format":{"type":"json_schema","schema":{"name":"decision","schema":{"type":"object","properties":{"urgent":{"type":"boolean"}},"required":["urgent"]}}}})
+        with self.assertRaises(ValueError): only.validate_chat_request({"chat_prompt":[{"role":"user","content":"reply"}]})
+        self.assertEqual(typed_calls, [])
+        for model in [mixed, nested, ProviderRouter({'providers':{'primary':decision,'alternatives':[generative]},'routing':{'capability':{'allowDegradation':True}}})]:
+            self.assertEqual(ax('question:string -> answer:string').forward(model,{'question':'hi'})['answer'],'hello')
+        self.assertEqual(typed_calls,[])
+        self.assertTrue(ax('ticket:string -> urgent:boolean').forward(only,{'ticket':'outage'})['urgent'])
+        schema={'type':'json_schema','schema':{'name':'decision','schema':{'type':'object','properties':{'urgent':{'type':'boolean'}},'required':['urgent']}}}
+        chunks=list(decision.stream({'chat_prompt':[{'role':'user','content':'outage'}],'response_format':schema}))
+        self.assertEqual(len(chunks),1)
+        self.assertEqual(json.loads(chunks[0]['results'][0]['content']),{'urgent':True})
+
+    def test_decisions_routing_and_nonstreaming(self):
+        typed_calls=[]; normal_calls=[]
+        def typed(request):
+            typed_calls.append(request)
+            return {'model':'gpt-6-luna','answers':[{'type':'predicate','name':'urgent','probability':0.9}],'usage':{'input_tokens':1,'output_tokens':0,'total_tokens':1,'input_tokens_details':{'cached_tokens':0,'cache_write_tokens':0},'output_tokens_details':{'reasoning_tokens':0}}}
+        def normal(request):
+            normal_calls.append(request)
+            return {'model':'gpt-6-luna','choices':[{'index':0,'message':{'role':'assistant','content':'Answer: hello'},'finish_reason':'stop'}],'usage':{'prompt_tokens':1,'completion_tokens':1,'total_tokens':2}}
+        decision=ai('openai-decisions',api_key='test',transport=typed,models=None)
+        generative=ai('openai-compatible',apiURL='https://api.openai.com/v1',api_key='test',model='gpt-6-luna',transport=normal,models=None)
+        only=AxBalancer([decision]); mixed=AxBalancer([decision,generative])
+        self.assertTrue(only.get_features().get('requiresStructuredOutput'))
+        self.assertFalse(mixed.get_features().get('requiresStructuredOutput',False))
+        nested=AxBalancer([only, generative])
+        only.validate_chat_request({"chat_prompt":[{"role":"user","content":"outage"}], "response_format":{"type":"json_schema","schema":{"name":"decision","schema":{"type":"object","properties":{"urgent":{"type":"boolean"}},"required":["urgent"]}}}})
+        with self.assertRaises(ValueError): only.validate_chat_request({"chat_prompt":[{"role":"user","content":"reply"}]})
+        self.assertEqual(typed_calls, [])
+        for model in [mixed, nested, ProviderRouter({'providers':{'primary':decision,'alternatives':[generative]},'routing':{'capability':{'allowDegradation':True}}})]:
+            self.assertEqual(ax('question:string -> answer:string').forward(model,{'question':'hi'})['answer'],'hello')
+        self.assertEqual(typed_calls,[])
+        self.assertTrue(ax('ticket:string -> urgent:boolean').forward(only,{'ticket':'outage'})['urgent'])
+        schema={'type':'json_schema','schema':{'name':'decision','schema':{'type':'object','properties':{'urgent':{'type':'boolean'}},'required':['urgent']}}}
+        chunks=list(decision.stream({'chat_prompt':[{'role':'user','content':'outage'}],'response_format':schema}))
+        self.assertEqual(len(chunks),1)
+        self.assertEqual(json.loads(chunks[0]['results'][0]['content']),{'urgent':True})
+
+    def test_native_http_credentials_retry_get_cancel(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        received=[]; stalled=threading.Event(); release=threading.Event()
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self,*args):pass
+            def do_GET(self):
+                received.append((self.command,self.headers.get('Content-Length'),self.headers.get('Authorization')))
+                status=429 if len(received)==1 else 200
+                body=json.dumps({'models':[{'name':'jev-latest','description':'Jev','release_date':'2026-09-01'}]}).encode()
+                self.send_response(status);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
+            def do_POST(self):
+                payload=json.loads(self.rfile.read(int(self.headers.get('Content-Length','0'))))
+                if payload.get('state') == 'headers':
+                    stalled.set();release.wait(3)
+                self.send_response(200);self.send_header('Content-Length','10000');self.end_headers();self.wfile.flush();stalled.set();release.wait(3)
+        server=ThreadingHTTPServer(('127.0.0.1',0),Handler)
+        thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+        try:
+            credentials=[]
+            def credential(request):
+                credentials.append(request)
+                return {'Authorization':f'Bearer key-{len(credentials)}'}
+            client=typesafe(base_url=f'http://127.0.0.1:{server.server_port}',api_key='',credential_provider=credential,options={'retry':{'maxRetries':1,'initialDelayMs':1}})
+            self.assertEqual(client.list_models()[0]['name'],'jev-latest')
+            self.assertEqual(received,[('GET',None,'Bearer key-1'),('GET',None,'Bearer key-2')])
+            self.assertEqual([v['operation'] for v in credentials],['models','models'])
+            token=AxCancellationToken()
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                pending=pool.submit(client.system_one,{'state':None,'questions':{'flag':{'type':'noul'}}},{'cancellation':token})
+                self.assertTrue(stalled.wait(2));token.cancel('stop native')
+                with self.assertRaisesRegex(Exception,'stop native'):pending.result(1)
+                self.assertEqual(len(token._subscriptions),0)
+            release.set()
+            import time
+            time.sleep(0.02)
+            # Cancellation must also interrupt a server withholding response headers.
+            stalled.clear();release.clear()
+            token=AxCancellationToken()
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                pending=pool.submit(client.system_one,{'state':'headers','questions':{'flag':{'type':'noul'}}},{'cancellation':token})
+                self.assertTrue(stalled.wait(2));token.cancel('stop headers')
+                with self.assertRaisesRegex(Exception,'stop headers'):pending.result(1)
+                self.assertEqual(len(token._subscriptions),0)
+        finally:release.set();server.shutdown();server.server_close();thread.join(2)
+
+    def test_unknown_provider_error_never_echoes_a_config(self):
+        with self.assertRaisesRegex(ValueError, 'unsupported AxAI provider: not-a-provider'):
+            ai('not-a-provider')
+        for config in ({'name': 'openai', 'apiKey': 'sk-test-secret'}, ['openai', 'sk-test-secret']):
+            with self.assertRaises(ValueError) as caught:
+                ai(config)
+            self.assertNotIn('sk-test-secret', str(caught.exception))
+            self.assertIn(type(config).__name__, str(caught.exception))
+
+if __name__=='__main__': unittest.main()

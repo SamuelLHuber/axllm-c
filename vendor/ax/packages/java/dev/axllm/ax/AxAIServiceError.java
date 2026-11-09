@@ -6,6 +6,8 @@ public class AxAIServiceError extends RuntimeException {
   public final Object responseBody;
   public final Object request;
   public final boolean retryable;
+  // A status response's Retry-After, which the request-layer retry reads.
+  String retryAfter;
 
   public AxAIServiceError(String message) { this(message, null, null, null, null, false); }
   public AxAIServiceError(String message, Integer status, String code, Object responseBody, Object request, boolean retryable) {
@@ -21,7 +23,11 @@ public class AxAIServiceError extends RuntimeException {
 class AxAIServiceStatusError extends AxAIServiceError {
   AxAIServiceStatusError(String message, Integer status, String code, Object responseBody, Object request, boolean retryable) { super(message, status, code, responseBody, request, retryable); }
 }
-class AxAIServiceNetworkError extends AxAIServiceError { AxAIServiceNetworkError(String message) { super(message); } }
+class AxAIServiceNetworkError extends AxAIServiceError {
+  AxAIServiceNetworkError(String message) { super(message); }
+  // A transport failure, with the request a provider error keeps.
+  AxAIServiceNetworkError(String message, Object request) { super(message, null, null, null, request, true); }
+}
 class AxAIServiceResponseError extends AxAIServiceError {
   AxAIServiceResponseError(String message) { super(message); }
   AxAIServiceResponseError(String message, Object responseBody) { super(message, null, null, responseBody, null, false); }

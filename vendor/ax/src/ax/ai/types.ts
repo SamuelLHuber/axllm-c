@@ -1,3 +1,4 @@
+import type { AxDecisionContext, AxDecisionField } from '../dsp/decision.js';
 // ReadableStream is available globally in modern browsers and Node.js 16+
 
 import type { Context, Meter, Tracer } from '@opentelemetry/api';
@@ -94,6 +95,7 @@ export type AxModelInfo = {
   serviceTierPricing?: Partial<
     Record<'flex' | 'priority', AxServiceTierPricing>
   >;
+  longContextCacheWriteTokenCostPer1M?: number;
   aliases?: string[];
   supported?: {
     thinkingBudget?: boolean;
@@ -103,14 +105,52 @@ export type AxModelInfo = {
     structuredOutputModes?: readonly AxStructuredOutputRung[];
     /** Portable request tiers verified for this exact model. */
     serviceTiers?: readonly AxServiceTier[];
+    /** Whether this model can return generated images from `chat()`. */
+    imageOutput?: boolean;
+    /** Public Ax operations verified for this exact model. */
+    operations?: readonly ('chat' | 'transcribe')[];
+    /**
+     * Reasoning can be turned off (reasoning effort `none`), and the model
+     * then accepts the sampling parameters listed in `notSupported`.
+     */
+    samplingWithoutReasoning?: boolean;
+    /** The model does not reason when a request sets no reasoning effort. */
+    reasoningOffByDefault?: boolean;
+    /**
+     * The model takes an explicit temperature of exactly 1, its default, where
+     * `notSupported.temperature` (or reasoning) rejects other values.
+     */
+    temperatureOne?: boolean;
   };
+  /**
+   * Sampling parameters the model rejects. With
+   * `supported.samplingWithoutReasoning` it rejects them only while it
+   * reasons. Ax never sends a default value for them; it sends an explicit
+   * value when the model accepts it for that request and otherwise drops it
+   * with a one-time warning.
+   */
   notSupported?: {
     temperature?: boolean;
     topP?: boolean;
+    topK?: boolean;
+    presencePenalty?: boolean;
+    frequencyPenalty?: boolean;
+    /**
+     * The model takes temperature or topP but not both in one request. An
+     * explicit topP with only the default temperature is sent alone; with an
+     * explicit temperature too, Ax keeps the temperature and drops topP with
+     * a one-time warning.
+     */
+    temperatureWithTopP?: boolean;
   };
   audio?: {
     input?: boolean;
     output?: boolean;
+  };
+  /** Exact provider-declared model input and output modalities. */
+  modalities?: {
+    input: readonly ('text' | 'image' | 'audio' | 'video' | 'pdf')[];
+    output: readonly ('text' | 'image')[];
   };
   maxTokens?: number;
   isExpensive?: boolean;
@@ -118,6 +158,11 @@ export type AxModelInfo = {
   isDeprecated?: boolean;
   /** ISO date (YYYY-MM-DD) the upstream provider will stop serving this model. */
   deprecatedOn?: string;
+  /** Provider data-use policy that materially differs between model variants. */
+  dataUse?: {
+    providerTraining: 'not-used' | 'allowed';
+    appliesTo?: readonly ('prompt' | 'completion')[];
+  };
 };
 
 /** A concrete strategy Ax can use to obtain a typed structured result. */
@@ -130,6 +175,7 @@ export type AxAICredentialRequest = Readonly<{
   profile: string;
   operation:
     | 'chat'
+    | 'models'
     | 'stream_chat'
     | 'embed'
     | 'responses'
@@ -353,6 +399,8 @@ export type AxFunctionHandler = (
     traceId?: string;
     debug?: boolean;
     ai?: AxAIService;
+    control?: import('../dsp/runControl.js').AxRunControl;
+    executionPath?: string;
     step?: import('../dsp/types.js').AxStepContext;
     abortSignal?: AbortSignal;
     protocol?: AxAgentCompletionProtocol;
@@ -388,6 +436,8 @@ export type AxFunctionJSONSchema = {
 };
 
 export type AxFunction = {
+  /** Background tools permit independent model work while they execute. */
+  execution?: 'blocking' | 'background';
   name: string;
   description: string;
   componentId?: string;
@@ -422,17 +472,43 @@ export type AxThoughtBlockItem = {
   data: string;
   encrypted: boolean;
   signature?: string;
+  /** Provider output-item identifier required for stateless replay. */
+  id?: string;
+  /** Human-readable reasoning summary, separate from encrypted provider state. */
+  summary?: string;
+  /** Opaque encrypted reasoning state returned by Responses-style APIs. */
+  encryptedContent?: string;
+  /** Output phase used to preserve reasoning/tool ordering across replay. */
+  phase?: 'commentary' | 'final_answer';
+};
+
+/** Generated image returned by an image-capable model through `chat()`. */
+export type AxChatImageOutput = {
+  id?: string;
+  data?: string;
+  url?: string;
+  mimeType?: string;
+  isDelta?: boolean;
 };
 
 export type AxChatResponseResult = {
+  /** Trusted decision adapter evidence, never model-authored JSON. */
+  decisionContext?: AxDecisionContext;
   index: number;
   content?: string;
+  /** Responses-style output phase for commentary/final-answer ordering. */
+  phase?: 'commentary' | 'final_answer';
   thought?: string;
   /** Array of thinking blocks, each with its own signature */
   thoughtBlocks?: AxThoughtBlockItem[];
   name?: string;
+  /** Latest provider-reported amount of realtime audio processed. */
+  audioProcessedMs?: number;
+  /** Replace the previous snapshot for this result id; content contains only finalized speech. */
+  transcript?: { text: string; isFinal: boolean };
   id?: string;
   audio?: AxChatAudioOutput;
+  images?: AxChatImageOutput[];
   functionCalls?: {
     id: string;
     type: 'function';
@@ -633,6 +709,10 @@ export type AxChatRequest<TModel = string> = {
         thoughtBlocks?: AxThoughtBlockItem[];
         /** Previous assistant audio response reference for audio-capable chat models */
         audio?: { id: string; transcript?: string };
+        /** Generated images retained for stateless Responses replay. */
+        images?: AxChatImageOutput[];
+        /** Responses-style output phase retained for replay. */
+        phase?: 'commentary' | 'final_answer';
         cache?: boolean;
       }
     | {
@@ -683,6 +763,7 @@ export type AxChatRequest<TModel = string> = {
     name: string;
     description: string;
     parameters?: AxFunctionJSONSchema;
+    execution?: 'blocking' | 'background';
     /** Mark this function for caching (creates breakpoint after tools) */
     cache?: boolean;
   }>[];
@@ -693,7 +774,23 @@ export type AxChatRequest<TModel = string> = {
     | { type: 'function'; function: { name: string } };
   responseFormat?: {
     type: 'json_object' | 'json_schema';
+    /** Logical decision fields; stripped from wire JSON Schema by adapters. */
+    decisionFields?: Readonly<Record<string, AxDecisionField>>;
     schema?: any;
+    /**
+     * Original per-value guidance for adapters that can represent it structurally.
+     * The standard schema's descriptions already contain the readable guidance.
+     * These annotations are not JSON Schema keywords and are not sent as such.
+     */
+    fieldDescriptions?: Readonly<
+      Record<
+        string,
+        {
+          description?: string;
+          valueDescriptions: Readonly<Record<string, string>>;
+        }
+      >
+    >;
   };
   modelConfig?: AxModelConfig;
   model?: TModel;
@@ -729,7 +826,13 @@ export interface AxAIServiceMetrics {
 }
 
 export type AxInternalChatRequest<TModel> = Omit<AxChatRequest, 'model'> &
-  Required<Pick<AxChatRequest<TModel>, 'model'>>;
+  Required<Pick<AxChatRequest<TModel>, 'model'>> & {
+    /**
+     * The sampling keys in `modelConfig` the caller set (the AI's config, a
+     * model key's config or the request), as opposed to provider defaults.
+     */
+    explicitSamplingKeys?: readonly string[];
+  };
 
 export type AxInternalTranscriptionRequest<TModel> = Omit<
   AxTranscriptionRequest,
@@ -989,6 +1092,11 @@ export type AxContextCacheInfo = {
  * ```
  */
 export type AxAIServiceOptions = {
+  /** Automatically use native async capabilities when available. */
+  asyncMode?: 'auto' | 'off';
+  control?: import('../dsp/runControl.js').AxRunControl;
+  /** Stable execution scope for targeted run updates. */
+  executionPath?: string;
   /** @internal Identifies whether a forced tool choice came from Ax itself. */
   functionCallSource?: 'ax' | 'caller';
   /**
@@ -1050,10 +1158,12 @@ export type AxAIServiceOptions = {
    *
    * Falls back to `sessionId` when unset.
    *
-   * **Currently used by:** OpenAI, on GPT-5.6 and later models. Earlier families
-   * predate the parameter and it is not sent to them.
+   * **Currently used by:** OpenAI GPT-5.6+ and Meta Responses/Chat Completions.
    */
   promptCacheKey?: string;
+
+  /** Meta Responses prompt-cache retention policy. */
+  promptCacheRetention?: 'in_memory' | '24h';
 
   /**
    * Request-scoped attribution included in normalized usage events.
@@ -1144,10 +1254,10 @@ export type AxAIServiceOptions = {
   showThoughts?: boolean;
 
   /**
-   * Hint to use a more capable (and expensive) model for complex tasks.
+   * Confirms a request may use a model marked `isExpensive` in its model info.
    *
-   * Some providers offer tiered models. Setting this to 'yes' requests the
-   * higher-capability tier when available.
+   * Requests for such a model are rejected unless this is `'yes'`. It does not
+   * select a different model.
    */
   useExpensiveModel?: 'yes';
 
@@ -1203,9 +1313,11 @@ export type AxAIServiceOptions = {
   /**
    * Whether to include the request body in `AxAIServiceError` messages.
    *
-   * When `false`, the request body is omitted from thrown errors. Useful when
-   * requests may contain sensitive data (API keys, PII) or large base64-encoded
-   * content that would bloat error logs.
+   * When `false`, the request body is omitted from thrown errors: their
+   * message, stack, `JSON.stringify`, object spread and `Object.keys` leave it
+   * out, though `error.requestBody` still returns it. Useful when requests may
+   * contain sensitive data (API keys, PII) or large base64-encoded content that
+   * would bloat error logs. Request headers are never kept on errors.
    *
    * @default true
    */
@@ -1233,6 +1345,26 @@ export interface AxAIService<
   getLastUsedChatModel(): TModel | undefined;
   getLastUsedEmbedModel(): TEmbedModel | undefined;
   getLastUsedModelConfig(): AxModelConfig | undefined;
+
+  /** Check request compatibility without network calls, credentials, or state changes. */
+  validateChatRequest?(
+    req: Readonly<AxChatRequest<TModel | TModelKey>>,
+    options?: Readonly<AxAIServiceOptions>
+  ): void;
+
+  /** Resolve a provider before a controlled/tool run; the returned service is pinned. */
+  resolveChatService?(
+    req: Readonly<AxChatRequest<TModel | TModelKey>>,
+    options?: Readonly<AxAIServiceOptions>
+  ): Promise<{
+    service: Readonly<AxAIService<unknown, unknown, any>>;
+    model?: string;
+  }>;
+
+  openChatSession?(
+    req: Readonly<AxChatRequest<TModel | TModelKey>>,
+    options?: Readonly<AxAIServiceOptions>
+  ): Promise<import('./session.js').AxChatSession>;
 
   chat(
     req: Readonly<AxChatRequest<TModel | TModelKey>>,
@@ -1295,12 +1427,18 @@ export interface AxAIServiceImpl<
   TChatResponseDelta,
   TEmbedResponse,
 > {
+  /** Validate original tools/history before automatic prompt-mode emulation. */
+  validateChatReq?(req: Readonly<AxInternalChatRequest<TModel>>): void;
+
   createChatReq(
     req: Readonly<AxInternalChatRequest<TModel>>,
     config?: Readonly<AxAIServiceOptions>
   ): Promise<[AxAPI, TChatRequest]> | [AxAPI, TChatRequest];
 
-  createChatResp(resp: Readonly<TChatResponse>): AxChatResponse;
+  createChatResp(
+    resp: Readonly<TChatResponse>,
+    request?: Readonly<AxInternalChatRequest<TModel>>
+  ): AxChatResponse;
 
   createChatStreamResp?(
     resp: Readonly<TChatResponseDelta>,
@@ -1324,6 +1462,23 @@ export interface AxAIServiceImpl<
   ): Promise<[AxAPI, TEmbedRequest]> | [AxAPI, TEmbedRequest];
 
   createEmbedResp?(resp: Readonly<TEmbedResponse>): AxEmbedResponse;
+
+  /**
+   * Optional: the reasoning effort a chat request for `model` will send, or
+   * `undefined` when it sends none. Lets the base layer tell whether the model
+   * reasons on that request, which decides whether it accepts sampling
+   * parameters (see `AxModelInfo.supported.samplingWithoutReasoning`).
+   */
+  resolveReasoningEffort?(
+    model: TModel,
+    config: Readonly<AxAIServiceOptions>
+  ): string | undefined;
+
+  /**
+   * Optional: model info for the sampling filter when the AI has none for
+   * `model` (the OpenAI o-series on profiles that carry no model info).
+   */
+  samplingModelInfo?(model: TModel): Readonly<AxModelInfo> | undefined;
 
   getModelConfig(): AxModelConfig;
 

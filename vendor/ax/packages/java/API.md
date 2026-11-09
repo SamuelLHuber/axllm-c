@@ -58,11 +58,21 @@ Create an AxGen program from a string or parsed signature.
 - Kind: `function`
 - Form: `Ax.ax(signature)`
 - Returns: `AxGen`
-- Important options: functions, examples, demos, sample count, result picker, modelConfig, maxRetries, streaming assertions, field processors
+- Important options: functions, examples, demos, sample count, result picker, modelConfig, maxRetries, streaming assertions, field processors, control, asyncMode
 
 ```java
 AxGen qa = Ax.ax("question:string -> answer:string");
 ```
+
+### `Ax.novelF1Score`
+
+Score novel multiset token overlap after Unicode normalization and history/stopword exclusion. Two empty filtered answers score one; a single empty answer scores zero.
+
+- Canonical Ax concept: `Ax.novelF1Score`
+- Kind: `function`
+- Form: `Ax.novelF1Score`
+- Returns: `score in [0, 1]`
+- Important options: history, prediction, ground truth, return recall
 
 ### `AxGen`
 
@@ -73,6 +83,57 @@ Structured generation program with indexed multi-sampling, winner selection, for
 - Form: `new AxGen(signature)`
 - Returns: `program object`
 - Important options: signature, functions, examples, demos, sample count, result picker, memory, prompt template
+
+### `Ax.runControl`
+
+Create a controller for scoped steering, reasoning updates, cancellation, and queued/applied lifecycle events. Pass it through forward options.
+
+- Canonical Ax concept: `run_control`
+- Kind: `function`
+- Form: `Ax.runControl()`
+- Returns: `AxRunControl`
+
+```java
+var control = Ax.runControl();
+```
+
+### `AxRunControl`
+
+Run control shared by active and future descendant programs. Cancellation reports unresolved work and does not undo external effects.
+
+- Canonical Ax concept: `AxRunControl`
+- Kind: `type`
+- Form: `AxRunControl`
+- Returns: `run controller`
+- Important options: steer, thinking token budget, target path, abort, event listener
+
+### `AxCachingFunction`
+
+TypeScript's cachingFunction: read and store finished AxGen outputs by key. The forward call's function comes first, then the program's, then the process-wide one, and a run control skips the cache.
+
+- Canonical Ax concept: `AxCachingFunction`
+- Kind: `type`
+- Form: `Map<String, Object> apply(String key, Map<String, Object> value)`
+- Returns: `stored output or miss`
+- Important options: read, store, SHA-256 key, streamed hit as one delta
+
+```java
+AxGen qa = new AxGen(Ax.s("question:string -> answer:string"), Map.of("cachingFunction", cache));
+```
+
+### `AxGlobals.setCachingFunction`
+
+Register, replace, or clear the process-wide AxGen caching function.
+
+- Canonical Ax concept: `set_caching_function`
+- Kind: `function`
+- Form: `AxGlobals.setCachingFunction(fn)`
+- Returns: `void`
+- Important options: caching function, clear
+
+```java
+AxGlobals.setCachingFunction(cache);
+```
 
 
 ## AxAI
@@ -91,6 +152,80 @@ Create a provider client from a named deployment profile and options.
 
 ```java
 AxAIService client = Ax.ai("openai", Map.of("apiKey", System.getenv("OPENAI_API_KEY")));
+```
+
+### `Ax.openaiDecisions`
+
+Create the native OpenAI Decisions client for ordered predicate, choice and score questions. Default model: gpt-6-luna.
+
+- Canonical Ax concept: `openai_decisions`
+- Kind: `function`
+- Form: `Ax.openaiDecisions`
+- Returns: `AxAIOpenAIDecisionsClient`
+- Important options: API key or credential provider, inline images, timeout, retry, cancellation
+
+### `AxAIOpenAIDecisionsClient`
+
+Native create requests preserve ordered answers, refusals, distributions, fractional scores and full usage. Signature adapters accept required boolean/class fields.
+
+- Canonical Ax concept: `AxAIOpenAIDecisionsClient`
+- Kind: `type`
+- Form: `AxAIOpenAIDecisionsClient`
+- Returns: `native Decisions response JSON`
+- Important options: create / Create, question names, boolean or string choices, safety_identifier
+
+### `Ax.typesafe`
+
+Create the native Typesafe/Jev client separately from ordinary AI services. Default model: jev-latest.
+
+- Canonical Ax concept: `typesafe`
+- Kind: `function`
+- Form: `Ax.typesafe(options)`
+- Returns: `AxAITypesafeClient`
+- Important options: api key or credential provider, endpoint, transport, timeout, retry
+
+### `AxAITypesafeClient`
+
+Native System One questions and model discovery. Returns typed Noul probabilities, Choice labels, fractional Score positions, model, and usage.
+
+- Canonical Ax concept: `AxAITypesafeClient`
+- Kind: `type`
+- Form: `AxAITypesafeClient`
+- Returns: `native Typesafe responses`
+- Important options: system_one / systemOne / SystemOne, list_models / listModels / ListModels, structured or null entries, cancellation
+
+### `AxCancellationToken`
+
+Reusable one-shot cancellation for provider calls, streams, retries, and event-clock sleeps. Go uses context.Context.
+
+- Canonical Ax concept: `AxCancellationToken`
+- Kind: `type`
+- Form: `new AxCancellationToken()`
+- Returns: `cancellation token or context`
+- Important options: first reason wins, removable wake subscriptions, non-retryable cancellation
+
+### `AxAIServiceAbortedError`
+
+Terminal provider error raised when caller cancellation is observed.
+
+- Canonical Ax concept: `AxAIServiceAbortedError`
+- Kind: `error`
+- Form: `new AxAIServiceAbortedError(reason)`
+- Returns: `non-retryable provider error`
+- Important options: reason preservation, no retry, no provider failover
+
+### `Ax.getSupportedAIModels`
+
+Return the AxIR-backed provider and model catalog, including dynamic named profiles and portable capability metadata.
+
+- Canonical Ax concept: `get_supported_ai_models`
+- Kind: `function`
+- Form: `Ax.getSupportedAIModels(type)`
+- Returns: `provider catalog entries`
+- Important options: type filter, thinkingLevels, serviceTiers, isDynamic
+
+```java
+List<Object> catalog = Ax.getSupportedAIModels();
 ```
 
 ### `OpenAICompatibleClient.CredentialRequest`
@@ -112,6 +247,26 @@ Return fresh request headers that override static profile authentication.
 - Form: `OpenAICompatibleClient.CredentialProvider`
 - Returns: `header map or credential error`
 - Important options: chat, stream, embeddings, Responses, audio, retries
+
+### `AiClient.ownedWorkerFactory`
+
+Optional factory for an independent client worker with preserved configuration, authentication and routing. Built-in providers supply it; custom services may omit it without changing chat compatibility.
+
+- Canonical Ax concept: `owned_client_factory`
+- Kind: `method`
+- Form: `AiClient.ownedWorkerFactory()`
+- Returns: `worker factory or unavailable`
+- Important options: owned configuration, shared balancer accounting, no borrowed client transfer
+
+### `AxChatSession`
+
+Optional normalized session capability for custom provider adapters. High-level programs own tool execution and continuation; chat-only services remain supported.
+
+- Canonical Ax concept: `AxChatSession`
+- Kind: `interface`
+- Form: `AxChatSession`
+- Returns: `run-owned chat session`
+- Important options: normalized events, completed calls, submit results, steering, reasoning updates, close
 
 ### `AxChatStream`
 
@@ -395,6 +550,16 @@ Choose a service by capability or model routing policy.
 - Returns: `AI service`
 - Important options: services, routing
 
+### `AxProviderRouter.getCompatibilityReport`
+
+Rank request-compatible providers and summarize supported requirements, counting audio input and audio output independently.
+
+- Canonical Ax concept: `AxProviderRouter.getCompatibilityReport`
+- Kind: `method`
+- Form: `AxProviderRouter.getCompatibilityReport`
+- Returns: `provider names, scores and compatibility summary`
+- Important options: request
+
 ### `ProviderRouter`
 
 Route requests by capability, preserving native media for supporting providers and degrading only when required.
@@ -434,6 +599,26 @@ RLM agent with Core-owned envelopes, complete runtime-state export/restore, trac
 - Returns: `agent program`
 - Important options: executor model, runtime, policy, context, skills, memories, relevance ranking, observers, runtime state, optimizer metadata, citations, playbook
 
+### `AxAgent.addChildAgent`
+
+Register an owned child agent for serialized delegation through the parent invocation boundary. Scoped controls use parent/namespace.name paths.
+
+- Canonical Ax concept: `add_child_agent`
+- Kind: `method`
+- Form: `AxAgent.addChildAgent(namespace, name, child)`
+- Returns: `parent agent`
+- Important options: namespace, name, child, independent conversation, child usage
+
+### `AxAgent.streamingForward`
+
+Run the agent and stream the responder's deltas, as TypeScript's streamingForward does, after the distiller and executor run without streaming.
+
+- Canonical Ax concept: `agent_streaming_forward`
+- Kind: `method`
+- Form: `AxAgent.streamingForward(client, values, options)`
+- Returns: `responder deltas`
+- Important options: deltas, versions, hidden citations, run control
+
 
 ## Flow
 
@@ -463,6 +648,16 @@ Workflow graph with Core-owned planning, cache keys, state merge, child aggregat
 - Returns: `flow program`
 - Important options: steps, state, parallel groups, returns
 
+### `AxProgram.ownedWorkerFactory`
+
+Optional factory for independent program state. Parallel groups require both client and program factories; otherwise the whole group runs serially with a fallback trace.
+
+- Canonical Ax concept: `owned_program_factory`
+- Kind: `method`
+- Form: `AxProgram.ownedWorkerFactory()`
+- Returns: `worker factory or unavailable`
+- Important options: owned memory, per-node controls, deterministic result merge, cooperative cancellation
+
 
 ## Tools
 
@@ -476,7 +671,7 @@ Build a typed function tool. Rust uses `tool` because `fn` is reserved.
 - Kind: `function`
 - Form: `Ax.fn(name).description(...).arg(...).handler(...).build()`
 - Returns: `tool builder or Tool`
-- Important options: name, description, args, returns, handler
+- Important options: name, description, args, returns, handler, execution: blocking or background, cancellation-aware handler
 
 ```java
 Tool search = Ax.fn("search").description("Search docs").build();
@@ -499,13 +694,13 @@ Use MCP clients and transports while keeping JSON-RPC lifecycle, tools, prompts,
 
 ### `AxMCPClient`
 
-MCP client that lists tools/prompts/resources and converts MCP tools to Ax functions.
+MCP client that lists tools/prompts/resources and converts MCP tools to Ax functions. `callTool` waits for a modern server's task; `callTool(name, args, Map.of("taskHandling", "expose"))` returns it as its CreateTaskResult, and `callToolOutcome` returns `{kind: complete, result}` or `{kind: task, task}`, as TypeScript's callTool taskHandling and callToolOutcome. A legacy server's task-shaped result is a complete result.
 
 - Canonical Ax concept: `AxMCPClient`
 - Kind: `type`
 - Form: `new AxMCPClient(transport, options)`
 - Returns: `MCP client`
-- Important options: transport, client info, roots, tool overrides
+- Important options: transport, client info, roots, tool overrides, host tool authorization, task handling (await or expose), tool call outcome
 
 ```java
 AxMCPClient client = new AxMCPClient(transport);
@@ -520,6 +715,16 @@ Streamable HTTP transport with session headers, OAuth options, and SSRF protecti
 - Form: `new AxMCPStreamableHTTPTransport(endpoint, options)`
 - Returns: `MCP transport`
 - Important options: endpoint, headers, OAuth, SSRF protection
+
+### `AxMCPWebSocketTransport`
+
+WebSocket transport with request-local pending ownership, send failure cleanup, cancellation, and close settlement. Batching requires MCP 2025-03-26.
+
+- Canonical Ax concept: `AxMCPWebSocketTransport`
+- Kind: `type`
+- Form: `new AxMCPWebSocketTransport(url)`
+- Returns: `MCP transport`
+- Important options: URL, socket factory, protocol version
 
 ### `AxMCPStdioTransport`
 
@@ -649,13 +854,13 @@ AxBootstrapFewShot bootstrap = new AxBootstrapFewShot(Map.of("qualityThreshold",
 
 ### `AxGEPA`
 
-Generated GEPA optimizer engine with Core-owned reflection, Pareto, bootstrap, and selector-state behavior.
+GEPA engine with Core-owned reflection, Pareto and bootstrap behavior. Artifacts report original-program baselineScore/baselineScores at the top level and in metadata, independently of the final frontier.
 
 - Canonical Ax concept: `AxGEPA`
 - Kind: `type`
 - Form: `new AxGEPA(reflection, options)`
 - Returns: `optimizer engine`
-- Important options: reflection client, budget, metric, candidate count
+- Important options: reflection client, budget, metric, candidate count, baselineScore, baselineScores
 
 ```java
 AxGEPA engine = new AxGEPA(reflectionClient, Map.of());
@@ -685,6 +890,26 @@ Evaluator callback boundary used by generated optimizers.
 ## Errors And Values
 
 Handle target-native errors and dynamic values at Ax host boundaries.
+
+### `AxGen.AxDecisionRefusalError`
+
+Terminal decision-field refusal; retains field path and provider provenance.
+
+- Canonical Ax concept: `AxDecisionRefusalError`
+- Kind: `type`
+- Form: `AxGen.AxDecisionRefusalError`
+- Returns: `error`
+- Important options: fieldPath, provenance
+
+### `AxGenerateError`
+
+Generation boundary failure retaining the original cause; cancellation propagates unchanged.
+
+- Canonical Ax concept: `AxGenerateError`
+- Kind: `type`
+- Form: `AxGenerateError`
+- Returns: `error`
+- Important options: message, cause
 
 ### `AxAIServiceError`
 

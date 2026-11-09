@@ -45,12 +45,17 @@ result = program.forward(client, inputs)
 
 ## Common Patterns
 
+Chrome Built-in AI (`chrome-ai`) is **TypeScript/JavaScript only** and requires
+Chrome's browser `LanguageModel` API. It runs Gemini Nano locally without an API
+key. It is excluded from AxIR portability and the Python, Java, C++, Go, and Rust
+packages. Browser availability and model download requirements still apply.
+
 - Use a provider `name` and environment-backed API key.
 - Set a default model in provider config when the app has one obvious model.
 - Define model aliases when callers should choose `fast`, `smart`, or `cheap` instead of provider model IDs.
 - Use the named profile for a documented deployment. Reserve
   `openai-compatible` plus `apiURL` for an unlisted custom endpoint.
-- Use model catalog helpers before runtime when the UI needs provider/model selectors.
+- Use model catalog helpers before runtime when the UI needs provider/model selectors, portable thinking levels, or verified service tiers.
 - Use routers or balancers when provider fallback is part of the product.
 
 `ProviderRouter` selects a provider by request capability and degrades media only
@@ -65,6 +70,112 @@ An explicit unsupported mode fails before transport. `structuredOutputs`
 remains the compatibility alias for native JSON Schema support, not for every
 JSON response format. The selected rung is recorded with the chat log so runs
 remain comparable and debuggable.
+
+### OpenAI Decisions {#openai-decisions}
+
+TypeScript supports `ai({ name: 'openai-decisions', apiKey })` with ordinary
+required boolean/class signatures, using the dedicated Decisions endpoint and
+`gpt-6-luna` by default. Predicates become booleans at or above `trueThreshold`
+(default `0.5`); class descriptions become choice descriptions. Inline images
+are supported. Refused questions fail explicitly.
+
+Use `openaiDecisions({ apiKey }).create({ input, questions })` for native ordered
+predicate, choice, and score questions, probabilities, confidence, usage, and
+per-question refusals. Scoring stays explicit in native rubrics. Numeric bounds
+never become scoring levels. Freeform outputs and tools require a generative
+provider. Python, Java, C++, Go, and Rust support both interfaces through shared
+Core validation and conversion. Their native factories are `openai_decisions`,
+`Ax.openaiDecisions`, `axllm::openai_decisions`, `axllm.OpenAIDecisions`, and
+`openai_decisions`; request and response values use each language JSON representation.
+Each language has runnable signature and native examples in its generation directory.
+
+The runnable examples are
+[`openai-decisions.ts`](https://github.com/ax-llm/ax/blob/main/src/examples/typescript/generation/openai-decisions.ts)
+[`openai-decisions-native.ts`](https://github.com/ax-llm/ax/blob/main/src/examples/typescript/generation/openai-decisions-native.ts),
+and [`openai-decisions-image.ts`](https://github.com/ax-llm/ax/blob/main/src/examples/typescript/generation/openai-decisions-image.ts).
+See the [provider guide](https://developers.openai.com/api/docs/guides/decisions)
+for native question and image formats.
+
+### Typesafe / Jev typed inference {#typesafe-jev}
+
+The `typesafe` profile supports ordinary Ax signatures with required boolean
+and class outputs. Booleans use Noul with provider-level `trueThreshold` (default
+`0.5`, inclusive comparison); classes retain the native Choice label. Field names
+and descriptions define the questions. Signature syntax and return types stay the same.
+
+Boolean value descriptions such as `boolean(true "...", false "...")` and
+class label descriptions after the label list become native criteria. The same
+signature retains those descriptions as text with other providers. The
+[Typesafe/Jev skill]({{typesafeSkillPath}}) covers the exact syntax,
+question design, native requests, transport options, and runnable examples.
+
+{{aiTypesafeExample}}
+
+Use the `typesafe` provider profile for these signatures.
+Numeric outputs, including bounded numbers, are rejected: bounds do not define a
+rating rubric; use an explicit score field. Freeform text, optional outputs, arrays, nested objects,
+tools, and generation controls such as temperature are also unsupported.
+Typesafe has no token streaming API; its stream interface delivers a completed result.
+
+TypeScript also supports PNG/JPEG image inputs and `box` signature outputs.
+Use Jev 1.14 for Box. Ax sends the required experimental images header, validates
+normalized coordinates, and exposes native confidence with `box(evidence)`.
+Other generated languages retain their existing text-only Jev support until the
+tracked AxIR parity work is complete. See the Typesafe skill for image limits.
+
+Use the separate `typesafe` native client for rich Noul/Choice/Score
+questions and structured state. `systemOne({ state, questions, model? })` returns
+native answers, probabilities, confidence, and usage. Noul remains a probability;
+Score remains a fractional zero-based rubric position. Custom thresholds and
+scale conversions are caller decisions. `listModels()` discovers native models
+without changing configured Ax model aliases. The default model is `jev-latest`.
+Choice supports up to 255 options and Score requires 2–10 descriptive levels.
+Their probabilities must be finite values in `[0, 1]`, match the criteria keys,
+and sum to one within an inclusive `0.01` tolerance. Totals of `0.99` and `1.01`
+are accepted with an allowance for floating-point summation error. Ax preserves
+the returned probabilities without renormalizing them.
+The provider's context limit covers state, instructions, and criteria; Ax does
+not silently truncate input or claim an exact local token count.
+
+Usage and raw adapter answers remain available through existing usage and chat-log
+APIs. Routing excludes unsupported requests even with degradation enabled.
+Typesafe-only balancers send schemas for scalar signatures; mixed pools can select
+Typesafe when the actual request already has a supported schema.
+
+TypeScript, Python, Java, C++, Go, and Rust support both interfaces. Each language
+has runnable examples for configurable boolean conversion, native criteria/scoring,
+and an explicit hybrid flow that passes decisions to a second Ax program for prose.
+The generated language APIs use native typed maps, records, or enums for answers;
+TypeScript additionally infers literal question names and Choice-label unions.
+
+### Meta Muse models
+
+Use `meta` for Meta's recommended Responses transport, `meta-chat` for Chat
+Completions, or `meta-messages` for Anthropic-compatible Messages. All three
+use `MODEL_API_KEY` bearer authentication and default to `muse-spark-1.3`.
+Ax maps logical `highest` reasoning to `xhigh`; unsupported reasoning and
+forced named-tool choices fail locally.
+
+Muse Spark uses the normal chat API. Muse Image (`muse-image-1.0`) also uses
+chat through `meta`: prompts and reference images go in the existing content
+array, and generated images come back in `results[].images` with their MIME
+type. Preserve the result in chat memory to edit the image on a later turn.
+Ordinary function tools are not supported by Muse Image.
+
+Muse Voice (`muse-voice-transcribe-1.0`) uses `transcribe` for mono WAV files
+and the existing streaming chat surface for realtime PCM16 at 16 or 24 kHz.
+Transcription supports speaker labels, turn timestamps, language bias,
+keywords, progress, and session IDs. It does not synthesize speech.
+Realtime partial captions are replacement snapshots in `results[].transcript`
+(`text` plus `isFinal`, or `is_final` in generated languages), keyed by result
+ID. Replace each partial instead of concatenating it. Normal `content` contains
+finalized turns once, in speech-start order. Audio sending and event reception
+run concurrently.
+
+Contributor variants explicitly allow provider-training data use and are
+never defaults. Muse Glimmer runs through the existing `vllm`, `llama-cpp`,
+`ollama`, or `lm-studio` profiles; Ax does not download or manage weights.
+No standalone image-generation or file-management service methods are added.
 
 ### Renewable credentials
 
@@ -93,6 +204,88 @@ GPT-5.6 OpenAI Chat requests can opt into stable explicit prompt-cache
 breakpoints. Give AxGen a stable `promptCacheKey` plus `contextCache`; those
 forward options reach the provider in every language. Cache reads and writes
 are normalized separately for usage and catalog-backed cost estimates.
+
+A per-call timeout bounds the wait for the response headers, in milliseconds.
+TypeScript reads it as `timeout`. Until the next major version, the other
+languages read it as `timeoutMs` and warn once when a call gives `timeout`
+alone. A request whose response has not started in time fails with
+`AxAIServiceTimeoutError`.
+
+### GPT-6.1 Sol
+
+Select `gpt-6.1-sol` on the `openai` or `openai-responses` deployment profile.
+Ax routes it through Responses with the GPT-6 effort ladder and breakpoint
+caching. Use `thinkingTokenBudget: 'low'`; the model requires reasoning, so
+`none` fails before transport. Ax currently exposes automatic sessions and
+mid-conversation reasoning updates only for Astra.
+
+Standard input, cache-read, cache-write, and output rates per million tokens are
+$2, $0.10, $2.50, and $10. Above 272K total input tokens they become $4, $0.20,
+$5, and $15. Priority multiplies these rates by 2; Flex multiplies them by 0.5.
+The served `fast` tier is accounted for as Priority. Fixed Bedrock OpenAI IDs
+inherit the matching model's sampling restrictions when profile metadata is absent.
+
+### GPT-6 Astra and automatic sessions (TypeScript)
+
+Select `ai({ name: 'openai', config: { model: AxAIOpenAIModel.GPT6Astra }, apiKey })`.
+Import `ai` and `AxAIOpenAIModel` from `@ax-llm/ax`. Ax automatically routes
+Astra through Responses. Existing defaults are unchanged.
+Use `thinkingTokenBudget: 'low'` and `serviceTier: 'standard'`. Astra requires
+reasoning; `minimal` maps to `low` and `none` throws. Unsupported sampling and
+log-probability options are removed. EU residency does not support priority processing.
+
+Keep calling `forward()` and `streamingForward()`. Declare independent tools with
+`fn('lookup').description('...').execution('background').handler(...).build()`.
+Ordinary tools default to blocking. JavaScript promises and MCP annotations do
+not opt a tool into background execution. Set `asyncMode: 'off'` to use the
+ordinary tool loop. Providers without session support retain that loop.
+
+Use `const control = runControl()` and pass `{ control }` in forward options.
+Call `control.steer(text)`, `control.setThinkingTokenBudget('high')`, or
+`control.abort()`. `control.onEvent(listener)` observes queued/applied updates,
+run lifecycle, tool activity, and model output activity. Untargeted updates apply
+to the root and future descendants. `{ target: 'root/nodeName' }` restricts an
+update to a flow node and its descendants. Completed nodes are not rerun.
+Controller-attached runs bypass result caching; provider prompt caching remains enabled.
+
+HTTP streaming needs no WebSocket dependency. With a configured host
+`options.webSocket`, steering can apply natively during generation; otherwise it
+applies at the next response boundary. Observe the applied event's `timing`.
+Reasoning updates use continuation input items, retaining the original prefix.
+Steering that awaits tool input is continued even when its pending notification
+arrives after completion. Duplicate acknowledgements do not apply an update twice.
+
+Ax owns tool execution and result submission. Only completed calls execute;
+pending results are incorporated before successful final output. Streaming clients
+reset accumulated output when `version` changes; provisional answers never
+count as successful completion. Sessions pin
+the selected provider and model and do not reconnect or replay calls after a
+failure. Cancellation requests tool cancellation; it does not undo external work.
+The native Responses wire client is internal. Custom providers may implement the
+optional normalized `openChatSession` contract; existing `.chat()` services work.
+Session adapters should expose their transport abort signal so pending host work
+does not prevent cancellation or disconnection from ending the run. Sessions
+preserve provider defaults and model-alias settings; explicit request settings win.
+
+Runnable examples: `typescript/generation/astra.ts`, `astra-async-tools.ts`,
+`astra-steering.ts`, `astra-reasoning-update.ts`, `astra-session-lifecycle.ts`, and
+`typescript/short-agents/astra-background.ts`. Python, Go, Java, C++, and Rust
+have provider-backed Astra generation, agent, flow, and cancellation examples in
+their language galleries. Their broader session parity is still being verified
+in the AxIR backlog. Independent flow groups now dispatch owned workers, with a traced serial
+fallback for unsupported custom clients or programs. Remaining agent invocation
+and session acceptance evidence is tracked in the backlog.
+
+The Java, C++, and Rust WebSocket adapters track response activity as frames
+arrive. A completed response cannot become active again when an older buffered
+event is consumed. When no response is active, steering is queued for the next
+response; an active successor can still receive native steering. Observe lifecycle
+timing rather than assuming that every update applies natively.
+All five session adapters also reject invalid raw-schema arguments before invoking
+the handler, allowing the model to correct its call within the step limit.
+These fixes have deterministic regression coverage; they do not establish full
+generated-language parity.
+
 
 ### Gemini thinking levels
 
@@ -142,6 +335,12 @@ Generated Python, Java, Go, Rust, and C++ provider clients expose each SSE event
 
 {{aiProviderStreamExample}}
 
+### Portable cancellation
+
+Generated Python, Java, Rust, and C++ calls accept a shared, thread-safe `AxCancellationToken`; Go continues to use `context.Context`. Cancellation is one-shot and first-reason-wins, propagates through provider retries and routing, and always becomes a non-retryable `AxAIServiceAbortedError`. A pre-cancelled call makes no transport attempt, retry backoff wakes promptly, and an active stream stops after its current I/O boundary. Realtime WebSocket turns use their existing lifecycle and are outside this contract.
+
+{{aiCancellationExample}}
+
 ### Provider clients
 
 {{aiProviderExamples}}
@@ -152,6 +351,27 @@ This matrix is generated from `ir/axcore/data/provider-profiles.json`. Defaults
 are conservative; exact or pattern rules apply only inside the selected profile,
 and callers can supply explicit model metadata for a deployment they have
 verified.
+
+### Haiku 5.5
+
+Select `AxAIAnthropicModel.Claude55Haiku` for `claude-haiku-5-5` on the Claude
+API, or `AxAIAnthropicVertexModel.Claude55Haiku` on Vertex. In Python, Go,
+Java, C++, and Rust, pass `model: "claude-haiku-5-5"` to the Anthropic client. Adaptive thinking
+defaults to medium effort. `thinkingTokenBudget: 'none'` disables thinking;
+combining it with `xhigh` or `max` effort fails locally. Other thinking levels
+use adaptive thinking, and forced tool choices remain supported. Ax supports
+both native JSON Schema and function-based structured output.
+
+Haiku 5.5 has a 1M-token context window and a 128K output limit. Base input/output
+pricing is $0.10/$0.50 per million tokens, rising to $0.50/$2.50 when total input
+exceeds 100K tokens, including cached input. Keep signed thinking blocks and
+earlier messages unchanged when replaying a conversation.
+
+The TypeScript example catalog includes **Haiku 5.5 ticket classification**.
+Python, Go, Java, C++, and Rust share the same request and replay semantics,
+and their public generation examples demonstrate the model.
+See the [Anthropic migration guide](https://platform.claude.com/docs/en/models/haiku-5-5/migration-guide).
+
 
 {{aiProfileMatrix}}
 
@@ -170,6 +390,19 @@ available.
 
 {{aiAudioExample}}
 
+## Streaming Usage And Incomplete Responses
+
+OpenAI Responses reports a token-limit stop as `length` and a content-filter
+stop as `content_filter`. The terminal response status takes precedence even
+when no message was produced or an earlier message completed. Incomplete
+streams retain their token usage and the served service tier. Reusing a client
+keeps each stream's usage separate; consume the terminal event for final totals.
+
+Anthropic `message_delta` counts are cumulative. Present input and cache counts
+replace earlier counts, including explicit zero; omitted or null fields retain
+previous values. Successive deltas retain the latest input, cache, and speed
+metadata while updating output tokens.
+
 ## Practical Notes
 
 - Prefer the named deployment-profile factory over direct provider classes in new code.
@@ -179,3 +412,23 @@ available.
 - Trace provider requests, token usage, estimated cost, and routing decisions in production.
 
 See [ai() API]({{langRoot}}/api/ai/).
+
+## File routing
+
+A provider router preserves files for providers that can read them directly. File
+names, media types, cache metadata, and content order survive routing and later
+conversation turns. For providers without native file support, supply extracted
+text or a file-to-text callback, or choose a degradation, skip, or error policy.
+The router checks the selected model before preprocessing the request.
+
+### Claude Sonnet 5.5
+
+Claude Sonnet 5.5 supports native structured output and preserves later system
+messages in conversation order. Logical `none` thinking sends
+`thinking.type: between_tools`: pre-response thinking is off, while signed and
+redacted updates remain available for tool-turn replay. These updates stay
+hidden under `none` or when thoughts are disabled. Effort `xhigh` and `max` are
+rejected while thinking is off; use `high` or below, or leave thinking on.
+Omitting effort leaves the provider default in control. Explicitly forced tool
+choices are rejected. These rules apply to TypeScript and the generated Python,
+Go, Java, C++, and Rust clients.

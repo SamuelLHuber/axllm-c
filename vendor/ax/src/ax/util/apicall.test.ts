@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   AxAIServiceAbortedError,
+  AxAIServiceAuthenticationError,
   type AxAIServiceError,
   AxAIServiceNetworkError,
   AxAIServiceStatusError,
@@ -371,7 +372,7 @@ describe('apiCall', () => {
       }
     });
 
-    it('should still store requestBody on error object even when not included in toString', async () => {
+    it('keeps requestBody readable but out of every serialization when includeRequestBodyInErrors is false', async () => {
       const mockFetch = vi.fn().mockResolvedValue(
         new Response(JSON.stringify({ error: 'bad request' }), {
           status: 500,
@@ -397,9 +398,36 @@ describe('apiCall', () => {
         expect(serviceError.requestBody).toEqual({
           sensitiveData: 'secret123',
         });
-        // But not in the string representation
+        // But no serialization a logger or error reporter uses shows it.
+        expect(Object.keys(serviceError)).not.toContain('requestBody');
+        expect(JSON.stringify(serviceError)).not.toContain('secret123');
+        expect(JSON.stringify({ ...serviceError })).not.toContain('secret123');
         expect(serviceError.toString()).not.toContain('secret123');
+        expect(serviceError.stack).not.toContain('secret123');
       }
+    });
+
+    it('serializes requestBody by default', async () => {
+      const mockFetch = vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ error: 'bad request' }), {
+          status: 500,
+          statusText: 'Internal Server Error',
+          headers: { 'content-type': 'application/json' },
+        })
+      );
+
+      const error = await apiCall(
+        {
+          url: 'https://api.example.com/test',
+          fetch: mockFetch,
+          retry: { maxRetries: 0 },
+        },
+        { sensitiveData: 'secret123' }
+      ).catch((e: AxAIServiceError) => e);
+
+      expect(error).toBeInstanceOf(AxAIServiceStatusError);
+      expect(Object.keys(error)).toContain('requestBody');
+      expect(JSON.stringify(error)).toContain('secret123');
     });
 
     it('should exclude request body from network errors when includeRequestBodyInErrors is false', async () => {
@@ -424,6 +452,87 @@ describe('apiCall', () => {
         expect(errorString).not.toContain('Request Body:');
         expect(errorString).not.toContain('largeBase64');
       }
+    });
+  });
+
+  describe('credentials in errors', () => {
+    const secret = 'sk-secret-header-value';
+    const credentialHeaders = {
+      Authorization: `Bearer ${secret}`,
+      'x-api-key': secret,
+      'x-goog-api-key': secret,
+    };
+    const rejectingFetch = (status: number) =>
+      vi.fn(
+        async (_url: unknown, _init?: RequestInit) =>
+          new Response(JSON.stringify({ error: { message: 'rejected' } }), {
+            status,
+            statusText: 'Rejected',
+            headers: { 'content-type': 'application/json' },
+          })
+      );
+    // Everything a logger, tracer or error reporter prints or serializes.
+    const errorText = (error: AxAIServiceError) =>
+      [
+        String(error),
+        error.stack ?? '',
+        JSON.stringify(error),
+        JSON.stringify(Object.values(error)),
+      ].join('\n');
+
+    it.each([
+      [400, AxAIServiceStatusError],
+      [401, AxAIServiceAuthenticationError],
+      [500, AxAIServiceStatusError],
+    ] as const)(
+      'keeps request headers out of a %s error, retries included',
+      async (status, errorClass) => {
+        const mockFetch = rejectingFetch(status);
+        const error = await apiCall(
+          {
+            url: 'https://api.example.com/v1/chat',
+            fetch: mockFetch,
+            headers: credentialHeaders,
+            retry: { maxRetries: 1, initialDelayMs: 0, maxDelayMs: 0 },
+          },
+          { prompt: 'hello' }
+        ).catch((e: AxAIServiceError) => e);
+
+        expect(error).toBeInstanceOf(errorClass);
+        expect(JSON.stringify(mockFetch.mock.calls[0]?.[1]?.headers)).toContain(
+          secret
+        );
+        expect(errorText(error as AxAIServiceError)).not.toContain(secret);
+      }
+    );
+
+    it('keeps resolved credential headers out of errors', async () => {
+      const error = await apiCall(
+        {
+          url: 'https://api.example.com/v1/chat',
+          fetch: rejectingFetch(401),
+          resolveHeaders: async () => credentialHeaders,
+        },
+        { prompt: 'hello' }
+      ).catch((e: AxAIServiceError) => e);
+
+      expect(error).toBeInstanceOf(AxAIServiceAuthenticationError);
+      expect(errorText(error as AxAIServiceError)).not.toContain(secret);
+    });
+
+    it('keeps request headers out of network errors', async () => {
+      const error = await apiCall(
+        {
+          url: 'https://api.example.com/v1/chat',
+          fetch: vi.fn().mockRejectedValue(new TypeError('fetch failed')),
+          headers: credentialHeaders,
+          retry: { maxRetries: 0 },
+        },
+        { prompt: 'hello' }
+      ).catch((e: AxAIServiceError) => e);
+
+      expect(error).toBeInstanceOf(AxAIServiceNetworkError);
+      expect(errorText(error as AxAIServiceError)).not.toContain(secret);
     });
   });
 
@@ -698,5 +807,152 @@ describe('apiCall', () => {
         { label: 'snowman ☃', index: 0 },
       ]);
     });
+  });
+});
+
+// Regression coverage for the user-abort listener leak: apiCall registers a
+// listener on the caller-owned `abortSignal` on every attempt but, before the
+// fix, only detached it on an actual abort. On normal resolution — and on each
+// retry — the listener accumulated, producing a MaxListenersExceededWarning at
+// 11 and unbounded growth on a long-lived signal. Sibling of PR #632 (remove
+// abort listener on normal resolution in AxInMemoryEventStore.waitForWork).
+describe('apiCall user abort listener lifecycle', () => {
+  // Duck-typed AbortSignal that counts add/remove of its 'abort' listener.
+  // `removed` only increments on a listener that was actually attached, so a
+  // double-remove cannot mask a leak.
+  const makeCountingAbortSignal = () => {
+    const listeners = new Set<EventListenerOrEventListenerObject>();
+    let added = 0;
+    let removed = 0;
+    const signal = {
+      aborted: false,
+      reason: undefined as unknown,
+      onabort: null,
+      addEventListener(
+        _type: string,
+        listener: EventListenerOrEventListenerObject,
+        _options?: AddEventListenerOptions | boolean
+      ) {
+        added++;
+        listeners.add(listener);
+      },
+      removeEventListener(
+        _type: string,
+        listener: EventListenerOrEventListenerObject
+      ) {
+        if (listeners.delete(listener)) {
+          removed++;
+        }
+      },
+      dispatchEvent() {
+        return true;
+      },
+    };
+    return {
+      signal: signal as unknown as AbortSignal,
+      counts: {
+        get added() {
+          return added;
+        },
+        get removed() {
+          return removed;
+        },
+        get live() {
+          return listeners.size;
+        },
+      },
+    };
+  };
+
+  const jsonResponse = () =>
+    new Response(JSON.stringify({ result: 'success' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+
+  it('detaches the abort listener after a non-stream resolution', async () => {
+    const { signal, counts } = makeCountingAbortSignal();
+    const mockFetch = vi.fn().mockResolvedValue(jsonResponse());
+
+    await apiCall(
+      {
+        url: 'https://api.example.com/test',
+        fetch: mockFetch,
+        abortSignal: signal,
+      },
+      { test: 'data' }
+    );
+
+    expect(counts.added).toBe(1);
+    expect(counts.removed).toBe(counts.added);
+    expect(counts.live).toBe(0);
+  });
+
+  it('does not accumulate abort listeners across retries', async () => {
+    const { signal, counts } = makeCountingAbortSignal();
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response('service unavailable', {
+          status: 503,
+          headers: { 'content-type': 'text/plain' },
+        })
+      )
+      .mockResolvedValueOnce(jsonResponse());
+
+    await apiCall(
+      {
+        url: 'https://api.example.com/test',
+        fetch: mockFetch,
+        abortSignal: signal,
+        retry: {
+          maxRetries: 3,
+          initialDelayMs: 1,
+          backoffFactor: 1,
+          maxDelayMs: 10,
+        },
+      },
+      { test: 'data' }
+    );
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    // One listener registered per attempt, each detached again: net zero.
+    expect(counts.added).toBe(2);
+    expect(counts.removed).toBe(counts.added);
+    expect(counts.live).toBe(0);
+  });
+
+  it('detaches the abort listener after a stream is fully consumed', async () => {
+    const { signal, counts } = makeCountingAbortSignal();
+    const mockFetch = vi.fn().mockResolvedValue(
+      new Response('data: {"index":0}\n\ndata: [DONE]\n\n', {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      })
+    );
+
+    const stream = (await apiCall<{ test: string }, { index: number }>(
+      {
+        url: 'https://api.example.com/test',
+        fetch: mockFetch,
+        stream: true,
+        abortSignal: signal,
+      },
+      { test: 'data' }
+    )) as ReadableStream<{ index: number }>;
+
+    // The listener must stay attached while the stream is live so a mid-stream
+    // user abort still reaches the fetch signal.
+    expect(counts.live).toBe(1);
+
+    const reader = stream.getReader();
+    while (true) {
+      const { done } = await reader.read();
+      if (done) break;
+    }
+
+    expect(counts.added).toBe(1);
+    expect(counts.removed).toBe(counts.added);
+    expect(counts.live).toBe(0);
   });
 });

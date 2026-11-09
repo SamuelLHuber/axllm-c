@@ -17,6 +17,7 @@ import {
   defaultRetryConfig,
 } from '../util/apicall.js';
 import { createHash, randomUUID } from '../util/crypto.js';
+import { mergeHeaders } from '../util/headers.js';
 import {
   axGetRuntimeHookFrame,
   axStartActiveSpanFailOpen,
@@ -177,6 +178,24 @@ function isManagedContextCacheRejection(
   return namesCachedContent || describesInvalidCache;
 }
 
+// Orders strings by Unicode code point, as the generated ports sort keys, so
+// the result doesn't depend on the host's locale the way localeCompare does
+// (which orders ID/id, userName/username or ä by the default collation).
+function compareCodePoints(a: string, b: string): number {
+  const length = Math.min(a.length, b.length);
+  for (let i = 0; i < length; i++) {
+    const left = a.codePointAt(i) ?? 0;
+    const right = b.codePointAt(i) ?? 0;
+    if (left !== right) {
+      return left - right;
+    }
+    if (left > 0xffff) {
+      i++;
+    }
+  }
+  return a.length - b.length;
+}
+
 function normalizeForStableStringify(value: unknown): unknown {
   if (Array.isArray(value)) {
     return value.map((item) => normalizeForStableStringify(item));
@@ -185,7 +204,7 @@ function normalizeForStableStringify(value: unknown): unknown {
   if (value && typeof value === 'object') {
     return Object.fromEntries(
       Object.entries(value)
-        .sort(([a], [b]) => a.localeCompare(b))
+        .sort(([a], [b]) => compareCodePoints(a, b))
         .map(([key, nestedValue]) => [
           key,
           normalizeForStableStringify(nestedValue),
@@ -209,6 +228,7 @@ const PROVIDER_REQUEST_ID_HEADERS = [
   'x-goog-request-id',
   'x-amzn-requestid',
   'x-amz-request-id',
+  'x-typesafe-request-id',
 ] as const;
 
 const PROVIDER_SESSION_ID_HEADERS = [
@@ -489,7 +509,12 @@ function computeCacheableContentHash<TModel>(
 }
 
 export interface AxAIFeatures {
+  asyncTools?: boolean;
+  nativeSteering?: boolean;
+  reasoningUpdates?: boolean;
   functions: boolean;
+  /** Whether Ax may emulate functions in prompts when native tools are absent. */
+  functionEmulation?: boolean;
   streaming: boolean;
   functionCot?: boolean;
   hasThinkingBudget?: boolean;
@@ -498,6 +523,8 @@ export interface AxAIFeatures {
   structuredOutputs?: boolean;
   /** Ordered, verified structured-output strategies for the selected model. */
   structuredOutputModes?: readonly AxStructuredOutputRung[];
+  /** Requires an output schema even for scalar-only signatures (typed inference). */
+  requiresStructuredOutput?: boolean;
   /** Enhanced media capability specifications */
   media: {
     /** Image processing capabilities */
@@ -587,6 +614,43 @@ export const axBaseAIDefaultConfig = (): AxModelConfig =>
     temperature: 0,
   });
 
+/** The sampling parameters model info can mark unsupported. */
+const axSamplingKeys = [
+  'temperature',
+  'topP',
+  'topK',
+  'presencePenalty',
+  'frequencyPenalty',
+] as const;
+
+const samplingWarnings = new Set<string>();
+
+/**
+ * console.warn once per process for each id: a setting Ax changed or did not
+ * send, so it is never dropped silently.
+ */
+export const warnSamplingOnce = (id: string, message: string): void => {
+  if (samplingWarnings.has(id)) return;
+  samplingWarnings.add(id);
+  console.warn(message);
+};
+
+/** Warns once per model and setting that an explicit value was not sent. */
+export const warnDroppedSampling = (
+  model: unknown,
+  key: string,
+  reason: string
+): void =>
+  warnSamplingOnce(
+    `${String(model)}\u0000${key}`,
+    `Ax dropped ${key} for ${String(model)}: ${reason}.`
+  );
+
+/** Test hook: shows every one-time sampling warning again. */
+export const resetDroppedSamplingWarnings = (): void => {
+  samplingWarnings.clear();
+};
+
 export const axBaseAIDefaultCreativeConfig = (): AxModelConfig =>
   structuredClone({
     temperature: 0.4,
@@ -666,6 +730,8 @@ export class AxBaseAI<
   private includeRequestBodyInErrors?: AxAIServiceOptions['includeRequestBodyInErrors'];
 
   private modelInfo: readonly AxModelInfo[];
+  /** Model config keys the caller set on the AI itself, as opposed to its defaults. */
+  private explicitModelConfigKeys: ReadonlySet<string> = new Set();
   private modelUsage?: AxModelUsage;
   private embedModelUsage?: AxModelUsage;
   private defaults: AxBaseAIArgs<TModel, TEmbedModel, TModelKey>['defaults'];
@@ -847,11 +913,35 @@ export class AxBaseAI<
     this.headers = headers;
   }
 
+  /**
+   * Records which model config keys the caller passed in the AI's own
+   * config, so the defaults merged underneath them are not mistaken for
+   * explicit settings.
+   */
+  protected setExplicitModelConfigKeys(config?: Readonly<object>): void {
+    this.explicitModelConfigKeys = new Set(
+      Object.entries(config ?? {})
+        .filter(([, value]) => value !== undefined)
+        .map(([key]) => key)
+    );
+  }
+
   get debug(): boolean {
     return this.getEffectiveDebug();
   }
 
+  private sessionOptions: Pick<
+    AxAIServiceOptions,
+    'webSocket' | 'asyncMode' | 'control' | 'executionPath'
+  > = {};
+
   setOptions(options: Readonly<AxAIServiceOptions>): void {
+    this.sessionOptions = {
+      webSocket: options.webSocket,
+      asyncMode: options.asyncMode ?? 'auto',
+      control: options.control,
+      executionPath: options.executionPath,
+    };
     this.#debug = options.debug;
     // verbose controls low-level HTTP logging (separate from debug)
     this.#verbose = options.verbose ?? false;
@@ -882,6 +972,7 @@ export class AxBaseAI<
 
   getOptions(): Readonly<AxAIServiceOptions> {
     return {
+      ...this.sessionOptions,
       debug: this.getEffectiveDebug(),
       verbose: this.#verbose,
       rateLimiter: this.getEffectiveRateLimiter(),
@@ -1394,6 +1485,7 @@ export class AxBaseAI<
       : isLongContext
         ? (tierPricing?.longContextCacheWriteTokenCostPer1M ??
           tierPricing?.cacheWriteTokenCostPer1M ??
+          modelInfo.longContextCacheWriteTokenCostPer1M ??
           modelInfo.cacheWriteTokenCostPer1M ??
           promptCostPer1M)
         : (tierPricing?.cacheWriteTokenCostPer1M ??
@@ -1768,29 +1860,23 @@ export class AxBaseAI<
     }
   }
 
-  private async _chat1(
+  private resolveChatModelConfig(
     req: Readonly<AxChatRequest<TModel | TModelKey>>,
     options?: Readonly<AxAIServiceOptions>
-  ): Promise<AxChatResponse | ReadableStream<AxChatResponse>> {
+  ) {
     const model =
       this.getModel(req.model) ?? (req.model as TModel) ?? this.defaults.model;
-
-    // Validate chat prompt messages
-    if (Array.isArray(req.chatPrompt)) {
-      for (const item of req.chatPrompt) {
-        axValidateChatRequestMessage(item);
-      }
-    }
 
     // Merge per-model-key default modelConfig if provided
     const modelKeyEntry = this.getModelByKey(
       req.model as TModel | TEmbedModel | TModelKey
     );
+    const keyModelConfig = modelKeyEntry
+      ? (modelKeyEntry as { modelConfig?: AxModelConfig }).modelConfig
+      : undefined;
     const modelConfig = {
       ...this.aiImpl.getModelConfig(),
-      ...(modelKeyEntry
-        ? (modelKeyEntry as { modelConfig?: AxModelConfig }).modelConfig
-        : undefined),
+      ...keyModelConfig,
       ...req.modelConfig,
     } as AxModelConfig;
 
@@ -1798,14 +1884,114 @@ export class AxBaseAI<
       model: model as string,
       modelInfo: this.modelInfo,
     });
-    if (selectedModelInfo?.notSupported?.temperature) {
-      if ('temperature' in modelConfig) {
-        delete (modelConfig as { temperature?: number }).temperature;
+    const explicitSamplingKeys = this.applySamplingSupport(
+      modelConfig,
+      model,
+      selectedModelInfo ?? this.aiImpl.samplingModelInfo?.(model) ?? null,
+      [keyModelConfig, req.modelConfig],
+      options
+    );
+
+    // stream is true by default unless explicitly set to false
+    modelConfig.stream =
+      (options?.stream !== undefined ? options.stream : modelConfig.stream) ??
+      true;
+
+    const canStream = this.getFeatures(model).streaming;
+    if (!canStream) {
+      modelConfig.stream = false;
+    }
+
+    return { model, modelConfig, selectedModelInfo, explicitSamplingKeys };
+  }
+
+  /**
+   * Removes the sampling parameters the selected model rejects on this
+   * request and returns the sampling keys the caller set that remain, so a
+   * provider can tell them from its defaults. A default value (the provider's
+   * own config) is always removed for such a parameter. An explicit value,
+   * from the AI's config, the model key's config or the request, is kept when
+   * the model accepts it: while it does not reason and this request does not
+   * reason, or as temperature 1 where the model takes its default; otherwise
+   * it is removed with a one-time warning.
+   */
+  private applySamplingSupport(
+    modelConfig: AxModelConfig,
+    model: TModel,
+    info: Readonly<AxModelInfo> | null,
+    explicitConfigs: readonly (Readonly<AxModelConfig> | undefined)[],
+    options?: Readonly<AxAIServiceOptions>
+  ): readonly string[] {
+    const config = modelConfig as Record<string, unknown>;
+    const isExplicit = (key: string) =>
+      this.explicitModelConfigKeys.has(key) ||
+      explicitConfigs.some(
+        (source) => (source as Record<string, unknown>)?.[key] !== undefined
+      );
+    const notSupported = info?.notSupported;
+    if (notSupported) {
+      let reasons: boolean | undefined;
+      for (const key of axSamplingKeys) {
+        if (!notSupported[key] || config[key] === undefined) continue;
+        const explicit = isExplicit(key);
+        const withoutReasoning =
+          info.supported?.samplingWithoutReasoning === true;
+        const temperatureOne =
+          key === 'temperature' && info.supported?.temperatureOne === true;
+        if (explicit && temperatureOne && config[key] === 1) continue;
+        if (explicit && withoutReasoning) {
+          if (reasons === undefined) {
+            const effort = this.aiImpl.resolveReasoningEffort?.(
+              model,
+              options ?? {}
+            );
+            reasons =
+              effort !== undefined
+                ? effort !== 'none'
+                : !info.supported?.reasoningOffByDefault;
+          }
+          if (!reasons) continue;
+        }
+        delete config[key];
+        if (explicit) {
+          warnDroppedSampling(
+            model,
+            key,
+            withoutReasoning && temperatureOne
+              ? 'the model accepts it only as 1 or with reasoning effort none'
+              : withoutReasoning
+                ? 'the model accepts it only with reasoning effort none'
+                : temperatureOne
+                  ? 'the model accepts it only as 1'
+                  : 'the model does not accept it'
+          );
+        }
       }
     }
-    if (selectedModelInfo?.notSupported?.topP) {
-      if ('topP' in modelConfig) {
-        delete (modelConfig as { topP?: number }).topP;
+    return axSamplingKeys.filter(
+      (key) => config[key] !== undefined && isExplicit(key)
+    );
+  }
+
+  validateChatRequest(
+    req: Readonly<AxChatRequest<TModel | TModelKey>>,
+    options?: Readonly<AxAIServiceOptions>
+  ): void {
+    if (!this.aiImpl.validateChatReq) return;
+    const { model, modelConfig } = this.resolveChatModelConfig(req, options);
+    this.aiImpl.validateChatReq({ ...req, model, modelConfig });
+  }
+
+  private async _chat1(
+    req: Readonly<AxChatRequest<TModel | TModelKey>>,
+    options?: Readonly<AxAIServiceOptions>
+  ): Promise<AxChatResponse | ReadableStream<AxChatResponse>> {
+    const { model, modelConfig, selectedModelInfo, explicitSamplingKeys } =
+      this.resolveChatModelConfig(req, options);
+    // Validate chat prompt messages
+    if (Array.isArray(req.chatPrompt)) {
+      for (const item of req.chatPrompt) {
+        axValidateChatRequestMessage(item);
       }
     }
 
@@ -1817,16 +2003,6 @@ export class AxBaseAI<
       throw new Error(
         `Model ${model as string} is marked as expensive and requires explicit confirmation. Set useExpensiveModel: "yes" to proceed.`
       );
-    }
-
-    // stream is true by default unless explicitly set to false
-    modelConfig.stream =
-      (options?.stream !== undefined ? options.stream : modelConfig.stream) ??
-      true;
-
-    const canStream = this.getFeatures(model).streaming;
-    if (!canStream) {
-      modelConfig.stream = false;
     }
 
     const tracer = this.getEffectiveTracer(options);
@@ -1863,11 +2039,22 @@ export class AxBaseAI<
         },
         options?.traceContext ?? context.active(),
         async (span) => {
-          return await this._chat2(model, modelConfig, req, options, span);
+          return await this._chat2(
+            model,
+            modelConfig,
+            { ...req, explicitSamplingKeys },
+            options,
+            span
+          );
         }
       );
     }
-    return await this._chat2(model, modelConfig, req, options);
+    return await this._chat2(
+      model,
+      modelConfig,
+      { ...req, explicitSamplingKeys },
+      options
+    );
   }
 
   private cleanupFunctionSchema(
@@ -1992,7 +2179,11 @@ export class AxBaseAI<
   private async _chat2(
     model: TModel,
     modelConfig: Readonly<AxModelConfig>,
-    chatReq: Readonly<Omit<AxChatRequest<TModel | TModelKey>, 'modelConfig'>>,
+    chatReq: Readonly<
+      Omit<AxChatRequest<TModel | TModelKey>, 'modelConfig'> & {
+        explicitSamplingKeys?: readonly string[];
+      }
+    >,
     options?: Readonly<AxAIServiceOptions>,
     span?: Span
   ): Promise<AxChatResponse | ReadableStream<AxChatResponse>> {
@@ -2033,24 +2224,52 @@ export class AxBaseAI<
       );
     }
 
+    this.aiImpl.validateChatReq?.(req);
+
     // After logging, optionally emulate prompt-based function mode centrally
     const providerSupportsFunctions = this.getFeatures(model).functions;
+    const functionEmulation = this.getFeatures(model).functionEmulation;
+    if (
+      !providerSupportsFunctions &&
+      functionEmulation === false &&
+      (req.functions?.length ?? 0) > 0
+    ) {
+      throw new Error(
+        `${this.name} model ${String(model)} does not permit function tools`
+      );
+    }
     const requestedFunctionCallMode = options?.functionCallMode ?? 'auto';
     const shouldEmulatePromptMode =
       requestedFunctionCallMode === 'prompt' ||
-      (requestedFunctionCallMode === 'auto' && !providerSupportsFunctions);
+      (requestedFunctionCallMode === 'auto' &&
+        !providerSupportsFunctions &&
+        functionEmulation !== false);
 
     const effectiveReq = shouldEmulatePromptMode
       ? {
           ...req,
           chatPrompt: req.chatPrompt.map((msg) => {
             if (msg.role === 'assistant') {
-              const { content, name, cache } = msg;
+              const {
+                content,
+                name,
+                cache,
+                thought,
+                thoughtBlocks,
+                audio,
+                images,
+                phase,
+              } = msg;
               return {
                 role: 'assistant' as const,
                 content,
                 name,
                 cache,
+                thought,
+                thoughtBlocks,
+                audio,
+                images,
+                phase,
               } as typeof msg;
             }
             if (msg.role === 'function') {
@@ -2105,12 +2324,12 @@ export class AxBaseAI<
               url,
             }),
           stream: modelConfig.stream,
-          timeout: this.timeout,
+          timeout: options?.timeout ?? this.timeout,
           verbose,
-          fetch: this.fetch,
+          fetch: options?.fetch ?? this.fetch,
           span,
           abortSignal,
-          corsProxy: this.corsProxy,
+          corsProxy: options?.corsProxy ?? this.corsProxy,
           onResponseMetadata,
           retry: options?.retry ?? this.retry,
           includeRequestBodyInErrors:
@@ -2358,8 +2577,6 @@ export class AxBaseAI<
               } catch {}
               try {
                 // DOMException is available in browsers; fallback to Error if unavailable
-                // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-                // @ts-ignore
                 controller.error(new DOMException('Aborted', 'AbortError'));
               } catch {
                 controller.error(new Error('Aborted'));
@@ -2430,7 +2647,7 @@ export class AxBaseAI<
     }
 
     try {
-      const res = this.aiImpl.createChatResp(rv as TChatResponse);
+      const res = this.aiImpl.createChatResp(rv as TChatResponse, effectiveReq);
       applyResponseCorrelationMetadata(
         res,
         options?.sessionId,
@@ -2666,11 +2883,11 @@ export class AxBaseAI<
               url,
             }),
           verbose,
-          fetch: this.fetch,
-          timeout: this.timeout,
+          fetch: options?.fetch ?? this.fetch,
+          timeout: options?.timeout ?? this.timeout,
           span,
           abortSignal,
-          corsProxy: this.corsProxy,
+          corsProxy: options?.corsProxy ?? this.corsProxy,
           onResponseMetadata,
           retry: options?.retry ?? this.retry,
           includeRequestBodyInErrors:
@@ -2774,15 +2991,15 @@ export class AxBaseAI<
     headers: Record<string, string> = {},
     request?: Omit<import('./types.js').AxAICredentialRequest, 'profile'>
   ): Promise<Record<string, string>> {
-    const staticHeaders = { ...(await this.headers()), ...headers };
+    const staticHeaders = mergeHeaders(await this.headers(), headers);
     if (!this.credentialProvider || !request) return staticHeaders;
-    return {
-      ...staticHeaders,
-      ...(await this.credentialProvider({
+    return mergeHeaders(
+      staticHeaders,
+      await this.credentialProvider({
         profile: this.credentialProfile,
         ...request,
-      })),
-    };
+      })
+    );
   }
 
   protected setChatCredentialOperation(operation: 'chat' | 'responses'): void {
@@ -3162,12 +3379,12 @@ export class AxBaseAI<
               url,
             }),
           stream: false,
-          timeout: this.timeout,
+          timeout: options?.timeout ?? this.timeout,
           verbose,
-          fetch: this.fetch,
+          fetch: options?.fetch ?? this.fetch,
           span,
           abortSignal,
-          corsProxy: this.corsProxy,
+          corsProxy: options?.corsProxy ?? this.corsProxy,
           retry: options?.retry ?? this.retry,
           includeRequestBodyInErrors:
             options?.includeRequestBodyInErrors ??

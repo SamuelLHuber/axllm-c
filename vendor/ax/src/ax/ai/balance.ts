@@ -21,6 +21,7 @@ import {
   sampleBalancerRouteHealth,
 } from './balance_adaptive.js';
 import type { AxAIFeatures } from './base.js';
+import { getRequestCompatibilityError } from './capabilities.js';
 import type {
   AxAIModelList,
   AxAIService,
@@ -41,9 +42,8 @@ import type {
 } from './types.js';
 
 // Helper type to extract model keys from a service
-type ExtractServiceModelKeys<T> = T extends AxAIService<any, any, infer K>
-  ? K
-  : never;
+type ExtractServiceModelKeys<T> =
+  T extends AxAIService<any, any, infer K> ? K : never;
 
 // Helper type to extract model keys from an array of services
 type ExtractAllModelKeys<T extends readonly any[]> = T extends readonly [
@@ -275,6 +275,36 @@ export class AxBalancer<
       },
       caching: { supported: false, types: [] },
     };
+    if (
+      this.services.length &&
+      this.services.every(
+        (service) => service.getFeatures(model).requiresStructuredOutput
+      )
+    ) {
+      features.requiresStructuredOutput = true;
+    }
+    if (
+      this.services.length &&
+      this.services.every(
+        (service) => service.getFeatures(model).functionEmulation === false
+      )
+    ) {
+      features.functionEmulation = false;
+    }
+    features.asyncTools = this.services.some(
+      (service) =>
+        !!service.openChatSession && !!service.getFeatures(model).asyncTools
+    );
+    features.nativeSteering =
+      features.asyncTools &&
+      this.services.some(
+        (service) => !!service.getFeatures(model).nativeSteering
+      );
+    features.reasoningUpdates =
+      features.asyncTools &&
+      this.services.some(
+        (service) => !!service.getFeatures(model).reasoningUpdates
+      );
     const structuredOutputModes: AxStructuredOutputRung[] = [];
     let allServicesAdvertiseStructuredOutputModes = this.services.length > 0;
 
@@ -312,6 +342,14 @@ export class AxBalancer<
       features.media.audio.formats = Array.from(
         new Set([...features.media.audio.formats, ...f.media.audio.formats])
       );
+      const output = f.media.audio.output;
+      if (output?.supported) {
+        features.media.audio.output ??= { supported: false, formats: [] };
+        features.media.audio.output.supported ||= output.supported;
+        features.media.audio.output.formats = Array.from(
+          new Set([...features.media.audio.output.formats, ...output.formats])
+        );
+      }
       if (f.media.files.supported) features.media.files.supported = true;
       features.media.files.formats = Array.from(
         new Set([...features.media.files.formats, ...f.media.files.formats])
@@ -492,6 +530,13 @@ export class AxBalancer<
     }
   }
 
+  validateChatRequest(
+    req: Readonly<AxChatRequest<TModelKey>>,
+    options?: Readonly<AxAIServiceOptions>
+  ): void {
+    this.getCandidateServices(req, options);
+  }
+
   private getCandidateServices(
     req: Readonly<AxChatRequest<TModelKey>>,
     options?: Readonly<AxAIServiceOptions>
@@ -501,26 +546,28 @@ export class AxBalancer<
     const caps = req.capabilities;
     const requiresImages = caps?.requiresImages;
     const requiresAudio = caps?.requiresAudio;
+    const requiresAudioOutput =
+      caps?.requiresAudioOutput === true ||
+      req.modelConfig?.audio?.output?.enabled === true;
     const model = req.model as unknown as string;
     const requestedTier = options?.serviceTier;
     const requiresServiceTier =
       requestedTier !== undefined && requestedTier !== 'auto';
 
-    if (
-      !requiresStructuredOutputs &&
-      !requiresImages &&
-      !requiresAudio &&
-      !requiresServiceTier
-    ) {
-      return this.services;
-    }
-
+    const incompatibilities: string[] = [];
     const candidates = this.services.filter((service) => {
+      const error = getRequestCompatibilityError(service, req, options);
+      if (error !== undefined) {
+        incompatibilities.push(`${service.getName()}: ${error}`);
+        return false;
+      }
       const features = service.getFeatures(model);
       if (requiresStructuredOutputs && !features.structuredOutputs)
         return false;
       if (requiresImages && !features.media.images.supported) return false;
       if (requiresAudio && !features.media.audio.supported) return false;
+      if (requiresAudioOutput && !features.media.audio.output?.supported)
+        return false;
       if (
         requiresServiceTier &&
         !features.serviceTiers?.includes(requestedTier)
@@ -531,10 +578,11 @@ export class AxBalancer<
     });
 
     if (candidates.length === 0) {
-      const requirements = [];
+      const requirements: string[] = [...incompatibilities];
       if (requiresStructuredOutputs) requirements.push('structured outputs');
       if (requiresImages) requirements.push('images');
       if (requiresAudio) requirements.push('audio');
+      if (requiresAudioOutput) requirements.push('audio output');
       if (requiresServiceTier)
         requirements.push(`service tier ${requestedTier}`);
 
@@ -961,6 +1009,36 @@ export class AxBalancer<
     } catch {
       // Observability must never affect routing.
     }
+  }
+
+  async resolveChatService(
+    req: Readonly<AxChatRequest<TModelKey>>,
+    options?: Readonly<AxAIServiceOptions>
+  ): Promise<{
+    service: Readonly<AxAIService<unknown, unknown, any>>;
+    model?: string;
+  }> {
+    const services = this.getCandidateServices(req, options);
+    const service = this.adaptive
+      ? (await this.rankAdaptiveCandidates(req, options, services))[0]?.service
+      : services.find((candidate) => this.canRetryService(candidate));
+    if (!service) throw new Error('No matching AI service is available');
+    this.currentService = service;
+    return { service, model: req.model as string | undefined };
+  }
+
+  async openChatSession(
+    req: Readonly<AxChatRequest<TModelKey>>,
+    options?: Readonly<AxAIServiceOptions>
+  ) {
+    const services = this.getCandidateServices(req, options);
+    const service = this.adaptive
+      ? (await this.rankAdaptiveCandidates(req, options, services))[0]?.service
+      : services.find((candidate) => this.canRetryService(candidate));
+    if (!service?.openChatSession)
+      throw new Error('Selected AI service does not support chat sessions');
+    this.currentService = service;
+    return await service.openChatSession(req, options);
   }
 
   async chat(

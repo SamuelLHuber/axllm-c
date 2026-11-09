@@ -1,8 +1,55 @@
-import { describe, expect, it } from 'vitest';
+import type {
+  ConverseCommandOutput,
+  ConverseRequest,
+  ConverseStreamOutput,
+} from '@aws-sdk/client-bedrock-runtime';
+import {
+  BedrockRuntimeClient,
+  InvokeModelCommand,
+} from '@aws-sdk/client-bedrock-runtime';
+import type {
+  AxAIServiceOptions,
+  AxChatRequest,
+  AxChatResponse,
+} from '@ax-llm/ax';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { AxAIBedrock } from './api.js';
 import type { BedrockTitanEmbedRequest } from './types.js';
 import { AxAIBedrockEmbedModel, AxAIBedrockModel } from './types.js';
+
+type BedrockChatRequest = AxChatRequest<AxAIBedrockModel> & {
+  model: AxAIBedrockModel;
+};
+
+type BedrockImpl = {
+  createChatReq: (
+    req: Readonly<BedrockChatRequest>,
+    options?: Readonly<AxAIServiceOptions>
+  ) => Promise<[unknown, ConverseRequest]>;
+  createChatResp: (resp: {
+    response: ConverseCommandOutput;
+    model: AxAIBedrockModel;
+    showThoughts: boolean;
+  }) => AxChatResponse;
+  createChatStreamResp: (
+    resp: {
+      event: ConverseStreamOutput;
+      model: AxAIBedrockModel;
+      requestId?: string;
+      showThoughts: boolean;
+    },
+    state: object
+  ) => AxChatResponse;
+};
+
+function getImpl(ai: AxAIBedrock): BedrockImpl {
+  return (ai as unknown as { aiImpl: BedrockImpl }).aiImpl;
+}
+
+function createAI(model = AxAIBedrockModel.ClaudeSonnet5): AxAIBedrock {
+  return new AxAIBedrock({ config: { model } });
+}
 
 // Access the private implementation's request builder without hitting AWS.
 // createEmbedReq only assembles the Titan request body; the AWS SDK call is
@@ -69,5 +116,725 @@ describe('AxAIBedrock Titan embeddings dimensions', () => {
     expect(JSON.parse(JSON.stringify(embedRequest))).not.toHaveProperty(
       'dimensions'
     );
+  });
+});
+
+describe('AxAIBedrock Titan embedding batches', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  function createEmbedAI(fallbackRegions: string[] = []): AxAIBedrock {
+    return new AxAIBedrock({
+      region: 'us-east-1',
+      fallbackRegions,
+      config: {
+        model: AxAIBedrockModel.ClaudeSonnet5,
+        embedModel: AxAIBedrockEmbedModel.TitanEmbedV2,
+        dimensions: 256,
+      },
+    });
+  }
+
+  function embeddingResponse(embedding: number[]) {
+    return {
+      $metadata: {},
+      body: new TextEncoder().encode(JSON.stringify({ embedding })),
+    };
+  }
+
+  it('embeds every text in request order and retains Titan options', async () => {
+    const bodies: BedrockTitanEmbedRequest[] = [];
+    const send = vi
+      .spyOn(BedrockRuntimeClient.prototype, 'send')
+      .mockImplementation(async (command) => {
+        expect(command).toBeInstanceOf(InvokeModelCommand);
+        const input = (command as InvokeModelCommand).input;
+        expect(input).toMatchObject({
+          modelId: AxAIBedrockEmbedModel.TitanEmbedV2,
+          contentType: 'application/json',
+          accept: 'application/json',
+        });
+        const body = JSON.parse(
+          input.body as string
+        ) as BedrockTitanEmbedRequest;
+        bodies.push(body);
+        return embeddingResponse([body.inputText.length]);
+      });
+    const response = await createEmbedAI().embed({ texts: ['a', 'bb', 'ccc'] });
+    expect(response.embeddings).toEqual([[1], [2], [3]]);
+    expect(send).toHaveBeenCalledTimes(3);
+    expect(bodies).toEqual(
+      ['a', 'bb', 'ccc'].map((inputText) => ({
+        inputText,
+        dimensions: 256,
+        normalize: true,
+      }))
+    );
+  });
+
+  it('retains single-text behavior', async () => {
+    const send = vi
+      .spyOn(BedrockRuntimeClient.prototype, 'send')
+      .mockResolvedValue(embeddingResponse([1, 2]));
+    await expect(
+      createEmbedAI().embed({ texts: ['hello'] })
+    ).resolves.toMatchObject({ embeddings: [[1, 2]] });
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects an empty batch before invoking AWS', async () => {
+    const send = vi.spyOn(BedrockRuntimeClient.prototype, 'send');
+    await expect(createEmbedAI().embed({ texts: [] })).rejects.toThrow(
+      'No texts provided'
+    );
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('retries a failed input in the fallback region without changing order', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const regions: string[] = [];
+    const inputs: string[] = [];
+    vi.spyOn(BedrockRuntimeClient.prototype, 'send').mockImplementation(
+      async function (this: BedrockRuntimeClient, command) {
+        const region = await this.config.region();
+        const body = JSON.parse(
+          (command as InvokeModelCommand).input.body as string
+        ) as BedrockTitanEmbedRequest;
+        regions.push(region);
+        inputs.push(body.inputText);
+        if (body.inputText === 'bb' && region === 'us-east-1')
+          throw new Error('Regional failure');
+        return embeddingResponse([body.inputText.length]);
+      }
+    );
+    const response = await createEmbedAI(['us-west-2']).embed({
+      texts: ['a', 'bb', 'ccc'],
+    });
+    expect(response.embeddings).toEqual([[1], [2], [3]]);
+    expect(inputs).toEqual(['a', 'bb', 'bb', 'ccc']);
+    expect(regions).toEqual([
+      'us-east-1',
+      'us-east-1',
+      'us-west-2',
+      'us-east-1',
+    ]);
+  });
+
+  it('rejects the entire batch when an input fails in every region', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const inputs: string[] = [];
+    vi.spyOn(BedrockRuntimeClient.prototype, 'send').mockImplementation(
+      async (command) => {
+        const body = JSON.parse(
+          (command as InvokeModelCommand).input.body as string
+        ) as BedrockTitanEmbedRequest;
+        inputs.push(body.inputText);
+        if (body.inputText === 'bb') throw new Error('Embedding failed');
+        return embeddingResponse([1]);
+      }
+    );
+    await expect(
+      createEmbedAI(['us-west-2']).embed({ texts: ['a', 'bb', 'ccc'] })
+    ).rejects.toThrow('Embedding failed');
+    expect(inputs).toEqual(['a', 'bb', 'bb']);
+  });
+});
+
+describe('AxAIBedrock Converse capabilities', () => {
+  it('advertises native Claude capabilities per model', () => {
+    const ai = createAI();
+    const features = ai.getFeatures(AxAIBedrockModel.ClaudeSonnet5);
+
+    expect(features).toMatchObject({
+      functions: true,
+      streaming: true,
+      functionCot: true,
+      structuredOutputs: false,
+      thinking: true,
+      multiTurn: true,
+      serviceTiers: ['standard'],
+      media: {
+        images: { supported: true },
+        files: { supported: true, uploadMethod: 'inline' },
+      },
+      caching: { supported: true, types: ['ephemeral'] },
+    });
+  });
+
+  it('keeps GPT OSS capabilities conservative and model-specific', () => {
+    const ai = createAI(AxAIBedrockModel.GptOss120B);
+    const features = ai.getFeatures(AxAIBedrockModel.GptOss120B);
+
+    expect(features).toMatchObject({
+      functions: false,
+      streaming: true,
+      structuredOutputs: true,
+      structuredOutputModes: ['native'],
+      thinking: false,
+      serviceTiers: ['standard', 'flex', 'priority'],
+      media: {
+        images: { supported: false },
+        files: { supported: false },
+      },
+      caching: { supported: false },
+    });
+  });
+
+  it('advertises GPT-6 and GPT-6.1 Sol tools, images, and reasoning', () => {
+    for (const model of [
+      AxAIBedrockModel.Gpt6Sol,
+      AxAIBedrockModel.Gpt6Luna,
+      AxAIBedrockModel.Gpt6Astra,
+      AxAIBedrockModel.Gpt61Sol,
+    ]) {
+      expect(createAI(model).getFeatures(model)).toMatchObject({
+        functions: true,
+        structuredOutputs: true,
+        structuredOutputModes: ['native', 'function'],
+        thinking: true,
+        serviceTiers: ['standard'],
+        media: {
+          images: { supported: true },
+          files: { supported: false },
+        },
+        caching: { supported: false },
+      });
+    }
+  });
+
+  it('advertises Haiku 4.5 and Haiku 5.5 native structured output support', () => {
+    for (const model of [
+      AxAIBedrockModel.ClaudeHaiku45,
+      AxAIBedrockModel.ClaudeHaiku55,
+    ]) {
+      expect(createAI(model).getFeatures(model)).toMatchObject({
+        structuredOutputs: true,
+        structuredOutputModes: ['native', 'function'],
+      });
+    }
+  });
+});
+
+describe('AxAIBedrock Converse request mapping', () => {
+  it('maps tools, native media, caching, thinking, and service tier', async () => {
+    const ai = createAI();
+    const image = Buffer.from('image-bytes').toString('base64');
+    const document = Buffer.from('document-bytes').toString('base64');
+    const [, request] = await getImpl(ai).createChatReq(
+      {
+        model: AxAIBedrockModel.ClaudeSonnet5,
+        modelConfig: { maxTokens: 8192, temperature: 0.4 },
+        chatPrompt: [
+          { role: 'system', content: 'Use the supplied evidence.' },
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: 'Inspect both attachments.' },
+              { type: 'image', image, mimeType: 'image/png' },
+              {
+                type: 'file',
+                data: document,
+                filename: 'notes.md',
+                mimeType: 'text/markdown',
+              },
+            ],
+          },
+          {
+            role: 'assistant',
+            thoughtBlocks: [
+              { data: 'signed reasoning', encrypted: false, signature: 'sig' },
+            ],
+            functionCalls: [
+              {
+                id: 'tool-1',
+                type: 'function',
+                function: { name: 'lookup', params: { id: 7 } },
+              },
+            ],
+          },
+          {
+            role: 'function',
+            functionId: 'tool-1',
+            result: '{"name":"Ax"}',
+          },
+        ],
+        functions: [
+          {
+            name: 'lookup',
+            description: 'Look up a record',
+            parameters: {
+              type: 'object',
+              properties: {
+                id: { type: 'number', description: 'Record ID' },
+              },
+              required: ['id'],
+            },
+          },
+        ],
+        functionCall: 'required',
+      },
+      {
+        contextCache: { ttlSeconds: 3600 },
+        thinkingTokenBudget: 'high',
+        showThoughts: true,
+        serviceTier: 'standard',
+      }
+    );
+
+    expect(request.modelId).toBe(AxAIBedrockModel.ClaudeSonnet5);
+    expect(request.inferenceConfig).toEqual({ maxTokens: 8192 });
+    expect(request.additionalModelRequestFields).toEqual({
+      thinking: { type: 'adaptive' },
+    });
+    expect(request.outputConfig).toEqual({ effort: 'high' });
+    expect(request.serviceTier).toEqual({ type: 'default' });
+    expect(request.system).toEqual([
+      { text: 'Use the supplied evidence.' },
+      { cachePoint: { type: 'default', ttl: '1h' } },
+    ]);
+    expect(request.toolConfig?.toolChoice).toEqual({ any: {} });
+    expect(request.toolConfig?.tools?.at(-1)).toEqual({
+      cachePoint: { type: 'default', ttl: '1h' },
+    });
+
+    const userContent = request.messages?.[0]?.content ?? [];
+    expect(userContent[0]).toEqual({ text: 'Inspect both attachments.' });
+    expect(Array.from(userContent[1].image?.source.bytes ?? [])).toEqual(
+      Array.from(Buffer.from('image-bytes'))
+    );
+    expect(userContent[2].document).toMatchObject({
+      format: 'md',
+      name: 'notes md',
+    });
+    expect(Array.from(userContent[2].document?.source.bytes ?? [])).toEqual(
+      Array.from(Buffer.from('document-bytes'))
+    );
+    expect(request.messages?.[1]?.content).toEqual([
+      {
+        reasoningContent: {
+          reasoningText: { text: 'signed reasoning', signature: 'sig' },
+        },
+      },
+      {
+        toolUse: { toolUseId: 'tool-1', name: 'lookup', input: { id: 7 } },
+      },
+    ]);
+    expect(request.messages?.[2]?.content).toEqual([
+      {
+        toolResult: {
+          toolUseId: 'tool-1',
+          content: [{ json: { name: 'Ax' } }],
+        },
+      },
+    ]);
+  });
+
+  it('maps native structured output and GPT service tiers without tools', async () => {
+    const ai = createAI(AxAIBedrockModel.GptOss120B);
+    const [, request] = await getImpl(ai).createChatReq(
+      {
+        model: AxAIBedrockModel.GptOss120B,
+        chatPrompt: [{ role: 'user', content: 'Return a count.' }],
+        functions: [
+          { name: 'ignored', description: 'Not native on this model' },
+        ],
+        responseFormat: {
+          type: 'json_schema',
+          schema: {
+            title: 'count_response',
+            type: 'object',
+            properties: { count: { type: 'number' } },
+            required: ['count'],
+          },
+        },
+      },
+      { serviceTier: 'flex' }
+    );
+
+    expect(request.toolConfig).toBeUndefined();
+    expect(request.serviceTier).toEqual({ type: 'flex' });
+    expect(request.outputConfig).toEqual({
+      textFormat: {
+        type: 'json_schema',
+        structure: {
+          jsonSchema: {
+            name: 'count_response',
+            schema: JSON.stringify({
+              title: 'count_response',
+              type: 'object',
+              properties: { count: { type: 'number' } },
+              required: ['count'],
+            }),
+          },
+        },
+      },
+    });
+  });
+
+  it('omits GPT-6 and Haiku 5.5 temperature/topP and maps thinking budgets', async () => {
+    const sent: ConverseRequest[] = [];
+    const chatWith = async (
+      model: AxAIBedrockModel,
+      options: Readonly<AxAIServiceOptions> = {},
+      modelConfig?: { temperature?: number; topP?: number }
+    ) => {
+      const ai = createAI(model);
+      // Capture the Converse request instead of calling AWS.
+      (getImpl(ai) as unknown as { getClient: () => unknown }).getClient =
+        () => ({
+          send: async (command: { input: ConverseRequest }) => {
+            sent.push(command.input);
+            return {
+              $metadata: {},
+              output: { message: { role: 'assistant', content: [] } },
+              stopReason: 'end_turn',
+            };
+          },
+        });
+      await ai.chat(
+        { chatPrompt: [{ role: 'user', content: 'ping' }], modelConfig },
+        { ...options, stream: false }
+      );
+    };
+
+    await chatWith(
+      AxAIBedrockModel.Gpt6Sol,
+      {},
+      { temperature: 0.3, topP: 0.9 }
+    );
+    await chatWith(AxAIBedrockModel.Gpt6Luna, { thinkingTokenBudget: 'none' });
+    await chatWith(AxAIBedrockModel.Gpt6Sol, {
+      thinkingTokenBudget: 'minimal',
+    });
+    await chatWith(AxAIBedrockModel.Gpt6Luna, {
+      thinkingTokenBudget: 'highest',
+    });
+    await chatWith(
+      AxAIBedrockModel.Gpt6Astra,
+      { thinkingTokenBudget: 'minimal' },
+      { temperature: 0.3 }
+    );
+    await chatWith(
+      AxAIBedrockModel.Gpt61Sol,
+      { thinkingTokenBudget: 'high' },
+      { temperature: 0.3, topP: 0.9 }
+    );
+    // Haiku 5.5 rejects temperature and top_p even with thinking disabled.
+    await chatWith(
+      AxAIBedrockModel.ClaudeHaiku55,
+      { thinkingTokenBudget: 'none' },
+      { temperature: 0.3, topP: 0.9 }
+    );
+    await chatWith(AxAIBedrockModel.GptOss120B);
+
+    expect(sent.map((r) => r.inferenceConfig)).toEqual([
+      { maxTokens: 4096 },
+      { maxTokens: 4096 },
+      { maxTokens: 4096 },
+      { maxTokens: 4096 },
+      { maxTokens: 4096 },
+      { maxTokens: 4096 },
+      { maxTokens: 4096 },
+      { maxTokens: 4096, temperature: 0 },
+    ]);
+    expect(sent.map((r) => r.additionalModelRequestFields)).toEqual([
+      undefined,
+      { reasoning: { effort: 'none' } },
+      { reasoning: { effort: 'low' } },
+      { reasoning: { effort: 'max' } },
+      { reasoning: { effort: 'low' } },
+      { reasoning: { effort: 'high' } },
+      { thinking: { type: 'disabled' } },
+      undefined,
+    ]);
+  });
+
+  it('rejects disabling GPT-6 Astra and GPT-6.1 Sol reasoning', async () => {
+    for (const model of [
+      AxAIBedrockModel.Gpt6Astra,
+      AxAIBedrockModel.Gpt61Sol,
+    ]) {
+      await expect(
+        getImpl(createAI(model)).createChatReq(
+          {
+            model,
+            chatPrompt: [{ role: 'user', content: 'Answer briefly.' }],
+          },
+          { thinkingTokenBudget: 'none' }
+        )
+      ).rejects.toThrow('Reasoning cannot be disabled');
+    }
+  });
+
+  it('rejects disabling Sonnet 5 adaptive thinking', async () => {
+    await expect(
+      getImpl(createAI()).createChatReq(
+        {
+          model: AxAIBedrockModel.ClaudeSonnet5,
+          chatPrompt: [{ role: 'user', content: 'Answer briefly.' }],
+        },
+        { thinkingTokenBudget: 'none' }
+      )
+    ).rejects.toThrow('Adaptive thinking cannot be disabled');
+  });
+
+  it('allows disabling Opus 5 and Haiku 5.5 adaptive thinking', async () => {
+    for (const model of [
+      AxAIBedrockModel.ClaudeOpus5,
+      AxAIBedrockModel.ClaudeHaiku55,
+    ]) {
+      const [, request] = await getImpl(createAI(model)).createChatReq(
+        {
+          model,
+          chatPrompt: [{ role: 'user', content: 'Answer briefly.' }],
+        },
+        { thinkingTokenBudget: 'none' }
+      );
+
+      expect(request.additionalModelRequestFields).toEqual({
+        thinking: { type: 'disabled' },
+      });
+    }
+  });
+
+  it('rejects disabling Opus 5.5 and Sonnet 5.5 adaptive thinking', async () => {
+    for (const model of [
+      AxAIBedrockModel.ClaudeOpus55,
+      AxAIBedrockModel.ClaudeSonnet55,
+    ]) {
+      await expect(
+        getImpl(createAI(model)).createChatReq(
+          {
+            model,
+            chatPrompt: [{ role: 'user', content: 'Answer briefly.' }],
+          },
+          { thinkingTokenBudget: 'none' }
+        )
+      ).rejects.toThrow('Adaptive thinking cannot be disabled');
+    }
+  });
+
+  it('keeps Opus 5.5 and Sonnet 5.5 structured output off forced tool choice', async () => {
+    for (const model of [
+      AxAIBedrockModel.ClaudeOpus55,
+      AxAIBedrockModel.ClaudeSonnet55,
+    ]) {
+      const ai = createAI(model);
+      expect(ai.getFeatures(model)).toMatchObject({
+        functions: true,
+        structuredOutputs: false,
+        structuredOutputModes: ['json_object'],
+      });
+
+      const [, request] = await getImpl(ai).createChatReq({
+        model,
+        chatPrompt: [{ role: 'user', content: 'Return JSON.' }],
+        responseFormat: { type: 'json_object' },
+        modelConfig: { temperature: 0.2, topP: 0.9 },
+      });
+
+      expect(request.toolConfig).toBeUndefined();
+      expect(request.outputConfig).toBeUndefined();
+      expect(request.inferenceConfig).toEqual({ maxTokens: 4096 });
+      expect(request.additionalModelRequestFields).toEqual({
+        thinking: { type: 'adaptive' },
+      });
+    }
+  });
+
+  it('rejects unsupported cache TTLs and service tiers', async () => {
+    const ai = createAI(AxAIBedrockModel.ClaudeSonnet4);
+    const request: BedrockChatRequest = {
+      model: AxAIBedrockModel.ClaudeSonnet4,
+      chatPrompt: [{ role: 'user', content: 'Hello' }],
+    };
+
+    await expect(
+      getImpl(ai).createChatReq(request, {
+        contextCache: { ttlSeconds: 3600 },
+      })
+    ).rejects.toThrow('Prompt-cache TTL 3600s is not supported');
+    await expect(
+      getImpl(ai).createChatReq(request, { serviceTier: 'priority' })
+    ).rejects.toThrow('Service tier priority is not supported');
+  });
+
+  it('adds a message checkpoint when context caching has no system or tools', async () => {
+    const [, request] = await getImpl(createAI()).createChatReq(
+      {
+        model: AxAIBedrockModel.ClaudeSonnet5,
+        chatPrompt: [{ role: 'user', content: 'Cache this prefix.' }],
+      },
+      { contextCache: { ttlSeconds: 300 } }
+    );
+
+    expect(request.messages?.[0]?.content).toEqual([
+      { text: 'Cache this prefix.' },
+      { cachePoint: { type: 'default', ttl: '5m' } },
+    ]);
+  });
+
+  it('counts a cached tool schema toward the four-checkpoint limit', async () => {
+    const ai = createAI();
+    await expect(
+      getImpl(ai).createChatReq({
+        model: AxAIBedrockModel.ClaudeSonnet5,
+        chatPrompt: [
+          { role: 'system', content: 'System', cache: true },
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: 'one', cache: true },
+              { type: 'text', text: 'two', cache: true },
+              { type: 'text', text: 'three', cache: true },
+            ],
+          },
+        ],
+        functions: [{ name: 'lookup', description: 'Lookup', cache: true }],
+      })
+    ).rejects.toThrow('at most four cache checkpoints');
+  });
+});
+
+describe('AxAIBedrock Converse response mapping', () => {
+  it('maps text, tool calls, reasoning, usage, and stop reason', () => {
+    const ai = createAI();
+    const response = getImpl(ai).createChatResp({
+      model: AxAIBedrockModel.ClaudeSonnet5,
+      showThoughts: true,
+      response: {
+        $metadata: { requestId: 'request-1' },
+        output: {
+          message: {
+            role: 'assistant',
+            content: [
+              {
+                reasoningContent: {
+                  reasoningText: { text: 'considering', signature: 'sig' },
+                },
+              },
+              { text: 'I need a record.' },
+              {
+                toolUse: {
+                  toolUseId: 'tool-1',
+                  name: 'lookup',
+                  input: { id: 7 },
+                },
+              },
+            ],
+          },
+        },
+        stopReason: 'tool_use',
+        usage: {
+          inputTokens: 10,
+          outputTokens: 4,
+          totalTokens: 14,
+          cacheReadInputTokens: 6,
+          cacheWriteInputTokens: 2,
+        },
+        serviceTier: { type: 'default' },
+      },
+    });
+
+    expect(response).toMatchObject({
+      remoteId: 'request-1',
+      remoteRequestId: 'request-1',
+      results: [
+        {
+          content: 'I need a record.',
+          thought: 'considering',
+          thoughtBlocks: [
+            { data: 'considering', encrypted: false, signature: 'sig' },
+          ],
+          functionCalls: [
+            {
+              id: 'tool-1',
+              type: 'function',
+              function: { name: 'lookup', params: { id: 7 } },
+            },
+          ],
+          finishReason: 'function_call',
+        },
+      ],
+    });
+  });
+
+  it('maps streaming text, tools, reasoning, usage, and finish events', () => {
+    const impl = getImpl(createAI());
+    const state = {};
+    const envelope = (event: ConverseStreamOutput) => ({
+      event,
+      model: AxAIBedrockModel.ClaudeSonnet5,
+      requestId: 'request-stream',
+      showThoughts: true,
+    });
+
+    expect(
+      impl.createChatStreamResp(
+        envelope({ messageStart: { role: 'assistant' } }),
+        state
+      ).results[0]
+    ).toMatchObject({ id: 'request-stream', content: '' });
+    expect(
+      impl.createChatStreamResp(
+        envelope({
+          contentBlockDelta: { contentBlockIndex: 0, delta: { text: 'Hi' } },
+        }),
+        state
+      ).results[0]
+    ).toMatchObject({ content: 'Hi' });
+    expect(
+      impl.createChatStreamResp(
+        envelope({
+          contentBlockStart: {
+            contentBlockIndex: 1,
+            start: { toolUse: { toolUseId: 'tool-1', name: 'lookup' } },
+          },
+        }),
+        state
+      ).results[0]?.functionCalls?.[0]
+    ).toMatchObject({ id: 'tool-1', function: { name: 'lookup', params: '' } });
+    expect(
+      impl.createChatStreamResp(
+        envelope({
+          contentBlockDelta: {
+            contentBlockIndex: 1,
+            delta: { toolUse: { input: '{"id":7}' } },
+          },
+        }),
+        state
+      ).results[0]?.functionCalls?.[0]
+    ).toMatchObject({ id: 'tool-1', function: { params: '{"id":7}' } });
+    expect(
+      impl.createChatStreamResp(
+        envelope({
+          contentBlockDelta: {
+            contentBlockIndex: 2,
+            delta: { reasoningContent: { text: 'thinking' } },
+          },
+        }),
+        state
+      ).results[0]
+    ).toMatchObject({
+      thought: 'thinking',
+      thoughtBlocks: [{ data: 'thinking', encrypted: false }],
+    });
+    expect(
+      impl.createChatStreamResp(
+        envelope({
+          metadata: {
+            usage: { inputTokens: 5, outputTokens: 3, totalTokens: 8 },
+            metrics: { latencyMs: 12 },
+            serviceTier: { type: 'priority' },
+          },
+        }),
+        state
+      ).results[0]
+    ).toMatchObject({ content: '' });
+    expect(
+      impl.createChatStreamResp(
+        envelope({ messageStop: { stopReason: 'end_turn' } }),
+        state
+      ).results[0]
+    ).toMatchObject({ content: '', finishReason: 'stop' });
   });
 });

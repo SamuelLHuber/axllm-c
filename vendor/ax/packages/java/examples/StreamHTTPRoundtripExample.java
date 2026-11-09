@@ -4,6 +4,10 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 // Drive a streaming stream() through the REAL HttpClient transport against an
 // in-process com.sun.net.httpserver loopback that returns a spec-legal
@@ -27,6 +31,15 @@ public final class StreamHTTPRoundtripExample {
     String sseRest = "data: " + event2;
     byte[] firstBytes = sseFirst.getBytes(StandardCharsets.UTF_8);
     byte[] restBytes = sseRest.getBytes(StandardCharsets.UTF_8);
+    // Both requests hold the rest of the body back and record whether the
+    // client got there first: the order proves incremental delivery and prompt
+    // cancellation, so a slow machine cannot fail either check. The 30 s
+    // bounds only run out when the client never gets there.
+    CountDownLatch releaseRest = new CountDownLatch(1);
+    CountDownLatch releaseCancelledRest = new CountDownLatch(1);
+    AtomicBoolean firstHoldExpired = new AtomicBoolean(false);
+    AtomicBoolean cancelHoldExpired = new AtomicBoolean(false);
+    AtomicInteger requests = new AtomicInteger();
 
     HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
     server.createContext(
@@ -37,7 +50,14 @@ public final class StreamHTTPRoundtripExample {
           exchange.sendResponseHeaders(200, firstBytes.length + restBytes.length);
           try (OutputStream os = exchange.getResponseBody()) {
             for (byte value : firstBytes) { os.write(value); os.flush(); }
-            try { Thread.sleep(300); } catch (InterruptedException error) { Thread.currentThread().interrupt(); }
+            boolean cancelled = requests.incrementAndGet() == 2;
+            AtomicBoolean expired = cancelled ? cancelHoldExpired : firstHoldExpired;
+            try {
+              if (!(cancelled ? releaseCancelledRest : releaseRest).await(30, TimeUnit.SECONDS)) expired.set(true);
+            } catch (InterruptedException error) {
+              Thread.currentThread().interrupt();
+              expired.set(true);
+            }
             os.write(restBytes);
             os.flush();
           }
@@ -50,17 +70,16 @@ public final class StreamHTTPRoundtripExample {
           new OpenAICompatibleClient(
               Map.of("api_key", "test-key", "base_url", "http://127.0.0.1:" + port, "model", "gpt-5.4-mini"));
       List<String> deltas = new ArrayList<>();
-      long started = System.nanoTime();
       try (AxChatStream stream = client.openStream(Map.of("chat_prompt", List.of(Map.of("role", "user", "content", "stream"))))) {
         Iterator<Map<String, Object>> iterator = stream.iterator();
         if (!iterator.hasNext()) throw new RuntimeException("stream ended before first event");
         Map<String, Object> firstEvent = iterator.next();
-        long ttft = System.nanoTime() - started;
+        releaseRest.countDown();
         List<Map<String, Object>> events = new ArrayList<>();
         events.add(firstEvent);
         iterator.forEachRemaining(events::add);
-        long completion = System.nanoTime() - started;
-        if (completion - ttft < 200_000_000L) throw new RuntimeException("first event was not incremental");
+        if (firstHoldExpired.get())
+          throw new RuntimeException("first event was not incremental: the client yielded it only after the server sent the rest of the body");
         for (Map<String, Object> event : events) {
         Object results = event.get("results");
         if (results instanceof List<?> list && !list.isEmpty() && list.get(0) instanceof Map<?, ?> first) {
@@ -73,7 +92,31 @@ public final class StreamHTTPRoundtripExample {
         throw new RuntimeException("multi-line data: event was not folded into one JSON value: " + deltas);
       if (!"Hello 🌍 world".equals(String.join("", deltas)))
         throw new RuntimeException("bad stream fold: " + deltas);
+
+      AxCancellationToken token = new AxCancellationToken();
+      try (AxChatStream cancelled = client.openStream(
+          Map.of("chat_prompt", List.of(Map.of("role", "user", "content", "cancel stream"))), token)) {
+        Iterator<Map<String, Object>> iterator = cancelled.iterator();
+        if (!iterator.hasNext()) throw new RuntimeException("cancel stream ended before first event");
+        iterator.next();
+        token.cancel("loopback stopped");
+        try {
+          iterator.hasNext();
+          throw new RuntimeException("cancelled stream did not raise an aborted error");
+        } catch (AxAIServiceAbortedError error) {
+          if (!"loopback stopped".equals(error.reason()) || error.retryable)
+            throw new RuntimeException("wrong cancellation error", error);
+        }
+        if (cancelHoldExpired.get())
+          throw new RuntimeException("cancelled stream did not return promptly: it waited for the server to end the body");
+        if (token.subscriptionCount() != 0)
+          throw new RuntimeException("cancelled stream retained a body-close subscription");
+      } finally {
+        releaseCancelledRest.countDown();
+      }
     } finally {
+      releaseRest.countDown();
+      releaseCancelledRest.countDown();
       server.stop(0);
     }
     System.out.println("stream-http-roundtrip-ok");

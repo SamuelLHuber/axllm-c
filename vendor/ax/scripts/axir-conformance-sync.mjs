@@ -68,17 +68,42 @@ function flagValue(flags, key, fallback = undefined) {
 // stay stable regardless of producer key order.
 const STABLE_ORDER_PRESERVING_KEYS = new Set(['sections']);
 
-function stable(value, parentKey = '') {
-  if (Array.isArray(value)) return value.map((item) => stable(item, parentKey));
+// Keys whose whole subtree keeps its key order: validator cases compare
+// schemas and arguments as written, and string-format cases write objects as
+// JSON in their key order.
+const ORDER_PRESERVING_SUBTREES = new Set([
+  // Decisions question order and description instruction order follow the input schema.
+  'request',
+  'validation_cases',
+  'format_cases',
+  'str_cases',
+]);
+
+function stable(
+  value,
+  parentKey = '',
+  preserveOrder = false,
+  inSignature = false
+) {
+  const keepOrder = preserveOrder || ORDER_PRESERVING_SUBTREES.has(parentKey);
+  const signature = inSignature || parentKey === 'signature_spec';
+  const fieldOrder =
+    signature && ['inputs', 'outputs', 'fields'].includes(parentKey);
+  if (Array.isArray(value))
+    return value.map((item) => stable(item, parentKey, keepOrder, signature));
   if (value && typeof value === 'object') {
     const entries = Object.entries(value).filter(
       ([, item]) => item !== undefined
     );
-    const ordered = STABLE_ORDER_PRESERVING_KEYS.has(parentKey)
-      ? entries
-      : entries.sort(([a], [b]) => a.localeCompare(b));
+    const ordered =
+      keepOrder || fieldOrder || STABLE_ORDER_PRESERVING_KEYS.has(parentKey)
+        ? entries
+        : entries.sort(([a], [b]) => a.localeCompare(b));
     return Object.fromEntries(
-      ordered.map(([key, item]) => [key, stable(item, key)])
+      ordered.map(([key, item]) => [
+        key,
+        stable(item, key, keepOrder, signature),
+      ])
     );
   }
   return value;
@@ -89,22 +114,61 @@ export function normalizeCatalog(catalog) {
 }
 
 export async function buildTypeScriptCatalog() {
-  const catalogModule = await import('../src/ax/ai/catalog.ts');
-  const { axGetSupportedAIModels } = catalogModule;
+  const { getPortableAIModels: axGetSupportedAIModels } = await import(
+    '../tools/axir/extractors/portable-ai-catalog.ts'
+  );
   return normalizeCatalog({
     all: axGetSupportedAIModels(),
     text: axGetSupportedAIModels({ type: 'text' }),
     embeddings: axGetSupportedAIModels({ type: 'embeddings' }),
     code: axGetSupportedAIModels({ type: 'code' }),
     audio: axGetSupportedAIModels({ type: 'audio' }),
+    image: axGetSupportedAIModels({ type: 'image' }),
   });
 }
 
 const providerDataFiles = {
   catalog: 'provider-model-catalog.json',
+  modelIndex: 'provider-model-index.json',
   registry: 'provider-profile-registry.json',
   summary: 'provider-model-catalog-summary.json',
 };
+
+const samplingSupportFlags = [
+  'samplingWithoutReasoning',
+  'reasoningOffByDefault',
+  'temperatureOne',
+];
+
+// The per-provider model names, aliases, isExpensive flags, notSupported
+// sampling parameters and the supported flags that qualify them
+// (samplingWithoutReasoning, reasoningOffByDefault, temperatureOne) from the
+// catalog, in catalog order. The chat path reads this small index on every request (the
+// expensive-model gate and the sampling filter), so it doesn't parse the full
+// catalog.
+export function buildProviderModelIndex(catalog) {
+  const index = {};
+  for (const provider of catalog.all ?? []) {
+    index[provider.name] = (provider.models ?? []).map((model) => {
+      const notSupported = Object.fromEntries(
+        Object.entries(model.notSupported ?? {}).filter(([, value]) => value)
+      );
+      const supported = Object.fromEntries(
+        samplingSupportFlags
+          .filter((flag) => model.supported?.[flag] === true)
+          .map((flag) => [flag, true])
+      );
+      return {
+        name: model.name,
+        ...(model.aliases?.length ? { aliases: model.aliases } : {}),
+        ...(model.isExpensive ? { isExpensive: true } : {}),
+        ...(Object.keys(notSupported).length > 0 ? { notSupported } : {}),
+        ...(Object.keys(supported).length > 0 ? { supported } : {}),
+      };
+    });
+  }
+  return normalizeCatalog(index);
+}
 
 export function providerDataPath(repoRoot, kind) {
   const file = providerDataFiles[kind];
@@ -125,6 +189,71 @@ export function writeProviderDataJson(repoRoot, kind, value) {
     providerDataPath(repoRoot, kind),
     JSON.stringify(normalizeCatalog(value))
   );
+}
+
+// The date data files tools/axir/extractors/date-goldens.ts writes. The
+// abbreviation tables are copied from TypeScript source and always compared.
+// The zone-name table is a snapshot of what V8/ICU accepts on the Node that
+// wrote it (with that machine's tz database names as candidates), so it is
+// compared, and rewritten, only on a Node and machine that match the source
+// it records; anywhere else the check says it skipped.
+const dateDataFiles = ['date-zone-abbreviations.json', 'date-time-zones.json'];
+const zoneTableFile = 'date-time-zones.json';
+
+export function sameZoneTableSource(left, right) {
+  const a = left?.source ?? {};
+  const b = right?.source ?? {};
+  return (
+    a.icu === b.icu &&
+    a.tz === b.tz &&
+    a.tzdata_candidates === b.tzdata_candidates
+  );
+}
+
+function readJsonIfExists(file) {
+  return existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : undefined;
+}
+
+export function compareDateData(repoRoot, generatedRoot, write) {
+  const failures = [];
+  for (const name of dateDataFiles) {
+    const generatedPath = path.join(
+      generatedRoot,
+      'ir',
+      'axcore',
+      'data',
+      name
+    );
+    const repoPath = path.join(repoRoot, 'ir', 'axcore', 'data', name);
+    const generated = readJsonIfExists(generatedPath);
+    if (generated === undefined) {
+      failures.push(`date-goldens did not write ir/axcore/data/${name}`);
+      continue;
+    }
+    const current = readJsonIfExists(repoPath);
+    if (
+      name === zoneTableFile &&
+      current !== undefined &&
+      !sameZoneTableSource(current, generated)
+    ) {
+      const source = (table) =>
+        `ICU ${table.source?.icu} tz ${table.source?.tz} tzdata ${table.source?.tzdata_candidates}`;
+      console.log(
+        `skipped ir/axcore/data/${name}: it was written on ${source(current)}, this run has ${source(generated)}`
+      );
+      continue;
+    }
+    const same =
+      current !== undefined &&
+      JSON.stringify(current) === JSON.stringify(generated);
+    if (same) continue;
+    if (write) {
+      writeFileSync(repoPath, readFileSync(generatedPath, 'utf8'));
+    } else {
+      failures.push(`stale data ir/axcore/data/${name}`);
+    }
+  }
+  return failures;
 }
 
 export function compareValues(actual, expected, label = '$') {
@@ -294,9 +423,11 @@ async function checkProviderCatalog(repoRoot, generatedRoot, write) {
     generatedRoot,
     'model-catalog-audit'
   );
+  const tsModelIndex = buildProviderModelIndex(tsCatalog);
   if (write) {
     writeProviderDataJson(repoRoot, 'summary', tsCatalogSummary);
     writeProviderDataJson(repoRoot, 'catalog', tsCatalog);
+    writeProviderDataJson(repoRoot, 'modelIndex', tsModelIndex);
     const axirProfileRegistry = readProviderDataJson(repoRoot, 'registry');
     return compareValues(
       axirProfileRegistry,
@@ -308,6 +439,7 @@ async function checkProviderCatalog(repoRoot, generatedRoot, write) {
     );
   }
   const axirCatalog = readProviderDataJson(repoRoot, 'catalog');
+  const axirModelIndex = readProviderDataJson(repoRoot, 'modelIndex');
   const axirProfileRegistry = readProviderDataJson(repoRoot, 'registry');
   const axirCatalogSummary = readProviderDataJson(repoRoot, 'summary');
   return [
@@ -316,6 +448,9 @@ async function checkProviderCatalog(repoRoot, generatedRoot, write) {
       tsCatalog,
       'provider_model_catalog_registry'
     ).map((diff) => `AxIR provider catalog drift: ${diff}`),
+    ...compareValues(axirModelIndex, tsModelIndex, 'provider_model_index').map(
+      (diff) => `AxIR provider model index drift: ${diff}`
+    ),
     ...compareValues(
       axirProfileRegistry,
       tsProfileRegistry,
@@ -336,10 +471,83 @@ async function runSync({ repoRoot, write }) {
     runConformanceExtractor(
       repoRoot,
       tempRoot,
+      'box-goldens.ts',
+      'Jev images and Box'
+    );
+    runConformanceExtractor(
+      repoRoot,
+      tempRoot,
+      'decisions-goldens.ts',
+      'OpenAI Decisions'
+    );
+    runConformanceExtractor(
+      repoRoot,
+      tempRoot,
+      'signature-goldens.ts',
+      'AxSignature'
+    );
+    runConformanceExtractor(
+      repoRoot,
+      tempRoot,
+      'prompt-goldens.ts',
+      'AxPrompt'
+    );
+    runConformanceExtractor(
+      repoRoot,
+      tempRoot,
       'schema-validation-goldens.ts',
       'AxSchema'
     );
     runConformanceExtractor(repoRoot, tempRoot, 'axgen-goldens.ts', 'AxGen');
+    runConformanceExtractor(
+      repoRoot,
+      tempRoot,
+      'axgen-streaming-goldens.ts',
+      'AxGen streaming'
+    );
+    runConformanceExtractor(
+      repoRoot,
+      tempRoot,
+      'axgen-audio-goldens.ts',
+      'AxGen audio'
+    );
+    runConformanceExtractor(
+      repoRoot,
+      tempRoot,
+      'date-goldens.ts',
+      'AxGen dates'
+    );
+    runConformanceExtractor(
+      repoRoot,
+      tempRoot,
+      'axgen-cache-goldens.ts',
+      'AxGen cache'
+    );
+    runConformanceExtractor(repoRoot, tempRoot, 'flow-goldens.ts', 'AxFlow');
+    runConformanceExtractor(
+      repoRoot,
+      tempRoot,
+      'flow-cache-goldens.ts',
+      'AxFlow cache'
+    );
+    runConformanceExtractor(
+      repoRoot,
+      tempRoot,
+      'mcp-authorization-goldens.ts',
+      'AxMCP'
+    );
+    runConformanceExtractor(
+      repoRoot,
+      tempRoot,
+      'mcp-inheritance-goldens.ts',
+      'AxMCP'
+    );
+    runConformanceExtractor(
+      repoRoot,
+      tempRoot,
+      'mcp-task-handling-goldens.ts',
+      'AxMCP'
+    );
     runConformanceExtractor(
       repoRoot,
       tempRoot,
@@ -349,13 +557,26 @@ async function runSync({ repoRoot, write }) {
     runConformanceExtractor(repoRoot, tempRoot, 'agent-goldens.ts', 'AxAgent', {
       AXIR_AGENT_PARITY_ONLY: '1',
     });
+    runConformanceExtractor(
+      repoRoot,
+      tempRoot,
+      'agent-streaming-goldens.ts',
+      'AxAgent streaming'
+    );
     const failures = [
       ...compareGeneratedFixtures(repoRoot, tempRoot, 'axai', write),
+      ...compareGeneratedFixtures(repoRoot, tempRoot, 'signature', write),
+      ...compareGeneratedFixtures(repoRoot, tempRoot, 'prompt', write),
       ...compareGeneratedFixtures(repoRoot, tempRoot, 'schema', write),
       ...compareGeneratedFixtures(repoRoot, tempRoot, 'validation', write),
       ...compareGeneratedFixtures(repoRoot, tempRoot, 'axgen', write),
+      ...compareGeneratedFixtures(repoRoot, tempRoot, 'axflow', write),
+      ...compareGeneratedFixtures(repoRoot, tempRoot, 'axprogram', write),
+      ...compareGeneratedFixtures(repoRoot, tempRoot, 'axmcp', write),
       ...compareGeneratedFixtures(repoRoot, tempRoot, 'axoptimize', write),
       ...compareGeneratedFixtures(repoRoot, tempRoot, 'axagent', write),
+      ...compareGeneratedFixtures(repoRoot, tempRoot, 'axagent-real', write),
+      ...compareDateData(repoRoot, tempRoot, write),
       ...(await checkProviderCatalog(repoRoot, tempRoot, write)),
     ];
     if (failures.length > 0) {

@@ -1,7 +1,7 @@
 ---
 name: "ax-python-agent-memory-skills"
 description: "Use when writing Python code with `axllm` for agent memory, recall callbacks, dynamic skill discovery, loaded-skill state, and used-skill tracking."
-version: "24.0.15"
+version: "25.4.9"
 ---
 # AxAgent Memory And Skills For Python
 
@@ -43,6 +43,7 @@ out = helper.forward(llm, {"question": "How should I proceed?"})
 - `onSkillsSearch` / `onMemoriesSearch` take precedence over static catalogs. Without a host callback, `skillsCatalog` / `memoriesCatalog` use the built-in deterministic lexical ranker.
 - `onLoadedMemories` / `onLoadedSkills` observe runtime recall and discovery, not constructor presets. `onUsedMemories` / `onUsedSkills` emit one consolidated notification per forward. Forward observers override constructor observers, and observer errors are ignored.
 - `relevanceRanking` produces advisory skill and memory hints using the same tokenization, weighting, tie suppression, limits, snippets, and already-loaded exclusion as TypeScript.
+- `contextMap` is TypeScript's context map: the distiller reads its text (TypeScript's section template when it has none), and after each completed run the context-map Distiller and Cartographer programs update it in place. Since 25.0.0 the text and item ids follow TypeScript's format (`[rr-00002]`, a blank line before each section, a trailing newline); a map saved by a 24.x port loads with its items and is normalized by its next update.
 - `get_state()` and `set_state(...)` preserve the legacy bare-runtime snapshot shape. Use `export_runtime_state()` and `restore_runtime_state(...)` for the complete portable agent snapshot, including loaded skills and constructor-preset reapplication. Do not interchange the two shapes.
 
 ## Runnable Examples
@@ -53,7 +54,7 @@ out = helper.forward(llm, {"question": "How should I proceed?"})
 
 ## Relevant API Surface
 
-- Agents And RLM: `agent`, `AxAgent`
+- Agents And RLM: `agent`, `AxAgent`, `AxAgent.add_child_agent`, `AxAgent.streaming_forward`
 - Runtime Profiles: `ProcessCodeRuntime`, `RuntimeCapabilities`, `RuntimeEnvelope`, `javascript-quickjs`, `python-pyodide`
 
 ## Guardrails

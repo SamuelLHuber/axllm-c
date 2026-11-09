@@ -1,7 +1,7 @@
 ---
 name: ax-signature
 description: This skill helps an LLM generate correct DSPy signature code using @ax-llm/ax. Use when the user asks about signatures, s(), f(), field types, string syntax, fluent builder API, validation constraints, or type-safe inputs/outputs.
-version: "24.0.14"
+version: "25.4.9"
 ---
 
 # Ax Signature Reference
@@ -24,14 +24,16 @@ version: "24.0.14"
 | DateTime | `:datetime` | `Date` | `timestamp:datetime` |
 | DateRange | `:dateRange` | `{ start: Date; end: Date }` | `travelDates:dateRange` |
 | DateTimeRange | `:datetimeRange` | `{ start: Date; end: Date }` | `meetingWindow:datetimeRange` |
-| Image | `:image` | `{mimeType, data}` | `photo:image` (input only) |
+| Image | `:image` | `{mimeType, data, details?}` | `photo:image` (input only) |
 | Audio | `:audio` | input: `AxAudioInput`; output: `AxChatAudioOutput` | `recording:audio`, `speech:audio` |
-| File | `:file` | `{mimeType, data}` | `document:file` (input only) |
+| File | `:file` | `{mimeType, data \| fileUri, filename?}` | `document:file` (input only) |
 | URL | `:url` | `string` | `website:url` |
 | Code | `:code` | `string` | `pythonScript:code` |
 | Class | `:class "a, b, c"` | `"a" \| "b" \| "c"` | `mood:class "happy, sad"` |
 
-Date, datetime, and range fields are AI-friendly but strict. They accept ISO-style values, trim minor whitespace/casing issues, and parse ranges as `{ "start": "...", "end": "..." }`, `[start, end]`, `start/end`, or natural delimiters like `start to end`; invalid values and reversed ranges should fail validation rather than being silently autocorrected.
+Media inputs carry the optional keys their chat part declares to the provider or router: an image's `details` (`'high'`, `'low'`, or `'auto'`; OpenAI's image `detail`), `cache`, `optimize`, and `altText`; a file's `filename` (OpenAI rejects inline file data without one), `cache`, and `extractedText`; a url's `cachedContent` and `cache`; and an audio input's `mimeType`, `sampleRate`, `channels`, `cache`, `transcription`, and `duration`. Other keys stay behind.
+
+Date, datetime, and range fields are AI-friendly but strict. They accept ISO-style values, trim minor whitespace/casing issues, and parse ranges as `{ "start": "...", "end": "..." }`, `[start, end]`, `start/end`, or natural delimiters like `start to end`; invalid values and reversed ranges should fail validation rather than being silently autocorrected. A datetime's zone can be `Z`, an offset, `UTC`/`GMT`, an IANA name (`2024-05-09 14:30 America/New_York`), or an abbreviation read at its literal offset all year (`PST` is -08:00 even in July, `EDT` is -04:00); ambiguous abbreviations (`BST`, `IST`, `CST`, `AST`, `SST`, `NST`, `ECT`, `GST`) and ICU's legacy short IDs are rejected with a correction that asks for an IANA name or an offset. `PST`/`PDT` and `CDT` follow US usage; for Philippine time (`PST`) or Cuban daylight time (`CDT`), give an IANA name (`Asia/Manila`, `America/Havana`) or a UTC offset. A wall time inside a DST gap is invalid, and one in an overlap takes the earlier instant.
 
 ## Arrays, Optional, and Internal Fields
 
@@ -62,6 +64,63 @@ objects declare structured fields inline.
 | `cache` | top-level input | Prefix-cache breakpoint |
 | `item "desc"` | arrays | Per-item description: `tags:string(item "a tag")[]` |
 | `<language>` | `code` | Language of the snippet: `snippet:code(python)` |
+| `true "desc"` / `false "desc"` | `boolean` | Explain when each outcome applies |
+
+## Descriptions for Boolean and Class Values (TypeScript)
+
+Describe individual outcomes without changing a field's type or allowed values:
+
+```typescript
+const triage = ax(`
+  ticket:string ->
+  urgent:boolean(
+    true "Customers cannot complete a core task",
+    false "A routine request or minor inconvenience"
+  ) "Does this need immediate attention?",
+  team:class "support, billing, engineering"(
+    support "Product usage questions",
+    billing "Invoice or charge disputes",
+    engineering "Broken functionality"
+  ) "Which team should investigate?"
+`);
+```
+
+Boolean descriptions use the existing modifier bag after `boolean`. Class
+descriptions follow the quoted list of allowed labels. Quote labels containing
+spaces or punctuation, for example `class "in progress, done"("in progress"
+"Work has started", done "Work is complete")`. Descriptions may be partial;
+duplicate keys, unknown labels, and empty descriptions are errors.
+
+The fluent equivalent uses `.describeValues(...)`:
+
+```typescript
+f.boolean('Does this need immediate attention?').describeValues({
+  true: 'Customers cannot complete a core task',
+  false: 'A routine request or minor inconvenience',
+});
+f.class(['support', 'billing'], 'Which team?').describeValues({
+  support: 'Product usage questions',
+  billing: 'Invoice or charge disputes',
+});
+```
+
+OpenAI and other conventional providers receive the question followed by
+`value: description` lines in the ordinary prompt and, when used, the JSON
+schema description. Typesafe receives separate Noul/Choice criteria. The
+original annotations remain separate in the signature and survive `toString()`
+round-trips. Rendering does not mutate the signature or duplicate descriptions.
+Boolean and class return types, optional/array behavior, and allowed values stay
+unchanged. Descriptions are guidance, not additional output validation. Number
+bounds still describe validation constraints; use an explicit `score` field for an ordered rubric.
+The same descriptions, validation, serialization, schemas, and prompt semantics
+are generated for Python, Java, C++, Go, and Rust.
+
+For Jev, use these descriptions for boolean/class criteria. Add `.withEvidence()`
+to retain probabilities in AxGen and use `f.score(levels)` for ordered rubrics.
+Full structured criteria use the separate native client; see the [ax-typesafe skill](https://github.com/ax-llm/ax/blob/main/src/ax/skills/ax-typesafe.md).
+The adapter's `trueThreshold` is provider-wide conversion policy, not a field modifier.
+
+### Existing modifier rules
 
 - `object{ field:type, opt?:type }` nests recursively; append `[]` for an array of objects.
 - Optional goes on the **name** (`userAge?:number`), never after the type.
@@ -69,6 +128,7 @@ objects declare structured fields inline.
 - Inside `object{ ... }`, the `!` internal marker, media types, `cache`, and `item` are rejected (they only apply at the top level).
 - In quoted values, backslashes are doubled — a regex `\d` is written `pattern "\\d+"`.
 - `AxSignature.toString()` renders every construct back to this grammar losslessly, so a signature round-trips — this is what lets a whole flow serialize its node contracts into mermaid `%%ax` directives (see the ax-flow skill).
+- Signature-level descriptions preserve quotes and backslashes through `toString()` and reparsing. Fluent `.description(...)` accepts ordinary text; string signatures escape embedded quotes and backslashes inside their quoted description.
 
 ## Signature Gallery
 
@@ -270,7 +330,7 @@ const searchDocs = fn('searchDocs')
   .arg('query', z.string().min(1), { cache: true })
   .arg('limit', z.number().int().positive().optional())
   .returnsField('results', z.array(z.string()))
-  .handler(async ({ query }) => [])
+  .handler(async ({ query }) => ({ results: [] }))
   .build();
 ```
 
@@ -320,7 +380,7 @@ f.string('email').email()
 f.string('website').url()
 f.string('birthDate').date()
 f.string('timestamp').datetime()
-f.string('pattern').regex('^[A-Z0-9]')
+f.string('pattern').regex('^[A-Z0-9]', 'Must start with an uppercase letter or digit')
 ```
 
 ### Number Constraints
@@ -419,3 +479,29 @@ Fetch these for full working code:
 - [Fluent Signature](https://raw.githubusercontent.com/ax-llm/ax/refs/heads/main/src/examples/fluent-signature-example.ts) — native fluent f() API
 - [Structured Output](https://raw.githubusercontent.com/ax-llm/ax/refs/heads/main/src/examples/structured_output.ts) — structured output with validation
 - [Debug Schema](https://raw.githubusercontent.com/ax-llm/ax/refs/heads/main/src/examples/debug_schema.ts) — JSON schema validation
+
+## Evidence fields
+
+Boolean and class fields can opt in with `.withEvidence()` or `(evidence)`.
+A rubric `score "Low, Medium, High"` returns a continuous zero-based index;
+add `(evidence)` to keep ordered probabilities and provenance. Boolean
+`threshold 0.7` applies locally to evidence fields only. `refusal return` adds
+a tagged answered/refused union. See [decision evidence](references/ax-typesafe.md#decision-evidence-and-reranking).
+
+## Bounding boxes (TypeScript)
+
+`photo:image -> target:box` returns `AxBox`: normalized `top`, `bottom`, `left`,
+and `right` coordinates in `[0, 1]`, measured from the image top-left. Ax validates
+`top < bottom` and `left < right`. `target:box(evidence)` returns `AxBoxEvidence`:
+`{ value: AxBox, confidence?: number, provenance }`. Use `f.box()` or
+`f.box().withEvidence()` in fluent signatures. Arrays, optional boxes, nested
+boxes, and box inputs work with generative providers. Native Jev outputs must be
+flat, required, single boxes.
+
+Jev 1.14 supports native localization using PNG/JPEG image inputs. Ax supplies its
+required experimental image header. A Box does not indicate presence; pair it
+with a boolean when the target might be absent. Generative vision models use
+validated structured output with elicited provenance and no native confidence.
+OpenAI Decisions supports images but rejects Box outputs. See `ax-typesafe.md`
+for transport details, image preparation limits, and model selection. Generated
+language Box support remains tracked in the AxIR backlog.

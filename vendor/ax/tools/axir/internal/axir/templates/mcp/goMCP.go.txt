@@ -16,7 +16,9 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+ "github.com/coder/websocket"
 )
 
 const AX_MCP_PROTOCOL_VERSION = "2025-11-25"
@@ -84,6 +86,7 @@ type AxMCPClient struct {
 	transport AxMCPTransport
 	options map[string]Value
 	serverCapabilities map[string]Value
+	serverInfoMu sync.RWMutex
 	serverInfo map[string]Value
 	serverInstructions string
 	negotiatedProtocolVersion string
@@ -101,11 +104,29 @@ type AxMCPClient struct {
 	subscriptionMu sync.Mutex
 	activeSubscriptionID string
 	subscriptionReady chan struct{}
-	nextID int
+	nextID atomic.Int64
 	notificationListeners map[int]func(map[string]Value)
 	lifecycleListeners map[int]func(string)
 	nextListenerID int
 	initialized bool
+	// Latest snapshot of each task this client has seen, by task id.
+	taskMu sync.Mutex
+	tasks map[string]map[string]Value
+}
+
+// AxMCPToolCallOptions tunes CallToolWithOptions, as TypeScript's callTool
+// options. TaskHandling "await" (the default, also "") waits for a modern
+// server's task; "expose" returns its flattened CreateTaskResult instead.
+type AxMCPToolCallOptions struct{ TaskHandling string }
+
+// AxMCPToolCallOutcome is what CallToolOutcome returns, as TypeScript's
+// AxMCPToolCallOutcome: Kind "complete" with Result, or Kind "task" with Task,
+// a modern server's CreateTaskResult. A legacy server's task-shaped result is
+// a complete Result.
+type AxMCPToolCallOutcome struct {
+	Kind   string
+	Result map[string]Value
+	Task   map[string]Value
 }
 
 type AxMCPElicitationHandler func(params, context map[string]Value) (map[string]Value, error)
@@ -124,7 +145,7 @@ var axMCPEraCache = struct{sync.Mutex; values map[string]string}{values:map[stri
 
 func NewAxMCPClient(transport AxMCPTransport, options map[string]Value) *AxMCPClient {
 	if options == nil { options = map[string]Value{} }
-	c := &AxMCPClient{transport: transport, options: options, nextID: 1, notificationListeners:map[int]func(map[string]Value){}, lifecycleListeners:map[int]func(string){}, nextListenerID:1,subscriptionOwners:map[string]map[string]bool{},catalogCache:map[string]map[string]Value{},resourceReadCache:map[string]map[string]Value{}}
+	c := &AxMCPClient{transport: transport, options: options, notificationListeners:map[int]func(map[string]Value){}, lifecycleListeners:map[int]func(string){}, nextListenerID:1,subscriptionOwners:map[string]map[string]bool{},catalogCache:map[string]map[string]Value{},resourceReadCache:map[string]map[string]Value{}}
 	transport.SetMessageHandler(c.handleInboundMessage)
 	if requestTransport,ok:=transport.(axMCPRequestHandlerTransport);ok{requestTransport.SetRequestHandler(c.handleServerRequest)}
 	transport.SetLifecycleHandler(c.EmitLifecycle)
@@ -160,7 +181,7 @@ func (c *AxMCPClient) initializeLegacy() error {
 	c.negotiatedProtocolVersion = negotiated
 	c.transport.SetProtocolVersion(negotiated)
 	c.serverCapabilities = asMap(coreGet(result, "capabilities", Object()))
-	c.serverInfo = asMap(coreGet(result, "serverInfo", Object()))
+	c.setServerInfo(asMap(coreGet(result, "serverInfo", Object())))
 	c.serverInstructions = display(coreGet(result, "instructions", ""))
 	c.negotiateExtensions()
 	_ = c.Notify("notifications/initialized", nil)
@@ -171,7 +192,7 @@ func (c *AxMCPClient) initializeLegacy() error {
 func(c *AxMCPClient)applyEra(era string){c.era=era;c.transport.SetEra(era);if era=="modern"{c.negotiatedProtocolVersion="2026-07-28";c.transport.SetProtocolVersion("2026-07-28")}else{c.negotiatedProtocolVersion=""}}
 func(c *AxMCPClient)rememberEra(era string){key:=c.transport.EraCacheKey();if key==""{return};axMCPEraCache.Lock();axMCPEraCache.values[key]=era;axMCPEraCache.Unlock();switch store:=c.options["eraStore"].(type){case map[string]string:store[key]=era;case map[string]Value:store[key]=era}}
 func(c *AxMCPClient)requestDiscovery()(map[string]Value,error){return c.request("server/discover",map[string]Value{})}
-func(c *AxMCPClient)applyDiscovery(result map[string]Value)error{classified:=asMap(mustCore(mcp_classify_discovery_result(result)));if !coreTruthy(classified["valid"]){return AxError{Category:"mcp",Message:"Invalid MCP server/discover result"}};c.discoverResult=cloneMCPMap(result);c.serverCapabilities=cloneMCPMap(asMap(classified["capabilities"]));c.serverInstructions=display(coreGet(result,"instructions",""));if info:=asMap(classified["serverInfo"]);len(info)>0{c.serverInfo=cloneMCPMap(info)};c.negotiateExtensions();return nil}
+func(c *AxMCPClient)applyDiscovery(result map[string]Value)error{classified:=asMap(mustCore(mcp_classify_discovery_result(result)));if !coreTruthy(classified["valid"]){return AxError{Category:"mcp",Message:"Invalid MCP server/discover result"}};c.discoverResult=cloneMCPMap(result);c.serverCapabilities=cloneMCPMap(asMap(classified["capabilities"]));c.serverInstructions=display(coreGet(result,"instructions",""));if info:=asMap(classified["serverInfo"]);len(info)>0{c.setServerInfo(info)};c.negotiateExtensions();return nil}
 func(c *AxMCPClient)negotiateExtensions(){client:=asMap(coreGet(c.clientCapabilities(),"extensions",Object()));server:=asMap(coreGet(c.serverCapabilities,"extensions",Object()));c.negotiatedExtensions=asMap(mustCore(mcp_negotiate_extensions(client,server)))}
 func(c *AxMCPClient)GetEra()string{return c.era}
 func(c *AxMCPClient)Discover()(map[string]Value,error){if err:=c.Init();err!=nil{return nil,err};if c.era!="modern"{return nil,fmt.Errorf("server/discover is only available for modern MCP")};result,err:=c.requestDiscovery();if err!=nil{return nil,err};if err=c.applyDiscovery(result);err!=nil{return nil,err};return cloneMCPMap(result),nil}
@@ -198,11 +219,11 @@ func (c *AxMCPClient) RefreshWithOptions(force bool) error {
 	return nil
 }
 
-func (c *AxMCPClient) collectCatalog(method,field string)([]map[string]Value,error){out:=[]map[string]Value{};pages:=[]Value{};cursor:="";seen:=map[string]bool{};maxPages:=1000;if value,ok:=c.options["maxPaginationPages"].(int);ok{maxPages=value};for page:=0;page<maxPages;page++{result,err:=c.request(method,cursorParams(cursor));if err!=nil{return nil,err};pages=append(pages,result);for _,item:=range asSlice(coreGet(result,field,Array())){out=append(out,cloneMCPMap(asMap(item)))};cursor=display(coreGet(result,"nextCursor",""));if cursor==""{if name:=map[string]string{"tools/list":"tools","prompts/list":"prompts","resources/list":"resources","resources/templates/list":"resourceTemplates"}[method];name!=""{c.catalogCache[name]=asMap(mustCore(mcp_fold_cache_info(pages,time.Now().UnixMilli())))};return out,nil};if seen[cursor]{return nil,fmt.Errorf("MCP %s repeated pagination cursor %s",method,cursor)};seen[cursor]=true};return nil,fmt.Errorf("MCP %s exceeded %d pagination pages",method,maxPages)}
+func (c *AxMCPClient) collectCatalog(method,field string,contexts ...context.Context)([]map[string]Value,error){out:=[]map[string]Value{};pages:=[]Value{};cursor:="";seen:=map[string]bool{};maxPages:=1000;if value,ok:=c.options["maxPaginationPages"].(int);ok{maxPages=value};for page:=0;page<maxPages;page++{result,err:=c.requestWithHeaders(method,cursorParams(cursor),nil,true,mcpCallContext(contexts));if err!=nil{return nil,err};pages=append(pages,result);for _,item:=range asSlice(coreGet(result,field,Array())){out=append(out,cloneMCPMap(asMap(item)))};cursor=display(coreGet(result,"nextCursor",""));if cursor==""{if name:=map[string]string{"tools/list":"tools","prompts/list":"prompts","resources/list":"resources","resources/templates/list":"resourceTemplates"}[method];name!=""{c.catalogCache[name]=asMap(mustCore(mcp_fold_cache_info(pages,time.Now().UnixMilli())))};return out,nil};if seen[cursor]{return nil,fmt.Errorf("MCP %s repeated pagination cursor %s",method,cursor)};seen[cursor]=true};return nil,fmt.Errorf("MCP %s exceeded %d pagination pages",method,maxPages)}
 func(c *AxMCPClient)catalogCacheFresh(name string)bool{return coreTruthy(mustCore(mcp_cache_freshness(c.catalogCache[name],time.Now().UnixMilli())))}
 
 type AxMCPCatalogSnapshot struct{Namespace,ProtocolVersion string;Revision int64;ServerInfo,ServerCapabilities map[string]Value;Tools,Prompts,Resources,ResourceTemplates []map[string]Value;Subscriptions []string}
-func (c *AxMCPClient) InspectCatalog(refresh bool)(AxMCPCatalogSnapshot,error){if err:=c.Init();err!=nil{return AxMCPCatalogSnapshot{},err};if refresh{if err:=c.Refresh();err!=nil{return AxMCPCatalogSnapshot{},err}};subscriptions:=[]string{};for uri:=range c.subscriptionOwners{subscriptions=append(subscriptions,uri)};sort.Strings(subscriptions);cloneList:=func(values []map[string]Value)[]map[string]Value{out:=make([]map[string]Value,0,len(values));for _,value:=range values{out=append(out,cloneMCPMap(value))};return out};return AxMCPCatalogSnapshot{c.Namespace(),c.negotiatedProtocolVersion,c.catalogRevision,cloneMCPMap(c.serverInfo),cloneMCPMap(c.serverCapabilities),cloneList(c.tools),cloneList(c.prompts),cloneList(c.resources),cloneList(c.resourceTemplates),subscriptions},nil}
+func (c *AxMCPClient) InspectCatalog(refresh bool)(AxMCPCatalogSnapshot,error){if err:=c.Init();err!=nil{return AxMCPCatalogSnapshot{},err};if refresh{if err:=c.Refresh();err!=nil{return AxMCPCatalogSnapshot{},err}};subscriptions:=[]string{};for uri:=range c.subscriptionOwners{subscriptions=append(subscriptions,uri)};sort.Strings(subscriptions);cloneList:=func(values []map[string]Value)[]map[string]Value{out:=make([]map[string]Value,0,len(values));for _,value:=range values{out=append(out,cloneMCPMap(value))};return out};return AxMCPCatalogSnapshot{c.Namespace(),c.negotiatedProtocolVersion,c.catalogRevision,c.serverInfoSnapshot(),cloneMCPMap(c.serverCapabilities),cloneList(c.tools),cloneList(c.prompts),cloneList(c.resources),cloneList(c.resourceTemplates),subscriptions},nil}
 
 func (c *AxMCPClient) ProtocolVersion() string { return c.negotiatedProtocolVersion }
 func (c *AxMCPClient) Tools() []map[string]Value { return append([]map[string]Value(nil), c.tools...) }
@@ -211,8 +232,52 @@ func (c *AxMCPClient) Resources() []map[string]Value { return append([]map[strin
 func (c *AxMCPClient) ResourceTemplates() []map[string]Value { return append([]map[string]Value(nil), c.resourceTemplates...) }
 func (c *AxMCPClient) Ping() (map[string]Value, error) { return c.request("ping", map[string]Value{}) }
 func (c *AxMCPClient) ListTools(cursor string) (map[string]Value, error) { return c.request("tools/list", cursorParams(cursor)) }
-func (c *AxMCPClient) CallTool(name string, args map[string]Value) (map[string]Value, error) {if args==nil{args=map[string]Value{}};headers:=c.toolHeaders(name,args);result,err:=c.requestWithInputRounds("tools/call",map[string]Value{"name":name,"arguments":args},headers);if protocol,ok:=err.(AxMCPProtocolError);ok&&c.era=="modern"&&protocol.Code==-32020{values,refreshErr:=c.collectCatalog("tools/list","tools");if refreshErr!=nil{return nil,refreshErr};c.tools=nil;for _,tool:=range values{if _,bindErr:=mcp_param_header_bindings(coreGet(tool,"inputSchema",Object()));bindErr==nil{c.tools=append(c.tools,tool)}};result,err=c.requestWithInputRounds("tools/call",map[string]Value{"name":name,"arguments":args},c.toolHeaders(name,args))};if err!=nil{return nil,err};if display(coreGet(result,"resultType",""))!="task"{return result,nil};if !c.hasTasksCapability(){return nil,fmt.Errorf("MCP protocol violation: server returned a task without negotiating io.modelcontextprotocol/tasks")};if !coreTruthy(mustCore(mcp_validate_modern_task(result))){return nil,fmt.Errorf("MCP protocol violation: invalid CreateTaskResult")};return c.awaitModernTask(display(result["taskId"]))}
-func(c *AxMCPClient)awaitModernTask(taskID string)(map[string]Value,error){max:=1000;if value,ok:=c.options["maxTaskPolls"].(int);ok{max=value};for poll:=0;poll<max;poll++{task,err:=c.GetTask(taskID);if err!=nil{return nil,err};outcome:=asMap(mustCore(mcp_task_terminal_outcome(task)));switch display(outcome["kind"]){case "result":return cloneMCPMap(asMap(outcome["result"])),nil;case "protocol_error":return nil,AxMCPProtocolError{Code:mcpInt(outcome["code"]),Message:display(outcome["message"]),Data:outcome["data"]};case "violation","failure","cancelled":return nil,fmt.Errorf("%s",display(outcome["message"]));case "input_required":handler,hasHandler:=c.elicitationHandler();fulfillment:=asMap(mustCore(mcp_mrtr_plan_fulfillment(coreGet(outcome,"inputRequests",Object()),coreGet(c.options,"roots",nil),hasHandler,false)));if !coreTruthy(fulfillment["ok"]){return nil,fmt.Errorf("%s",display(fulfillment["message"]))};responses:=asMap(coreGet(fulfillment,"responses",Object()));for key,rawPending:=range asMap(coreGet(fulfillment,"pending",Object())){if key=="__order"{continue};pending:=asMap(rawPending);if !hasHandler||display(coreGet(pending,"method",""))!="elicitation/create"{return nil,fmt.Errorf("MCP protocol violation: unsupported pending task input request method %s",display(coreGet(pending,"method","")))};response,handlerErr:=handler(asMap(coreGet(pending,"params",Object())),map[string]Value{"client":c,"namespace":c.Namespace()});if handlerErr!=nil{return nil,handlerErr};responses[key]=response};if err:=c.ProvideTaskInput(taskID,responses);err!=nil{return nil,err}}};return nil,fmt.Errorf("MCP task %s exceeded %d polls",taskID,max)}
+func (c *AxMCPClient) CallTool(name string, args map[string]Value) (map[string]Value, error) {return c.CallToolWithContext(context.Background(),name,args)}
+func (c *AxMCPClient) CallToolWithContext(ctx context.Context,name string,args map[string]Value)(map[string]Value,error){return c.CallToolWithOptions(ctx,name,args,AxMCPToolCallOptions{})}
+// CallToolWithOptions calls a tool, as TypeScript's callTool with options: a
+// modern server's task is awaited, or returned as its flattened CreateTaskResult
+// when options.TaskHandling is "expose".
+func (c *AxMCPClient) CallToolWithOptions(ctx context.Context,name string,args map[string]Value,options AxMCPToolCallOptions)(map[string]Value,error){
+  if options.TaskHandling!=""&&options.TaskHandling!="await"&&options.TaskHandling!="expose"{return nil,fmt.Errorf("TaskHandling must be \"await\" or \"expose\", not %q",options.TaskHandling)}
+  if ctx==nil{ctx=context.Background()}
+  outcome,err:=c.requestToolCallOutcome(ctx,name,args);if err!=nil{return nil,err}
+  if outcome.Kind=="complete"{return outcome.Result,nil}
+  if options.TaskHandling=="expose"{return outcome.Task,nil}
+  return c.awaitModernTask(display(outcome.Task["taskId"]),ctx)
+}
+// CallToolOutcome calls a tool without waiting on a task, as TypeScript's
+// callToolOutcome.
+func (c *AxMCPClient) CallToolOutcome(name string,args map[string]Value)(AxMCPToolCallOutcome,error){return c.CallToolOutcomeWithContext(context.Background(),name,args)}
+func (c *AxMCPClient) CallToolOutcomeWithContext(ctx context.Context,name string,args map[string]Value)(AxMCPToolCallOutcome,error){if ctx==nil{ctx=context.Background()};return c.requestToolCallOutcome(ctx,name,args)}
+func (c *AxMCPClient) requestToolCallOutcome(ctx context.Context,name string,args map[string]Value)(AxMCPToolCallOutcome,error){if err:=ctx.Err();err!=nil{return AxMCPToolCallOutcome{},err};if args==nil{args=map[string]Value{}};
+  if authorize:=coreGet(c.options,"authorizeToolCall",coreGet(c.options,"authorize_tool_call",nil));authorize!=nil{
+    tools:=make([]Value,len(c.tools));for index,tool:=range c.tools{tools[index]=tool};raw,err:=_mcp_tool_authorization_context(tools,c.Namespace(),name,args);if err!=nil{return AxMCPToolCallOutcome{},err};call:=asMap(raw);call["client"]=c
+    var decision Value
+    switch callback:=authorize.(type){
+    case func(map[string]Value)bool:decision=callback(call)
+    case func(map[string]Value)(bool,error):decision,err=callback(call)
+    case func(map[string]Value)Value:decision=callback(call)
+    case func(map[string]Value)(Value,error):decision,err=callback(call)
+    default:return AxMCPToolCallOutcome{},fmt.Errorf("authorizeToolCall must be a host callback")
+    }
+    if err!=nil{return AxMCPToolCallOutcome{},err};if _,err=_mcp_tool_authorization_result(name,decision);err!=nil{return AxMCPToolCallOutcome{},err}
+  }
+headers:=c.toolHeaders(name,args);result,err:=c.requestWithInputRounds("tools/call",map[string]Value{"name":name,"arguments":args},headers,ctx);if protocol,ok:=err.(AxMCPProtocolError);ok&&c.era=="modern"&&protocol.Code==-32020{values,refreshErr:=c.collectCatalog("tools/list","tools",ctx);if refreshErr!=nil{return AxMCPToolCallOutcome{},refreshErr};c.tools=nil;for _,tool:=range values{if _,bindErr:=mcp_param_header_bindings(coreGet(tool,"inputSchema",Object()));bindErr==nil{c.tools=append(c.tools,tool)}};result,err=c.requestWithInputRounds("tools/call",map[string]Value{"name":name,"arguments":args},c.toolHeaders(name,args),ctx)};if err!=nil{return AxMCPToolCallOutcome{},err}
+  outcome:=asMap(mustCore(mcp_tool_call_outcome(result,c.hasTasksCapability())))
+  switch display(outcome["kind"]){
+  case "violation":return AxMCPToolCallOutcome{},fmt.Errorf("%s",display(outcome["message"]))
+  case "task":c.recordTask(result,false);return AxMCPToolCallOutcome{Kind:"task",Task:result},nil
+  default:return AxMCPToolCallOutcome{Kind:"complete",Result:result},nil
+  }
+}
+// recordTask keeps a task's latest snapshot, as TypeScript's recordTask, and
+// asks a running modern listener for a new task's updates. A task that arrives
+// in a notification restarts the listener off the delivering goroutine.
+func(c *AxMCPClient)recordTask(task map[string]Value,fromNotification bool){taskID,ok:=task["taskId"].(string);if !ok||taskID==""{return};c.taskMu.Lock();if c.tasks==nil{c.tasks=map[string]map[string]Value{}};_,known:=c.tasks[taskID];c.tasks[taskID]=cloneMCPMap(task);c.taskMu.Unlock();if known||c.era!="modern"||!c.hasActiveSubscription(){return};if fromNotification{go func(){_ = c.restartModernListener()}()}else{_ = c.restartModernListener()}}
+// listenTaskIDs are the recorded tasks a modern listener asks updates for, as
+// TypeScript's listener does when something listens for them.
+func(c *AxMCPClient)listenTaskIDs()[]string{_,hasCallback:=c.options["onNotification"].(func(map[string]Value));if (len(c.notificationListeners)==0&&!hasCallback)||!c.hasTasksCapability(){return nil};c.taskMu.Lock();defer c.taskMu.Unlock();ids:=make([]string,0,len(c.tasks));for id:=range c.tasks{ids=append(ids,id)};sort.Strings(ids);return ids}
+func(c *AxMCPClient)awaitModernTask(taskID string,contexts ...context.Context)(map[string]Value,error){max:=1000;if value,ok:=c.options["maxTaskPolls"].(int);ok{max=value};for poll:=0;poll<max;poll++{task,err:=c.getTaskWithContext(mcpCallContext(contexts),taskID);if err!=nil{return nil,err};outcome:=asMap(mustCore(mcp_task_terminal_outcome(task)));switch display(outcome["kind"]){case "result":return cloneMCPMap(asMap(outcome["result"])),nil;case "protocol_error":return nil,AxMCPProtocolError{Code:mcpInt(outcome["code"]),Message:display(outcome["message"]),Data:outcome["data"]};case "violation","failure","cancelled":return nil,fmt.Errorf("%s",display(outcome["message"]));case "input_required":handler,hasHandler:=c.elicitationHandler();fulfillment:=asMap(mustCore(mcp_mrtr_plan_fulfillment(coreGet(outcome,"inputRequests",Object()),coreGet(c.options,"roots",nil),hasHandler,false)));if !coreTruthy(fulfillment["ok"]){return nil,fmt.Errorf("%s",display(fulfillment["message"]))};responses:=asMap(coreGet(fulfillment,"responses",Object()));for key,rawPending:=range asMap(coreGet(fulfillment,"pending",Object())){if key=="__order"{continue};pending:=asMap(rawPending);if !hasHandler||display(coreGet(pending,"method",""))!="elicitation/create"{return nil,fmt.Errorf("MCP protocol violation: unsupported pending task input request method %s",display(coreGet(pending,"method","")))};response,handlerErr:=handler(asMap(coreGet(pending,"params",Object())),map[string]Value{"client":c,"namespace":c.Namespace()});if handlerErr!=nil{return nil,handlerErr};responses[key]=response};if err:=c.provideTaskInputWithContext(mcpCallContext(contexts),taskID,responses);err!=nil{return nil,err}}};return nil,fmt.Errorf("MCP task %s exceeded %d polls",taskID,max)}
 func(c *AxMCPClient)toolHeaders(name string,args map[string]Value)map[string]string{out:=map[string]string{};if c.era!="modern"{return out};for _,tool:=range c.tools{if display(coreGet(tool,"name",""))==name{bindings,err:=mcp_param_header_bindings(coreGet(tool,"inputSchema",Object()));if err!=nil{return out};values,err:=mcp_param_header_values(bindings,args);if err!=nil{return out};for key,value:=range asMap(values){out[key]=display(value)};break}};return out}
 func (c *AxMCPClient) ListPrompts(cursor string) (map[string]Value, error) { return c.request("prompts/list", cursorParams(cursor)) }
 func (c *AxMCPClient) GetPrompt(name string, args map[string]Value) (map[string]Value, error) { if args == nil { args = map[string]Value{} }; return c.requestWithInputRounds("prompts/get", map[string]Value{"name":name, "arguments":args},nil) }
@@ -223,16 +288,18 @@ func (c *AxMCPClient) AcquireResourceSubscription(uri,owner string)(map[string]V
 func (c *AxMCPClient) ReleaseResourceSubscription(uri,owner string)(map[string]Value,error){if err:=c.assertResourceSubscriptions();err!=nil{return nil,err};current:=[]string{};for value:=range c.subscriptionOwners[uri]{current=append(current,value)};sort.Strings(current);raw,err:=mcp_resource_subscription_ownership(current,owner,"release");if err!=nil{return nil,err};transition:=asMap(raw);owners:=map[string]bool{};for _,value:=range asSlice(transition["owners"]){owners[display(value)]=true};if len(owners)==0{delete(c.subscriptionOwners,uri)}else{c.subscriptionOwners[uri]=owners};if c.era=="modern"{if coreTruthy(transition["changed"])&&c.hasActiveSubscription(){err=c.restartModernListener()};return map[string]Value{},err};result:=map[string]Value{};if display(transition["wireAction"])=="unsubscribe"{result,err=c.request("resources/unsubscribe",map[string]Value{"uri":uri})};return result,err}
 func (c *AxMCPClient) RestoreResourceSubscriptions()error{if c.era=="modern"{if c.hasActiveSubscription(){return c.restartModernListener()};return nil};uris:=[]string{};for uri:=range c.subscriptionOwners{uris=append(uris,uri)};sort.Strings(uris);for _,uri:=range uris{if _,err:=c.request("resources/subscribe",map[string]Value{"uri":uri});err!=nil{return err}};return nil}
 func(c *AxMCPClient)hasActiveSubscription()bool{c.subscriptionMu.Lock();defer c.subscriptionMu.Unlock();return c.activeSubscriptionID!=""}
-func(c *AxMCPClient)StartListening()error{if err:=c.Init();err!=nil{return err};if c.era!="modern"{return c.transport.StartListening()};_ = c.transport.CloseRequestStream();id:=fmt.Sprintf("listen-%d",c.nextID);c.nextID++;uris:=[]string{};for uri:=range c.subscriptionOwners{uris=append(uris,uri)};sort.Strings(uris);notifications:=mustCore(mcp_listen_interests(uris,coreGet(c.options,"subscriptionFilters",Object())));params:=map[string]Value{"notifications":notifications};params["_meta"]=mustCore(mcp_build_request_meta(Object(),c.negotiatedProtocolVersion,c.clientCapabilities(),map[string]Value{"name":"AxMCPClient","title":"Ax MCP Client","version":"1.0.0"},coreGet(c.options,"logLevel",nil),nil,nil));ready:=make(chan struct{},1);c.subscriptionMu.Lock();c.activeSubscriptionID=id;c.subscriptionReady=ready;c.subscriptionMu.Unlock();if err:=c.transport.OpenRequestStream(map[string]Value{"jsonrpc":"2.0","id":id,"method":"subscriptions/listen","params":params});err!=nil{return err};timeout:=2*time.Second;if raw:=coreGet(c.options,"listenAckTimeoutMs",nil);raw!=nil{timeout=time.Duration(mcpInt(raw))*time.Millisecond};select{case<-ready:return nil;case<-time.After(timeout):return fmt.Errorf("subscriptions/listen acknowledgement timed out")}}
+func(c *AxMCPClient)StartListening()error{if err:=c.Init();err!=nil{return err};if c.era!="modern"{return c.transport.StartListening()};_ = c.transport.CloseRequestStream();id:=fmt.Sprintf("listen-%d",c.nextID.Add(1));uris:=[]string{};for uri:=range c.subscriptionOwners{uris=append(uris,uri)};sort.Strings(uris);notifications:=mustCore(mcp_listen_interests(uris,coreGet(c.options,"subscriptionFilters",Object()),stringValues(c.listenTaskIDs())));params:=map[string]Value{"notifications":notifications};params["_meta"]=mustCore(mcp_build_request_meta(Object(),c.negotiatedProtocolVersion,c.clientCapabilities(),map[string]Value{"name":"AxMCPClient","title":"Ax MCP Client","version":"1.0.0"},coreGet(c.options,"logLevel",nil),nil,nil));ready:=make(chan struct{},1);c.subscriptionMu.Lock();c.activeSubscriptionID=id;c.subscriptionReady=ready;c.subscriptionMu.Unlock();if err:=c.transport.OpenRequestStream(map[string]Value{"jsonrpc":"2.0","id":id,"method":"subscriptions/listen","params":params});err!=nil{return err};timeout:=2*time.Second;if raw:=coreGet(c.options,"listenAckTimeoutMs",nil);raw!=nil{timeout=time.Duration(mcpInt(raw))*time.Millisecond};select{case<-ready:return nil;case<-time.After(timeout):return fmt.Errorf("subscriptions/listen acknowledgement timed out")}}
 func(c *AxMCPClient)restartModernListener()error{if c.era!="modern"||!c.hasActiveSubscription(){return nil};return c.StartListening()}
 func (c *AxMCPClient) SubscribeResource(uri string)(map[string]Value,error){return c.AcquireResourceSubscription(uri,"manual")}
 func (c *AxMCPClient) UnsubscribeResource(uri string)(map[string]Value,error){return c.ReleaseResourceSubscription(uri,"manual")}
 func(c *AxMCPClient)hasTasksCapability()bool{if c.era=="modern"{_,ok:=c.negotiatedExtensions["io.modelcontextprotocol/tasks"];return ok};return c.capability("tasks")}
-func (c *AxMCPClient) GetTask(taskID string)(map[string]Value,error){if !c.hasTasksCapability(){return nil,fmt.Errorf("Tasks are not supported")};result,err:=c.request("tasks/get",map[string]Value{"taskId":taskID});if err==nil&&c.era=="modern"&&!coreTruthy(mustCore(mcp_validate_modern_task(result))){return nil,fmt.Errorf("MCP protocol violation: invalid tasks/get result")};return result,err}
+func (c *AxMCPClient) GetTask(taskID string)(map[string]Value,error){return c.getTaskWithContext(context.Background(),taskID)}
+func(c *AxMCPClient)getTaskWithContext(ctx context.Context,taskID string)(map[string]Value,error){if !c.hasTasksCapability(){return nil,fmt.Errorf("Tasks are not supported")};result,err:=c.requestWithHeaders("tasks/get",map[string]Value{"taskId":taskID},nil,true,ctx);if err==nil&&c.era=="modern"&&!coreTruthy(mustCore(mcp_validate_modern_task(result))){return nil,fmt.Errorf("MCP protocol violation: invalid tasks/get result")};if err==nil{c.recordTask(result,false)};return result,err}
 func (c *AxMCPClient) CancelTask(taskID string)(map[string]Value,error){if !c.hasTasksCapability(){return nil,fmt.Errorf("Tasks are not supported")};result,err:=c.request("tasks/cancel",map[string]Value{"taskId":taskID});if c.era=="modern"&&err==nil{return map[string]Value{},nil};return result,err}
 func(c *AxMCPClient)ListTasks(cursor string)(map[string]Value,error){if c.era=="modern"{return nil,fmt.Errorf("tasks/list is only available for legacy MCP tasks")};if !c.hasTasksCapability(){return nil,fmt.Errorf("Tasks are not supported")};return c.request("tasks/list",cursorParams(cursor))}
 func(c *AxMCPClient)GetTaskResult(taskID string)(map[string]Value,error){if c.era=="modern"{return nil,fmt.Errorf("tasks/result is only available for legacy MCP tasks; modern results are embedded in tasks/get")};if !c.hasTasksCapability(){return nil,fmt.Errorf("Tasks are not supported")};return c.request("tasks/result",map[string]Value{"taskId":taskID})}
-func(c *AxMCPClient)ProvideTaskInput(taskID string,inputResponses map[string]Value)error{if c.era!="modern"||!c.hasTasksCapability(){return fmt.Errorf("tasks/update is only available for modern MCP Tasks v2")};_,err:=c.request("tasks/update",map[string]Value{"taskId":taskID,"inputResponses":inputResponses});return err}
+func(c *AxMCPClient)ProvideTaskInput(taskID string,inputResponses map[string]Value)error{return c.provideTaskInputWithContext(context.Background(),taskID,inputResponses)}
+func(c *AxMCPClient)provideTaskInputWithContext(ctx context.Context,taskID string,inputResponses map[string]Value)error{if c.era!="modern"||!c.hasTasksCapability(){return fmt.Errorf("tasks/update is only available for modern MCP Tasks v2")};_,err:=c.requestWithHeaders("tasks/update",map[string]Value{"taskId":taskID,"inputResponses":inputResponses},nil,true,ctx);return err}
 func (c *AxMCPClient) ListResourceTemplates(cursor string) (map[string]Value, error) { return c.request("resources/templates/list", cursorParams(cursor)) }
 
 func (c *AxMCPClient) Notify(method string, params map[string]Value) error {
@@ -266,16 +333,19 @@ func (c *AxMCPClient) NativeTools() []Tool {
 		original := display(coreGet(spec, "name", ""))
 		name := c.overrideName(original)
 		desc := c.overrideDescription(spec)
-		out = append(out, Tool{Name:name, Description:desc, Args:map[string]Field{}, Returns:map[string]Field{}, Handler: func(args map[string]Value) (Value, error) {
+		out = append(out, Tool{Name:name, Description:desc, Parameters:cloneValue(coreGet(spec,"inputSchema",Object())), Args:map[string]Field{}, Returns:map[string]Field{}, Handler: func(args map[string]Value) (Value, error) {
 			return c.CallTool(original, args)
-		}})
+		},ContextHandler:func(ctx context.Context,args map[string]Value)(Value,error){return c.CallToolWithContext(ctx,original,args)}})
 	}
 	return out
 }
 
+func (c *AxMCPClient) serverInfoSnapshot() map[string]Value {c.serverInfoMu.RLock();defer c.serverInfoMu.RUnlock();return cloneMCPMap(c.serverInfo)}
+func (c *AxMCPClient) setServerInfo(info map[string]Value) {copy:=cloneMCPMap(info);c.serverInfoMu.Lock();c.serverInfo=copy;c.serverInfoMu.Unlock()}
+
 func (c *AxMCPClient) Namespace() string {
 	if value := display(coreGet(c.options, "namespace", "")); value != "" { return value }
-	if value := display(coreGet(c.serverInfo, "name", "")); value != "" { return value }
+	if value := display(coreGet(c.serverInfoSnapshot(), "name", "")); value != "" { return value }
 	return "mcp"
 }
 
@@ -416,9 +486,13 @@ type AxEventPublishReceipt struct { EventID string; Accepted bool; Duplicate boo
 type AxEventRun struct { ID,DeliveryID,RouteID,TargetID,InstanceKey,Status string; Attempt int; Output Value; Error string; ContinuationIDs []string }
 type AxEventDeadLetter struct { ID,DeliveryID,RunID,SinkID,Reason string }
 type AxEventContinuation struct { ID,TargetID,InstanceKey,IdentityScope string; Correlation []map[string]string; Metadata map[string]Value; Completed bool; ExpiresAt int64 }
-type AxEventCancellationToken struct { mu sync.Mutex; Cancelled bool; Reason string }
-func (t *AxEventCancellationToken) Cancel(reason string){t.mu.Lock();defer t.mu.Unlock();t.Cancelled=true;t.Reason=reason}
-func (t *AxEventCancellationToken) IsCancelled()bool{t.mu.Lock();defer t.mu.Unlock();return t.Cancelled}
+type AxEventCancellationToken struct { mu sync.RWMutex; Cancelled bool; Reason string; done chan struct{}; subscriptions map[uint64]func(); nextSubscription uint64 }
+func (t *AxEventCancellationToken) Cancel(reason string)bool{t.mu.Lock();if t.Cancelled{t.mu.Unlock();return false};t.Cancelled=true;t.Reason=reason;if t.done==nil{t.done=make(chan struct{})};close(t.done);callbacks:=make([]func(),0,len(t.subscriptions));for _,callback:=range t.subscriptions{callbacks=append(callbacks,callback)};t.subscriptions=nil;t.mu.Unlock();for _,callback:=range callbacks{callback()};return true}
+func (t *AxEventCancellationToken) IsCancelled()bool{t.mu.RLock();defer t.mu.RUnlock();return t.Cancelled}
+func (t *AxEventCancellationToken) CancellationReason()string{t.mu.RLock();defer t.mu.RUnlock();return t.Reason}
+func (t *AxEventCancellationToken) Done()<-chan struct{}{t.mu.Lock();defer t.mu.Unlock();if t.done==nil{t.done=make(chan struct{})};return t.done}
+func (t *AxEventCancellationToken) Subscribe(callback func())func(){t.mu.Lock();if t.Cancelled{t.mu.Unlock();callback();return func(){}};if t.subscriptions==nil{t.subscriptions=map[uint64]func(){}};t.nextSubscription++;id:=t.nextSubscription;t.subscriptions[id]=callback;t.mu.Unlock();return func(){t.mu.Lock();delete(t.subscriptions,id);t.mu.Unlock()}}
+func (t *AxEventCancellationToken) SubscriptionCount()int{t.mu.RLock();defer t.mu.RUnlock();return len(t.subscriptions)}
 type AxEventTarget struct {
 	ID string
 	Invoke func(Value,map[string]Value)(Value,error)
@@ -466,12 +540,12 @@ type AxEventSink interface { Write(Value, map[string]Value) error }
 type AxEventClock interface { Now() int64; Sleep(time.Duration,*AxEventCancellationToken) bool }
 type AxSystemEventClock struct{}
 func (AxSystemEventClock) Now()int64{return time.Now().UnixMilli()}
-func (AxSystemEventClock) Sleep(delay time.Duration,token *AxEventCancellationToken)bool{timer:=time.NewTimer(delay);defer timer.Stop();<-timer.C;return token==nil||!token.IsCancelled()}
+func (AxSystemEventClock) Sleep(delay time.Duration,token *AxEventCancellationToken)bool{if token==nil{timer:=time.NewTimer(delay);defer timer.Stop();<-timer.C;return true};if token.IsCancelled(){return false};timer:=time.NewTimer(delay);defer timer.Stop();select{case <-timer.C:return !token.IsCancelled();case <-token.Done():return false}}
 type AxManualEventClock struct{mu sync.Mutex;cond *sync.Cond;current int64}
 func NewAxManualEventClock(current int64)*AxManualEventClock{value:=&AxManualEventClock{current:current};value.cond=sync.NewCond(&value.mu);return value}
 func (c *AxManualEventClock) Now()int64{c.mu.Lock();defer c.mu.Unlock();return c.current}
 func (c *AxManualEventClock) Advance(milliseconds int64){c.mu.Lock();c.current+=milliseconds;c.cond.Broadcast();c.mu.Unlock()}
-func (c *AxManualEventClock) Sleep(delay time.Duration,token *AxEventCancellationToken)bool{target:=c.Now()+delay.Milliseconds();c.mu.Lock();defer c.mu.Unlock();for c.current<target{if token!=nil&&token.IsCancelled(){return false};c.cond.Wait()};return token==nil||!token.IsCancelled()}
+func (c *AxManualEventClock) Sleep(delay time.Duration,token *AxEventCancellationToken)bool{target:=c.Now()+delay.Milliseconds();unsubscribe:=func(){};if token!=nil{unsubscribe=token.Subscribe(func(){c.mu.Lock();c.cond.Broadcast();c.mu.Unlock()});defer unsubscribe()};c.mu.Lock();defer c.mu.Unlock();for c.current<target{if token!=nil&&token.IsCancelled(){return false};c.cond.Wait()};return token==nil||!token.IsCancelled()}
 type AxEventStore interface { Enqueue(AxEventEnvelope, []AxEventCommand) error }
 type axEventDelivery struct { Event AxEventEnvelope; Command AxEventCommand; IdentityScope,Trust,Status,RunID string; AvailableAt,Sequence,Size int64; Attempt int }
 type AxInMemoryEventStore struct { Deliveries map[string]*axEventDelivery; Runs map[string]*AxEventRun; DeadLetters map[string]AxEventDeadLetter; Continuations map[string]*AxEventContinuation; ProgramState map[string]Value; Clock AxEventClock;MaxPending int;MaxQueuedBytes,MaxEnvelopeBytes,PublishTimeoutMs,QueuedBytes,sequence int64;mu sync.Mutex;cond *sync.Cond }
@@ -549,18 +623,29 @@ func (c *AxExecutionContext) RuntimeModules() []Value {
 }
 
 func (c *AxExecutionContext) Namespaces() []string { out:=[]string{};for _,client:=range c.MCP{out=append(out,client.Namespace())};for _,client:=range c.UCP{out=append(out,client.Namespace())};return out }
-func (c *AxExecutionContext) Derive(inheritance Value) *AxExecutionContext { if display(inheritance)=="none"{empty,_:=NewAxExecutionContext(nil,nil);return empty};allowed:=map[string]bool{};for _,raw:=range asSlice(inheritance){allowed[display(raw)]=true};if len(allowed)==0{return c};mcp:=[]*AxMCPClient{};ucp:=[]*AxUCPClient{};for _,x:=range c.MCP{if allowed[x.Namespace()]{mcp=append(mcp,x)}};for _,x:=range c.UCP{if allowed[x.Namespace()]{ucp=append(ucp,x)}};out,_:=NewAxExecutionContext(mcp,ucp);return out }
+func (c *AxExecutionContext) DeriveChecked(inheritance Value) (*AxExecutionContext,error) {
+    mcpNames,ucpNames:=Array(),Array();byMcp:=map[string]*AxMCPClient{};byUcp:=map[string]*AxUCPClient{}
+    for _,client:=range c.MCP{mcpNames=append(mcpNames,client.Namespace());byMcp[client.Namespace()]=client}
+    for _,client:=range c.UCP{ucpNames=append(ucpNames,client.Namespace());byUcp[client.Namespace()]=client}
+    plan,err:=_mcp_inheritance_plan(mcpNames,ucpNames,inheritance);if err!=nil{return nil,err}
+    mcp:=[]*AxMCPClient{};ucp:=[]*AxUCPClient{}
+    for _,name:=range asSlice(coreGet(plan,"mcp",Array())){mcp=append(mcp,byMcp[display(name)])}
+    for _,name:=range asSlice(coreGet(plan,"ucp",Array())){ucp=append(ucp,byUcp[display(name)])}
+    return NewAxExecutionContext(mcp,ucp)
+}
+func (c *AxExecutionContext) Derive(inheritance Value) *AxExecutionContext {child,err:=c.DeriveChecked(inheritance);if err!=nil{panic(err)};return child}
+
 func (c *AxExecutionContext) ContinuationState() AxMCPContinuationState { names:=c.Namespaces();sum:=sha256.Sum256([]byte(strings.Join(names,"\n")));return AxMCPContinuationState{Namespaces:names,Tasks:[]map[string]Value{},Subscriptions:[]map[string]Value{},CatalogFingerprint:fmt.Sprintf("%x",sum)} }
 
-func ResolveAxExecutionContext(options map[string]Value,parent *AxExecutionContext)(*AxExecutionContext,error){if options==nil{options=map[string]Value{}};if raw:=coreGet(options,"executionContext",coreGet(options,"mcpExecutionContext",nil));raw!=nil{if c,ok:=raw.(*AxExecutionContext);ok{return c.Derive(coreGet(options,"mcpInheritance","all")),nil}};if _,ok:=options["mcp"];ok||options["ucp"]!=nil{mcp:=[]*AxMCPClient{};for _,raw:=range asSlice(coreGet(options,"mcp",Array())){if c,ok:=raw.(*AxMCPClient);ok{mcp=append(mcp,c)}};if c,ok:=coreGet(options,"mcp",nil).(*AxMCPClient);ok{mcp=append(mcp,c)};ucp:=[]*AxUCPClient{};for _,raw:=range asSlice(coreGet(options,"ucp",Array())){if c,ok:=raw.(*AxUCPClient);ok{ucp=append(ucp,c)}};if c,ok:=coreGet(options,"ucp",nil).(*AxUCPClient);ok{ucp=append(ucp,c)};return NewAxExecutionContext(mcp,ucp)};if parent!=nil{return parent.Derive(coreGet(options,"mcpInheritance","all")),nil};return nil,nil}
+func ResolveAxExecutionContext(options map[string]Value,parent *AxExecutionContext)(*AxExecutionContext,error){if options==nil{options=map[string]Value{}};if raw:=coreGet(options,"executionContext",coreGet(options,"mcpExecutionContext",nil));raw!=nil{if c,ok:=raw.(*AxExecutionContext);ok{return c,nil}};if _,ok:=options["mcp"];ok||options["ucp"]!=nil{mcp:=[]*AxMCPClient{};for _,raw:=range asSlice(coreGet(options,"mcp",Array())){if c,ok:=raw.(*AxMCPClient);ok{mcp=append(mcp,c)}};if c,ok:=coreGet(options,"mcp",nil).(*AxMCPClient);ok{mcp=append(mcp,c)};ucp:=[]*AxUCPClient{};for _,raw:=range asSlice(coreGet(options,"ucp",Array())){if c,ok:=raw.(*AxUCPClient);ok{ucp=append(ucp,c)}};if c,ok:=coreGet(options,"ucp",nil).(*AxUCPClient);ok{ucp=append(ucp,c)};return NewAxExecutionContext(mcp,ucp)};if parent!=nil{return parent,nil};if inherited,ok:=options["inheritedExecutionContext"].(*AxExecutionContext);ok{return inherited,nil};return nil,nil}
 
 func (c *AxMCPClient) request(method string, params map[string]Value) (map[string]Value, error) {
 	return c.requestWithHeaders(method,params,nil,true)
 }
-func(c *AxMCPClient)requestWithInputRounds(method string,baseParams map[string]Value,headers map[string]string)(map[string]Value,error){
+func(c *AxMCPClient)requestWithInputRounds(method string,baseParams map[string]Value,headers map[string]string,contexts ...context.Context)(map[string]Value,error){
 	params:=cloneMCPMap(baseParams);maxRounds:=coreGet(c.options,"maxInputRounds",nil)
 	for round:=0;;round++{
-		result,err:=c.requestWithHeaders(method,params,headers,true);if err!=nil{return nil,err}
+		result,err:=c.requestWithHeaders(method,params,headers,true,mcpCallContext(contexts));if err!=nil{return nil,err}
 		rawPlan,err:=mcp_mrtr_plan_round(result,c.era,method,round,maxRounds);if err!=nil{return nil,err};plan:=asMap(rawPlan)
 		switch display(plan["action"]){case "complete":return result,nil;case "violation":return nil,fmt.Errorf("%s",display(plan["message"]))}
 		var inputResponses Value
@@ -576,18 +661,22 @@ func(c *AxMCPClient)requestWithInputRounds(method string,baseParams map[string]V
 		rawNext,nextErr:=mcp_mrtr_next_params(baseParams,inputResponses,requestState);if nextErr!=nil{return nil,nextErr};params=asMap(rawNext)
 	}
 }
-func (c *AxMCPClient) requestWithHeaders(method string, params map[string]Value, headers map[string]string, allowVersionRetry bool) (map[string]Value, error) {
-	id := fmt.Sprintf("%d", c.nextID); c.nextID++
+func mcpCallContext(values []context.Context)context.Context{if len(values)>0&&values[0]!=nil{return values[0]};return context.Background()}
+func (c *AxMCPClient) requestWithHeaders(method string, params map[string]Value, headers map[string]string, allowVersionRetry bool,contexts ...context.Context) (map[string]Value, error) {
+ ctx:=mcpCallContext(contexts);if err:=ctx.Err();err!=nil{return nil,err}
+	id := fmt.Sprintf("%d", c.nextID.Add(1))
 	msg := map[string]Value{"jsonrpc":"2.0", "id":id, "method":method}
 	requestParams:=cloneMCPMap(params);if c.era=="modern"{existing:=asMap(coreGet(requestParams,"_meta",Object()));meta:=mustCore(mcp_build_request_meta(existing,c.negotiatedProtocolVersion,c.clientCapabilities(),map[string]Value{"name":"AxMCPClient","title":"Ax MCP Client","version":"1.0.0"},coreGet(c.options,"logLevel",nil),nil,nil));requestParams["_meta"]=meta}
 	if params != nil { msg["params"] = requestParams }
-	response, err := c.transport.SendWithHeaders(msg,headers)
+	var response map[string]Value;var err error
+ if transport,ok:=c.transport.(interface{SendWithContext(context.Context,map[string]Value,map[string]string)(map[string]Value,error)});ok{response,err=transport.SendWithContext(ctx,msg,headers)}else{response,err=c.transport.SendWithHeaders(msg,headers)}
+ if ctx.Err()!=nil{return nil,ctx.Err()}
 	if err != nil { return nil, err }
 	if rawErr := coreGet(response, "error", nil); rawErr != nil {
 		er := asMap(rawErr)
-		protocol:=AxMCPProtocolError{Code:mcpInt(coreGet(er,"code",0)),Message:display(coreGet(er,"message","MCP JSON-RPC error")),Data:coreGet(er,"data",nil)};if c.era=="modern"&&allowVersionRetry&&protocol.Code==-32022{version:=display(mustCore(mcp_select_mutual_version(protocol.Data,stringValues(AX_MCP_SUPPORTED_PROTOCOL_VERSIONS))));if version!=""{c.negotiatedProtocolVersion=version;c.transport.SetProtocolVersion(version);return c.requestWithHeaders(method,params,headers,false)}};return nil,protocol
+		protocol:=AxMCPProtocolError{Code:mcpInt(coreGet(er,"code",0)),Message:display(coreGet(er,"message","MCP JSON-RPC error")),Data:coreGet(er,"data",nil)};if c.era=="modern"&&allowVersionRetry&&protocol.Code==-32022{version:=display(mustCore(mcp_select_mutual_version(protocol.Data,stringValues(AX_MCP_SUPPORTED_PROTOCOL_VERSIONS))));if version!=""{c.negotiatedProtocolVersion=version;c.transport.SetProtocolVersion(version);return c.requestWithHeaders(method,params,headers,false,ctx)}};return nil,protocol
 	}
-	result:=asMap(coreGet(response,"result",Object()));if c.era=="modern"{meta:=asMap(coreGet(result,"_meta",Object()));info:=asMap(coreGet(meta,"io.modelcontextprotocol/serverInfo",Object()));if display(coreGet(info,"name",""))!=""&&display(coreGet(info,"version",""))!=""{c.serverInfo=cloneMCPMap(info)}};return result,nil
+	result:=asMap(coreGet(response,"result",Object()));if c.era=="modern"{meta:=asMap(coreGet(result,"_meta",Object()));info:=asMap(coreGet(meta,"io.modelcontextprotocol/serverInfo",Object()));if display(coreGet(info,"name",""))!=""&&display(coreGet(info,"version",""))!=""{c.setServerInfo(info)}};return result,nil
 }
 
 func (c *AxMCPClient) clientCapabilities() map[string]Value {
@@ -610,6 +699,7 @@ func (c *AxMCPClient) handleInboundMessage(message map[string]Value) {
 	method:=display(coreGet(message,"method",""))
 	if method=="notifications/tools/list_changed"||method=="notifications/prompts/list_changed"||method=="notifications/resources/list_changed"{_ = c.Refresh()}
 	if method=="notifications/resources/updated"{uri:=display(coreGet(coreGet(message,"params",Object()),"uri",""));if uri!=""{delete(c.resourceReadCache,uri)}}
+	if method=="notifications/tasks"||method=="notifications/tasks/status"{params:=asMap(coreGet(message,"params",Object()));if task,ok:=params["task"].(map[string]Value);ok{c.recordTask(task,true)}else{c.recordTask(params,true)}}
 	if callback,ok:=c.options["onNotification"].(func(map[string]Value));ok{callback(message)}
 	listeners:=make([]func(map[string]Value),0,len(c.notificationListeners));for _,listener:=range c.notificationListeners{listeners=append(listeners,listener)};for _,listener:=range listeners{listener(message)}
 }
@@ -640,12 +730,13 @@ func (c *AxMCPClient) toolToFunction(tool map[string]Value) Tool {
 	original := display(coreGet(tool, "name", ""))
 	name := c.overrideName(original)
 	desc := c.overrideDescription(tool)
-	return Tool{Name:name, Description:desc, Args:map[string]Field{}, Returns:map[string]Field{}, Handler: func(args map[string]Value) (Value, error) {
-		result, err := c.CallTool(original, args)
+	invoke:=func(ctx context.Context,args map[string]Value)(Value,error){
+		result, err := c.CallToolWithContext(ctx,original,args)
 		if err != nil { return nil, err }
 		if value := coreGet(result, "structuredContent", nil); value != nil { return value, nil }
 		return map[string]Value{"content": contentText(asSlice(coreGet(result, "content", Array())))}, nil
-	}}
+	}
+	return Tool{Name:name, Description:desc, Parameters:cloneValue(coreGet(tool,"inputSchema",Object())),Args:map[string]Field{},Returns:map[string]Field{},Handler:func(args map[string]Value)(Value,error){return invoke(context.Background(),args)},ContextHandler:invoke}
 }
 
 func (c *AxMCPClient) promptToFunction(prompt map[string]Value) Tool {
@@ -683,6 +774,7 @@ func (c *AxMCPClient) overrideDescription(item map[string]Value) string {
 }
 
 type AxMCPStreamableHTTPTransport struct {
+    requestStateMu sync.Mutex
 	Endpoint string
 	Options map[string]Value
 	Headers map[string]string
@@ -718,9 +810,10 @@ func (t *AxMCPStreamableHTTPTransport) Send(message map[string]Value) (map[strin
 	return t.SendWithHeaders(message, nil)
 }
 
-func (t *AxMCPStreamableHTTPTransport) SendWithHeaders(message map[string]Value, extraHeaders map[string]string) (map[string]Value, error) {
-	body, _ := json.Marshal(message)
-	req, err := http.NewRequest("POST", t.Endpoint, bytes.NewReader(body))
+func (t *AxMCPStreamableHTTPTransport) SendWithHeaders(message map[string]Value, extraHeaders map[string]string) (map[string]Value, error) {return t.SendWithContext(context.Background(),message,extraHeaders)}
+func(t *AxMCPStreamableHTTPTransport)SendWithContext(ctx context.Context,message map[string]Value,extraHeaders map[string]string)(map[string]Value,error){
+	body := wireJSONBody(message)
+	req, err := http.NewRequestWithContext(ctx,"POST", t.Endpoint, bytes.NewReader(body))
 	if err != nil { return nil, err }
 	method := display(coreGet(message, "method", ""))
 	extra := map[string]Value{}; for key, value := range extraHeaders { extra[key] = value }
@@ -728,10 +821,11 @@ func (t *AxMCPStreamableHTTPTransport) SendWithHeaders(message map[string]Value,
 	res, err := t.client.Do(req)
 	if err != nil { return nil, err }
 	defer res.Body.Close()
-	if sid := res.Header.Get("MCP-Session-Id"); t.Era != "modern" && sid != "" { t.SessionID = sid }
-	if res.StatusCode == 401 { challenge := res.Header.Get("WWW-Authenticate"); _, _ = io.Copy(io.Discard, res.Body); _ = res.Body.Close(); applied, oauthErr := t.ApplyOAuth(challenge); if oauthErr != nil { return nil, oauthErr }; if applied { return t.SendWithHeaders(message, extraHeaders) } }
+	t.recordSessionID(res.Header.Get("MCP-Session-Id"))
+	if res.StatusCode == 401 { challenge := res.Header.Get("WWW-Authenticate"); _, _ = io.Copy(io.Discard, res.Body); _ = res.Body.Close(); applied, oauthErr := t.ApplyOAuth(challenge); if oauthErr != nil { return nil, oauthErr }; if applied { return t.SendWithContext(ctx,message,extraHeaders) } }
 	if res.StatusCode < 200 || res.StatusCode >= 300 { return nil, AxError{Category:"mcp", Message:fmt.Sprintf("HTTP error %d", res.StatusCode)} }
-	data, _ := io.ReadAll(res.Body)
+	data, readErr := io.ReadAll(res.Body)
+ if ctx.Err()!=nil{return nil,ctx.Err()};if readErr!=nil{return nil,readErr}
 	if len(strings.TrimSpace(string(data))) == 0 { return map[string]Value{"jsonrpc":"2.0", "id":coreGet(message, "id", nil), "result":map[string]Value{}}, nil }
 	// A spec-compliant MCP server may answer a JSON-RPC POST with an SSE stream
 	// (Content-Type: text/event-stream) carrying the response — and any interleaved
@@ -769,8 +863,8 @@ func (t *AxMCPStreamableHTTPTransport) SetMessageHandler(handler func(map[string
 func (t *AxMCPStreamableHTTPTransport) SetRequestHandler(handler func(map[string]Value)map[string]Value){t.requestHandler=handler}
 func(t *AxMCPStreamableHTTPTransport)dispatchInbound(message map[string]Value){if _,hasID:=message["id"];hasID&&coreGet(message,"method",nil)!=nil&&t.requestHandler!=nil{_ = t.SendResponse(t.requestHandler(message));return};if t.handler!=nil{t.handler(message)}}
 func (t *AxMCPStreamableHTTPTransport) SetLifecycleHandler(handler func(string)) { t.lifecycleHandler = handler }
-func (t *AxMCPStreamableHTTPTransport) SetProtocolVersion(protocolVersion string) { t.ProtocolVersion = protocolVersion }
-func (t *AxMCPStreamableHTTPTransport) SetEra(era string) { t.Era = era; if era == "modern" { t.SessionID = ""; t.ProtocolVersion = "2026-07-28" } else if t.ProtocolVersion == "2026-07-28" { t.ProtocolVersion = "" } }
+func (t *AxMCPStreamableHTTPTransport) SetProtocolVersion(protocolVersion string) {t.requestStateMu.Lock();defer t.requestStateMu.Unlock();t.ProtocolVersion = protocolVersion}
+func (t *AxMCPStreamableHTTPTransport) SetEra(era string) {t.requestStateMu.Lock();defer t.requestStateMu.Unlock();t.Era = era; if era == "modern" { t.SessionID = ""; t.ProtocolVersion = "2026-07-28" } else if t.ProtocolVersion == "2026-07-28" { t.ProtocolVersion = "" } }
 func (t *AxMCPStreamableHTTPTransport) EraHint() string { return "" }
 func (t *AxMCPStreamableHTTPTransport) EraCacheKey() string { return t.eraCacheKey }
 func (t *AxMCPStreamableHTTPTransport) Connect() error { return nil }
@@ -791,7 +885,7 @@ func (t *AxMCPStreamableHTTPTransport) OpenRequestStream(message map[string]Valu
 	if t.Era != "modern" { return AxError{Category:"mcp", Message:"Request streams are only available for modern MCP"} }
 	_ = t.CloseRequestStream()
 	t.listenMu.Lock();ctx,cancel:=context.WithCancel(context.Background());t.listenCancel=cancel;t.listenDone=make(chan struct{});done:=t.listenDone;t.listenMu.Unlock()
-	go func(){defer close(done);body,_:=json.Marshal(message);req,err:=http.NewRequestWithContext(ctx,"POST",t.Endpoint,bytes.NewReader(body));if err!=nil{return};method:=display(coreGet(message,"method",""));for key,value:=range t.BuildHeaders(map[string]string{"Content-Type":"application/json","Accept":"text/event-stream"},true,method,coreGet(message,"params",Object()),Object()){req.Header.Set(key,value)};res,err:=t.client.Do(req);if err!=nil{return};t.listenMu.Lock();t.listenBody=res.Body;t.listenMu.Unlock();if res.StatusCode>=200&&res.StatusCode<300{t.consumeRequestSSE(ctx,res.Body)};_ = res.Body.Close();t.listenMu.Lock();if t.listenBody==res.Body{t.listenBody=nil};t.listenMu.Unlock();if ctx.Err()==nil&&t.lifecycleHandler!=nil{go t.lifecycleHandler("disconnected")}}()
+	go func(){defer close(done);body:=wireJSONBody(message);req,err:=http.NewRequestWithContext(ctx,"POST",t.Endpoint,bytes.NewReader(body));if err!=nil{return};method:=display(coreGet(message,"method",""));for key,value:=range t.BuildHeaders(map[string]string{"Content-Type":"application/json","Accept":"text/event-stream"},true,method,coreGet(message,"params",Object()),Object()){req.Header.Set(key,value)};res,err:=t.client.Do(req);if err!=nil{return};t.listenMu.Lock();t.listenBody=res.Body;t.listenMu.Unlock();if res.StatusCode>=200&&res.StatusCode<300{t.consumeRequestSSE(ctx,res.Body)};_ = res.Body.Close();t.listenMu.Lock();if t.listenBody==res.Body{t.listenBody=nil};t.listenMu.Unlock();if ctx.Err()==nil&&t.lifecycleHandler!=nil{go t.lifecycleHandler("disconnected")}}()
 	return nil
 }
 func(t *AxMCPStreamableHTTPTransport)consumeRequestSSE(ctx context.Context,body io.Reader){scanner:=bufio.NewScanner(body);data:=[]string{};dispatch:=func(){if len(data)>0{var message map[string]Value;if json.Unmarshal([]byte(strings.Join(data,"\n")),&message)==nil{t.dispatchInbound(message)}};data=nil};for scanner.Scan()&&ctx.Err()==nil{line:=strings.TrimSuffix(scanner.Text(),"\r");if line==""{dispatch()}else if strings.HasPrefix(line,"data:"){data=append(data,strings.TrimSpace(strings.TrimPrefix(line,"data:")))}};if len(data)>0{dispatch()}}
@@ -809,7 +903,7 @@ func (t *AxMCPStreamableHTTPTransport) listenLoop(ctx context.Context, done chan
 			if t.lastEventID != "" { req.Header.Set("Last-Event-ID", t.lastEventID) }
 			res, requestErr := t.client.Do(req)
 			if requestErr == nil && res.StatusCode >= 200 && res.StatusCode < 300 {
-				if sid := res.Header.Get("MCP-Session-Id"); t.Era != "modern" && sid != "" { t.SessionID = sid }
+				t.recordSessionID(res.Header.Get("MCP-Session-Id"))
 				t.listenMu.Lock(); t.listenBody = res.Body; t.listenMu.Unlock()
 				if connectedOnce && t.lifecycleHandler != nil { t.lifecycleHandler("reconnected") }
 				connectedOnce = true
@@ -862,6 +956,7 @@ func (t *AxMCPStreamableHTTPTransport) Close() error {
 }
 
 func (t *AxMCPStreamableHTTPTransport) BuildHeaders(base map[string]string, includeProtocol bool, context ...Value) map[string]string {
+    t.requestStateMu.Lock();defer t.requestStateMu.Unlock()
 	out := map[string]string{}
 	for key, value := range t.Headers { out[key] = value }
 	for key, value := range base { out[key] = value }
@@ -877,8 +972,11 @@ func (t *AxMCPStreamableHTTPTransport) BuildHeaders(base map[string]string, incl
 	return out
 }
 
+func (t *AxMCPStreamableHTTPTransport) recordSessionID(id string){t.requestStateMu.Lock();defer t.requestStateMu.Unlock();if t.Era!="modern"&&id!=""{t.SessionID=id}}
+func (t *AxMCPStreamableHTTPTransport) recordAuthorization(value string){t.requestStateMu.Lock();defer t.requestStateMu.Unlock();t.Headers["Authorization"]=value}
+
 func axMCPEncodeHeaderValue(value string) string { plan := asMap(mustCore(mcp_header_value_plan(value))); if display(coreGet(plan, "mode", "plain")) == "plain" { return value }; return "=?base64?"+base64.StdEncoding.EncodeToString([]byte(value))+"?=" }
-func (t *AxMCPStreamableHTTPTransport) TerminateSession() error { if t.Era == "modern" || t.SessionID == "" { return nil }; t.SessionID = ""; return nil }
+func (t *AxMCPStreamableHTTPTransport) TerminateSession() error {t.requestStateMu.Lock();defer t.requestStateMu.Unlock();if t.Era == "modern" || t.SessionID == "" { return nil }; t.SessionID = ""; return nil }
 
 func axMCPOAuthTokenValue(token *AxMCPTokenSet) Value {
 	if token == nil { return nil }
@@ -924,7 +1022,7 @@ func (t *AxMCPStreamableHTTPTransport) ApplyOAuth(wwwAuthenticate ...string) (bo
 	planValue, err := mcp_oauth_plan_ensure_token(axMCPOAuthTokenValue(stored), time.Now().UnixMilli(), false, grantType, t.OAuth.OnAuthCode != nil); if err != nil { return false, err }
 	plan := asMap(planValue); if !coreTruthy(coreGet(plan,"ok",false)) { return false, fmt.Errorf("%s",display(coreGet(plan,"message","OAuth token planning failed"))) }
 	action := display(coreGet(plan,"action",""))
-	if action == "cached" { token := axMCPOAuthTokenSet(coreGet(plan,"token",axMCPOAuthTokenValue(stored))); t.Headers["Authorization"] = "Bearer "+token.AccessToken; return true,nil }
+	if action == "cached" { token := axMCPOAuthTokenSet(coreGet(plan,"token",axMCPOAuthTokenValue(stored))); t.recordAuthorization("Bearer "+token.AccessToken); return true,nil }
 	parsedValue, err := mcp_oauth_parse_www_authenticate(challenge); if err != nil { return false,err }; parsed := asMap(parsedValue)
 	resource := t.OAuth.Resource
 	asMetadata := t.OAuth.AuthorizationServerMetadata
@@ -951,7 +1049,7 @@ func (t *AxMCPStreamableHTTPTransport) ApplyOAuth(wwwAuthenticate ...string) (bo
 	if action=="refresh"{token,err=exchange("refresh_token","","",display(coreGet(plan,"refreshToken","")));if err!=nil{if t.OAuth.TokenStore!=nil{_ = t.OAuth.TokenStore.ClearToken(t.Endpoint)};if grantType=="client_credentials"{action="client_credentials"}else{action="authorize"}}}
 	if action=="client_credentials"{token,err=exchange("client_credentials","","","");if err!=nil{return false,err}}else if action=="authorize"{if t.OAuth.OnAuthCode==nil{return false,fmt.Errorf("Authorization required. Provide oauth.onAuthCode to complete the flow")};verifier:=AxMCPPKCEVerifier();codeChallenge:=AxMCPPKCEChallenge(verifier);state:=AxMCPPKCEVerifier();paramsValue,callErr:=mcp_oauth_authorization_request_params(clientID,redirectURI,scopes,resource,state,codeChallenge);if callErr!=nil{return false,callErr};authorizationEndpoint,validateErr:=AxMCPValidateEndpoint(display(coreGet(asMetadata,"authorization_endpoint","")),t.OAuth.SSRFProtection);if validateErr!=nil{return false,validateErr};parsedURL,parseErr:=url.Parse(authorizationEndpoint);if parseErr!=nil{return false,parseErr};query:=parsedURL.Query();for key,value:=range asMap(paramsValue){if key!="__order"{query.Set(key,display(value))}};parsedURL.RawQuery=query.Encode();auth,callbackErr:=t.OAuth.OnAuthCode(parsedURL.String());if callbackErr!=nil{return false,callbackErr};if auth["code"]==""{return false,nil};response:=map[string]Value{"expectedState":state};for key,value:=range auth{response[key]=value};issuerValidationValue,callErr:=mcp_oauth_validate_issuer(response,issuer,t.OAuth.RequireIss||coreTruthy(coreGet(metadataValidation,"requireIss",false)));if callErr!=nil{return false,callErr};issuerValidation:=asMap(issuerValidationValue);if !coreTruthy(coreGet(issuerValidation,"ok",false)){return false,fmt.Errorf("%s",display(coreGet(issuerValidation,"message","OAuth authorization response validation failed")))};token,err=exchange("authorization_code",auth["code"],verifier,"");if err!=nil{return false,err}}
 	if t.OAuth.TokenStore != nil { _ = t.OAuth.TokenStore.SetToken(t.Endpoint, token) }
-	t.Headers["Authorization"] = "Bearer " + token.AccessToken
+	t.recordAuthorization("Bearer " + token.AccessToken)
 	return true, nil
 }
 
@@ -1047,7 +1145,7 @@ func (t *AxMCPScriptedTransport) SendNotification(message map[string]Value) erro
 func (t *AxMCPScriptedTransport) SendResponse(message map[string]Value) error { t.SentResponses = append(t.SentResponses, cloneMCPMap(message)); return nil }
 func (t *AxMCPScriptedTransport) Emit(message map[string]Value) { if _,hasID:=message["id"];hasID&&coreGet(message,"method",nil)!=nil&&t.requestHandler!=nil{_ = t.SendResponse(t.requestHandler(message));return};if t.handler != nil { t.handler(message) } }
 
-func AxMCPStdioEncode(message map[string]Value) string { data, _ := json.Marshal(message); return string(data)+"\n" }
+func AxMCPStdioEncode(message map[string]Value) string { return string(wireJSONBody(message))+"\n" }
 func AxMCPStdioDecode(line string) (map[string]Value, error) { var out map[string]Value; err := json.Unmarshal([]byte(strings.TrimSpace(line)), &out); return out, err }
 func AxMCPPKCEVerifier() string { return base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("%d", time.Now().UnixNano()))) }
 func AxMCPPKCEChallenge(verifier string) string { sum := sha256.Sum256([]byte(verifier)); return base64.RawURLEncoding.EncodeToString(sum[:]) }
@@ -1070,6 +1168,47 @@ func AxMCPValidateEndpoint(endpoint string, options map[string]Value) (string, e
 
 func runMCPConformanceFixture(fixture map[string]Value) {
 	op := display(coreGet(fixture, "operation", "initialize"))
+  if op=="inheritance_context" || op=="inheritance_agent_context" {
+    for _,raw:=range asSlice(fixture["cases"]){test:=asMap(raw);clients:=[]*AxMCPClient{};transports:=map[string]*AxMCPScriptedTransport{}
+      for _,item:=range asSlice(fixture["clients"]){spec:=asMap(item);name:=display(spec["namespace"]);transport:=NewAxMCPScriptedTransport(asSlice(spec["responses"]));transports[name]=transport;clients=append(clients,NewAxMCPClient(transport,Object("namespace",name,"era","modern")))}
+      context,err:=NewAxExecutionContext(clients,nil);if err!=nil{panic(err)};child,err:=context.DeriveChecked(test["inheritance"]);results:=Array();selected:=Array()
+      if err==nil{for _,name:=range child.Namespaces(){selected=append(selected,name)};if op=="inheritance_agent_context"{options:=Object();for key,value:=range asMap(fixture["agent_options"]){options[key]=value};options["executionContext"]=child;program:=NewAgent("question:string -> answer:string",options);assertEqual(program.InvokeCallable("tools.local_echo",Object(),Object()),fixture["expected_local_result"],"Existing tool result");for _,client:=range child.MCP{for _,tool:=range client.NativeTools(){result:=program.InvokeCallable("mcp."+client.Namespace()+".tools."+tool.Name,Object("query","scope-probe"),Object());assertEqual(coreGet(result,"status",nil),"ok","Attached MCP invocation");results=append(results,coreGet(result,"value",nil))}}}else{var functions []Tool;functions,err=child.NativeTools();if err==nil{for _,tool:=range functions{var result Value;result,err=tool.invoke(Object("query","scope-probe"));if err!=nil{break};results=append(results,result)}}}}
+      message:="";if err!=nil{message=err.Error()};if message!=display(coreGet(test,"expected_error","")){panic(fmt.Sprintf("Inheritance error: %s",message))};if err==nil{assertEqual(selected,test["expected_namespaces"],"selected client order")};assertEqual(results,test["expected_results"],"inherited tool results")
+      for name,transport:=range transports{methods:=Array();for _,request:=range transport.Requests{methods=append(methods,request["method"]);if request["method"]=="tools/call"{assertEqual(coreGet(coreGet(request,"params",nil),"arguments",nil),Object("query","scope-probe"),"inherited tool arguments")}};assertEqual(methods,coreGet(test["expected_methods"],name,nil),"inherited client requests")}
+      parentTools,parentErr:=context.NativeTools();if parentErr!=nil{panic(parentErr)};parentResults:=Array();for _,tool:=range parentTools{parentResults=append(parentResults,tool.Call(Object("query","parent-probe")))};assertEqual(parentResults,test["expected_parent_results"],"parent continuation results")
+      for name,transport:=range transports{methods,calls:=Array(),Array();for _,request:=range transport.Requests{methods=append(methods,request["method"]);if request["method"]=="tools/call"{params:=coreGet(request,"params",Object());calls=append(calls,Object("name",coreGet(params,"name",nil),"arguments",coreGet(params,"arguments",nil)))}};assertEqual(methods,coreGet(test["expected_parent_methods"],name,nil),"parent continuation methods");assertEqual(calls,coreGet(test["expected_calls"],name,nil),"parent continuation calls")}
+    };return
+  }
+  if op=="inheritance_plan" {
+    for _,raw:=range asSlice(fixture["cases"]){test:=asMap(raw);result,err:=_mcp_inheritance_plan(fixture["mcp"],fixture["ucp"],test["inheritance"])
+      if expected:=coreGet(test,"expected_error",nil);expected!=nil{if err==nil||err.Error()!=display(expected){panic(fmt.Sprintf("Inheritance error mismatch: %v expected %v",err,expected))}}else{if err!=nil{panic(err)};assertEqual(result,test["expected"],"MCP inheritance selection")}
+    };return
+  }
+  if op=="tool_authorization" {
+    for _,raw:=range asSlice(coreGet(fixture,"cases",Array())){testCase:=asMap(raw);transport:=NewAxMCPScriptedTransport(asSlice(fixture["responses"]));observed:=[]Value{};var client *AxMCPClient;options:=cloneMCPMap(asMap(fixture["client_options"]))
+      options["authorizeToolCall"]=func(call map[string]Value)Value{if call["client"]!=client{panic("Lost authorization client")};copied:=map[string]Value{};for key,value:=range call{if key!="client"{copied[key]=value}};observed=append(observed,copied);return testCase["decision"]}
+      client=NewAxMCPClient(transport,options);if err:=client.Init();err!=nil{panic(err)};name:=display(testCase["name"]);result,err:=client.CallTool(name,Object("query","REF-42"));message:="";if err!=nil{message=err.Error()};if message!=display(coreGet(testCase,"expected_error","")){panic("MCP authorization error mismatch: "+message)};if err==nil{assertEqual(result,testCase["expected_result"],"authorized MCP result")};if len(observed)!=mcpInt(testCase["expected_authorization_calls"]){panic("Authorization call count mismatch")};if len(observed)>0{assertSubset(observed[0],testCase["expected_context"],"authorization context");assertSubset(testCase["expected_context"],observed[0],"authorization context fields")}
+      count:=0;for _,request:=range transport.Requests{if display(request["method"])=="tools/call"{count++;assertSubset(request,Object("params",Object("name",name,"arguments",Object("query","REF-42"))),"authorized request")}};if count!=mcpInt(testCase["expected_tool_requests"]){panic("Denied MCP request reached transport")}
+    };return
+  }
+  if op=="tool_task_handling" {
+    toolName:=display(fixture["tool"]);toolArgs:=asMap(coreGet(fixture,"arguments",Object()))
+    for _,raw:=range asSlice(coreGet(fixture,"cases",Array())){
+      testCase:=asMap(raw);label:=display(testCase["name"]);transport:=NewAxMCPScriptedTransport(asSlice(testCase["responses"]));options:=cloneMCPMap(asMap(fixture["client_options"]));options["era"]=testCase["era"]
+      client:=NewAxMCPClient(transport,options);if err:=client.Init();err!=nil{panic(err)};before:=len(transport.Requests)
+      var result Value;var err error
+      switch display(testCase["api"]){
+      case "call_tool":result,err=client.CallTool(toolName,cloneMCPMap(toolArgs))
+      case "call_tool_expose":result,err=client.CallToolWithOptions(context.Background(),toolName,cloneMCPMap(toolArgs),AxMCPToolCallOptions{TaskHandling:"expose"})
+      case "call_tool_outcome":var outcome AxMCPToolCallOutcome;outcome,err=client.CallToolOutcome(toolName,cloneMCPMap(toolArgs));if err==nil{if outcome.Kind=="task"{result=map[string]Value{"kind":"task","task":outcome.Task}}else{result=map[string]Value{"kind":outcome.Kind,"result":outcome.Result}}}
+      default:panic("unknown task-handling api "+display(testCase["api"]))
+      }
+      message:="";if err!=nil{message=err.Error()};if message!=display(coreGet(testCase,"expected_error","")){panic(label+": task-handling error mismatch: "+message)}
+      if err==nil{assertEqual(result,testCase["expected"],label)}
+      methods:=[]Value{};for _,request:=range transport.Requests[before:]{methods=append(methods,display(request["method"]))};assertEqual(methods,coreGet(testCase,"expected_methods",Array()),label+" methods")
+    };return
+  }
+
 	expectedErr := display(coreGet(fixture, "expected_error_contains", ""))
 	defer func() {
 		if r := recover(); r != nil {
@@ -1272,7 +1411,9 @@ func runMCPConformanceFixture(fixture map[string]Value) {
 	case "mrtr_roots":
 		result,err:=client.CallTool("work",map[string]Value{"value":1});if err!=nil{panic(err)};assertSubset(result,coreGet(fixture,"expected_call_result",Object()),"MRTR tool result");prompt,err:=client.GetPrompt("ask",map[string]Value{});if err!=nil{panic(err)};assertSubset(prompt,coreGet(fixture,"expected_prompt_result",Object()),"MRTR prompt result");resource,err:=client.ReadResource("file:///resource");if err!=nil{panic(err)};assertSubset(resource,coreGet(fixture,"expected_resource_result",Object()),"MRTR resource result");methods:=[]Value{};toolCalls:=[]map[string]Value{};ids:=map[string]bool{};for _,request:=range transport.Requests{method:=display(coreGet(request,"method",""));methods=append(methods,method);if method=="tools/call"{toolCalls=append(toolCalls,request);id:=display(coreGet(request,"id",""));if ids[id]{panic("MRTR rounds reused a request id")};ids[id]=true}};assertEqual(methods,coreGet(fixture,"expected_methods",Array()),"MRTR request methods");for index,raw:=range asSlice(coreGet(fixture,"expected_tool_call_params",Array())){expected:=asMap(raw);params:=asMap(coreGet(toolCalls[index],"params",Object()));assertSubset(params,expected,fmt.Sprintf("MRTR tool params %d",index));expectedResponses:=coreGet(expected,"inputResponses",nil);if expectedResponses==nil{if _,ok:=params["inputResponses"];ok{panic("initial MRTR request included inputResponses")};if _,ok:=params["requestState"];ok{panic("initial MRTR request included requestState")}}else{actualKeys:=asMap(coreGet(params,"inputResponses",Object()));expectedKeys:=asMap(expectedResponses);if len(actualKeys)!=len(expectedKeys){panic("MRTR request retained stale input responses")};for key:=range expectedKeys{if _,ok:=actualKeys[key];!ok{panic("MRTR request retained stale input responses")}}};if _,wanted:=expected["requestState"];!wanted{if _,present:=params["requestState"];present{panic("MRTR request retained stale requestState")}}}
 	case "subscriptions_listen":
-		for _,raw:=range asSlice(coreGet(fixture,"semantic_cases",Array())){item:=asMap(raw);actual:=mustCore(mcp_listen_interests(coreGet(item,"subscribed_uris",Array()),coreGet(item,"filters",Object())));assertEqual(actual,coreGet(item,"expected",Object()),"listen interests")};delivered:=[]map[string]Value{};client.AddNotificationListener(func(message map[string]Value){delivered=append(delivered,cloneMCPMap(message))});if err:=client.StartListening();err!=nil{panic(err)};if len(transport.RequestStreams)!=1{panic("initial subscriptions/listen stream missing")};first:=transport.RequestStreams[0];assertSubset(coreGet(coreGet(first,"params",Object()),"notifications",Object()),coreGet(fixture,"expected_first_notifications",Object()),"initial listen interests");if _,err:=client.AcquireResourceSubscription(display(coreGet(fixture,"uri","")),"fixture");err!=nil{panic(err)};if len(transport.RequestStreams)!=mcpInt(coreGet(fixture,"expected_stream_count",0)){panic("subscription interest change did not restart request stream")};second:=transport.RequestStreams[len(transport.RequestStreams)-1];if display(first["id"])==display(second["id"]){panic("subscriptions/listen restart reused its request id")};assertSubset(coreGet(coreGet(second,"params",Object()),"notifications",Object()),coreGet(fixture,"expected_second_notifications",Object()),"updated listen interests");countUpdates:=func()int{count:=0;for _,item:=range delivered{if display(item["method"])=="notifications/resources/updated"{count++}};return count};before:=countUpdates();notification:=cloneMCPMap(asMap(coreGet(fixture,"delivered_notification",Object())));params:=asMap(coreGet(notification,"params",Object()));params["_meta"]=map[string]Value{"io.modelcontextprotocol/subscriptionId":"other"};notification["params"]=params;transport.Emit(notification);if countUpdates()!=before{panic("cross-subscription notification was delivered")};params["_meta"]=map[string]Value{"io.modelcontextprotocol/subscriptionId":second["id"]};notification["params"]=params;transport.Emit(notification);if countUpdates()!=before+1{panic("active subscription notification was not delivered")};last:=delivered[len(delivered)-1];if _,ok:=asMap(coreGet(last,"params",Object()))["_meta"];ok{panic("subscription id leaked to notification consumer")};for _,forbidden:=range asSlice(coreGet(fixture,"expected_forbidden_methods",Array())){for _,request:=range transport.Requests{if display(request["method"])==display(forbidden){panic("modern subscription emitted legacy method "+display(forbidden))}}}
+		for _,raw:=range asSlice(coreGet(fixture,"semantic_cases",Array())){item:=asMap(raw);actual:=mustCore(mcp_listen_interests(coreGet(item,"subscribed_uris",Array()),coreGet(item,"filters",Object()),coreGet(item,"task_ids",nil)));assertEqual(actual,coreGet(item,"expected",Object()),"listen interests")};delivered:=[]map[string]Value{};client.AddNotificationListener(func(message map[string]Value){delivered=append(delivered,cloneMCPMap(message))});if err:=client.StartListening();err!=nil{panic(err)};if len(transport.RequestStreams)!=1{panic("initial subscriptions/listen stream missing")};first:=transport.RequestStreams[0];assertSubset(coreGet(coreGet(first,"params",Object()),"notifications",Object()),coreGet(fixture,"expected_first_notifications",Object()),"initial listen interests");if _,err:=client.AcquireResourceSubscription(display(coreGet(fixture,"uri","")),"fixture");err!=nil{panic(err)};if len(transport.RequestStreams)!=mcpInt(coreGet(fixture,"expected_stream_count",0)){panic("subscription interest change did not restart request stream")};second:=transport.RequestStreams[len(transport.RequestStreams)-1];if display(first["id"])==display(second["id"]){panic("subscriptions/listen restart reused its request id")};assertSubset(coreGet(coreGet(second,"params",Object()),"notifications",Object()),coreGet(fixture,"expected_second_notifications",Object()),"updated listen interests");countUpdates:=func()int{count:=0;for _,item:=range delivered{if display(item["method"])=="notifications/resources/updated"{count++}};return count};before:=countUpdates();notification:=cloneMCPMap(asMap(coreGet(fixture,"delivered_notification",Object())));params:=asMap(coreGet(notification,"params",Object()));params["_meta"]=map[string]Value{"io.modelcontextprotocol/subscriptionId":"other"};notification["params"]=params;transport.Emit(notification);if countUpdates()!=before{panic("cross-subscription notification was delivered")};params["_meta"]=map[string]Value{"io.modelcontextprotocol/subscriptionId":second["id"]};notification["params"]=params;transport.Emit(notification);if countUpdates()!=before+1{panic("active subscription notification was not delivered")};last:=delivered[len(delivered)-1];if _,ok:=asMap(coreGet(last,"params",Object()))["_meta"];ok{panic("subscription id leaked to notification consumer")};for _,forbidden:=range asSlice(coreGet(fixture,"expected_forbidden_methods",Array())){for _,request:=range transport.Requests{if display(request["method"])==display(forbidden){panic("modern subscription emitted legacy method "+display(forbidden))}}}
+	case "task_listen_restart":
+		delivered:=[]map[string]Value{};client.AddNotificationListener(func(message map[string]Value){delivered=append(delivered,cloneMCPMap(message))});if err:=client.StartListening();err!=nil{panic(err)};if len(transport.RequestStreams)!=1{panic("initial subscriptions/listen stream missing")};if _,ok:=asMap(coreGet(coreGet(transport.RequestStreams[0],"params",Object()),"notifications",Object()))["taskIds"];ok{panic("listener asked for tasks before any were recorded")};outcome,err:=client.CallToolOutcome(display(fixture["tool"]),asMap(coreGet(fixture,"arguments",Object())));if err!=nil{panic(err)};if outcome.Kind!="task"{panic("expected a task outcome, got "+outcome.Kind)};if len(transport.RequestStreams)!=2{panic("a recorded task did not restart the listener")};second:=transport.RequestStreams[len(transport.RequestStreams)-1];assertSubset(coreGet(coreGet(second,"params",Object()),"notifications",Object()),coreGet(fixture,"expected_second_notifications",Object()),"task listen interests");notification:=cloneMCPMap(asMap(coreGet(fixture,"task_notification",Object())));params:=asMap(coreGet(notification,"params",Object()));params["_meta"]=map[string]Value{"io.modelcontextprotocol/subscriptionId":second["id"]};notification["params"]=params;transport.Emit(notification);count:=0;for _,item:=range delivered{if display(item["method"])=="notifications/tasks"{count++}};if count!=1{panic("task notification was not delivered")};if len(transport.RequestStreams)!=2{panic("a known task restarted the listener")}
 	case "initialize", "protocol_negotiation":
 		assertMCPRequests(transport.Requests, fixture)
 	case "ping":
@@ -1280,6 +1421,9 @@ func runMCPConformanceFixture(fixture map[string]Value) {
 		assertMCPRequests(transport.Requests, fixture)
 	case "tools":
 		functions := client.NativeTools()
+        for _, function := range functions {
+            if expected := coreGet(coreGet(fixture,"expected_schemas",Object()),function.Name,nil); expected != nil { assertEqual(function.Schema(),expected,"native tool schema") }
+        }
 		var names []Value
 		for _, fn := range functions { names = append(names, fn.Name) }
 		if expected := coreGet(fixture, "expected_function_names", nil); expected != nil { assertEqual(names, expected, "function names") }
@@ -1332,3 +1476,109 @@ func mcpHeaderValues(headers map[string]string) map[string]Value { out := map[st
 func contentText(items []Value) string { var out []string; for _, item := range items { m := asMap(item); if display(coreGet(m, "type", "")) == "text" { out = append(out, display(coreGet(m, "text", ""))) } }; return strings.Join(out, "\n") }
 func safeMCPName(value string) string { var b strings.Builder; last := false; for _, r := range value { ok := (r>='a'&&r<='z')||(r>='A'&&r<='Z')||(r>='0'&&r<='9'); if ok { b.WriteRune(r); last=false } else if !last { b.WriteByte('_'); last=true } }; return strings.Trim(b.String(), "_") }
 func cloneMCPMap(value map[string]Value) map[string]Value { data, _ := json.Marshal(value); var out map[string]Value; _ = json.Unmarshal(data, &out); return out }
+
+// AxMCPWebSocket supports injectable sockets and the built-in TLS-capable transport.
+type AxMCPWebSocket interface {
+    Send(string) error
+    Receive() (string,error)
+    Close() error
+}
+type AxMCPWebSocketFactory func(string,[]string)(AxMCPWebSocket,error)
+type mcpWSResult struct { message map[string]Value; err error }
+type mcpWSPending struct { result chan mcpWSResult }
+type AxMCPWebSocketTransport struct {
+    url string
+    protocols []string
+    factory AxMCPWebSocketFactory
+    mu sync.Mutex
+    socket AxMCPWebSocket
+    pending map[string]*mcpWSPending
+    protocol string
+    handler func(map[string]Value)
+    requestHandler func(map[string]Value)map[string]Value
+    lifecycle func(string)
+}
+func NewAxMCPWebSocketTransport(url string,options map[string]Value)*AxMCPWebSocketTransport {
+    t:=&AxMCPWebSocketTransport{url:url,pending:map[string]*mcpWSPending{}}
+    for _,item:=range coreIter(coreGet(options,"protocols",Array())){t.protocols=append(t.protocols,display(item))}
+    t.factory,_=coreGet(options,"webSocketFactory",coreGet(options,"web_socket_factory",nil)).(AxMCPWebSocketFactory)
+    if t.factory==nil {t.factory=func(target string,protocols []string)(AxMCPWebSocket,error){
+        ctx,cancel:=context.WithTimeout(context.Background(),30*time.Second);defer cancel()
+        conn,_,err:=websocket.Dial(ctx,target,&websocket.DialOptions{Subprotocols:protocols});if err!=nil{return nil,err}
+        // Match the existing native WebSocket transport; tool results can exceed 32 KiB.
+        conn.SetReadLimit(-1)
+        return &mcpNativeWebSocket{conn},nil
+    }}
+    return t
+}
+type mcpNativeWebSocket struct{conn *websocket.Conn}
+func(s *mcpNativeWebSocket)Send(text string)error{ctx,cancel:=context.WithTimeout(context.Background(),30*time.Second);defer cancel();return s.conn.Write(ctx,websocket.MessageText,[]byte(text))}
+func(s *mcpNativeWebSocket)Receive()(string,error){_,data,err:=s.conn.Read(context.Background());return string(data),err}
+func(s *mcpNativeWebSocket)Close()error{return s.conn.CloseNow()}
+func(t *AxMCPWebSocketTransport)Connect()error{
+    t.mu.Lock();defer t.mu.Unlock();if t.socket!=nil{return nil}
+    socket,err:=t.factory(t.url,t.protocols);if err!=nil{return err};if socket==nil{return fmt.Errorf("MCP WebSocket factory returned nil")};t.socket=socket
+    go t.receive(socket);return nil
+}
+func(t *AxMCPWebSocketTransport)receive(socket AxMCPWebSocket){
+    for {raw,err:=socket.Receive();if err!=nil{t.terminate(socket,err);return}
+        var parsed Value;if err=json.Unmarshal([]byte(raw),&parsed);err!=nil{t.terminate(socket,err);return}
+        messages,batch:=parsed.([]Value);if !batch{messages=[]Value{parsed}}
+        t.mu.Lock();protocol:=t.protocol;t.mu.Unlock()
+        if batch&&protocol!="2025-03-26"{t.terminate(socket,fmt.Errorf("JSON-RPC batching is only allowed for MCP 2025-03-26"));return}
+        for _,rawMessage:=range messages{
+            message,ok:=rawMessage.(map[string]Value);if !ok{t.terminate(socket,fmt.Errorf("Invalid MCP WebSocket message"));return}
+            t.mu.Lock();if t.socket!=socket{t.mu.Unlock();return}
+            var slot *mcpWSPending
+            if id,hasID:=message["id"];hasID&&message["method"]==nil{key:=stableStringify(id);slot=t.pending[key];delete(t.pending,key)}
+            handler,requestHandler:=t.handler,t.requestHandler;t.mu.Unlock()
+            if slot!=nil{slot.result<-mcpWSResult{message:message}}else if message["id"]!=nil&&message["method"]!=nil&&requestHandler!=nil{go t.respond(socket,message,requestHandler)}else if handler!=nil{go handler(message)}
+        }
+    }
+}
+func(t *AxMCPWebSocketTransport)respond(socket AxMCPWebSocket,message map[string]Value,handler func(map[string]Value)map[string]Value){
+    t.mu.Lock();active:=t.socket==socket;t.mu.Unlock();if !active{return}
+    response:=handler(message)
+    t.mu.Lock();active=t.socket==socket;t.mu.Unlock();if !active{return}
+    _ = socket.Send(string(wireJSONBody(response)))
+}
+func(t *AxMCPWebSocketTransport)terminate(socket AxMCPWebSocket,err error){
+    t.mu.Lock();if t.socket!=socket{t.mu.Unlock();return};t.socket=nil
+    pending:=t.pending;t.pending=map[string]*mcpWSPending{};handler:=t.lifecycle;t.mu.Unlock()
+    for _,slot:=range pending{slot.result<-mcpWSResult{err:err}}
+    _=socket.Close();if handler!=nil{handler("disconnected")}
+}
+func(t *AxMCPWebSocketTransport)requests(ctx context.Context,messages []Value,batch bool)([]map[string]Value,error){
+    t.mu.Lock();protocol:=t.protocol;t.mu.Unlock()
+    rawIDs,err:=mcp_websocket_request_ids(messages,protocol,batch);if err!=nil{return nil,err}
+    ids:=[]string{};for _,id:=range coreIter(rawIDs){ids=append(ids,display(id))}
+    if err=ctx.Err();err!=nil{return nil,err}
+    var payload Value=messages;if !batch{payload=messages[0]};data:=wireJSONBody(payload)
+    if err=t.Connect();err!=nil{return nil,err}
+    slots:=make([]*mcpWSPending,len(ids))
+    t.mu.Lock();for _,id:=range ids{if t.pending[id]!=nil{t.mu.Unlock();return nil,fmt.Errorf("MCP request ID is already pending")}}
+    socket:=t.socket;if socket==nil{t.mu.Unlock();return nil,fmt.Errorf("MCP WebSocket closed")}
+    for i,id:=range ids{slots[i]=&mcpWSPending{make(chan mcpWSResult,1)};t.pending[id]=slots[i]};t.mu.Unlock()
+    defer func(){t.mu.Lock();defer t.mu.Unlock();for i,id:=range ids{if t.pending[id]==slots[i]{delete(t.pending,id)}}}()
+    if err=ctx.Err();err!=nil{return nil,err};if err=socket.Send(string(data));err!=nil{return nil,err}
+    results:=make([]map[string]Value,0,len(ids))
+    for _,slot:=range slots{select{case <-ctx.Done():return nil,ctx.Err();case result:=<-slot.result:if result.err!=nil{return nil,result.err};results=append(results,result.message)}}
+    return results,nil
+}
+func(t *AxMCPWebSocketTransport)Send(message map[string]Value)(map[string]Value,error){return t.SendWithContext(context.Background(),message,nil)}
+func(t *AxMCPWebSocketTransport)SendWithHeaders(message map[string]Value,headers map[string]string)(map[string]Value,error){return t.Send(message)}
+func(t *AxMCPWebSocketTransport)SendWithContext(ctx context.Context,message map[string]Value,headers map[string]string)(map[string]Value,error){result,err:=t.requests(ctx,[]Value{message},false);if err!=nil{return nil,err};return result[0],nil}
+func(t *AxMCPWebSocketTransport)SendBatch(ctx context.Context,messages []Value)([]map[string]Value,error){return t.requests(ctx,messages,true)}
+func(t *AxMCPWebSocketTransport)SendNotification(message map[string]Value)error{if err:=t.Connect();err!=nil{return err};data:=wireJSONBody(message);t.mu.Lock();socket:=t.socket;t.mu.Unlock();if socket==nil{return fmt.Errorf("MCP WebSocket closed")};return socket.Send(string(data))}
+func(t *AxMCPWebSocketTransport)SendResponse(message map[string]Value)error{return t.SendNotification(message)}
+func(t *AxMCPWebSocketTransport)SetMessageHandler(handler func(map[string]Value)){t.mu.Lock();defer t.mu.Unlock();t.handler=handler}
+func(t *AxMCPWebSocketTransport)SetRequestHandler(handler func(map[string]Value)map[string]Value){t.mu.Lock();defer t.mu.Unlock();t.requestHandler=handler}
+func(t *AxMCPWebSocketTransport)SetLifecycleHandler(handler func(string)){t.mu.Lock();defer t.mu.Unlock();t.lifecycle=handler}
+func(t *AxMCPWebSocketTransport)SetProtocolVersion(version string){t.mu.Lock();defer t.mu.Unlock();t.protocol=version}
+func(t *AxMCPWebSocketTransport)SetEra(era string){}
+func(t *AxMCPWebSocketTransport)EraHint()string{return "legacy"}
+func(t *AxMCPWebSocketTransport)EraCacheKey()string{return ""}
+func(t *AxMCPWebSocketTransport)StartListening()error{return t.Connect()}
+func(t *AxMCPWebSocketTransport)OpenRequestStream(message map[string]Value)error{return fmt.Errorf("Request streams are only available for modern MCP")}
+func(t *AxMCPWebSocketTransport)CloseRequestStream()error{return nil}
+func(t *AxMCPWebSocketTransport)Close()error{t.mu.Lock();socket:=t.socket;t.mu.Unlock();if socket!=nil{t.terminate(socket,fmt.Errorf("MCP WebSocket closed"))};return nil}

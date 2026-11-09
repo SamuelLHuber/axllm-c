@@ -2,14 +2,26 @@ from __future__ import annotations
 import os
 
 import copy
+import hashlib
 import inspect
+import math
 import json
 import re
 import time
+import warnings
 from typing import Any
 
 from .ai import (
+    _core_axgen_deprecation,
+    _core_math_floor,
     AIClient,
+    AxAIRefusalError,
+    AxAIServiceAbortedError,
+    AxAIServiceNetworkError,
+    AxAIServiceStatusError,
+    AxAIServiceStreamTerminatedError,
+    AxAIServiceTimeoutError,
+    AxCancellationToken,
     AxMeter,
     AxRateLimiter,
     AxRuntimeHooks,
@@ -17,15 +29,60 @@ from .ai import (
     _coerce_runtime_hooks,
     _merge_runtime_hooks,
     _runtime_hook_scope,
+    _gen_metric_labels,
     _runtime_hooks_from_options,
     _strip_runtime_hooks,
+    _snapshot_global_caching_function,
+    _snapshot_global_function_result_formatter,
     chat_response_to_completion,
+    ai_merge_replay_metadata,
+    fold_chat_response_stream,
 )
-from .prompt import AxPromptTemplate
-from .schema import AxValidationError, strip_internal, validate_fields, validate_output
-from .signature import AxSignature
+from .prompt import AxPromptTemplate, _core_json_pretty, _core_string_split
+from .schema import AxValidationError, _core_field_item, _core_url_valid, strip_internal, validate_fields, validate_output
+from .signature import AxSignature, _core_string_replace, _js_date_prompt_text, _js_json_dumps, _js_number_text, _js_format, _js_text
 from .mcp import resolve_execution_context
 # AXIR_CORE_IMPORTS
+from .signature import _evidence_has_fields_impl, _evidence_example_values_impl
+
+
+class _StreamingConsumerStopped(AxAIServiceAbortedError):
+    """The streaming_forward consumer stopped the run early."""
+
+
+def _core_json_stable_stringify(value):
+    return _js_json_dumps(value or {}, sort_keys=True)
+
+
+def _core_crypto_sha256_hex(text):
+    return hashlib.sha256(str(text).encode("utf-8")).hexdigest()
+
+
+def _core_axgen_function_result_formatter():
+    # The process-wide tool result formatter (set_function_result_formatter),
+    # or None.
+    return _snapshot_global_function_result_formatter()
+
+
+def _core_axgen_caching_function(gen, options):
+    # The forward call's caching function, else the constructor's, else the
+    # process-wide one (set_caching_function).
+    for source in (options, getattr(gen, "options", None)):
+        if isinstance(source, dict):
+            caching_function = source.get("caching_function", source.get("cachingFunction"))
+            if caching_function is not None:
+                return caching_function
+    return _snapshot_global_caching_function()
+
+
+def _core_axgen_cache_read(caching_function, key):
+    # fn(key) returns the stored output, or None for a miss.
+    return caching_function(key)
+
+
+def _core_axgen_cache_write(caching_function, key, value):
+    caching_function(key, value)
+    return None
 
 
 def _call_optimizer_engine(engine, request: dict[str, Any], evaluator):
@@ -116,6 +173,7 @@ class AxMemory:
         item = {"role": "assistant", "response": result, "session_id": session_id, "tags": []}
         for existing in reversed(self.items):
             if existing.get("role") == "assistant" and existing.get("session_id") == session_id:
+                item["response"] = ai_merge_replay_metadata(existing.get("response") or {}, result)
                 existing.update(item)
                 return self
         self.items.append(item)
@@ -165,7 +223,7 @@ def _ax_memory_response_meaningful(response) -> bool:
     content = response.get("content")
     if isinstance(content, str) and content.strip():
         return True
-    for key in ("function_calls", "functionCalls", "tool_calls", "toolCalls", "thought_blocks", "thoughtBlocks"):
+    for key in ("function_calls", "functionCalls", "tool_calls", "toolCalls", "thought_blocks", "thoughtBlocks", "images"):
         value = response.get(key)
         if isinstance(value, list) and value:
             return True
@@ -173,6 +231,13 @@ def _ax_memory_response_meaningful(response) -> bool:
 
 
 class AxGen:
+    def owned_worker_factory(self):
+        if self.execution_context is not None: return None
+        memo = {id(self.runtime_hooks):self.runtime_hooks}
+        try: snapshot = copy.deepcopy(self, dict(memo))
+        except (TypeError, ValueError): return None
+        return lambda: copy.deepcopy(snapshot, dict(memo))
+
     def __init__(self, signature, options: dict[str, Any] | None = None, hooks: AxRuntimeHooks | None = None):
         self.signature = signature if isinstance(signature, AxSignature) else AxSignature(signature)
         self.runtime_hooks = _merge_runtime_hooks(_coerce_runtime_hooks(hooks), _runtime_hooks_from_options(options))
@@ -185,6 +250,8 @@ class AxGen:
         self.assertions = list(self.options.get("assertions") or [])
         self.streaming_assertions = list(self.options.get("streaming_assertions") or self.options.get("streamingAssertions") or [])
         self.field_processors = list(self.options.get("field_processors") or self.options.get("fieldProcessors") or [])
+        self.feedback_processors = list(self.options.get("feedback_processors") or self.options.get("feedbackProcessors") or [])
+        self.streaming_field_processors = list(self.options.get("streaming_field_processors") or self.options.get("streamingFieldProcessors") or [])
         self.stop_functions = list(self.options.get("stop_functions") or self.options.get("stopFunctions") or [])
         self.memory = self.options.get("memory") or self.options.get("mem") or AxMemory()
         self.chat_log: list[dict[str, Any]] = []
@@ -197,9 +264,15 @@ class AxGen:
             functions=self.functions,
             structured_output_function_name=self.options.get("structured_output_function_name", self.options.get("structuredOutputFunctionName")),
             custom_template=self.options.get("custom_template", self.options.get("customTemplate")),
+            include_optional_input_fields_in_system_prompt=self._include_optional_input_fields(),
         )
         if self.instruction:
             self.prompt_template.set_instruction(self.instruction)
+
+    def _include_optional_input_fields(self) -> bool:
+        # TS includeOptionalInputFieldsInSystemPrompt: the system prompt lists
+        # every input field, provided or not. Off by default.
+        return bool(self.options.get("include_optional_input_fields_in_system_prompt", self.options.get("includeOptionalInputFieldsInSystemPrompt", False)))
 
     def set_rate_limiter(self, limiter: AxRateLimiter | None):
         self.runtime_hooks = AxRuntimeHooks(limiter, self.runtime_hooks.tracer, self.runtime_hooks.meter)
@@ -231,19 +304,83 @@ class AxGen:
         self.options["result_picker"] = result_picker
         return self
 
-    def add_assert(self, assertion):
+    def set_function_result_formatter(self, formatter):
+        """Write each tool result for the model as TS's functionResultFormatter
+        option does: formatter(result) -> text. Without one, a string goes as it
+        is, None as "done", and any other value as pretty JSON. A forward
+        call's function_result_formatter option wins over this one, and this
+        one over the process-wide axllm.set_function_result_formatter. A
+        formatter that raises fails the forward ("Generate failed: ..."), as
+        in TS."""
+        self.options["function_result_formatter"] = formatter
+        return self
+
+    def add_assert(self, assertion, message=None):
+        """Add an assertion: a declarative spec or a callable over the outputs.
+
+        A callable returns None or True to pass, a string to fail with that
+        message, or False to fail with ``message``. As in TypeScript, a failure
+        with a message is retried with a correction, while a failure without
+        one, or an error the callable raises, surfaces at once.
+        """
+        if message is not None and callable(assertion):
+            assertion = _MessageAssertion(assertion, message)
+        elif message is not None and isinstance(assertion, dict):
+            assertion = {**assertion, "message": message}
         self.assertions.append(assertion)
         return self
 
     def add_streaming_assert(self, field, not_contains=None, message=None):
-        spec = dict(field) if isinstance(field, dict) else {"field": field, "not_contains": not_contains}
+        """Add a streaming assertion on a string or code output field.
+
+        ``not_contains`` is text the field must not contain, or a callable
+        ``check(text, done)`` over the field's text so far that returns None or
+        True to pass, a message string, or False. As in TypeScript, a failure
+        stops the attempt and retries it with a correction.
+        """
+        if isinstance(field, dict):
+            spec = dict(field)
+        elif callable(not_contains):
+            spec = {"field": field, "fn": not_contains}
+        else:
+            spec = {"field": field, "not_contains": not_contains}
         if message is not None:
             spec["message"] = message
         self.streaming_assertions.append(spec)
         return self
 
-    def add_field_processor(self, field, processor):
+    def add_field_transform(self, field, processor):
+        """Rewrite an output field's final value: an op name ("uppercase",
+        "lowercase", "trim", "prefix:...", "suffix:...") or a callable.
+
+        This is a port extension; TypeScript field processors feed back to
+        the model instead (see add_field_processor(...)).
+        """
         self.field_processors.append({"field": field, "processor": processor})
+        return self
+
+    def add_field_processor(self, field, processor, *, feedback=True):
+        """Send processor(value, {"values", "done"}) feedback to the model.
+
+        A non-empty result requests another step. Use add_field_transform()
+        to rewrite the field locally; feedback=False retains that behavior.
+        """
+        if feedback:
+            self.feedback_processors.append({"field": field, "processor": processor})
+            return self
+        return self.add_field_transform(field, processor)
+
+    def add_streaming_field_processor(self, field, processor):
+        """Run ``processor(text, {"values", "done"})`` on each streamed chunk of
+        a string or code output field; a non-empty result is sent to the
+        model as a user message for another step, as in TypeScript."""
+        output = next((item for item in self.signature.get_output_fields() if item.name == field), None)
+        if output is None:
+            raise ValueError(f"addFieldProcessor: field {field} not found")
+        type_name = getattr(getattr(output, "type", None), "name", "string") or "string"
+        if type_name not in ("string", "code"):
+            raise ValueError(f"addFieldProcessor: field {field} must be a text field")
+        self.streaming_field_processors.append({"field": field, "processor": processor})
         return self
 
     def set_stop_functions(self, names):
@@ -359,6 +496,8 @@ class AxGen:
 
     def evaluate_optimization(self, client, dataset, candidate_map: dict[str, Any] | None = None, options: dict[str, Any] | None = None):
         opts = options or {}
+        if opts.get("demos"):
+            self.set_demos(opts["demos"])
         normalized = _normalize_optimization_dataset(dataset or [])
         rows = []
         original = _optimization_component_current_map(self.get_optimizable_components())
@@ -435,31 +574,70 @@ class AxGen:
         options: dict[str, Any] | None = None,
         hooks: AxRuntimeHooks | None = None,
     ):
+        # As in TS, the cache is read before the run's span and metrics, so a
+        # stored output records neither.
+        run_options = _strip_runtime_hooks(options) or {}
+        run_options["_evidence_cache_identity"] = {"instance": id(client), "provider": getattr(client, "name", type(client).__name__), "model": getattr(client, "model", None), "config": getattr(client, "model_config", None)}
+        lookup = _cache_lookup_impl(self, values, run_options, False)
+        if lookup.get("hit"):
+            # A stored output's audio outputs are rendered, as TS does.
+            return _render_audio_outputs_impl(self, client, lookup.get("value"), run_options)
         call_hooks = _merge_runtime_hooks(_coerce_runtime_hooks(hooks), _runtime_hooks_from_options(options))
         with _runtime_hook_scope(
             call_hooks,
             self.runtime_hooks,
             span_name="ax_gen_forward",
             attributes={"ax.program.id": self.program_id, "ax.program.type": "AxGen"},
+            metric_labels=_gen_metric_labels(client, self.options, run_options),
         ):
-            return self._forward_unscoped(client, values, _strip_runtime_hooks(options))
+            return self._forward_unscoped(client, values, {**run_options, "_ax_cache_lookup": lookup})
 
     def _forward_unscoped(self, client: AIClient, values: dict[str, Any], options: dict[str, Any] | None = None):
         call_context = resolve_execution_context(options, self.execution_context)
-        if call_context is self.execution_context:
-            return _forward_impl(self, client, values, options)
-        call_gen = copy.copy(self)
-        call_gen.execution_context = call_context
-        call_gen.functions = self._base_functions + (call_context.native_tools() if call_context else [])
-        call_gen.prompt_template = AxPromptTemplate(
-            self.signature,
-            functions=call_gen.functions,
-            structured_output_function_name=self.options.get("structured_output_function_name", self.options.get("structuredOutputFunctionName")),
-            custom_template=self.options.get("custom_template", self.options.get("customTemplate")),
-        )
-        if self.instruction:
-            call_gen.prompt_template.set_instruction(self.instruction)
-        return _forward_impl(call_gen, client, values, options)
+        if call_context is not self.execution_context:
+            call_gen = copy.copy(self)
+            call_gen.execution_context = call_context
+            call_gen.functions = self._base_functions + (call_context.native_tools() if call_context else [])
+            call_gen.prompt_template = AxPromptTemplate(
+                self.signature,
+                functions=call_gen.functions,
+                structured_output_function_name=self.options.get("structured_output_function_name", self.options.get("structuredOutputFunctionName")),
+                custom_template=self.options.get("custom_template", self.options.get("customTemplate")),
+                include_optional_input_fields_in_system_prompt=self._include_optional_input_fields(),
+            )
+            if self.instruction:
+                call_gen.prompt_template.set_instruction(self.instruction)
+            return call_gen._forward_unscoped(client, values, options)
+        run_options = {**self.options, **(options or {})}
+        model = str(run_options.get("model") or getattr(client, "model", ""))
+        session_enabled = (chat_session_mode_enabled(run_options)
+            and (callable(getattr(client, "_pin_chat_run", None)) or
+                 (callable(getattr(client, "open_chat_session", None)) and
+                  bool(getattr(client, "get_features", lambda model=None: {})(model or None).get("asyncTools"))))
+            and (run_options.get("control") is not None or any(getattr(tool, "execution", "blocking") == "background" for tool in self.functions)))
+        if session_enabled:
+            from .session import _SessionClient
+            pinned = _SessionClient(self, client, run_options)
+            try:
+                result = self._forward_unscoped(pinned, values, {**run_options, "asyncMode": "off", "async_mode": "off", "infraRetries": 0, "infra_retries": 0})
+            except BaseException as error:
+                pinned.close(error)
+                raise
+            pinned.close()
+            return result
+        from .session import _BoundaryClient
+        if run_options.get("control") is not None and not isinstance(client, (_BoundaryClient,)):
+            from .session import _SessionClient
+            if not isinstance(client, _SessionClient):
+                bounded = _BoundaryClient(client, run_options)
+                try:
+                    result = self._forward_unscoped(bounded, values, run_options)
+                except BaseException as error:
+                    bounded.close(error)
+                    raise
+                bounded.close()
+                return result
+        return _forward_impl(self, client, values, options)
 
     def streaming_forward(
         self,
@@ -468,46 +646,219 @@ class AxGen:
         options: dict[str, Any] | None = None,
         hooks: AxRuntimeHooks | None = None,
     ):
+        """Yield {"version", "index", "delta"} field deltas by default.
+
+        Merge strings and lists within an index and start over when the
+        version changes. Use stream_raw() for provider response events.
+        """
+        run_options = dict(options or {})
+        if run_options.pop("deltas", True):
+            return self._streaming_deltas(client, values, run_options, hooks)
+        return self.stream_raw(client, values, run_options, hooks)
+
+    def stream_raw(
+        self,
+        client: AIClient,
+        values: dict[str, Any],
+        options: dict[str, Any] | None = None,
+        hooks: AxRuntimeHooks | None = None,
+    ):
+        """Yield the raw provider events of one streamed request."""
         call_hooks = _merge_runtime_hooks(_coerce_runtime_hooks(hooks), _runtime_hooks_from_options(options))
         with _runtime_hook_scope(
             call_hooks,
             self.runtime_hooks,
             span_name="ax_gen_forward",
             attributes={"ax.program.id": self.program_id, "ax.program.type": "AxGen", "ax.streaming": True},
+            metric_labels=_gen_metric_labels(client, self.options, options),
         ):
             yield from self._streaming_forward_unscoped(client, values, _strip_runtime_hooks(options))
 
-    def _streaming_forward_unscoped(self, client: AIClient, values: dict[str, Any], options: dict[str, Any] | None = None):
+    def _streaming_deltas(self, client, values, options, hooks):
+        # The forward runs in a worker thread and hands each delta to this
+        # generator, then waits until the consumer asks for the next one, as
+        # TypeScript's async generator does. Closing the generator stops the
+        # run at that delta; with a run control it ends as aborted.
+        import contextvars
+        import queue
+        import threading
+
+        deliveries = queue.Queue()
+        resume = threading.Semaphore(0)
+        stopped = threading.Event()
+
+        def sink(envelope):
+            if stopped.is_set():
+                raise _StreamingConsumerStopped("streaming consumer closed")
+            deliveries.put(("delta", copy.deepcopy(envelope)))
+            resume.acquire()
+            if stopped.is_set():
+                raise _StreamingConsumerStopped("streaming consumer closed")
+
+        def run():
+            try:
+                self._streaming_forward_with(client, values, options, sink, hooks)
+                deliveries.put(("done", None))
+            except BaseException as error:  # noqa: BLE001 - re-raised in the consumer
+                deliveries.put(("error", error))
+
+        context = contextvars.copy_context()
+        worker = threading.Thread(target=context.run, args=(run,), daemon=True)
+        worker.start()
+        try:
+            while True:
+                kind, item = deliveries.get()
+                if kind == "error":
+                    raise item
+                if kind == "done":
+                    return
+                yield item
+                resume.release()
+        finally:
+            stopped.set()
+            resume.release()
+            worker.join()
+
+    def _streaming_forward_with(self, client, values, options, sink, hooks=None):
+        # Runs the streaming forward, sending each {version, index, delta} to
+        # sink, and returns the merged output of the picked sample. As in TS,
+        # the cache is read before the run's span and metrics, a read error
+        # is ignored, and a stored output arrives as one delta.
+        run_options = _strip_runtime_hooks(options) or {}
+        run_options["_evidence_cache_identity"] = {"instance": id(client), "provider": getattr(client, "name", type(client).__name__), "model": getattr(client, "model", None), "config": getattr(client, "model_config", None)}
+        lookup = _cache_lookup_impl(self, values, run_options, True)
+        if lookup.get("hit"):
+            # A stored output's audio outputs are rendered, as TS does.
+            cached = _render_audio_outputs_impl(self, client, lookup.get("value"), run_options)
+            sink({"version": 0, "index": 0, "delta": cached})
+            return cached
+        call_hooks = _merge_runtime_hooks(_coerce_runtime_hooks(hooks), _runtime_hooks_from_options(options))
+        with _runtime_hook_scope(
+            call_hooks,
+            self.runtime_hooks,
+            span_name="ax_gen_forward",
+            attributes={"ax.program.id": self.program_id, "ax.program.type": "AxGen", "ax.streaming": True},
+            metric_labels=_gen_metric_labels(client, self.options, run_options),
+        ):
+            return self._streaming_forward_unscoped_with(client, values, {**run_options, "_ax_cache_lookup": lookup}, sink)
+
+    def _streaming_forward_unscoped_with(self, client, values, options, sink):
+        run_options = {**self.options, **(options or {})}
+        session_enabled = (chat_session_mode_enabled(run_options)
+            and (callable(getattr(client, "_pin_chat_run", None)) or
+                 (callable(getattr(client, "open_chat_session", None)) and
+                  bool(getattr(client, "get_features", lambda model=None: {})(str(run_options.get("model") or getattr(client, "model", "")) or None).get("asyncTools"))))
+            and (run_options.get("control") is not None or any(getattr(tool, "execution", "blocking") == "background" for tool in self.functions)))
+        from .session import _BoundaryClient, _SessionClient
+        if session_enabled and not isinstance(client, (_BoundaryClient, _SessionClient)):
+            # As in forward, a session-capable client pins the run; each
+            # request streams its own native session's items.
+            pinned = _SessionClient(self, client, run_options)
+            try:
+                result = self._streaming_forward_unscoped_with(pinned, values, {**(options or {}), "asyncMode": "off", "async_mode": "off", "infraRetries": 0, "infra_retries": 0}, sink)
+            except BaseException as error:
+                pinned.close(error)
+                raise
+            pinned.close()
+            return result
+        if run_options.get("control") is not None and not isinstance(client, (_BoundaryClient, _SessionClient)):
+            bounded = _BoundaryClient(client, run_options)
+            try:
+                result = self._streaming_forward_unscoped_with(bounded, values, options, sink)
+            except BaseException as error:
+                bounded.close(error)
+                raise
+            bounded.close()
+            return result
         call_context = resolve_execution_context(options, self.execution_context)
         if call_context is not self.execution_context:
             call_gen = copy.copy(self)
             call_gen.execution_context = call_context
             call_gen.functions = self._base_functions + (call_context.native_tools() if call_context else [])
-            call_gen.prompt_template = AxPromptTemplate(self.signature, functions=call_gen.functions)
+            call_gen.prompt_template = AxPromptTemplate(
+                self.signature,
+                functions=call_gen.functions,
+                structured_output_function_name=self.options.get("structured_output_function_name", self.options.get("structuredOutputFunctionName")),
+                custom_template=self.options.get("custom_template", self.options.get("customTemplate")),
+                include_optional_input_fields_in_system_prompt=self._include_optional_input_fields(),
+            )
+            if self.instruction:
+                call_gen.prompt_template.set_instruction(self.instruction)
+            return _streaming_forward_impl(call_gen, client, values, options, sink)
+        return _streaming_forward_impl(self, client, values, options, sink)
+
+    def _streaming_forward_unscoped(self, client: AIClient, values: dict[str, Any], options: dict[str, Any] | None = None):
+        run_options = {**self.options, **(options or {})}
+        model = str(run_options.get("model") or getattr(client, "model", ""))
+        session_enabled = (chat_session_mode_enabled(run_options)
+            and (callable(getattr(client, "_pin_chat_run", None)) or
+                 (callable(getattr(client, "open_chat_session", None)) and
+                  bool(getattr(client, "get_features", lambda model=None: {})(model or None).get("asyncTools"))))
+            and (run_options.get("control") is not None or any(getattr(tool, "execution", "blocking") == "background" for tool in self.functions)))
+        if session_enabled:
+            import contextvars
+            import queue
+            import threading
+            from .session import run_control
+            deliveries = queue.Queue()
+            control = run_options.get("control") or run_control()
+            stopped = threading.Event()
+            def emit(event):
+                if not stopped.is_set():
+                    deliveries.put(("delta", event))
+            def run():
+                try:
+                    self._forward_unscoped(client, values, {**run_options, "control": control, "_session_delta": emit})
+                    deliveries.put(("done", None))
+                except BaseException as error:
+                    deliveries.put(("error", error))
+            context = contextvars.copy_context()
+            threading.Thread(target=context.run, args=(run,), daemon=True).start()
+            complete = False
+            try:
+                while True:
+                    kind, event = deliveries.get()
+                    if kind == "error":
+                        raise event
+                    if kind == "done":
+                        complete = True
+                        return
+                    yield event
+            finally:
+                stopped.set()
+                if not complete:
+                    control.abort()
+            return
+        call_context = resolve_execution_context(options, self.execution_context)
+        if call_context is not self.execution_context:
+            call_gen = copy.copy(self)
+            call_gen.execution_context = call_context
+            call_gen.functions = self._base_functions + (call_context.native_tools() if call_context else [])
+            call_gen.prompt_template = AxPromptTemplate(self.signature, functions=call_gen.functions, include_optional_input_fields_in_system_prompt=self._include_optional_input_fields())
             yield from call_gen._streaming_forward_unscoped(client, values, {**(options or {}), "executionContext": call_context})
             return
         validate_fields(self.signature.get_input_fields(), values, "input")
         stream_options = {**self.options, **(options or {}), "stream": True}
         req = self._request(self.prompt_template.render(values), stream_options, client)
         chunks = []
-        for event in client.stream(req):
+        for event in client.stream(req, stream_options):
             chunks.append(event)
             _core_axgen_run_streaming_assertions(self, fold_stream(chunks))
             yield event
         content = fold_stream(chunks)
         _core_axgen_run_streaming_assertions(self, content)
         if content:
-            output = _parse_output_impl(content)
+            output = _parse_output_fields_impl(content, self.signature.get_output_fields())
             validate_output(self.signature.get_output_fields(), output)
 
     def _request(self, messages, options, client=None):
         request_options = options or {}
         features = _core_ai_client_features(client, request_options.get("model")) if client is not None else {}
         selection = _select_structured_output_rung(self.signature, features, request_options)
-        return _build_gen_chat_request(self, messages, request_options, selection)
+        return _build_gen_chat_request(self, messages, request_options, selection, 0)
 
     def _execute_tool(self, call):
-        return _execute_tool_call(self.functions, call)
+        return _execute_tool_call(self.functions, call, self.options)
 
 
 def ax(
@@ -516,6 +867,7 @@ def ax(
     *,
     sample_count: int | None = None,
     result_picker=None,
+    function_result_formatter=None,
     hooks: AxRuntimeHooks | None = None,
 ) -> AxGen:
     normalized = dict(options or {})
@@ -523,6 +875,8 @@ def ax(
         normalized["sample_count"] = int(sample_count)
     if result_picker is not None:
         normalized["result_picker"] = result_picker
+    if function_result_formatter is not None:
+        normalized["function_result_formatter"] = function_result_formatter
     return AxGen(signature, normalized, hooks=hooks)
 
 
@@ -538,6 +892,62 @@ def _core_gte(left, right): return left >= right
 def _core_add(left, right): return left + right
 def _core_mul(left, right): return float(left or 0) * float(right or 0)
 def _core_div(left, right): return float(left or 0) / float(right or 1)
+def _core_string_utf16_units(value):
+    raw = value.encode("utf-16-le", "surrogatepass")
+    return [raw[index] + 256 * raw[index + 1] for index in range(0, len(raw), 2)]
+
+def _core_string_codepoint_length(value): return len(value)
+
+
+def _core_string_concat_stream_text(left, right):
+    # Streamed text appends chunk by chunk; a surrogate pair split across two
+    # chunks joins back into one character, as it does in a UTF-16 string.
+    left, right = str(left), str(right)
+    if left and right and "\ud800" <= left[-1] <= "\udbff" and "\udc00" <= right[0] <= "\udfff":
+        joined = chr(0x10000 + ((ord(left[-1]) - 0xD800) << 10) + (ord(right[0]) - 0xDC00))
+        return left[:-1] + joined + right[1:]
+    return left + right
+
+
+def _core_string_drop_trailing_high_surrogate(value):
+    # A str can end in half of a surrogate pair when a provider split the
+    # pair across stream events.
+    text = str(value)
+    if text and "\ud800" <= text[-1] <= "\udbff":
+        return text[:-1]
+    return text
+
+
+_DATE_ZONES: dict[str, Any] = {}
+# datetime covers years 1-9999. Offsets are constant before a zone's first
+# transition and follow its rule after the last, so an instant a day past
+# either end reads the same offset as the clamped one.
+_DATE_MIN_SECONDS = -62135510400  # 0001-01-02T00:00:00Z
+_DATE_MAX_SECONDS = 253402128000  # 9999-12-30T00:00:00Z
+
+
+def _core_date_zone_offset(name, epoch_ms):
+    """UTC offset in seconds of the IANA zone `name` at an instant (epoch
+    milliseconds), from the platform tz database through zoneinfo. Raises
+    for a zone the database does not have."""
+    import datetime as _datetime
+    import zoneinfo as _zoneinfo
+
+    key = str(name)
+    zone = _DATE_ZONES.get(key)
+    if zone is None:
+        try:
+            zone = _zoneinfo.ZoneInfo(key)
+        except (ValueError, OSError, _zoneinfo.ZoneInfoNotFoundError) as exc:
+            raise ValueError(f"unknown time zone {key}") from exc
+        _DATE_ZONES[key] = zone
+    seconds = math.floor(float(epoch_ms) / 1000)
+    seconds = min(max(seconds, _DATE_MIN_SECONDS), _DATE_MAX_SECONDS)
+    instant = _datetime.datetime(1970, 1, 1, tzinfo=_datetime.timezone.utc) + _datetime.timedelta(seconds=seconds)
+    return int(instant.astimezone(zone).utcoffset().total_seconds())
+
+def _core_math_is_finite(value): return math.isfinite(value)
+
 def _core_len(value): return len(value)
 def _core_contains(container, item): return False if container is None else item in container
 def _core_truthy(value): return bool(value)
@@ -619,6 +1029,9 @@ def _core_map_values(values):
 
 
 def _core_object_call_method(target, method_name, *args):
+    if str(method_name) == "format_result" and callable(target):
+        # A function result formatter: formatter(result) -> text.
+        return target(args[0] if args else None)
     if str(method_name) == "call" and callable(target):
         payload = args[0] if args else None
         if isinstance(payload, dict) and payload.get("type") == "fields":
@@ -642,7 +1055,13 @@ def _core_json_parse_strict(value):
 
 
 def _core_json_stringify(value):
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    # TS JSON.stringify(value): keys in insertion order, null as null.
+    return _js_json_dumps(value)
+
+
+def _core_json_pretty(value):
+    # TS JSON.stringify(value, null, 2).
+    return _js_json_dumps(value, indent=2)
 
 
 def _core_fields_from_map(fields):
@@ -669,6 +1088,7 @@ def _nested_field(name, item):
             maximum=item.get("maximum"),
             pattern=item.get("pattern"),
             pattern_description=item.get("patternDescription", item.get("pattern_description")),
+            value_descriptions=item.get("valueDescriptions", item.get("value_descriptions")),
             format=item.get("format"),
             description=item.get("description"),
         )
@@ -683,7 +1103,7 @@ def _nested_field(name, item):
 
 
 def _core_string_format(template, *args):
-    return str(template).format(*args)
+    return _js_format(template, args)
 
 
 def _core_string_lower(value):
@@ -707,27 +1127,165 @@ def _core_string_default_if_empty(value, fallback):
     return text if text else fallback
 
 
+def _core_accepts_options(method):
+    try:
+        parameters = inspect.signature(method).parameters.values()
+        return len(inspect.signature(method).parameters) >= 2 or any(
+            parameter.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+            for parameter in parameters
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _core_ai_control_take_pending(client):
+    # The run control updates queued for this run, which the forward applies
+    # when a step starts, as TS does. Only a request boundary tracks them; a
+    # chat session applies its controls itself.
+    take = getattr(client, "_take_control_updates", None)
+    return take() if callable(take) else []
+
+
+def _core_ai_control_pending_count(client):
+    count = getattr(client, "_pending_control_count", None)
+    return int(count()) if callable(count) else 0
+
+
 def _core_ai_complete_once(client, request, options):
+    # As in TS, a streamed forward folds the stream's chunks into one response.
+    streaming = bool(((request or {}).get("model_config") or {}).get("stream"))
+    stream = getattr(client, "stream", None)
+    if streaming and callable(stream):
+        events = stream(request, options or {}) if _core_accepts_options(stream) else stream(request)
+        return chat_response_to_completion(fold_chat_response_stream(list(events)))
     chat = getattr(client, "chat", None)
     if callable(chat):
-        try:
-            parameters = inspect.signature(chat).parameters.values()
-            accepts_options = (
-                len(inspect.signature(chat).parameters) >= 2
-                or any(
-                    parameter.kind
-                    in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
-                    for parameter in parameters
-                )
-            )
-        except (TypeError, ValueError):
-            accepts_options = False
+        accepts_options = _core_accepts_options(chat)
         response = chat(request, options or {}) if accepts_options else chat(request)
+        if response is not None and not isinstance(response, dict):
+            response = fold_chat_response_stream(list(response))
         return chat_response_to_completion(response)
     complete = getattr(client, "complete", None)
     if callable(complete):
         return complete(request)
     raise TypeError("AI client must implement chat() or complete()")
+
+
+def _core_coalesce(value, fallback):
+    return fallback if value is None else value
+
+
+def _core_string_index_of(value, needle, start=0):
+    return str(value).find(str(needle), max(0, int(start)))
+
+
+class _CoreChatStream:
+    """Pull handle over a client stream: next() returns the next chunk or None."""
+
+    def __init__(self, events):
+        self._events = events
+        self._iterator = iter(events)
+
+    def next(self):
+        return next(self._iterator, None)
+
+    def close(self):
+        close = getattr(self._events, "close", None)
+        if callable(close):
+            close()
+
+
+def _core_completion_chat_chunk(completion):
+    # A complete()-only client answers in the completion shape; stream it as
+    # one chat response chunk.
+    if not isinstance(completion, dict) or "results" in completion:
+        return completion
+    result = {"index": 0, "content": completion.get("content") or ""}
+    calls = [
+        {"id": call.get("id"), "type": "function", "function": {"name": call.get("name"), "params": call.get("params")}}
+        for call in completion.get("function_calls") or []
+    ]
+    if calls:
+        result["function_calls"] = calls
+    for key in ("thought", "thought_blocks"):
+        if completion.get(key):
+            result[key] = completion[key]
+    result["finish_reason"] = completion.get("finish_reason", "function_call" if calls else "stop")
+    return {"results": [result]}
+
+
+def _core_ai_stream_open(client, request, options):
+    # streaming_forward reads the provider stream chunk by chunk; a client
+    # without stream() answers with one chat (or completion) response.
+    stream = getattr(client, "stream", None)
+    if callable(stream):
+        events = stream(request, options or {}) if _core_accepts_options(stream) else stream(request)
+        return _CoreChatStream(events)
+    chat = getattr(client, "chat", None)
+    if callable(chat):
+        response = chat(request, options or {}) if _core_accepts_options(chat) else chat(request)
+        return _CoreChatStream([response] if response is None or isinstance(response, dict) else response)
+    complete = getattr(client, "complete", None)
+    if callable(complete):
+        return _CoreChatStream([_core_completion_chat_chunk(complete(request))])
+    raise TypeError("AI client must implement stream(), chat() or complete()")
+
+
+def _core_ai_stream_next(handle):
+    return handle.next()
+
+
+def _core_ai_stream_close(handle):
+    try:
+        handle.close()
+    except Exception:  # noqa: BLE001 - closing an abandoned stream is best effort
+        pass
+    return None
+
+
+# _core_axgen_deprecation (warn once per process) comes from the ai module,
+# which shares it with the provider functions.
+
+
+def _core_axgen_emit_delta(sink, envelope):
+    sink(envelope)
+    return None
+
+
+def _core_axgen_speak(client, request, options):
+    # Backs intrinsic.axgen.speak: the AxGen audio output renderer calls the
+    # client's speak(), as TS calls ai.speak().
+    speak = getattr(client, "speak", None)
+    if not callable(speak):
+        raise RuntimeError("Audio speech not supported by this AI client")
+    return speak(request, options or {})
+
+
+def _core_axgen_call_processor(spec, value, context):
+    # TS field processors take (value, {values, sessionId, done}); a
+    # one-argument callable gets the value alone.
+    processor = spec.get("processor", spec.get("fn")) if isinstance(spec, dict) else spec
+    if not callable(processor):
+        raise TypeError("field processor must be callable")
+    ctx = {"values": dict((context or {}).get("values") or {}), "done": bool((context or {}).get("done"))}
+    return processor(value, ctx) if _core_accepts_options(processor) else processor(value)
+
+
+def _core_axgen_check_streaming_assertion(spec, value, done):
+    # A callable returns None or True to pass, a message string, or False; a
+    # {"not_contains": ...} spec fails when the field text contains it.
+    check = spec.get("fn", spec.get("assert")) if isinstance(spec, dict) else spec
+    if callable(check):
+        result = check(value, done) if _core_accepts_options(check) else check(value)
+        if result is None or result is True:
+            return {"status": "pass"}
+        if isinstance(result, str):
+            return {"status": "fail", "message": result}
+        return {"status": "fail"}
+    needle = spec.get("not_contains", spec.get("notContains")) if isinstance(spec, dict) else None
+    if needle is not None and str(needle) in str(value):
+        return {"status": "fail"}
+    return {"status": "pass"}
 
 
 def _core_ai_client_features(client, model):
@@ -737,12 +1295,67 @@ def _core_ai_client_features(client, model):
     return {"functions": True, "structured_outputs": True}
 
 
-def _core_retry_sleep(attempt):
-    time.sleep(min(0.25 * (int(attempt) + 1), 1.0))
+def _core_retry_sleep(attempt, _client=None, options=None):
+    delay = min(0.25 * (int(attempt) + 1), 1.0)
+    token = None
+    if isinstance(options, dict):
+        token = options.get("cancellation") or options.get("cancellationToken") or options.get("cancellation_token")
+    if token is None:
+        time.sleep(delay)
+        return
+    if not isinstance(token, AxCancellationToken):
+        raise TypeError("cancellation must be an AxCancellationToken")
+    token.wait(delay)
+    token.throw_if_cancelled()
 
 
 def _core_exception_message(error):
     return str(error)
+
+
+# The same error with a new message and the original as its cause. It keeps
+# its class, so existing handlers still catch it (TS wraps it in
+# AxGenerateError, which the ports adopt at the next major).
+class AxGenerateError(RuntimeError):
+    """Generation failed; the original failure is available as __cause__."""
+    def __init__(self, message, cause=None):
+        super().__init__(message)
+        self.__cause__ = cause
+
+
+def _core_exception_generate(error, message):
+    return AxGenerateError(message, error)
+
+
+def _core_exception_rewrap(error, message):
+    try:
+        wrapped = copy.copy(error)
+        wrapped.args = (message,)
+    except Exception:
+        wrapped = RuntimeError(message)
+    wrapped.__cause__ = error
+    return wrapped
+
+
+def _core_exception_is_aborted(error):
+    return isinstance(error, AxAIServiceAbortedError)
+
+
+def _core_exception_is_infrastructure(error):
+    # TS AxGen retries only 5xx status, network, timeout and stream-termination errors.
+    if isinstance(error, AxAIServiceStatusError):
+        status = getattr(error, "status", None)
+        return isinstance(status, int) and 500 <= status < 600
+    return isinstance(error, (AxAIServiceNetworkError, AxAIServiceTimeoutError, AxAIServiceStreamTerminatedError))
+
+
+# TS AxGen retries a model refusal inside its validation loop.
+def _core_exception_is_refusal(error):
+    return isinstance(error, AxAIRefusalError)
+
+
+def _core_exception_is_validation(error):
+    return isinstance(error, AxValidationError)
 
 
 def _core_regex_match(pattern, value):
@@ -757,7 +1370,24 @@ def _core_validation_error(message):
     return AxValidationError(str(message))
 
 
-def _core_tool_invoke(fn, params):
+_TOOL_EXTRA_KEYS = {"sessionId": "session_id", "executionPath": "execution_path", "eventContext": "event_context"}
+
+
+def _core_tool_context(context):
+    # A context handler's context: the run's extras (TS's sessionId,
+    # executionPath and eventContext, as session_id, execution_path and
+    # event_context, each when set) and a cancellation signal.
+    if context is None:
+        return None
+    out = {_TOOL_EXTRA_KEYS.get(key, key): value for key, value in context.items()}
+    if "signal" not in out:
+        import threading
+        out["signal"] = threading.Event()
+    return out
+
+
+def _core_tool_invoke(fn, params, context=None):
+    context = _core_tool_context(context)
     name = str(getattr(fn, "name", "") or "tool")
     with _runtime_hook_scope(
         None,
@@ -766,7 +1396,7 @@ def _core_tool_invoke(fn, params):
         attributes={"ax.tool.name": name},
         metric_prefix="ax_gen_tool",
     ):
-        return fn.call(params or {})
+        return fn.call(params or {}, context) if context is not None else fn.call(params or {})
 
 
 def _core_stream_event_content_parts(event) -> list[str]:
@@ -794,13 +1424,17 @@ def _core_string_join(sep, values):
 
 
 def _core_string_str(value):
-    return str(value)
+    return _js_text(value)
 
 
-def _core_axgen_value_text(value):
+def _core_axgen_value_text(value, type_name=None):
+    # A native date in a date-typed field reads as TS renders a Date.
+    dated = _js_date_prompt_text(type_name, value) if type_name else None
+    if dated is not None:
+        return dated
     if isinstance(value, str):
         return value
-    return json.dumps(value, sort_keys=True)
+    return _js_json_dumps(value, sort_keys=True, separators=(", ", ": "))
 
 
 def _core_axgen_fields_for(gen, kind):
@@ -811,12 +1445,15 @@ def _core_axgen_fields_for(gen, kind):
 def _core_axgen_format_values(gen, values, kind):
     values = values or {}
     fields = _core_axgen_fields_for(gen, kind)
+    if kind == 'output' and _evidence_has_fields_impl(fields):
+        return _js_json_dumps(_evidence_example_values_impl(fields, values))
     lines = []
     for field in fields:
         name = _core_get(field, "name")
         if name in values:
             title = _core_get(field, "title", name)
-            lines.append(f"{title}: {_core_axgen_value_text(values[name])}")
+            field_type = _core_get(field, "type")
+            lines.append(f"{title}: {_core_axgen_value_text(values[name], _core_get(field_type, 'name', None))}")
     if not lines:
         for name, value in values.items():
             lines.append(f"{name}: {_core_axgen_value_text(value)}")
@@ -932,33 +1569,50 @@ def _core_axgen_apply_field_processors(gen, output):
     return result
 
 
+class _MessageAssertion:
+    """A callable assertion with the message TypeScript addAssert(fn, message) takes."""
+
+    def __init__(self, fn, message):
+        self.fn = fn
+        self.message = message
+
+    def __call__(self, output):
+        return self.fn(output)
+
+
 def _core_axgen_run_assertions(gen, output):
+    # Evaluate the assertions in order and report the first failure as
+    # {status: "pass"}, {status: "fail", message?} or {status: "error", error};
+    # gen.axir decides what each outcome raises, as TS assertAssertions does.
     for assertion in _core_get(gen, "assertions", []) or []:
         if callable(assertion):
-            result = assertion(output)
+            try:
+                result = assertion(output)
+            except Exception as error:  # noqa: BLE001 - gen.axir surfaces it
+                return {"status": "error", "error": error}
             if isinstance(result, str):
-                raise RuntimeError(result)
+                return {"status": "fail", "message": result}
             if result is False:
-                raise RuntimeError("assertion failed")
+                return {"status": "fail", "message": getattr(assertion, "message", None) or None}
             continue
+        if "throw" in assertion:
+            return {"status": "error", "error": RuntimeError(str(assertion["throw"]))}
         field = assertion.get("field")
         value = output.get(field) if field else output
-        message = assertion.get("message") or "assertion failed"
+        message = str(assertion["message"]) if assertion.get("message") else None
         if "return" in assertion:
             returned = assertion.get("return")
             if returned is None:
                 continue
-            if returned is False and "message" not in assertion:
-                raise RuntimeError("assertion failed without message")
             if returned is False:
-                raise RuntimeError(str(message))
+                return {"status": "fail", "message": message}
             if isinstance(returned, str):
-                raise RuntimeError(returned)
+                return {"status": "fail", "message": returned}
         if "contains" in assertion and str(assertion["contains"]) not in str(value):
-            raise RuntimeError(str(message))
+            return {"status": "fail", "message": message}
         if "equals" in assertion and value != assertion["equals"]:
-            raise RuntimeError(str(message))
-    return None
+            return {"status": "fail", "message": message}
+    return {"status": "pass"}
 
 
 def _core_axgen_run_streaming_assertions(gen, content):
@@ -1019,10 +1673,14 @@ def _core_axgen_memory_add_response(gen, request, response):
     return None
 
 
-def _core_axgen_memory_add_function_result(gen, call, result, ok):
+def _core_axgen_memory_add_function_result(gen, call, result, ok, result_text=None):
+    # `result` and `result_text` both keep the text the model got.
     memory = _core_get(gen, "memory")
     if memory is not None and hasattr(memory, "add_function_results"):
-        memory.add_function_results({"call": call, "result": result, "ok": bool(ok)})
+        entry = {"call": call, "result": result, "ok": bool(ok)}
+        if result_text is not None:
+            entry["result_text"] = result_text
+        memory.add_function_results(entry)
     return None
 
 
@@ -1078,3 +1736,17 @@ def _core_axgen_record_function_call(gen, call, result, status):
 
 
 # AXIR_CORE_GEN_FUNCTIONS
+
+class AxDecisionRefusalError(RuntimeError):
+    """Terminal refusal of a signature decision field."""
+    def __init__(self, field_path, provenance):
+        self.field_path, self.provenance = field_path, provenance
+        super().__init__(f"Decision refused: {field_path}")
+
+def _core_decision_refusal_error(path, provenance):
+    return AxDecisionRefusalError(path, provenance)
+
+
+def novel_f1_score(history: str, prediction: str, ground_truth: str, return_recall: bool = False) -> float:
+    """Score novel token overlap, excluding history and stopwords; two empty inputs score one."""
+    return eval_novel_f1(history, prediction, ground_truth, return_recall)

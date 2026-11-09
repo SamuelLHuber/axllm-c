@@ -1,7 +1,7 @@
 ---
 name: "ax-java-agent-rlm"
 description: "Use when writing Java code with `dev.axllm:ax` for RLM executor loops, AxCodeRuntime sessions, runtime envelopes, process runtimes, and optional runtime profiles."
-version: "24.0.15"
+version: "25.4.9"
 ---
 # AxAgent RLM Runtime For Java
 
@@ -33,7 +33,7 @@ var out = helper.forward(llm, java.util.Map.of("question", "How should I proceed
 
 ## Relevant API Surface
 
-- Agents And RLM: `Ax.agent`, `AxAgent`
+- Agents And RLM: `Ax.agent`, `AxAgent`, `AxAgent.addChildAgent`, `AxAgent.streamingForward`
 - Runtime Profiles: `ProcessCodeRuntime`, `RuntimeCapabilities`, `RuntimeEnvelope`, `javascript-quickjs`, `python-pyodide`
 
 ## Guardrails

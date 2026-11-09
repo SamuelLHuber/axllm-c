@@ -33,6 +33,71 @@ final class Core {
   }
 
   private Core() {}
+  static Object ownedCopy(Object value) {
+    if(value instanceof Map<?,?> map){Map<String,Object> out=new LinkedHashMap<>();for(var entry:map.entrySet())out.put(String.valueOf(entry.getKey()),ownedCopy(entry.getValue()));return out;}
+    if(value instanceof List<?> list){List<Object> out=new ArrayList<>();for(Object item:list)out.add(ownedCopy(item));return out;}
+    if(value instanceof AxMemory memory)return memory.ownedCopy();
+    return value;
+  }
+  static Object flowDispatchGroup(Object flowValue,Object clientValue,Object groupSteps,Object state,Object options) {
+    if(!(clientValue instanceof AiClient client))throw new IllegalArgumentException("Flow requires an AI client");
+    var clientFactory=client.ownedWorkerFactory();if(clientFactory==null)return null;
+    record Task(int index,Object plan,Map<String,Object> step,AxProgram program,AiClient client){}
+    record Delivery(int position,Object report,Map<String,Object> event){}
+    List<Task> tasks=new ArrayList<>();
+    for(Object plan:iter(groupSteps)){
+      int index=(int)asDouble(get(plan,"stepIndex",0));Object step=get(get(flowValue,"steps",List.of()),index,null);
+      if(!(get(step,"program",null) instanceof AxProgram program))return null;
+      var factory=program.ownedWorkerFactory();if(factory==null)return null;
+      tasks.add(new Task(index,ownedCopy(plan),asMap(ownedCopy(step)),factory.get(),clientFactory.get()));
+    }
+    var queue=new java.util.concurrent.LinkedBlockingQueue<Delivery>();
+    Object deliveryLock=new Object();boolean[] acceptingDeliveries={true};
+    java.util.function.Consumer<Delivery> deliver=value->{synchronized(deliveryLock){if(acceptingDeliveries[0])queue.add(value);}};
+    Runnable closeDeliveries=()->{synchronized(deliveryLock){acceptingDeliveries[0]=false;}};
+    var parent=get(options,"control",null) instanceof AxRunControl c?c:null;
+    var parentToken=get(options,"cancellation",get(options,"cancellationToken",get(options,"cancellation_token",null))) instanceof AxCancellationToken token?token:null;
+    List<AxCancellationToken> tokens=new ArrayList<>();List<Thread> threads=new ArrayList<>();
+    for(int position=0;position<tasks.size();position++){
+      Task task=tasks.get(position);int slot=position;task.step().put("program",task.program());
+      Object workerFlow=ownedCopy(flowValue),workerState=ownedCopy(state);
+      Map<String,Object> workerOptions=asMap(ownedCopy(options));var token=new AxCancellationToken();tokens.add(token);
+      workerOptions.put("cancellation",token);
+      workerOptions.put("control",new AxRunControl(parent,event->deliver.accept(new Delivery(-1,null,event))));
+      Thread thread=new Thread(()->{
+        Object report;
+        try{report=flow_execute_owned_worker(workerFlow,task.step(),task.plan(),task.client(),workerState,workerOptions);}
+        catch(Throwable error){report=Map.of("error",error.toString());}
+        deliver.accept(new Delivery(slot,report,null));
+      },"ax-flow-worker");thread.setDaemon(true);threads.add(thread);
+    }
+    threads.forEach(Thread::start);
+    Object[] reports=new Object[tasks.size()];int remaining=tasks.size();long deadline=Long.MAX_VALUE;
+    java.util.Set<String> pending=new java.util.LinkedHashSet<>();
+    try{
+      while(remaining>0){
+        if(((parent!=null&&parent.isAborted())||(parentToken!=null&&parentToken.cancelled()))&&deadline==Long.MAX_VALUE){deadline=System.nanoTime()+100_000_000L;tokens.forEach(token->token.cancel("Flow group cancelled"));threads.forEach(Thread::interrupt);}
+        Delivery delivery=queue.poll(20,java.util.concurrent.TimeUnit.MILLISECONDS);
+        if(delivery!=null){
+          if(delivery.event()!=null){var event=delivery.event();String key=event.get("path")+":"+event.get("call_id");if("tool.started".equals(event.get("type")))pending.add(key);if(List.of("tool.completed","tool.failed").contains(event.get("type")))pending.remove(key);if(parent!=null)parent.emit(event);}
+          else if(reports[delivery.position()]==null){
+            reports[delivery.position()]=delivery.report();remaining--;
+            if(get(delivery.report(),"error",null)!=null){if(deadline==Long.MAX_VALUE)deadline=System.nanoTime()+100_000_000L;tokens.forEach(token->token.cancel("Flow sibling failed"));threads.forEach(Thread::interrupt);}
+            else{Task task=tasks.get(delivery.position());set(get(get(flowValue,"steps",List.of()),task.index(),null),"program",task.program());}
+          }
+        }
+        if(System.nanoTime()>=deadline)closeDeliveries.run();
+        if(System.nanoTime()>=deadline&&queue.isEmpty()){
+          for(int position=0;position<reports.length;position++)if(reports[position]==null){reports[position]=Map.of("error","Flow cancelled; unresolved node: "+tasks.get(position).step().get("name")+"; unresolved calls: "+pending);remaining--;}
+        }
+      }
+    }catch(InterruptedException error){
+      Thread.currentThread().interrupt();
+      for(int position=0;position<reports.length;position++)if(reports[position]==null)reports[position]=Map.of("error","Flow interrupted; unresolved node: "+tasks.get(position).step().get("name")+"; unresolved calls: "+pending);
+    }finally{closeDeliveries.run();tokens.forEach(token->token.cancel("Flow dispatcher closed"));threads.forEach(Thread::interrupt);}
+    return new ArrayList<>(java.util.Arrays.asList(reports));
+  }
+
 
   static boolean truthy(Object value) {
     if (value == null) return false;
@@ -47,8 +112,11 @@ final class Core {
   static Object not(Object value) { return !truthy(value); }
   static Object and(Object left, Object right) { return truthy(left) && truthy(right); }
   static Object or(Object left, Object right) { return truthy(left) || truthy(right); }
-  static Object eq(Object left, Object right) { return java.util.Objects.equals(left, right); }
-  static Object ne(Object left, Object right) { return !java.util.Objects.equals(left, right); }
+  static Object eq(Object left, Object right) {
+    if (left instanceof Number a && right instanceof Number b) return a.doubleValue() == b.doubleValue();
+    return java.util.Objects.equals(left, right);
+  }
+  static Object ne(Object left, Object right) { return !truthy(eq(left, right)); }
   static Object lt(Object left, Object right) { return asDouble(left) < asDouble(right); }
   static Object lte(Object left, Object right) { return asDouble(left) <= asDouble(right); }
   static Object gt(Object left, Object right) { return asDouble(left) > asDouble(right); }
@@ -63,6 +131,106 @@ final class Core {
     return asDouble(left) / (denom == 0.0 ? 1.0 : denom);
   }
   static Object mathAbs(Object value) { return Math.abs(asDouble(value)); }
+  static Object stringUTF16Units(Object value) {
+    List<Object> units=new ArrayList<>();String text=String.valueOf(value);
+    for(int index=0;index<text.length();index++)units.add((int)text.charAt(index));
+    return units;
+  }
+  static Object stringUTF8Length(Object value) {
+    String text=String.valueOf(value);long bytes=0;
+    for(int index=0;index<text.length();){int cp=text.codePointAt(index);index+=Character.charCount(cp);bytes+=cp<128?1:cp<2048?2:cp<65536?3:4;}
+    return bytes;
+  }
+  static Object stringCodepointLength(Object value) { String text = String.valueOf(value); return text.codePointCount(0, text.length()); }
+  // Streamed text appends chunk by chunk. Java strings hold UTF-16 units, so
+  // a surrogate pair a provider split across two chunks joins back into one
+  // character by plain concatenation.
+  static Object stringConcatStreamText(Object left, Object right) { return String.valueOf(left) + String.valueOf(right); }
+  // A streamed delta never ends in half of a surrogate pair: a trailing high
+  // surrogate waits for its low half, or for the end of the stream.
+  static Object stringDropTrailingHighSurrogate(Object value) {
+    String text = String.valueOf(value);
+    return !text.isEmpty() && Character.isHighSurrogate(text.charAt(text.length() - 1)) ? text.substring(0, text.length() - 1) : text;
+  }
+  /**
+   * The epoch milliseconds of a java.time or java.util.Date value, read as
+   * TypeScript reads a Date: Instant, OffsetDateTime, ZonedDateTime and Date
+   * are their instant, a LocalDateTime is in the JVM's zone (as new Date(2024,
+   * 4, 9) is local), and a LocalDate is its UTC midnight (as new
+   * Date("2024-05-09") parses). Null for anything else.
+   */
+  static Long jsDateMillis(Object value) {
+    if (value instanceof java.time.Instant instant) return instant.toEpochMilli();
+    if (value instanceof java.time.OffsetDateTime time) return time.toInstant().toEpochMilli();
+    if (value instanceof java.time.ZonedDateTime time) return time.toInstant().toEpochMilli();
+    if (value instanceof java.time.LocalDateTime time) return time.atZone(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli();
+    if (value instanceof java.time.LocalDate date) return date.toEpochDay() * 86_400_000L;
+    if (value instanceof java.util.Date date) return date.getTime();
+    return null;
+  }
+  /** Date.prototype.toISOString of epoch milliseconds. */
+  static String jsISOString(long millis) {
+    java.time.OffsetDateTime time = java.time.Instant.ofEpochMilli(millis).atOffset(java.time.ZoneOffset.UTC);
+    int year = time.getYear();
+    String yearText = year < 0 ? String.format("-%06d", -year) : year > 9999 ? String.format("+%06d", year) : String.format("%04d", year);
+    return String.format("%s-%02d-%02dT%02d:%02d:%02d.%03dZ", yearText, time.getMonthValue(), time.getDayOfMonth(), time.getHour(), time.getMinute(), time.getSecond(), time.getNano() / 1_000_000);
+  }
+  /**
+   * The prompt text TypeScript writes for a Date in a date-typed field
+   * (processValue in src/ax/dsp/prompt.ts): a date field's UTC day, a datetime
+   * without milliseconds, and for a range with two dates the {start, end}
+   * JSON of those; a range object holding anything else is its JSON with each
+   * date as toISOString. Null when TS would not see a Date.
+   */
+  static String jsDatePromptText(String typeName, Object value) {
+    if ("date".equals(typeName) || "datetime".equals(typeName)) {
+      Long millis = jsDateMillis(value);
+      if (millis == null) return null;
+      String iso = jsISOString(millis);
+      return "date".equals(typeName) ? iso.substring(0, iso.indexOf('T')) : iso.substring(0, iso.length() - 5) + "Z";
+    }
+    if (("dateRange".equals(typeName) || "datetimeRange".equals(typeName)) && value instanceof Map<?, ?> map && map.containsKey("start") && map.containsKey("end")) {
+      Long start = jsDateMillis(map.get("start"));
+      Long end = jsDateMillis(map.get("end"));
+      if (start != null && end != null) {
+        Map<String, Object> bounds = new LinkedHashMap<>();
+        boolean dayOnly = "dateRange".equals(typeName);
+        String startIso = jsISOString(start), endIso = jsISOString(end);
+        bounds.put("start", dayOnly ? startIso.substring(0, 10) : startIso.substring(0, startIso.length() - 5) + "Z");
+        bounds.put("end", dayOnly ? endIso.substring(0, 10) : endIso.substring(0, endIso.length() - 5) + "Z");
+        return Json.pretty(bounds);
+      }
+      boolean dated = false;
+      Map<String, Object> copied = new LinkedHashMap<>();
+      for (Map.Entry<?, ?> entry : map.entrySet()) {
+        Long millis = jsDateMillis(entry.getValue());
+        if (millis != null) dated = true;
+        copied.put(String.valueOf(entry.getKey()), millis != null ? jsISOString(millis) : entry.getValue());
+      }
+      if (dated) return Json.pretty(copied);
+    }
+    return null;
+  }
+  private static final java.util.concurrent.ConcurrentHashMap<String, java.time.zone.ZoneRules> DATE_ZONE_RULES = new java.util.concurrent.ConcurrentHashMap<>();
+  /**
+   * The UTC offset in seconds of the IANA zone {@code name} at an instant
+   * (epoch milliseconds), from java.time's tz database. Only region IDs count
+   * as zones (ZoneId.of would also read "GMT+5" as an offset); an unknown one
+   * throws.
+   */
+  static Object dateZoneOffset(Object name, Object epochMillis) {
+    String zone = String.valueOf(name);
+    java.time.zone.ZoneRules rules = DATE_ZONE_RULES.get(zone);
+    if (rules == null) {
+      if (!java.time.ZoneId.getAvailableZoneIds().contains(zone)) throw new RuntimeException("unknown time zone " + zone);
+      rules = java.time.ZoneId.of(zone).getRules();
+      DATE_ZONE_RULES.put(zone, rules);
+    }
+    long seconds = (long) Math.floor(asDouble(epochMillis) / 1000.0);
+    return (double) rules.getOffset(java.time.Instant.ofEpochSecond(seconds)).getTotalSeconds();
+  }
+  static Object mathIsFinite(Object value) { return Double.isFinite(asDouble(value)); }
+  static Object mathFloor(Object value) { return Math.floor(asDouble(value)); }
   static Object mathLog(Object value) { return Math.log(asDouble(value)); }
   static Object mathExp(Object value) { return Math.exp(asDouble(value)); }
   static Object mathSqrt(Object value) { return Math.sqrt(asDouble(value)); }
@@ -123,7 +291,7 @@ final class Core {
   }
   static int asInt(Object value) { return value instanceof Number n ? n.intValue() : Integer.parseInt(String.valueOf(value)); }
   static double asDouble(Object value) { return value instanceof Number n ? n.doubleValue() : Double.parseDouble(String.valueOf(value)); }
-  static String stringStr(Object value) { return display(value); }
+  static String stringStr(Object value) { return jsText(value); }
 
   static Object get(Object target, Object key, Object defaultValue) {
     if (target == null) return defaultValue;
@@ -157,6 +325,8 @@ final class Core {
         case "maximum" -> t.maximum;
         case "pattern" -> t.pattern;
         case "pattern_description", "patternDescription" -> t.patternDescription;
+        case "value_descriptions", "valueDescriptions" -> t.valueDescriptions;
+        case "evidence" -> t.evidence;
         case "format" -> t.format;
         case "language" -> t.language;
         case "description" -> t.description;
@@ -168,6 +338,7 @@ final class Core {
         case "description" -> s.description;
         case "inputs", "input_fields" -> s.inputs;
         case "outputs", "output_fields" -> s.outputs;
+        case "force_structured", "forceStructured" -> s.forceStructured;
         default -> defaultValue;
       };
     }
@@ -182,6 +353,8 @@ final class Core {
         case "assertions" -> g.assertions;
         case "streaming_assertions", "streamingAssertions" -> g.streamingAssertions;
         case "field_processors", "fieldProcessors" -> g.fieldProcessors;
+        case "feedback_processors", "feedbackProcessors" -> g.feedbackProcessors;
+        case "streaming_field_processors", "streamingFieldProcessors" -> g.streamingFieldProcessors;
         case "stop_functions", "stopFunctions" -> g.stopFunctions;
         case "memory" -> g.memory;
         case "chat_log", "chatLog" -> g.chatLog;
@@ -211,6 +384,8 @@ final class Core {
     if (target instanceof Tool t) {
       return switch (k) {
         case "name" -> t.name;
+        case "namespace" -> t.namespace() == null ? defaultValue : t.namespace();
+        case "execution" -> t.execution;
         case "description" -> t.description;
         case "parameters" -> t.schema();
         case "args" -> t.args;
@@ -260,6 +435,7 @@ final class Core {
     int i = asInt(index);
     return i >= 0 && i < list.size() ? list.get(i) : defaultValue;
   }
+  static Object listGet(Object values, Object index) { return listGet(values, index, null); }
   static Object typeIs(Object value, Object typeName) {
     return switch (String.valueOf(typeName)) {
       case "object" -> value instanceof Map<?, ?>;
@@ -269,11 +445,31 @@ final class Core {
       case "boolean" -> value instanceof Boolean;
       case "null" -> value == null;
       case "json" -> value == null || value instanceof Map<?, ?> || value instanceof List<?> || value instanceof String || value instanceof Number || value instanceof Boolean;
+      // A java.time or java.util.Date value, which a date or datetime field
+      // takes where TypeScript takes a Date.
+      case "date" -> jsDateMillis(value) != null;
       default -> false;
     };
   }
   static boolean regexMatch(Object pattern, Object value) { return value instanceof String s && Pattern.compile(String.valueOf(pattern)).matcher(s).find(); }
-  static Object stringTrim(Object value) { return String.valueOf(value).trim(); }
+  // As JavaScript's String.prototype.trim: white space and line terminators,
+  // not other control characters.
+  static Object stringTrim(Object value) {
+    String text = String.valueOf(value);
+    int start = 0, end = text.length();
+    while (start < end && isJsWhitespace(text.charAt(start))) start++;
+    while (end > start && isJsWhitespace(text.charAt(end - 1))) end--;
+    return text.substring(start, end);
+  }
+  static boolean isJsWhitespace(char c) {
+    switch (c) {
+      case '\t': case '\n': case '\u000b': case '\f': case '\r': case ' ': case '\u00a0': case '\u1680':
+      case '\u2028': case '\u2029': case '\u202f': case '\u205f': case '\u3000': case '\ufeff':
+        return true;
+      default:
+        return c >= '\u2000' && c <= '\u200a';
+    }
+  }
   static Object stringJoin(Object sep, Object values) { List<String> parts = new ArrayList<>(); for (Object item : asList(values)) parts.add(String.valueOf(item)); return String.join(String.valueOf(sep), parts); }
   static Object stringLower(Object value) { return String.valueOf(value).toLowerCase(java.util.Locale.ROOT); }
   static Object stringLowerCamel(Object values) {
@@ -310,20 +506,40 @@ final class Core {
   }
   static Object stringWords(Object value) { return Arrays.asList(String.valueOf(value).split("\\s+")); }
   static Object stringDefaultIfEmpty(Object value, Object fallback) { String text = String.valueOf(value).trim(); return text.isEmpty() ? fallback : text; }
+  // Each {} takes the next argument's jsText, from left to right and inserted
+  // as is (never read as a template); {{ and }} write one brace, any other
+  // brace is kept, and a {} past the last argument stays {}.
   static Object stringFormat(Object template, Object... args) {
-    String out = String.valueOf(template);
-    for (Object arg : args) {
-      int index = out.indexOf("{}");
-      if (index < 0) break;
-      out = out.substring(0, index) + display(arg) + out.substring(index + 2);
+    String text = String.valueOf(template);
+    StringBuilder out = new StringBuilder();
+    int next = 0;
+    for (int i = 0; i < text.length(); ) {
+      if (i + 1 < text.length()) {
+        String pair = text.substring(i, i + 2);
+        if (pair.equals("{{")) { out.append('{'); i += 2; continue; }
+        if (pair.equals("}}")) { out.append('}'); i += 2; continue; }
+        if (pair.equals("{}")) {
+          out.append(next < args.length ? jsText(args[next++]) : "{}");
+          i += 2;
+          continue;
+        }
+      }
+      out.append(text.charAt(i));
+      i++;
     }
-    return out;
+    return out.toString();
+  }
+  // A value's text in string.format and string.str, as every port writes it:
+  // a string as is, null as "null", a boolean as "true" or "false", a number
+  // as JavaScript's String(x), and a list or map as compact JSON with its keys
+  // in insertion order (JSON.stringify).
+  static String jsText(Object value) {
+    if (value == null) return "null";
+    if (value instanceof List<?> || value instanceof Map<?, ?>) return Json.stringify(value);
+    return display(value);
   }
   static String display(Object value) {
-    if (value instanceof Number n) {
-      double d = n.doubleValue();
-      if (Math.rint(d) == d) return String.valueOf((long) d);
-    }
+    if (value instanceof Number n) return Json.numberText(n);
     return String.valueOf(value);
   }
   static Object stringSplit(Object value, Object sep) { return Arrays.asList(String.valueOf(value).split(Pattern.quote(String.valueOf(sep)), -1)); }
@@ -336,6 +552,13 @@ final class Core {
     out.put("right", idx >= 0 ? text.substring(idx + s.length()) : "");
     return out;
   }
+  // JS indexOf in UTF-16 units, the same units as len and string.slice: the
+  // needle's index at or after start (a negative start searches from 0), else -1.
+  static Object stringIndexOf(Object value, Object needle, Object start) {
+    int from = start == null ? 0 : Math.max(0, asInt(start));
+    return String.valueOf(value).indexOf(String.valueOf(needle), from);
+  }
+  static Object stringIndexOf(Object value, Object needle) { return stringIndexOf(value, needle, 0); }
   static Object stringSplitTrimNonEmpty(Object value, Object sep) {
     List<Object> out = new ArrayList<>();
     for (String part : String.valueOf(value).split(Pattern.quote(String.valueOf(sep)))) if (!part.trim().isEmpty()) out.add(part.trim());
@@ -467,16 +690,101 @@ final class Core {
 
   static Object signatureError(Object message) { return new AxSignatureError(String.valueOf(message)); }
   static Object validationError(Object message) { return new AxValidationError(String.valueOf(message)); }
+  static Object decisionRefusalError(Object path, Object provenance) { return new AxGen.AxDecisionRefusalError(String.valueOf(path), asMap(provenance)); }
   static Object runtimeError(Object message) { return new RuntimeException(String.valueOf(message)); }
   static Object exceptionMessage(Object error) { return error instanceof Throwable t ? t.getMessage() : String.valueOf(error); }
+  // The same error with a new message and the original as its cause. It keeps
+  // its class and the Ax error fields, so existing handlers still catch it (TS
+  // wraps it in AxGenerateError, which the ports adopt at the next major). An
+  // error this cannot rebuild becomes a RuntimeException.
+  static Object exceptionGenerate(Object error, Object message) {
+    return new AxGenerateError(String.valueOf(message), error instanceof Throwable cause ? cause : null);
+  }
+  static Object exceptionRewrap(Object error, Object message) {
+    String text = String.valueOf(message);
+    if (!(error instanceof Throwable original)) return new RuntimeException(text);
+    RuntimeException wrapped = rebuildError(original, text);
+    try {
+      wrapped.initCause(original);
+      return wrapped;
+    } catch (IllegalStateException causeAlreadySet) {
+      return new RuntimeException(text, original);
+    }
+  }
+  private static RuntimeException rebuildError(Throwable error, String message) {
+    Class<?> type = error.getClass();
+    if (error instanceof AxAIServiceError ai) {
+      if (type == AxAIServiceStatusError.class) return new AxAIServiceStatusError(message, ai.status, ai.code, ai.responseBody, ai.request, ai.retryable);
+      if (type == AxAIServiceTimeoutError.class) return new AxAIServiceTimeoutError(message, ai.status, ai.code, ai.responseBody, ai.request, ai.retryable);
+      if (type == AxAIServiceAuthenticationError.class) return new AxAIServiceAuthenticationError(message, ai.status, ai.code, ai.responseBody, ai.request);
+      if (type == AxAIServiceStreamTerminatedError.class) return new AxAIServiceStreamTerminatedError(message, ai.responseBody, ai.retryable);
+      if (type == AxAIServiceResponseError.class) return new AxAIServiceResponseError(message, ai.responseBody);
+      if (type == AxAIServiceNetworkError.class) return new AxAIServiceNetworkError(message);
+      if (type == AxAIRefusalError.class) return new AxAIRefusalError(message, ai.responseBody);
+      if (type == AxUnsupportedCapabilityError.class) return new AxUnsupportedCapabilityError(message);
+      if (type == AxAIServiceError.class) return new AxAIServiceError(message, ai.status, ai.code, ai.responseBody, ai.request, ai.retryable);
+    }
+    if (type == AxValidationError.class) return new AxValidationError(message);
+    if (type == AxSignatureError.class) return new AxSignatureError(message);
+    if (type == TemplateError.class) return new TemplateError(message);
+    if (type == RuntimeException.class) return new RuntimeException(message);
+    // Any other RuntimeException keeps its class when its public (String)
+    // constructor rebuilds it with exactly this message.
+    if (error instanceof RuntimeException) {
+      try {
+        Object rebuilt = type.getConstructor(String.class).newInstance(message);
+        if (rebuilt instanceof RuntimeException same && message.equals(same.getMessage())) return same;
+      } catch (ReflectiveOperationException | RuntimeException | LinkageError unsupported) {
+        // falls back to a plain RuntimeException
+      }
+    }
+    return new RuntimeException(message);
+  }
+  static Object exceptionIsAborted(Object error) {
+    Object current=error;
+    while(current instanceof Throwable throwable){if(throwable instanceof AxAIServiceAbortedError || throwable instanceof java.util.concurrent.CancellationException)return true;current=throwable.getCause();}
+    return false;
+  }
+  // TS AxGen retries only 5xx status, network, timeout and stream-termination errors.
+  // The HTTP client's IOException (a failed connection, its timeout), which chat
+  // and embed throw until the next major version, is TS's network or timeout
+  // error.
+  static Object exceptionIsInfrastructure(Object error) {
+    Object current=error;
+    while(current instanceof Throwable throwable){
+      if(throwable instanceof AxAIServiceStatusError status)return status.status!=null&&status.status>=500&&status.status<600;
+      if(throwable instanceof AxAIServiceNetworkError||throwable instanceof AxAIServiceTimeoutError||throwable instanceof AxAIServiceStreamTerminatedError)return true;
+      if(throwable instanceof java.io.IOException)return true;
+      current=throwable.getCause();
+    }
+    return false;
+  }
+  // TS AxGen retries a model refusal inside its validation loop.
+  static Object exceptionIsValidation(Object error) {
+    Object current=error;
+    while(current instanceof Throwable throwable){
+      if(throwable instanceof AxValidationError)return true;
+      if(throwable.getCause()==null || throwable.getCause()==throwable)break;
+      current=throwable.getCause();
+    }
+    return false;
+  }
+  static Object exceptionIsRefusal(Object error) {
+    Object current=error;
+    while(current instanceof Throwable throwable){
+      if(throwable instanceof AxAIRefusalError)return true;
+      current=throwable.getCause();
+    }
+    return false;
+  }
   static Object aiErrorResponse(Object message) { return new AxAIServiceResponseError(String.valueOf(message)); }
   static Object aiErrorResponse(Object message, Object responseBody) { return new AxAIServiceResponseError(String.valueOf(message), responseBody); }
   static Object aiErrorRefusal(Object message, Object responseBody) { return new AxAIRefusalError(String.valueOf(message), responseBody); }
   static Object aiErrorStream(Object message, Object responseBody, Object retryable) { return new AxAIServiceStreamTerminatedError(String.valueOf(message), responseBody, truthy(retryable)); }
   static Object aiErrorUnsupported(Object message) { return new AxUnsupportedCapabilityError(String.valueOf(message)); }
-  static Object aiErrorAuth(Object message, Object status, Object code, Object responseBody, Object request) { return new AxAIServiceAuthenticationError(String.valueOf(message), status == null ? null : asInt(status), code == null ? null : String.valueOf(code), responseBody, request); }
-  static Object aiErrorTimeout(Object message, Object status, Object code, Object responseBody, Object request, Object retryable) { return new AxAIServiceTimeoutError(String.valueOf(message), status == null ? null : asInt(status), code == null ? null : String.valueOf(code), responseBody, request, truthy(retryable)); }
-  static Object aiErrorStatus(Object message, Object status, Object code, Object responseBody, Object request, Object retryable) { return new AxAIServiceStatusError(String.valueOf(message), status == null ? null : asInt(status), code == null ? null : String.valueOf(code), responseBody, request, truthy(retryable)); }
+  static Object aiErrorAuth(Object message, Object status, Object code, Object responseBody, Object request) { return new AxAIServiceAuthenticationError(String.valueOf(message), status == null ? null : asInt(status), code == null ? null : String.valueOf(code), responseBody, _ai_error_request(request, null)); }
+  static Object aiErrorTimeout(Object message, Object status, Object code, Object responseBody, Object request, Object retryable) { return new AxAIServiceTimeoutError(String.valueOf(message), status == null ? null : asInt(status), code == null ? null : String.valueOf(code), responseBody, _ai_error_request(request, null), truthy(retryable)); }
+  static Object aiErrorStatus(Object message, Object status, Object code, Object responseBody, Object request, Object retryable) { return new AxAIServiceStatusError(String.valueOf(message), status == null ? null : asInt(status), code == null ? null : String.valueOf(code), responseBody, _ai_error_request(request, null), truthy(retryable)); }
 
   static Object recordNew(Object name, Object values) {
     Map<String, Object> v = asMap(values);
@@ -496,6 +804,12 @@ final class Core {
     if (v.get("maxLength") != null || v.get("max_length") != null) t.maxLength = asInt(v.getOrDefault("maxLength", v.get("max_length")));
     if (v.get("minimum") != null) t.minimum = asDouble(v.get("minimum"));
     if (v.get("maximum") != null) t.maximum = asDouble(v.get("maximum"));
+    Object descriptions = v.getOrDefault("valueDescriptions", v.get("value_descriptions"));
+    if (descriptions != null) {
+      t.valueDescriptions = new LinkedHashMap<>();
+      for (var entry : asMap(descriptions).entrySet()) t.valueDescriptions.put(entry.getKey(), (String) entry.getValue());
+    }
+    t.evidence = v.get("evidence") == null ? null : new LinkedHashMap<>(asMap(v.get("evidence")));
     t.pattern = (String) v.get("pattern");
     t.patternDescription = (String) v.getOrDefault("patternDescription", v.get("pattern_description"));
     t.format = (String) v.get("format");
@@ -527,20 +841,44 @@ final class Core {
     return out;
   }
   static Object fieldItem(Object field) {
+    // Structured validation describes a nested field as a {name, title, type}
+    // map; its item is the same map with a scalar type.
+    if (field instanceof Map<?, ?> map) {
+      Map<String, Object> item = new LinkedHashMap<>(asMap(map));
+      Object type = item.get("type");
+      if (type instanceof FieldType fieldType) {
+        FieldType scalar = fieldType.copy();
+        scalar.array = false;
+        item.put("type", scalar);
+      } else if (type instanceof Map<?, ?> typeMap) {
+        Map<String, Object> scalar = new LinkedHashMap<>(asMap(typeMap));
+        scalar.remove("isArray");
+        scalar.put("is_array", false);
+        item.put("type", scalar);
+      }
+      return item;
+    }
     Field f = (Field) field;
     FieldType t = f.type.copy();
     t.array = false;
     return new Field(f.name, t, f.description, f.title, f.optional, f.internal, f.cached);
   }
+  // A field name's title as TS's toTitle writes it (src/ax/dsp/sig.ts):
+  // underscores become spaces, and a word starts at a capital after a lowercase
+  // letter or digit, at the last capital of a run that begins a word, and at each
+  // run of digits; words are separated by one space. userID is "User ID",
+  // parseHTTPResponse "Parse HTTP Response", item123 "Item 123", field_2 "Field 2".
+  private static final Pattern TITLE_CAMEL_BOUNDARY = Pattern.compile("([a-z0-9])([A-Z])");
+  private static final Pattern TITLE_ACRONYM_BOUNDARY = Pattern.compile("([A-Z])([A-Z][a-z])");
+  private static final Pattern TITLE_DIGIT_BOUNDARY = Pattern.compile("([^0-9])([0-9])");
+  private static final Pattern TITLE_SPACES = Pattern.compile("\\s+");
+
   static String title(String name) {
-    String s = name == null ? "" : name.replace("_", " ");
-    StringBuilder out = new StringBuilder();
-    for (int i = 0; i < s.length(); i++) {
-      char ch = s.charAt(i);
-      if (i > 0 && (Character.isUpperCase(ch) || Character.isDigit(ch))) out.append(' ');
-      out.append(ch);
-    }
-    String text = out.toString().trim();
+    String text = name == null ? "" : name.replace("_", " ");
+    text = TITLE_CAMEL_BOUNDARY.matcher(text).replaceAll("$1 $2");
+    text = TITLE_ACRONYM_BOUNDARY.matcher(text).replaceAll("$1 $2");
+    text = TITLE_DIGIT_BOUNDARY.matcher(text).replaceAll("$1 $2");
+    text = TITLE_SPACES.matcher(text).replaceAll(" ").trim();
     return text.isEmpty() ? text : text.substring(0, 1).toUpperCase() + text.substring(1);
   }
   static Object descriptionAppend(Object base, Object hint) {
@@ -550,6 +888,19 @@ final class Core {
     if (!text.endsWith(".")) text += ".";
     return text + " " + hint;
   }
+  // JavaScript's encodeURIComponent: every UTF-8 byte except A-Z a-z 0-9 and
+  // - _ . ! ~ * ' ( ) becomes %XX.
+  static Object urlEncodeComponent(Object value) {
+    String text = value == null ? "" : String.valueOf(value);
+    StringBuilder out = new StringBuilder();
+    for (byte raw : text.getBytes(java.nio.charset.StandardCharsets.UTF_8)) {
+      int c = raw & 0xff;
+      boolean alnum = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+      if (alnum || "-_.!~*'()".indexOf(c) >= 0) out.append((char) c);
+      else out.append('%').append("0123456789ABCDEF".charAt(c >> 4)).append("0123456789ABCDEF".charAt(c & 15));
+    }
+    return out.toString();
+  }
   static Object urlValid(Object value) { return value instanceof String s && Pattern.compile("^[a-zA-Z][a-zA-Z0-9+.-]*://").matcher(s).find(); }
   static Object validImage(Object value) { return value instanceof Map<?, ?> map && map.containsKey("mimeType") && map.containsKey("data"); }
   static Object validAudio(Object value) { return value instanceof String || (value instanceof Map<?, ?> map && (map.containsKey("data") || map.containsKey("id"))); }
@@ -557,8 +908,12 @@ final class Core {
   static Object validUrlShape(Object value) { return value instanceof String || (value instanceof Map<?, ?> map && map.containsKey("url")); }
 
   static Object objectCallMethod(Object target, Object methodName, Object... args) {
-    if (target instanceof PromptTemplate p && "render".equals(String.valueOf(methodName))) return p.render(asMap(args.length > 0 ? args[0] : null));
+    // AxGen renders with the selected structured-output rung's options.
+    if (target instanceof PromptTemplate p && "render".equals(String.valueOf(methodName))) return p.render(asMap(args.length > 0 ? args[0] : null), args.length > 1 ? asMap(args[1]) : null);
     if (target instanceof AxFlow.Mapper mapper && "call".equals(String.valueOf(methodName))) return mapper.apply(asMap(args.length > 0 ? args[0] : null));
+    if (target instanceof AxGen.FunctionResultFormatter formatter && "format_result".equals(String.valueOf(methodName))) {
+      return formatter.format(args.length > 0 ? args[0] : null);
+    }
     if (target instanceof AxGen.ResultPickerCallback picker && "call".equals(String.valueOf(methodName))) {
       Map<String, Object> payload = asMap(args.length > 0 ? args[0] : null);
       return picker.pick(asMapList(payload.get("results")));
@@ -573,8 +928,21 @@ final class Core {
     if (program instanceof AxProgram axProgram) axProgram.applyOptimizedComponents(asMap(componentMap));
     return Map.of();
   }
+  // An AxGen's or AxAgent's signature text. Any other program (a nested flow,
+  // a custom program) has none, and its undeclared step is a barrier.
+  static Object programSignature(Object program) {
+    if (program instanceof AxGen gen) return gen.signature.toString();
+    if (program instanceof AxAgent agent) return String.valueOf(signature_to_string(agent.signature));
+    return null;
+  }
   static Object aiCompleteOnce(Object client, Object request, Object options) {
     try {
+      // As in TS, a streamed forward folds the stream's chunks into one response.
+      if (truthy(get(get(request, "model_config", Map.of()), "stream", false)) && client instanceof AiClient streaming) {
+        List<Object> events = new ArrayList<>();
+        for (Map<String, Object> event : streaming.stream(asMap(request))) events.add(event);
+        return chat_response_to_completion(fold_chat_response_stream(events));
+      }
       if (client instanceof AxAIService service) return chat_response_to_completion(service.chat(asMap(request), asMap(options)));
       if (client instanceof AiClient ai) return ai.complete(asMap(request));
       throw new RuntimeException("client does not implement AiClient");
@@ -584,14 +952,263 @@ final class Core {
       throw new RuntimeException(e.getMessage(), e);
     }
   }
+  /** Pull handle over an open provider stream: next() returns the next chunk, or null at the end. */
+  static final class ChatStreamHandle {
+    private final AxChatStream stream;
+    private final java.util.Iterator<Map<String, Object>> iterator;
+    private boolean closed;
+
+    ChatStreamHandle(AxChatStream stream) {
+      this.stream = stream;
+      this.iterator = stream.iterator();
+    }
+
+    Map<String, Object> next() {
+      if (closed || !iterator.hasNext()) return null;
+      return iterator.next();
+    }
+
+    void close() {
+      if (closed) return;
+      closed = true;
+      stream.close();
+    }
+  }
+  // streaming_forward reads the provider stream chunk by chunk. openStream()
+  // returns a pull-based AxChatStream (an HTTP provider reads each SSE event
+  // as it arrives) with the call options and cancellation token, as
+  // complete_once passes them to chat(); a client without streaming answers
+  // with its chat response as one chunk.
+  static Object aiStreamOpen(Object client, Object request, Object options) {
+    if (!(client instanceof AiClient ai)) throw new RuntimeException("client does not implement AiClient");
+    Map<String, Object> callOptions = new LinkedHashMap<>(asMap(options));
+    Object token = callOptions.getOrDefault("cancellation", callOptions.getOrDefault("cancellationToken", callOptions.get("cancellation_token")));
+    AxCancellationToken cancellation = token instanceof AxCancellationToken value ? value : null;
+    try {
+      AxChatStream stream = ai.openStream(asMap(request), callOptions, cancellation);
+      if (stream == null) throw new AxAIServiceResponseError("AI client returned no stream");
+      return new ChatStreamHandle(stream);
+    } catch (RuntimeException error) {
+      throw error;
+    } catch (Exception error) {
+      throw new RuntimeException(error.getMessage(), error);
+    }
+  }
+  // Provider errors surface here as the client raised them, so the exception
+  // intrinsics classify them as they do for complete_once.
+  static Object aiStreamNext(Object handle) {
+    if (!(handle instanceof ChatStreamHandle stream)) throw new IllegalArgumentException("not an open AI stream");
+    return stream.next();
+  }
+  static Object aiStreamClose(Object handle) {
+    if (handle instanceof ChatStreamHandle stream) {
+      try {
+        stream.close();
+      } catch (RuntimeException ignored) {
+        // closing an abandoned stream is best effort
+      }
+    }
+    return null;
+  }
+  // The sink receives each {version, index, delta} envelope; its errors
+  // propagate, so a consumer that stops aborts the run.
+  @SuppressWarnings("unchecked")
+  static Object axgenEmitDelta(Object sink, Object envelope) {
+    if (sink == null) return null;
+    if (!(sink instanceof java.util.function.Consumer<?> consumer)) throw new IllegalArgumentException("streaming sink must be a Consumer");
+    ((java.util.function.Consumer<Object>) consumer).accept(envelope);
+    return null;
+  }
+  // TS field processors take (value, {values, sessionId, done}); a
+  // one-argument callback gets the value alone. A null result is undefined.
+  @SuppressWarnings("unchecked")
+  static Object axgenCallProcessor(Object spec, Object value, Object context) {
+    Object processor = spec instanceof Map<?, ?> map ? (map.containsKey("processor") ? map.get("processor") : map.get("fn")) : spec;
+    if (processor instanceof AxFieldProcessor fieldProcessor) {
+      return fieldProcessor.process(value, new AxFieldProcessorContext(asMap(get(context, "values", null)), truthy(get(context, "done", false))));
+    }
+    Map<String, Object> processorContext = new LinkedHashMap<>();
+    processorContext.put("values", new LinkedHashMap<>(asMap(get(context, "values", null))));
+    processorContext.put("done", truthy(get(context, "done", false)));
+    if (processor instanceof java.util.function.BiFunction<?, ?, ?> fn) return ((java.util.function.BiFunction<Object, Object, Object>) fn).apply(value, processorContext);
+    if (processor instanceof AxGen.FieldProcessorCallback callback) return callback.apply(value);
+    if (processor instanceof java.util.function.Function<?, ?> fn) return ((java.util.function.Function<Object, Object>) fn).apply(value);
+    throw new IllegalArgumentException("field processor must be callable");
+  }
+  // A callable check(value, done) returns null or true to pass, a message
+  // string, or false; a {not_contains} spec fails when the field text contains
+  // it, without a message (the IR then uses the spec's message).
+  @SuppressWarnings("unchecked")
+  static Object axgenCheckStreamingAssertion(Object spec, Object value, Object done) {
+    Object check = spec instanceof Map<?, ?> map ? (map.containsKey("fn") ? map.get("fn") : map.get("assert")) : spec;
+    Object result;
+    if (check instanceof AxStreamingAssertion assertion) result = assertion.check(value == null ? "" : String.valueOf(value), truthy(done));
+    else if (check instanceof java.util.function.BiFunction<?, ?, ?> fn) result = ((java.util.function.BiFunction<Object, Object, Object>) fn).apply(value, truthy(done));
+    else if (check instanceof java.util.function.Function<?, ?> fn) result = ((java.util.function.Function<Object, Object>) fn).apply(value);
+    else {
+      Map<String, Object> descriptor = asMap(spec);
+      Object needle = descriptor.containsKey("not_contains") ? descriptor.get("not_contains") : descriptor.get("notContains");
+      boolean failed = needle != null && String.valueOf(value).contains(String.valueOf(needle));
+      return assertionOutcome(failed ? "fail" : "pass", null, null);
+    }
+    if (result == null || Boolean.TRUE.equals(result)) return assertionOutcome("pass", null, null);
+    if (result instanceof String message) return assertionOutcome("fail", "message", message);
+    return assertionOutcome("fail", null, null);
+  }
+  private static final Map<String, java.util.Optional<String>> ENV_OVERRIDES = new java.util.concurrent.ConcurrentHashMap<>();
+  // Environment lookups for provider credentials and base URLs. Java cannot
+  // change its own environment, so conformance fixtures set overrides here (a
+  // null value hides the variable).
+  static String env(String name) {
+    java.util.Optional<String> override = ENV_OVERRIDES.get(name);
+    if (override != null) return override.orElse(null);
+    return System.getenv(name);
+  }
+  static void setEnvOverrides(Map<String, Object> values) {
+    ENV_OVERRIDES.clear();
+    if (values == null) return;
+    for (Map.Entry<String, Object> entry : values.entrySet()) {
+      ENV_OVERRIDES.put(entry.getKey(), java.util.Optional.ofNullable(entry.getValue() == null ? null : String.valueOf(entry.getValue())));
+    }
+  }
+  private static final Set<String> AI_WARNINGS_SHOWN = java.util.concurrent.ConcurrentHashMap.newKeySet();
+  private static volatile java.util.function.Consumer<String> aiWarningSink;
+  // TS console.warn, once per key per process: a setting Ax could not send,
+  // such as a sampling parameter the selected model rejects.
+  static Object aiWarnOnce(Object key, Object message) {
+    if (!AI_WARNINGS_SHOWN.add(String.valueOf(key))) return null;
+    java.util.function.Consumer<String> sink = aiWarningSink;
+    if (sink != null) {
+      sink.accept(String.valueOf(message));
+      return null;
+    }
+    try {
+      System.getLogger("dev.axllm.ax").log(System.Logger.Level.WARNING, String.valueOf(message));
+    } catch (RuntimeException ignored) {
+      // a failing logger must not fail the request
+    }
+    return null;
+  }
+  // Conformance hook: forgets the one-time warnings already shown and sends
+  // new ones to sink (null logs them again).
+  static void aiCaptureWarnings(java.util.function.Consumer<String> sink) {
+    AI_WARNINGS_SHOWN.clear();
+    aiWarningSink = sink;
+  }
+  private static final Set<String> AXGEN_DEPRECATIONS_SHOWN = java.util.concurrent.ConcurrentHashMap.newKeySet();
+  private static volatile java.util.function.Consumer<String> axgenDeprecationSink;
+  // Deprecated port behavior warns once per key per process.
+  static Object axgenDeprecation(Object key, Object message) {
+    if (!AXGEN_DEPRECATIONS_SHOWN.add(String.valueOf(key))) return null;
+    java.util.function.Consumer<String> sink = axgenDeprecationSink;
+    if (sink != null) {
+      sink.accept(String.valueOf(message));
+      return null;
+    }
+    try {
+      System.getLogger("dev.axllm.ax").log(System.Logger.Level.WARNING, String.valueOf(message));
+    } catch (RuntimeException ignored) {
+      // a failing logger must not fail the forward
+    }
+    return null;
+  }
+  // Conformance hook: forgets the deprecations already shown and sends new
+  // ones to sink (null logs them again).
+  static void axgenCaptureDeprecations(java.util.function.Consumer<String> sink) {
+    AXGEN_DEPRECATIONS_SHOWN.clear();
+    axgenDeprecationSink = sink;
+  }
+  // The lowercase hex SHA-256 of the text's UTF-8 bytes (AxGen cache keys).
+  static Object cryptoSha256Hex(Object text) {
+    try {
+      byte[] digest = java.security.MessageDigest.getInstance("SHA-256").digest(String.valueOf(text).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+      return java.util.HexFormat.of().formatHex(digest);
+    } catch (java.security.NoSuchAlgorithmException error) {
+      throw new IllegalStateException("SHA-256 is unavailable", error);
+    }
+  }
+  // The forward call's cachingFunction, else the AxGen constructor's, else the
+  // process-wide one (AxGlobals.setCachingFunction); null when none is set.
+  // The process-wide tool result formatter, or null.
+  static Object axgenFunctionResultFormatter() {
+    return AxGlobals.functionResultFormatter();
+  }
+  static Object axgenCachingFunction(Object gen, Object options) {
+    Object fromCall = cachingFunctionOption(options);
+    if (fromCall != null) return fromCall;
+    Object fromGen = cachingFunctionOption(get(gen, "options", null));
+    return fromGen != null ? fromGen : AxGlobals.cachingFunction();
+  }
+  // TS AxFlow's cachingFunction: the call's (cachingFunction or
+  // caching_function), else the process-wide one; the flow's constructor
+  // takes none. The flow passes its call options to its AxGen nodes, so they
+  // cache through the same function.
+  static Object flowCachingFunction(Object options) {
+    Object fromCall = cachingFunctionOption(options);
+    return fromCall != null ? fromCall : AxGlobals.cachingFunction();
+  }
+  private static Object cachingFunctionOption(Object options) {
+    if (!(options instanceof Map<?, ?> map)) return null;
+    Object value = map.get("cachingFunction");
+    return value != null ? value : map.get("caching_function");
+  }
+  // fn.apply(key, null) returns a copy of the stored output, or null for a
+  // miss. Its exceptions propagate: forward rethrows them, streaming_forward
+  // ignores them.
+  static Object axgenCacheRead(Object fn, Object key) {
+    Map<String, Object> cached = applyCachingFunction(fn, key, null);
+    return cached == null ? null : ownedCopy(cached);
+  }
+  // fn.apply(key, output) stores a copy of the output; the IR ignores its errors.
+  static Object axgenCacheWrite(Object fn, Object key, Object value) {
+    if (value == null) return null;
+    applyCachingFunction(fn, key, asMap(ownedCopy(value)));
+    return null;
+  }
+  private static Map<String, Object> applyCachingFunction(Object fn, Object key, Map<String, Object> value) {
+    if (!(fn instanceof AxCachingFunction cachingFunction)) {
+      throw new IllegalArgumentException("cachingFunction must be an AxCachingFunction, got " + (fn == null ? "null" : fn.getClass().getName()));
+    }
+    try {
+      return cachingFunction.apply(String.valueOf(key), value);
+    } catch (RuntimeException error) {
+      throw error;
+    } catch (Exception error) {
+      if (error instanceof InterruptedException) Thread.currentThread().interrupt();
+      throw new RuntimeException(error.getMessage(), error);
+    }
+  }
+  // The run control updates pending for this run, which the forward applies
+  // when a step starts, as TypeScript does: a steer, a thinking budget. Only
+  // the run's request boundary (SessionRun without a native chat session)
+  // tracks them; any other client has none.
+  static Object aiControlTakePending(Object client) {
+    return client instanceof SessionRun run ? run.takeControlUpdates() : new ArrayList<>();
+  }
+  static Object aiControlPendingCount(Object client) {
+    return client instanceof SessionRun run ? run.pendingControlCount() : 0;
+  }
   static Object aiClientFeatures(Object client, Object model) {
+    if (client instanceof SessionRun session) return aiClientFeatures(session.client, model);
+    if (client instanceof ChatRunFeatures features) return features.getFeatures(model == null ? null : String.valueOf(model));
     if (client instanceof AxAIService service) {
       return service.getFeatures(model == null ? null : String.valueOf(model));
     }
     return Map.of("functions", true, "structured_outputs", true);
   }
-  static Object retrySleep(Object attempt) { return null; }
-  static Object toolInvoke(Object fn, Object params) {
+  static Object retrySleep(Object attempt,Object client,Object options) {
+    long milliseconds=Math.min(250L*(asInt(attempt)+1L),1000L);
+    Map<String,Object> optionMap=asMap(options);
+    Object raw=optionMap.getOrDefault("cancellation",optionMap.getOrDefault("cancellationToken",optionMap.get("cancellation_token")));
+    if(!(raw instanceof AxCancellationToken cancellation)){try{Thread.sleep(milliseconds);}catch(InterruptedException error){Thread.currentThread().interrupt();throw new RuntimeException(error);}return null;}
+    try{cancellation.await(milliseconds);cancellation.throwIfCancelled();return null;}
+    catch(InterruptedException error){Thread.currentThread().interrupt();cancellation.throwIfCancelled();throw new RuntimeException(error);}
+  }
+  static Object toolInvoke(Object fn,Object params){return toolInvoke(fn,params,()->Thread.currentThread().isInterrupted());}
+  // extras: the run's tool_call_extras map, for an extrasHandler.
+  static Object toolInvoke(Object fn,Object params,Object extras){return toolInvoke(fn,params,()->Thread.currentThread().isInterrupted(),extras);}
+  static Object toolInvoke(Object fn, Object params,java.util.function.BooleanSupplier cancelled) {return toolInvoke(fn,params,cancelled,null);}
+  static Object toolInvoke(Object fn, Object params,java.util.function.BooleanSupplier cancelled,Object extras) {
     if (!(fn instanceof Tool tool)) throw new RuntimeException("unknown tool");
     AxGlobals.Scope scope = AxGlobals.openScope(
         AxRuntimeHooks.empty(),
@@ -600,7 +1217,7 @@ final class Core {
         "ax_gen_tool",
         Map.of("ax.tool.name", tool.name));
     try {
-      return tool.call(asMap(params));
+      return tool.call(asMap(params),cancelled,extras);
     } catch (RuntimeException | Error error) {
       scope.fail(error);
       throw error;
@@ -631,6 +1248,51 @@ final class Core {
     Map<String, Object> out = new LinkedHashMap<>();
     out.put("results", List.of(result));
     if (raw.get("usage") != null) out.put("model_usage", Map.of("tokens", raw.get("usage")));
+    return out;
+  }
+  // A complete() answer as one chat response, for chat() and streams over a
+  // complete()-only client: function calls take the chat {id, type,
+  // function: {name, params}} shape and each result keeps its thought,
+  // thought blocks, images and phase. A completion with per-sample results
+  // (complete_once's shape) keeps every sample; a chat response passes
+  // through with its calls unchanged.
+  static Map<String, Object> completionToChatResponse(Map<String, Object> completion) {
+    boolean sampled = completion.get("results") instanceof List<?>;
+    List<Object> samples = sampled ? asList(completion.get("results")) : List.of(completion);
+    List<Object> results = new ArrayList<>();
+    for (int position = 0; position < samples.size(); position++) {
+      Map<String, Object> sample = asMap(samples.get(position));
+      Map<String, Object> result = new LinkedHashMap<>();
+      if (sampled) result.putAll(sample);
+      result.put("index", sample.containsKey("index") ? sample.get("index") : position);
+      result.put("content", sample.get("content") == null ? "" : sample.get("content"));
+      List<Object> calls = new ArrayList<>();
+      for (Object item : asList(sample.get("function_calls"))) {
+        Map<String, Object> call = asMap(item);
+        if (call.get("function") instanceof Map<?, ?>) {
+          calls.add(call);
+          continue;
+        }
+        Map<String, Object> function = new LinkedHashMap<>();
+        function.put("name", call.get("name"));
+        function.put("params", call.get("params"));
+        Map<String, Object> chatCall = new LinkedHashMap<>();
+        chatCall.put("id", call.get("id"));
+        chatCall.put("type", "function");
+        chatCall.put("function", function);
+        calls.add(chatCall);
+      }
+      result.put("function_calls", calls);
+      for (String key : List.of("thought", "thought_blocks", "images", "phase")) if (sample.get(key) != null) result.put(key, sample.get(key));
+      Object finish = sample.get("finish_reason");
+      result.put("finish_reason", finish != null ? finish : calls.isEmpty() ? "stop" : "function_call");
+      results.add(result);
+    }
+    Map<String, Object> out = new LinkedHashMap<>();
+    out.put("results", results);
+    if (completion.get("model_usage") != null) out.put("model_usage", completion.get("model_usage"));
+    else if (completion.get("usage") != null) out.put("model_usage", Map.of("tokens", completion.get("usage")));
+    if (completion.get("remote_id") != null) out.put("remote_id", completion.get("remote_id"));
     return out;
   }
   static Map<String, Object> coerceChatRequest(Map<String, Object> request) {
@@ -690,11 +1352,15 @@ final class Core {
     return Json.stringify(value);
   }
   static String axgenFormatValues(Object gen, Object values, String kind) {
+    Object decisionFields=get(get(gen,"signature",null),kind+"_fields",new ArrayList<>());
+    if (kind.equals("output") && truthy(_evidence_has_fields_impl(decisionFields))) return Json.stringify(_evidence_example_values_impl(decisionFields,values));
     Map<String, Object> map = asMap(values);
     List<String> lines = new ArrayList<>();
     for (Object raw : asList(get(get(gen, "signature", null), kind + "_fields", List.of()))) {
       Field field = (Field) raw;
-      if (map.containsKey(field.name)) lines.add(field.title + ": " + axgenValueText(map.get(field.name)));
+      if (!map.containsKey(field.name)) continue;
+      String dated = field.type == null ? null : jsDatePromptText(field.type.name, map.get(field.name));
+      lines.add(field.title + ": " + (dated != null ? dated : axgenValueText(map.get(field.name))));
     }
     if (lines.isEmpty()) for (Map.Entry<String, Object> e : map.entrySet()) lines.add(e.getKey() + ": " + axgenValueText(e.getValue()));
     return String.join("\n", lines);
@@ -750,6 +1416,12 @@ final class Core {
         changed = true;
         continue;
       }
+      // AxFieldProcessorMode.TRANSFORM: the returned value rewrites the field.
+      if (processor instanceof AxFieldProcessor fieldProcessor) {
+        result.put(field, fieldProcessor.process(result.get(field), new AxFieldProcessorContext(result, true)));
+        changed = true;
+        continue;
+      }
       String op = String.valueOf(processor);
       Object value = result.get(field);
       if ("uppercase".equals(op)) { result.put(field, String.valueOf(value).toUpperCase()); changed = true; }
@@ -761,30 +1433,54 @@ final class Core {
     if (changed && get(gen, "memory", null) instanceof AxMemory mem) mem.addProcessorOutput(result);
     return result;
   }
+  // Evaluates the assertions in order and reports the first failure as
+  // {status: "pass"}, {status: "fail", message?} or {status: "error", error};
+  // gen.axir decides what each outcome raises, as TS assertAssertions does.
   static Object axgenRunAssertions(Object gen, Object output) {
     Map<String, Object> map = asMap(output);
     for (Object raw : asList(get(gen, "assertions", List.of()))) {
-      if (raw instanceof AxGen.AssertionCallback cb) {
-        Object returned = cb.apply(map);
-        if (returned instanceof String s) throw new RuntimeException(s);
-        if (Boolean.FALSE.equals(returned)) throw new RuntimeException("assertion failed");
+      AxGen.AssertionCallback callback = null;
+      String callbackMessage = null;
+      if (raw instanceof AxGen.AssertionCallback cb) callback = cb;
+      if (raw instanceof AxGen.MessageAssertion messaged) {
+        callback = messaged.callback();
+        callbackMessage = messaged.message();
+      }
+      if (callback != null) {
+        Object returned;
+        try {
+          returned = callback.apply(map);
+        } catch (RuntimeException error) {
+          return assertionOutcome("error", "error", error);
+        }
+        if (returned instanceof String s) return assertionOutcome("fail", "message", s);
+        if (Boolean.FALSE.equals(returned)) return assertionOutcome("fail", "message", nonEmpty(callbackMessage));
         continue;
       }
       Map<String, Object> assertion = asMap(raw);
+      if (assertion.containsKey("throw")) return assertionOutcome("error", "error", new RuntimeException(String.valueOf(assertion.get("throw"))));
       Object field = assertion.get("field");
       Object value = field == null ? output : map.get(String.valueOf(field));
-      String message = String.valueOf(assertion.getOrDefault("message", "assertion failed"));
+      String message = nonEmpty(assertion.get("message"));
       if (assertion.containsKey("return")) {
         Object returned = assertion.get("return");
         if (returned == null) continue;
-        if (Boolean.FALSE.equals(returned) && !assertion.containsKey("message")) throw new RuntimeException("assertion failed without message");
-        if (Boolean.FALSE.equals(returned)) throw new RuntimeException(message);
-        if (returned instanceof String s) throw new RuntimeException(s);
+        if (Boolean.FALSE.equals(returned)) return assertionOutcome("fail", "message", message);
+        if (returned instanceof String s) return assertionOutcome("fail", "message", s);
       }
-      if (assertion.containsKey("contains") && !String.valueOf(value).contains(String.valueOf(assertion.get("contains")))) throw new RuntimeException(message);
-      if (assertion.containsKey("equals") && !java.util.Objects.equals(value, assertion.get("equals"))) throw new RuntimeException(message);
+      if (assertion.containsKey("contains") && !String.valueOf(value).contains(String.valueOf(assertion.get("contains")))) return assertionOutcome("fail", "message", message);
+      if (assertion.containsKey("equals") && !java.util.Objects.equals(value, assertion.get("equals"))) return assertionOutcome("fail", "message", message);
     }
-    return null;
+    return assertionOutcome("pass", null, null);
+  }
+  private static Map<String, Object> assertionOutcome(String status, String key, Object value) {
+    Map<String, Object> outcome = new LinkedHashMap<>();
+    outcome.put("status", status);
+    if (key != null && value != null) outcome.put(key, value);
+    return outcome;
+  }
+  private static String nonEmpty(Object message) {
+    return message == null || String.valueOf(message).isEmpty() ? null : String.valueOf(message);
   }
   static Object axgenRecordTrace(Object gen, Object values, Object output, Object status) {
     Object traces = get(gen, "traces", List.of());
@@ -805,12 +1501,14 @@ final class Core {
     if (get(gen, "memory", null) instanceof AxMemory mem) mem.addResponse(response);
     return null;
   }
-  static Object axgenMemoryAddFunctionResult(Object gen, Object call, Object result, Object ok) {
+  // `result` and `result_text` both keep the text the model got.
+  static Object axgenMemoryAddFunctionResult(Object gen, Object call, Object result, Object ok, Object resultText) {
     if (get(gen, "memory", null) instanceof AxMemory mem) {
       Map<String, Object> item = new LinkedHashMap<>();
       item.put("call", call);
       item.put("result", result);
       item.put("ok", truthy(ok));
+      if (resultText != null) item.put("result_text", resultText);
       mem.addFunctionResults(item);
     }
     return null;
@@ -854,10 +1552,50 @@ final class Core {
     }
     return null;
   }
+  static Object runControlAborted(Object control) {
+    return control instanceof AxRunControl value ? value.isAborted() : truthy(get(control,"aborted",false));
+  }
+
+  static Object agentNativeStageForward(Object stage,Object state,Object client,Object values,Object options,Object selected) {
+    if(!(stage instanceof AxGen gen)||!(client instanceof AiClient ai))throw new IllegalArgumentException("Native agent stage requires AxGen and an AI client");
+    var tools=new ArrayList<Tool>();
+    for(Object descriptor:asList(selected)) {
+      Object source=_agent_callable_implementation(state,get(descriptor,"qualified_name",""));
+      if(!(source instanceof Tool tool))throw new IllegalArgumentException("Background agent callables must have a typed fn() implementation");
+      tools.add(new Tool(String.valueOf(get(descriptor,"native_name","")),String.valueOf(get(descriptor,"description","")),tool.args,tool.returns,tool.handler,"background",tool.contextHandler).parameters(tool.schema()));
+    }
+    var original=new ArrayList<>(gen.functions);var base=new ArrayList<>(gen.baseFunctions);var previous=new ArrayList<>(gen.functionCallTraces);
+    gen.functions.addAll(tools);gen.baseFunctions.addAll(tools);gen.functionCallTraces.clear();
+    try{return gen.forward(ai,asMap(values),asMap(options));}
+    finally{var records=new ArrayList<>(gen.functionCallTraces);gen.functions.clear();gen.functions.addAll(original);gen.baseFunctions.clear();gen.baseFunctions.addAll(base);gen.functionCallTraces.clear();gen.functionCallTraces.addAll(previous);gen.functionCallTraces.addAll(records);_agent_record_native_calls(state,selected,records,options);}
+  }
+
+  // Streams the stage's AxGen deltas to sink, each through the agent's
+  // citation handling (hidden citations leave the delta).
+  @SuppressWarnings("unchecked")
+  static Object agentStageStreamingForward(Object stage, Object state, Object client, Object values, Object options, Object sink) {
+    if (!(stage instanceof AxGen program)) throw new RuntimeException("the agent's streamed stage must be an AxGen");
+    if (!(client instanceof AiClient ai)) throw new RuntimeException("client does not implement AiClient");
+    if (!(sink instanceof java.util.function.Consumer<?> consumer)) throw new IllegalArgumentException("the agent stream has no delta sink");
+    java.util.function.Consumer<Object> deliver = (java.util.function.Consumer<Object>) consumer;
+    return program.streamingForwardWith(ai, asMap(values), asMap(options), envelope -> deliver.accept(_agent_stream_citation_delta(state, envelope)));
+  }
   static Object agentStageForward(Object stage, Object client, Object values, Object options) {
     if (!(stage instanceof AxProgram program)) throw new RuntimeException("agent stage is not AxProgram");
     if (!(client instanceof AiClient ai)) throw new RuntimeException("client does not implement AiClient");
-    return program.forward(ai, asMap(values), asMap(options));
+    Map<String,Object> forwarded = new LinkedHashMap<>(asMap(options));
+    if (stage instanceof AxAgent && forwarded.containsKey("mcpInheritanceFromParent")) {
+      Object context = forwarded.remove("executionContext");
+      Object policy = forwarded.remove("mcpInheritanceFromParent");
+      if (context instanceof AxExecutionContext parent) forwarded.put("inheritedExecutionContext", parent.derive(policy));
+    }
+    return program.forward(ai, asMap(values), forwarded);
+  }
+  /** A one-off AxGen (the context map's distiller and cartographer), forwarded like an agent stage. */
+  static Object agentProgramForward(Object signature, Object programOptions, Object client, Object values, Object options) {
+    if (!(client instanceof AiClient ai)) throw new RuntimeException("client does not implement AiClient");
+    AxGen program = new AxGen(AxSignature.create(String.valueOf(signature)), new LinkedHashMap<>(asMap(programOptions)));
+    return program.forward(ai, asMap(values), new LinkedHashMap<>(asMap(options)));
   }
   static Object agentStageChatLog(Object stage) {
     if (stage instanceof AxProgram program) return program.getChatLog();
@@ -886,6 +1624,7 @@ final class Core {
     Object clarification = asList(args).isEmpty() ? payload : asList(args).get(0);
     return new AxAgentClarificationException(clarification, get(state, "runtime_state", Map.of()), payload);
   }
+  static Object agentRuntimeIsExecutable(Object runtime) { return runtime instanceof AxCodeRuntime; }
   static Object agentRuntimeCreateSession(Object runtime, Object globals, Object options) {
     if (!(runtime instanceof AxCodeRuntime rt)) throw new RuntimeException("agent runtime does not implement AxCodeRuntime");
     AxCodeSession session = rt.createSession(asMap(globals), asMap(options));
@@ -907,6 +1646,33 @@ final class Core {
   static Object agentRuntimeRestoreState(Object session, Object snapshot, Object options) {
     if (!(session instanceof AxCodeSession active)) throw new RuntimeException("agent code session is not active");
     return active.restoreState(snapshot, asMap(options));
+  }
+  // A runtime's language: a runtime config's "language", else the code
+  // runtime's own, else JavaScript, TS's default runtime.
+  static Object agentRuntimeLanguage(Object runtime) {
+    String language = "";
+    if (runtime instanceof Map<?, ?> config) {
+      Object raw = config.get("language");
+      language = raw == null ? "" : String.valueOf(raw).trim();
+    } else if (runtime instanceof AxCodeRuntime code) {
+      String raw = code.language();
+      language = raw == null ? "" : raw.trim();
+    }
+    return language.isEmpty() ? "JavaScript" : language;
+  }
+  // A runtime's own usage instructions, as TS's getUsageInstructions(): a
+  // runtime config's "usageInstructions", else the code runtime's own, else none.
+  static Object agentRuntimeUsageInstructions(Object runtime) {
+    if (runtime instanceof Map<?, ?> config) {
+      Object raw = config.get("usageInstructions");
+      if (raw == null) raw = config.get("usage_instructions");
+      return raw == null ? "" : String.valueOf(raw);
+    }
+    if (runtime instanceof AxCodeRuntime code) {
+      String raw = code.getUsageInstructions();
+      return raw == null ? "" : raw;
+    }
+    return "";
   }
   static Object agentRuntimeClose(Object session) {
     if (!(session instanceof AxCodeSession active)) return Map.of("closed", true);
@@ -933,6 +1699,19 @@ final class Core {
     if (scripted instanceof List<?>) return scripted;
     return List.of();
   }
+  static Object axgenSpeak(Object client, Object request, Object options) {
+    // Backs intrinsic.axgen.speak: the AxGen audio output renderer calls the
+    // client's speak(), as TS calls ai.speak().
+    if (!(client instanceof AiClient ai)) throw new UnsupportedOperationException("Audio speech not supported by this AI client");
+    try {
+      return ai.speak(asMap(request), asMap(options));
+    } catch (RuntimeException e) {
+      throw e;
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }
+  }
+
   static Object agentTranscribe(Object client, Object request, Object options) {
     // Backs intrinsic.agent.transcribe: call the AI client's transcribe so audio inputs become
     // text before the agent loop (the client passes through _agent_forward as a real client).
@@ -998,6 +1777,14 @@ final class Core {
   static Object agentCallableInvoke(Object state, Object request, Object optionsArg) {
     Map<String, Object> options = asMap(get(state, "options", Map.of()));
     String qualified = String.valueOf(get(request, "qualified_name", get(request, "name", "")));
+    Object implementation=_agent_callable_implementation(state,qualified);
+    Object values=get(request,"args",Map.of());
+    java.util.function.BooleanSupplier cancelled=()->Thread.currentThread().isInterrupted()
+      || get(optionsArg,"control",null) instanceof AxRunControl control && control.isAborted()
+      || get(optionsArg,"cancellation",get(optionsArg,"cancellationToken",get(optionsArg,"cancellation_token",null))) instanceof AxCancellationToken token && token.cancelled();
+    if(implementation instanceof Tool tool){var result=new LinkedHashMap<String,Object>();result.put("status","ok");result.put("value",toolInvoke(tool,values,cancelled));return result;}
+    Object handler=get(implementation,"handler",null);
+    if(handler instanceof Tool.Handler callback){try{Object value=callback.call(asMap(values));var result=new LinkedHashMap<String,Object>();result.put("status","ok");result.put("value",value);return result;}catch(Exception error){throw asRuntime(error);}}
     Object scripted = options.getOrDefault("callable_results", options.get("callableResults"));
     if (scripted instanceof Map<?, ?> map) {
       Object requestName = String.valueOf(get(request, "name", ""));
@@ -1214,7 +2001,10 @@ class PromptRuntime {
     "Return the complete output by calling " + BT + "{{ structuredOutputFunctionName }}" + BT + ".\n{{ else }}{{ if hasComplexFields }}\nReturn one valid JSON object matching <output_fields>. Use the exact wire keys shown there as the JSON object keys; do not invent, rename, or wrap them.\n{{ else }}\nReturn one " + BT + "field name: value" + BT + " pair per line for the required output fields only, using each exact wire key shown in <output_fields> as the field name.\n{{ /if }}{{ /if }}Above rules override later instructions.\n\n</formatting_rules>\n{{ if hasExampleDemonstrations }}\n\n## Example Demonstrations\nThe following User/Assistant turns are examples only until --- END OF EXAMPLES ---, not context for the current task.\n{{ /if }}\n";
 
   static String structured(AxSignature sig, Map<String, Object> values, List<Object> functions, Map<String, Object> options) {
-    boolean complex = sig.hasComplexFields();
+    // As TypeScript's structuredOutput option: AxGen renders with it set when
+    // a structured-output rung is selected; without it the signature decides.
+    Object structuredOption = options.containsKey("structured_output") ? options.get("structured_output") : options.get("structuredOutput");
+    boolean complex = structuredOption == null ? sig.hasComplexFields() : Core.truthy(structuredOption);
     List<Field> outputFields = outputFields(sig);
     String task = taskDefinition(sig, options);
     List<Map<String, Object>> funcs = functionDescriptors(functions);
@@ -1225,11 +2015,14 @@ class PromptRuntime {
     vars.put("hasOutputFields", !outputFields.isEmpty());
     vars.put("hasComplexFields", complex);
     vars.put("hasStructuredOutputFunction", complex && options.get("structured_output_function_name") != null);
-    vars.put("identityText", identity(sig, values));
+    // TS includeOptionalInputFieldsInSystemPrompt: the system prompt lists
+    // every input field, provided or not. Off by default.
+    boolean includeOptional = Core.truthy(options.getOrDefault("include_optional_input_fields_in_system_prompt", options.getOrDefault("includeOptionalInputFieldsInSystemPrompt", false)));
+    vars.put("identityText", identity(sig, values, includeOptional));
     vars.put("taskDefinitionText", task);
     vars.put("functionsList", funcs.isEmpty() ? "" : renderFunctions(funcs));
-    vars.put("inputFieldsSection", inputSection(sig, values));
-    vars.put("outputFieldsSection", outputSection(sig));
+    vars.put("inputFieldsSection", inputSection(sig, values, includeOptional));
+    vars.put("outputFieldsSection", outputSection(sig, complex));
     vars.put("structuredOutputFunctionName", options.getOrDefault("structured_output_function_name", ""));
     String source = options.get("custom_template") == null ? DEFAULT_DSPY_TEMPLATE : String.valueOf(options.get("custom_template"));
     String context = options.get("custom_template") == null ? "template:dsp/dspy.md" : "inline-template";
@@ -1244,26 +2037,168 @@ class PromptRuntime {
         if (field.optional || field.internal) continue;
         throw new IllegalArgumentException("Value for input field '" + field.name + "' is required.");
       }
-      if (field.type != null && List.of("image", "audio", "file", "url").contains(field.type.name) && value instanceof Map<?, ?> map) {
+      String kind = field.type == null ? "string" : field.type.name;
+      boolean audio = "audio".equals(kind);
+      // As TS processValue: an audio object with a transcript (what an AxGen
+      // audio output renders to) reaches the model as that text.
+      if (audio && value instanceof Map<?, ?> audioMap && audioMap.get("transcript") instanceof String transcript) value = transcript;
+      // As TS defaultRenderInField: image, file and url values, and audio that
+      // is not text, go out as media parts after a text part with the title.
+      if ("image".equals(kind) || "file".equals(kind) || "url".equals(kind) || (audio && !(value instanceof String))) {
         parts.add(new LinkedHashMap<>(Map.of("type", "text", "text", field.title + ": \n")));
-        Map<String, Object> media = new LinkedHashMap<>(Core.asMap(map));
-        media.putIfAbsent("type", field.type.name);
-        parts.add(media);
+        if (field.type.array) {
+          if (!(value instanceof List<?> items)) throw new IllegalArgumentException(mediaLabel(kind) + " field value must be an array.");
+          for (Object item : items) parts.add(mediaPart(kind, item));
+        } else {
+          parts.add(mediaPart(kind, value));
+        }
       } else {
-        String rendered = value instanceof String ? String.valueOf(value) : Json.pretty(value);
+        String dated = field.type == null ? null : Core.jsDatePromptText(field.type.name, value);
+        String rendered = dated != null ? dated : value instanceof String ? String.valueOf(value) : Json.pretty(value);
         Map<String, Object> part = new LinkedHashMap<>(Map.of("type", "text", "text", field.title + ": " + rendered + "\n"));
         if (field.cached) part.put("cache", true);
         parts.add(part);
       }
     }
     boolean allText = true;
-    for (Map<String, Object> part : parts) if (!"text".equals(part.get("type")) || Boolean.TRUE.equals(part.get("cache"))) allText = false;
+    for (Map<String, Object> part : parts) if (!"text".equals(part.get("type"))) allText = false;
     if (allText) {
       List<String> text = new ArrayList<>();
       for (Map<String, Object> part : parts) text.add(String.valueOf(part.getOrDefault("text", "")));
       return String.join("\n", text);
     }
-    return parts;
+    // As TS combineConsecutiveStrings: in a message with media, each run of
+    // text parts joins with a newline and is cached when any of them is.
+    List<Map<String, Object>> combined = new ArrayList<>();
+    for (Map<String, Object> part : parts) {
+      Map<String, Object> previous = combined.isEmpty() ? null : combined.get(combined.size() - 1);
+      if ("text".equals(part.get("type")) && previous != null && "text".equals(previous.get("type"))) {
+        previous.put("text", previous.getOrDefault("text", "") + "\n" + part.getOrDefault("text", ""));
+        if (Boolean.TRUE.equals(part.get("cache"))) previous.put("cache", true);
+      } else {
+        combined.add(part);
+      }
+    }
+    return combined;
+  }
+
+  static String mediaLabel(String kind) {
+    return switch (kind) {
+      case "image" -> "Image";
+      case "audio" -> "Audio";
+      case "file" -> "File";
+      default -> "URL";
+    };
+  }
+
+  // The snake_case aliases the provider mappings read, per media part type:
+  // they become the declared camelCase keys (a camelCase key wins), so inputs
+  // written with them keep working.
+  static Object mediaAliases(String kind, Object value) {
+    if (!(value instanceof Map<?, ?> map)) return value;
+    String[][] aliases = switch (kind) {
+      case "image" -> new String[][] {{"mime_type", "mimeType"}};
+      case "audio" -> new String[][] {{"audio", "data"}, {"mime_type", "mimeType"}, {"sample_rate", "sampleRate"}};
+      case "file" -> new String[][] {{"mime_type", "mimeType"}, {"file_uri", "fileUri"}, {"extracted_text", "extractedText"}};
+      default -> new String[][] {{"cached_content", "cachedContent"}};
+    };
+    Map<Object, Object> out = null;
+    for (String[] alias : aliases) {
+      if (map.containsKey(alias[0]) && !map.containsKey(alias[1])) {
+        if (out == null) out = new LinkedHashMap<>(map);
+        out.put(alias[1], map.get(alias[0]));
+      }
+    }
+    return out == null ? value : out;
+  }
+
+  static Map<String, Object> mediaPart(String kind, Object value) {
+    value = mediaAliases(kind, value);
+    return switch (kind) {
+      case "image" -> imagePart(value);
+      case "audio" -> audioPart(value);
+      case "file" -> filePart(value);
+      default -> urlPart(value);
+    };
+  }
+
+  // JavaScript's !value for a JSON value: objects and arrays are truthy.
+  static boolean jsFalsy(Object value) {
+    if (value == null || Boolean.FALSE.equals(value) || "".equals(value)) return true;
+    return value instanceof Number n && (n.doubleValue() == 0 || Double.isNaN(n.doubleValue()));
+  }
+
+  static Map<?, ?> mediaObject(Object value, String label, String requiredKey) {
+    if (jsFalsy(value)) throw new IllegalArgumentException(label + " field value is required.");
+    if (!(value instanceof Map<?, ?>) && !(value instanceof List<?>)) throw new IllegalArgumentException(label + " field value must be an object.");
+    if (!(value instanceof Map<?, ?> map) || !map.containsKey(requiredKey)) throw new IllegalArgumentException(label + " field must have " + requiredKey);
+    return map;
+  }
+
+  // TS defaultRenderInField: an image part carries the mime type, the data as
+  // `image`, and the details the provider reads (OpenAI's image detail).
+  static Map<String, Object> imagePart(Object value) {
+    Map<?, ?> map = mediaObject(value, "Image", "mimeType");
+    if (!map.containsKey("data")) throw new IllegalArgumentException("Image field must have data");
+    Map<String, Object> part = new LinkedHashMap<>();
+    part.put("type", "image");
+    part.put("mimeType", map.get("mimeType"));
+    part.put("image", map.get("data"));
+    return declaredKeys(part, map, "details", "cache", "optimize", "altText");
+  }
+
+  // The optional keys a media part type declares (TS AxChatRequest) that the
+  // value sets go on the part, so the provider or router that reads them gets
+  // them; other keys stay behind.
+  static Map<String, Object> declaredKeys(Map<String, Object> part, Map<?, ?> value, String... keys) {
+    for (String key : keys) if (value.containsKey(key)) part.put(key, value.get(key));
+    return part;
+  }
+
+  // TS defaultRenderInField: an audio part carries only its format (wav when
+  // it has none) and its data.
+  static Map<String, Object> audioPart(Object value) {
+    Map<?, ?> map = mediaObject(value, "Audio", "data");
+    Map<String, Object> part = new LinkedHashMap<>();
+    part.put("type", "audio");
+    Object format = map.get("format");
+    part.put("format", format == null ? "wav" : format);
+    part.put("data", map.get("data"));
+    return declaredKeys(part, map, "mimeType", "sampleRate", "channels", "cache", "transcription", "duration");
+  }
+
+  // TS defaultRenderInField: a file part carries the mime type and either its
+  // data or its fileUri.
+  static Map<String, Object> filePart(Object value) {
+    Map<?, ?> map = mediaObject(value, "File", "mimeType");
+    boolean hasData = map.containsKey("data");
+    boolean hasFileUri = map.containsKey("fileUri");
+    if (!hasData && !hasFileUri) throw new IllegalArgumentException("File field must have either data or fileUri");
+    if (hasData && hasFileUri) throw new IllegalArgumentException("File field cannot have both data and fileUri");
+    Map<String, Object> part = new LinkedHashMap<>();
+    part.put("type", "file");
+    part.put("mimeType", map.get("mimeType"));
+    if (hasFileUri) part.put("fileUri", map.get("fileUri"));
+    else part.put("data", map.get("data"));
+    return declaredKeys(part, map, "filename", "cache", "extractedText");
+  }
+
+  // TS defaultRenderInField: a url part carries the url, and the title and
+  // description when they are set; a plain string is the url.
+  static Map<String, Object> urlPart(Object value) {
+    if (jsFalsy(value)) throw new IllegalArgumentException("URL field value is required.");
+    Map<String, Object> part = new LinkedHashMap<>();
+    part.put("type", "url");
+    if (value instanceof String url) {
+      part.put("url", url);
+      return part;
+    }
+    if (!(value instanceof Map<?, ?>) && !(value instanceof List<?>)) throw new IllegalArgumentException("URL field value must be a string or object.");
+    if (!(value instanceof Map<?, ?> map) || !map.containsKey("url")) throw new IllegalArgumentException("URL field must have url property");
+    part.put("url", map.get("url"));
+    if (!jsFalsy(map.get("title"))) part.put("title", map.get("title"));
+    if (!jsFalsy(map.get("description"))) part.put("description", map.get("description"));
+    return declaredKeys(part, map, "cachedContent", "cache");
   }
 
   static List<Field> inputFieldsForValues(AxSignature sig, Map<String, Object> values) {
@@ -1273,13 +2208,24 @@ class PromptRuntime {
     for (Field field : fields) if (!field.optional || provided(values.get(field.name))) out.add(field);
     return out;
   }
+  // The input fields the system prompt shows: every one, cached first, with
+  // includeOptionalInputFieldsInSystemPrompt; otherwise the ones the user
+  // message renders.
+  static List<Field> systemInputFields(AxSignature sig, Map<String, Object> values, boolean includeOptional) {
+    if (!includeOptional) return inputFieldsForValues(sig, values);
+    List<Field> fields = new ArrayList<>(sig.inputs);
+    fields.sort(Comparator.comparing(f -> f.cached ? 0 : 1));
+    return fields;
+  }
   static boolean provided(Object value) { return value != null && (!(value instanceof String s) || !s.isEmpty()) && (!(value instanceof List<?> l) || !l.isEmpty()); }
-  static String identity(AxSignature sig, Map<String, Object> values) { return "You will be provided with the following fields: " + descFields(inputFieldsForValues(sig, values)) + ". Your task is to generate new fields: " + descFields(outputFields(sig)) + "."; }
+  static String identity(AxSignature sig, Map<String, Object> values, boolean includeOptional) { return "You will be provided with the following fields: " + descFields(systemInputFields(sig, values, includeOptional)) + ". Your task is to generate new fields: " + descFields(outputFields(sig)) + "."; }
   static String descFields(List<Field> fields) { List<String> out = new ArrayList<>(); for (Field f : fields) out.add(BT + f.title + BT); return String.join(", ", out); }
   static String taskDefinition(AxSignature sig, Map<String, Object> options) { String instruction = String.valueOf(options.getOrDefault("instruction", "")).trim(); String description = sig.description == null ? "" : sig.description.trim(); List<String> parts = new ArrayList<>(); if (!instruction.isEmpty()) parts.add(formatFieldRefs(formatDescription(instruction), fieldMap(sig))); if (!description.isEmpty() && !description.equals(instruction)) parts.add(formatFieldRefs(formatDescription(description), fieldMap(sig))); return String.join("\n\n", parts); }
-  static String inputSection(AxSignature sig, Map<String, Object> values) { return "**Input Fields**: The following fields will be provided to you:\n\n" + renderInputFields(inputFieldsForValues(sig, values), fieldMap(sig)); }
-  static String outputSection(AxSignature sig) { List<Field> fields = outputFields(sig); String out = "**Output Fields**: You must generate the following fields:\n\n" + renderOutputFields(fields, fieldMap(sig)); if (sig.hasComplexFields()) { Map<String, Object> shape = new LinkedHashMap<>(); for (Field field : fields) shape.put(field.name, outputTypePlaceholder(field.type)); out += "\n\n**Exact JSON shape**: " + BT + Json.stringify(shape) + BT; } return out; }
-  static Object outputTypePlaceholder(FieldType type) { Object value; switch (type.name) { case "number" -> value = 0; case "boolean" -> value = true; case "object", "json" -> { Map<String, Object> object = new LinkedHashMap<>(); if (type.fields != null) for (Map.Entry<String, Object> entry : type.fields.entrySet()) { Field field = entry.getValue() instanceof Field nested ? nested : new Field(entry.getKey(), (FieldType) entry.getValue(), null, false, false, false); if (!field.internal) object.put(entry.getKey(), outputTypePlaceholder(field.type)); } value = object; } case "class" -> value = type.options == null || type.options.isEmpty() ? "<allowed value>" : type.options.get(0); case "code" -> value = "<complete source>"; case "date" -> value = "<YYYY-MM-DD>"; case "datetime" -> value = "<ISO 8601 datetime>"; case "dateRange" -> value = new LinkedHashMap<>(Map.of("start", "<YYYY-MM-DD>", "end", "<YYYY-MM-DD>")); case "datetimeRange" -> value = new LinkedHashMap<>(Map.of("start", "<ISO 8601 datetime>", "end", "<ISO 8601 datetime>")); case "url" -> value = "<url>"; default -> value = "<string>"; } return type.array ? List.of(value) : value; }
+  static String inputSection(AxSignature sig, Map<String, Object> values, boolean includeOptional) { return "**Input Fields**: The following fields will be provided to you:\n\n" + renderInputFields(systemInputFields(sig, values, includeOptional), fieldMap(sig)); }
+  // structured: whether the prompt asks for structured output, which ends the
+  // section with the exact JSON shape.
+  static String outputSection(AxSignature sig, boolean structured) { List<Field> fields = outputFields(sig); String out = "**Output Fields**: You must generate the following fields:\n\n" + renderOutputFields(fields, fieldMap(sig)); if (structured) { Map<String, Object> shape = new LinkedHashMap<>(); for (Field field : fields) shape.put(field.name, outputTypePlaceholder(field.type)); out += "\n\n**Exact JSON shape**: " + BT + Json.stringify(shape) + BT; } return out; }
+  static Object outputTypePlaceholder(FieldType type) { if (Core.truthy(Core._evidence_is_type_impl(type))) return Core._evidence_placeholder_impl(type); Object value; switch (type.name) { case "number" -> value = 0; case "boolean" -> value = true; case "object", "json" -> { Map<String, Object> object = new LinkedHashMap<>(); if (type.fields != null) for (Map.Entry<String, Object> entry : type.fields.entrySet()) { Field field = entry.getValue() instanceof Field nested ? nested : new Field(entry.getKey(), (FieldType) entry.getValue(), null, false, false, false); if (!field.internal) object.put(entry.getKey(), outputTypePlaceholder(field.type)); } value = object; } case "class" -> value = type.options == null || type.options.isEmpty() ? "<allowed value>" : type.options.get(0); case "code" -> value = "<complete source>"; case "date" -> value = "<YYYY-MM-DD>"; case "datetime" -> value = "<ISO 8601 datetime>"; case "dateRange" -> value = new LinkedHashMap<>(Map.of("start", "<YYYY-MM-DD>", "end", "<YYYY-MM-DD>")); case "datetimeRange" -> value = new LinkedHashMap<>(Map.of("start", "<ISO 8601 datetime>", "end", "<ISO 8601 datetime>")); case "url" -> value = "<url>"; default -> value = "<string>"; } return type.array ? List.of(value) : value; }
   static List<Field> outputFields(AxSignature sig) { List<Field> out = new ArrayList<>(); for (Field field : sig.outputs) if (!field.internal) out.add(field); return out; }
   static Map<String, String> fieldMap(AxSignature sig) { Map<String, String> out = new LinkedHashMap<>(); for (Field f : sig.inputs) out.put(f.name, f.title); for (Field f : sig.outputs) out.put(f.name, f.title); return out; }
   static String formatDescription(String text) { String v = text == null ? "" : text.trim(); if (v.isEmpty()) return ""; return v.substring(0, 1).toUpperCase() + v.substring(1) + (v.endsWith(".") ? "" : "."); }
@@ -1304,8 +2250,29 @@ class PromptRuntime {
     return t.array ? "json array of " + base + " items" : base;
   }
   static String objectStructure(Map<String, Object> fields) { List<String> out = new ArrayList<>(); for (Map.Entry<String, Object> e : fields.entrySet()) { Field f = e.getValue() instanceof Field field ? field : new Field(e.getKey(), (FieldType) e.getValue(), null, false, false, false); out.add(e.getKey() + (f.optional ? "?" : "") + ": " + fieldTypeText(f.type)); } return "{ " + String.join(", ", out) + " }"; }
-  static String renderInputFields(List<Field> fields, Map<String, String> names) { List<String> rows = new ArrayList<>(); for (Field f : fields) rows.add((f.title + ":" + (f.description == null ? "" : " " + formatFieldRefs(formatDescription(f.description), names))).trim()); return String.join("\n", rows); }
-  static String renderOutputFields(List<Field> fields, Map<String, String> names) { List<String> rows = new ArrayList<>(); for (Field f : fields) { String typeText = fieldTypeText(f.type); String req = f.optional ? "Only include this " + typeText + " field if its value is available" : "This " + typeText + " field must be included"; String desc = ""; if (f.description != null) desc = " " + formatFieldRefs("class".equals(f.type.name) ? f.description : formatDescription(f.description), names); if (f.type.options != null) desc += (desc.isEmpty() ? "" : ". ") + "Allowed values: " + String.join(", ", f.type.options); rows.add((f.title + " (wire key: " + BT + f.name + BT + "): (" + req + ")" + desc).trim()); } return String.join("\n", rows); }
+  static String renderInputFields(List<Field> fields, Map<String, String> names) {
+    List<String> rows = new ArrayList<>();
+    for (Field f : fields) {
+      String description = (String) Core._signature_describe_field_values_impl(f);
+      String text = description == null ? "" : f.type.valueDescriptions != null ? description : formatDescription(description);
+      rows.add((f.title + ":" + (text.isEmpty() ? "" : " " + formatFieldRefs(text, names))).trim());
+      for (Object line : Core.asList(Core._signature_nested_value_descriptions_impl(f.type.fields, f.name))) rows.add(String.valueOf(line));
+    }
+    return String.join("\n", rows);
+  }
+  static String renderOutputFields(List<Field> fields, Map<String, String> names) {
+    List<String> rows = new ArrayList<>();
+    for (Field f : fields) {
+      String typeText = fieldTypeText(f.type);
+      String req = f.optional ? "Only include this " + typeText + " field if its value is available" : "This " + typeText + " field must be included";
+      String description = (String) Core._signature_describe_field_values_impl(f);
+      String desc = description == null ? "" : " " + formatFieldRefs("class".equals(f.type.name) || f.type.valueDescriptions != null ? description : formatDescription(description), names);
+      if (f.type.options != null) desc += (desc.isEmpty() ? "" : ". ") + "Allowed values: " + String.join(", ", f.type.options);
+      rows.add((f.title + " (wire key: " + BT + f.name + BT + "): (" + req + ")" + desc).trim());
+      for (Object line : Core.asList(Core._signature_nested_value_descriptions_impl(f.type.fields, f.name))) rows.add(String.valueOf(line));
+    }
+    return String.join("\n", rows);
+  }
   static List<Map<String, Object>> functionDescriptors(List<Object> functions) { List<Map<String, Object>> out = new ArrayList<>(); for (Object fn : functions) { if (fn instanceof Tool t) out.add(Map.of("name", t.name, "description", t.description)); else if (fn instanceof Map<?, ?> map) out.add(Map.of("name", Core.asMap(map).get("name"), "description", Core.asMap(map).getOrDefault("description", ""))); } return out; }
   static String renderFunctions(List<Map<String, Object>> funcs) { List<String> out = new ArrayList<>(); for (Map<String, Object> fn : funcs) out.add("- " + BT + fn.get("name") + BT + ": " + formatDescription(String.valueOf(fn.getOrDefault("description", "")))); return String.join("\n", out); }
 }

@@ -2,6 +2,7 @@
   "name": "structured-output-singleton-json-object",
   "kind": "forward",
   "signature": "task:string -> javascriptCode:code",
+  "options": { "force_structured": true },
   "input": { "task": "write a program" },
   "features": { "structured_outputs": false, "functions": false },
   "responses": [
@@ -21,7 +22,7 @@
     "Javascript Code (wire key: `javascriptCode`)",
     "javascriptCode",
     "<complete source>",
-    "no prose or Markdown fences"
+    "do not invent, rename, or wrap them"
   ],
   "expected_chat_log_subset": [
     {

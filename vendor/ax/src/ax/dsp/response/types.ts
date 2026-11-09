@@ -9,6 +9,7 @@ import type {
 } from '../../ai/types.js';
 import type { AxAIMemory } from '../../mem/types.js';
 import type { AxAssertion, AxStreamingAssertion } from '../asserts.js';
+import type { AxDecisionContext } from '../decision.js';
 import type { extractionState } from '../extract.js';
 import type { AxFieldProcessor } from '../fieldProcessor.js';
 import type { SignatureToolCallingManager } from '../signatureToolCalling.js';
@@ -34,9 +35,12 @@ export interface AxResponseHandlerArgs<T> {
   ) => void | Promise<void>;
   mcpExecutionContext?: import('../../mcp/execution.js').AxMCPExecutionContext;
   eventContext?: import('../../event/types.js').AxEventContext;
+  control?: import('../runControl.js').AxRunControl;
+  executionPath?: string;
 }
 
 export type InternalAxGenState = {
+  decisionContext?: AxDecisionContext;
   index: number;
   values: Record<string, any>;
   content: string;
@@ -44,6 +48,9 @@ export type InternalAxGenState = {
   functionCalls: NonNullable<AxChatResponseResult['functionCalls']>;
   xstate: extractionState;
   structuredAccumulator?: StructuredStreamAccumulator;
+  // Feedback streaming field processors returned mid-stream; it is added to
+  // memory when the step ends.
+  pendingFeedback?: unknown[];
 };
 
 export type ProcessResponseBaseArgs = Readonly<

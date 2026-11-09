@@ -5,11 +5,26 @@
   "fence": "cpp",
   "packageName": "axllm",
   "install": [
+    "cmake_minimum_required(VERSION 3.20)",
+    "project(ax_quick_start LANGUAGES CXX)",
+    "set(CMAKE_CXX_STANDARD 17)",
+    "",
     "include(FetchContent)",
     "FetchContent_Declare(axllm GIT_REPOSITORY https://github.com/ax-llm/ax GIT_TAG main SOURCE_SUBDIR packages/cpp)",
     "FetchContent_MakeAvailable(axllm)",
-    "target_link_libraries(your_app PRIVATE axllm::axllm)"
+    "",
+    "add_executable(quick_start quick_start.cpp)",
+    "target_link_libraries(quick_start PRIVATE axllm::axllm)"
   ],
+  "quickStartRun": {
+    "file": "quick_start.cpp",
+    "setup": ["export OPENAI_API_KEY=\"sk-...\""],
+    "run": [
+      "cmake -S . -B build && cmake --build build",
+      "./build/quick_start"
+    ],
+    "output": ["sentiment: positive"]
+  },
   "exampleRoot": "packages/cpp/examples",
   "academy": {
     "unitExamples": {
@@ -88,6 +103,20 @@
           "});"
         ]
       },
+      "cancellation": {
+        "sourcePath": "src/examples/cpp/generation/cancellation.cpp",
+        "verified": true,
+        "requiresCredentials": false,
+        "code": [
+          "axllm::AxCancellationToken token;",
+          "token.cancel(\"user stopped\");",
+          "try {",
+          "  client.chat(request, axllm::Value::object(), &token);",
+          "} catch (const axllm::AxAIServiceAbortedError& error) {",
+          "  assert(!error.retryable);",
+          "}"
+        ]
+      },
       "balancer": {
         "sourcePath": "src/examples/cpp/generation/adaptive_balancer.cpp",
         "verified": true,
@@ -103,18 +132,58 @@
         ]
       },
       "audio": [
-        "// Realtime audio over WebSocket — build with -DAXLLM_ENABLE_REALTIME=ON",
+        "// Realtime audio over WebSocket \u2014 build with -DAXLLM_ENABLE_REALTIME=ON",
         "axllm::OpenAIResponsesClient client(axllm::object({{\"model\", \"gpt-realtime-2\"}, {\"api_key\", std::getenv(\"OPENAI_APIKEY\")}}));",
         "axllm::Value request = axllm::object({{\"model\", \"gpt-realtime-2\"}, {\"chat_prompt\", axllm::array({axllm::object({{\"role\", \"user\"}, {\"content\", \"Say hello.\"}})})}, {\"audio\", axllm::object({{\"output\", axllm::object({{\"voice\", \"alloy\"}})}})}});",
         "axllm::Value result = client.realtime_chat(request, nullptr);  // one merged turn: transcript + base64 PCM audio",
         "// Realtime models also route transparently through chat(); chat() accepts input_audio parts; transcribe()/speak() do batch STT/TTS."
-      ]
+      ],
+      "typesafe": {
+        "sourcePath": "src/examples/cpp/generation/typesafe.cpp",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "// ax-example:start",
+          "// title: Cpp Jev Signature Decisions",
+          "// group: generation",
+          "// description: Converts Jev probabilities into boolean and class outputs with a provider threshold.",
+          "// provider: typesafe",
+          "// env: TYPESAFE_APIKEY",
+          "// level: beginner",
+          "// order: 35",
+          "// ax-example:end",
+          "#include \"axllm/axllm.hpp\"",
+          "#include <cstdlib>",
+          "#include <iostream>",
+          "#include <stdexcept>",
+          "using namespace axllm;",
+          "",
+          "static std::string key(const char* name) { const char* value = std::getenv(name); if (!value || !*value) throw std::runtime_error(std::string(\"Set \") + name); return value; }",
+          "int main() {",
+          "  auto model = ai(\"typesafe\", object({{\"api_key\", key(\"TYPESAFE_APIKEY\")}, {\"trueThreshold\", 0.9}}));",
+          "  auto triage = ax(\"ticket:string -> urgent:boolean(true \\\"Customers cannot complete a core task\\\", false \\\"Routine request\\\") \\\"Needs immediate attention?\\\", team:class \\\"support, billing, engineering\\\"\");",
+          "  auto decision = triage.forward(*model, object({{\"ticket\", \"Checkout is unavailable for all customers after the latest deployment.\"}}));",
+          "  if (!Core::get(decision, \"urgent\").is_bool()) throw std::runtime_error(\"Invalid boolean\");",
+          "  std::cout << stringify(decision) << \"\\n\";",
+          "}"
+        ]
+      }
     },
     "quickStart": [
       "#include <axllm/axllm.hpp>",
+      "#include <cstdlib>",
+      "#include <iostream>",
       "",
-      "auto llm = axllm::ai(\"openai\", axllm::object({{\"apiKey\", std::getenv(\"OPENAI_API_KEY\")}}));",
-      "auto classify = axllm::ax(\"review:string -> sentiment:class \\\"positive, negative, neutral\\\"\");"
+      "int main() {",
+      "  auto llm = axllm::ai(\"openai\", axllm::object({{\"apiKey\", std::getenv(\"OPENAI_API_KEY\")}}));",
+      "  auto classify = axllm::ax(\"review:string -> sentiment:class \\\"positive, negative, neutral\\\"\");",
+      "  auto result = classify.forward(*llm, axllm::object({",
+      "    {\"review\", \"Useful and boring in the best way.\"}",
+      "  }));",
+      "",
+      "  auto sentiment = axllm::Core::get(result, \"sentiment\");",
+      "  std::cout << \"sentiment: \" << std::get<std::string>(sentiment.data) << \"\\n\";",
+      "}"
     ],
     "dspy": [
       "auto qa = axllm::ax(\"question:string -> answer:string, confidence:number\");"
@@ -159,10 +228,49 @@
       "pb.evolve(examples, metric);   // grow a playbook offline from examples",
       "auto rendered = pb.render();   // the playbook is now applied to the program",
       "auto state = pb.to_json();     // persist; restore later with playbook(...).load(state)"
-    ]
+    ],
+    "decisionEvidenceExample": {
+      "sourcePath": "src/examples/cpp/generation/decision-evidence.cpp",
+      "code": [
+        "#include \"axllm/axllm.hpp\"",
+        "#include <algorithm>",
+        "#include <cstdlib>",
+        "#include <iostream>",
+        "#include <stdexcept>",
+        "using namespace axllm;",
+        "",
+        "int main() {",
+        "  const char* key=std::getenv(\"OPENAI_API_KEY\"); if(!key)key=std::getenv(\"OPENAI_APIKEY\"); if(!key)throw std::runtime_error(\"Set OPENAI_API_KEY or OPENAI_APIKEY\");",
+        "  auto model=ai(\"openai-decisions\",object({{\"api_key\",key}}));",
+        "  auto judge=ax(\"query:string, document:string -> relevant:boolean(evidence, threshold 0.7), relevance:score \\\"Irrelevant, Related, Partial answer, Direct answer\\\"(evidence)\");",
+        "  std::vector<Value> ranked;",
+        "  for(auto item: std::vector<std::pair<std::string,std::string>>{{\"refund\",\"Request a refund within 30 days through your account billing page.\"},{\"password\",\"Reset your password using the sign-in page.\"}}) {",
+        "    auto result=judge.forward(*model,object({{\"query\",\"How do I request a refund?\"},{\"document\",item.second}}));",
+        "    Core::set(result,\"id\",item.first); ranked.push_back(result);",
+        "  }",
+        "  std::stable_sort(ranked.begin(),ranked.end(),[](Value a,Value b){return Core::number(Core::get(Core::get(a,\"relevance\"),\"value\"))>Core::number(Core::get(Core::get(b,\"relevance\"),\"value\"));});",
+        "  Value output=Value::array(); for(auto result:ranked)Core::append(output,result);",
+        "  std::cout<<stringify(output)<<\"\\n\";",
+        "}"
+      ],
+      "fence": "cpp",
+      "requiresCredentials": true
+    }
   },
   "snippetGroups": {
     "ai": {
+      "catalog": {
+        "sourcePath": "src/examples/cpp/generation/model_catalog.cpp",
+        "verified": true,
+        "requiresCredentials": false,
+        "code": [
+          "auto catalog = axllm::get_supported_ai_models();",
+          "auto azure = provider(catalog, \"azure-openai\");",
+          "auto capabilities = axllm::Core::get(azure, \"capabilities\");",
+          "std::cout << axllm::stringify(axllm::Core::get(capabilities, \"thinkingLevels\"));",
+          "std::cout << axllm::stringify(axllm::Core::get(capabilities, \"serviceTiers\"));"
+        ]
+      },
       "serviceTier": {
         "sourcePath": "src/examples/cpp/generation/gemini_service_tier.cpp",
         "verified": true,
@@ -170,7 +278,7 @@
         "code": [
           "axllm::GoogleGeminiClient client(axllm::object({",
           "    {\"api_key\", key},",
-          "    {\"model\", model == nullptr || std::string(model).empty() ? \"gemini-3.7-flash\" : model},",
+          "    {\"model\", model == nullptr || std::string(model).empty() ? \"gemini-3.8-flash\" : model},",
           "}));",
           "axllm::Value out = client.chat(request, axllm::object({{\"service_tier\", \"flex\"}}));"
         ]
@@ -186,6 +294,35 @@
           "    {\"region\", required(\"GOOGLE_REGION\")},",
           "    {\"model\", model == nullptr || std::string(model).empty() ? \"gemini-3.5-flash\" : model},",
           "}));"
+        ]
+      }
+    },
+    "ax": {
+      "streaming": {
+        "sourcePath": "src/examples/cpp/generation/streaming_forward.cpp",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "auto story = axllm::ax(R\"(topic:string -> title:string, story:string \"Three short sentences\")\");",
+          "story.streaming_forward(*client, values, axllm::Value::object(), [&](const axllm::AxGenDelta& delta) {",
+          "  // delta.version changes when a retry starts the output over.",
+          "  axllm::Value text = axllm::Core::get(delta.delta, \"story\");",
+          "  if (text.is_string()) std::cout << axllm::display(text) << std::flush;",
+          "  return true;  // return false to stop the run",
+          "});"
+        ]
+      },
+      "dates": {
+        "sourcePath": "src/examples/cpp/generation/date_fields.cpp",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "auto planner = axllm::ax(",
+          "    \"emailText:string, sentAt:datetime -> meetingStartsAt:datetime, travelWindow:dateRange\",",
+          "    axllm::object({{\"parse_dates\", true}}));",
+          "axllm::Value out = planner.forward(",
+          "    *client, axllm::object({{\"emailText\", email_text}, {\"sentAt\", \"2024-05-02T16:30:00Z\"}}));",
+          "std::cout << axllm::display(axllm::Core::get(out, \"meetingStartsAt\"));  // 2024-05-07T19:00:00.000Z"
         ]
       }
     },
@@ -284,6 +421,46 @@
           "axllm::Value evolution = assistant.get_playbook()->evolve(",
           "    dataset,",
           "    axllm::object({{\"verify\", true}, {\"maxProposals\", 1}}));"
+        ]
+      },
+      "streaming": {
+        "sourcePath": "src/examples/cpp/short-agents/streaming_agent.cpp",
+        "verified": true,
+        "requiresCredentials": true,
+        "code": [
+          "// The handbook stays in the agent's runtime, out of the prompt. With citations",
+          "// on, the answer cites the evidence it used, and ids the run never gathered",
+          "// are sent back to the model for a correction.",
+          "auto assistant = axllm::agent(",
+          "    \"question:string, handbook:string -> answer:string\",",
+          "    axllm::object({",
+          "        {\"contextFields\", axllm::array({\"handbook\"})},",
+          "        {\"runtime\", axllm::object({{\"language\", \"JavaScript\"}})},",
+          "        {\"citations\", axllm::Value::object()},",
+          "    }));",
+          "assistant.set_citations_observer([](axllm::Value ids) { std::cout << \"\\ncited: \" << axllm::stringify(ids) << \"\\n\"; });",
+          "",
+          "// The distiller and the executor run first; then the responder's answer",
+          "// streams. Merge each delta and start over when the version changes (a retry).",
+          "axllm::runtime::quickjs::QuickJsCodeRuntime runtime;",
+          "int64_t version = 0;",
+          "assistant.streaming_forward(",
+          "    *client,",
+          "    axllm::object({",
+          "        {\"question\", \"I downgraded today. When does it take effect, and is my data safe if I delete the workspace?\"},",
+          "        {\"handbook\", handbook},",
+          "    }),",
+          "    axllm::object({{\"runtime\", axllm::Core::code_runtime_ref(runtime)}, {\"max_actor_steps\", 12}}),",
+          "    [&version](const axllm::AxGenDelta& delta) {",
+          "      if (delta.version != version) {",
+          "        version = delta.version;",
+          "        std::cout << \"\\n[retry: starting over]\\n\";",
+          "      }",
+          "      axllm::Value text = axllm::Core::get(delta.delta, \"answer\");",
+          "      if (text.is_string()) std::cout << axllm::display(text) << std::flush;",
+          "      return true;",
+          "    });",
+          "std::cout << \"\\n\";"
         ]
       }
     },

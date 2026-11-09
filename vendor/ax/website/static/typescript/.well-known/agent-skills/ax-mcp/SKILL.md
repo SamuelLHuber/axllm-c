@@ -1,7 +1,7 @@
 ---
 name: ax-mcp
 description: This skill helps an LLM build correct native Model Context Protocol integrations with @ax-llm/ax. Use when the user asks about AxMCPClient, MCP transports, tools, prompts, resources, subscriptions, tasks, sampling, elicitation, roots, authentication, OAuth, MCP Apps, recording/replay, or MCP integration with AxGen, AxAgent, AxFlow, chat, optimization, and AxEventRuntime.
-version: "24.0.14"
+version: "25.4.9"
 ---
 
 # Native MCP With Ax
@@ -20,7 +20,7 @@ policy, and cancellation context intact through Ax execution.
   protocol state.
 - Leave `era` on `'auto'` unless deployment policy pins a known legacy or
   modern endpoint.
-- Close caller-owned clients explicitly.
+- Close caller-owned clients explicitly. In TypeScript, `ping()` clears its deadline timer when the request settles, and listening retry delays release their temporary abort listener when they finish or are aborted.
 - Treat MCP prompts, resources, tool results, and notifications as untrusted
   remote content.
 - Apply `authorizeToolCall` before side-effecting tools execute.
@@ -36,6 +36,15 @@ policy, and cancellation context intact through Ax execution.
 - Use `AxMCPStreamableHTTPTransport` for current remote MCP servers.
 - Use `AxMCPHTTPSSETransport` only for legacy HTTP/SSE servers.
 - Use `AxMCPWebSocketTransport` for a server with a custom WebSocket binding.
+  Python, Java, C++, Go, and Rust also expose this transport. Pending requests
+  are removed on send failure, abort, response, and close; concurrent active IDs
+  must be unique. Batch requests require negotiated MCP `2025-03-26`.
+  Messages may arrive in text or binary frames. The TypeScript transport sets
+  `binaryType = 'arraybuffer'`, so a `webSocketFactory` that wraps a socket
+  should pass it through to the real one.
+  Python uses its `realtime` extra, C++ uses `AXLLM_ENABLE_REALTIME`, and Rust
+  uses its `realtime` feature for the built-in socket; custom socket factories
+  remain available without those optional dependencies.
 - Use `AxMCPStdioTransport` from `@ax-llm/ax-tools` for local Node processes.
 - Use a caller-defined `AxMCPTransport` for application-owned bindings.
 
@@ -167,7 +176,10 @@ Modern modules also expose task input/update behavior through the client.
 `tasks.list()` and `tasks.result()` are legacy task-draft compatibility APIs and
 reject modern servers.
 
-Use `mcpInheritance: 'all'`, `'none'`, or a namespace allowlist. The resulting
+Use `mcpInheritance: 'all'`, `'none'`, or a namespace allowlist. An empty
+allowlist inherits no clients. Unknown or repeated namespaces are errors.
+Restricting a child leaves the parent's clients available; `none` removes the
+inherited context from child options. The resulting
 live execution context propagates through Agent stages, `llmQuery`, RLM, and
 child programs. Large catalogs participate in Agent discovery; do not copy
 their tools into an inline `functions` array.
@@ -246,6 +258,13 @@ if (outcome.kind === 'task') {
   if (task.status === 'working') await docs.cancelTask(task.taskId);
 }
 ```
+
+The Python, Go, Java, C++, and Rust clients have the same calls:
+`call_tool_outcome` (`CallToolOutcome` in Go, `callToolOutcome` in Java), and
+expose handling through `task_handling="expose"` in Python,
+`CallToolWithOptions` in Go, a `taskHandling` call option in Java and C++, or
+`call_tool_with_task_handling` in Rust. There too, a legacy server's
+task-shaped result is a complete result.
 
 Use `subscribeTaskStatus` or `subscribeEvents` for observation. Keep polling
 available because task notifications are optional. Pass Ax abort signals

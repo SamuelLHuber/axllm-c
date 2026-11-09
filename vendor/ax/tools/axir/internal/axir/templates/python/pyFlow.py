@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+from .session import _core_run_control_aborted
 
 from abc import ABC, abstractmethod
 import copy
@@ -16,11 +17,15 @@ from .ai import (
     _merge_runtime_hooks,
     _runtime_hook_scope,
     _runtime_hooks_from_options,
+    _snapshot_global_caching_function,
     _strip_runtime_hooks,
 )
 from .gen import (
     AxGen,
     ax,
+    _core_axgen_cache_read,
+    _core_axgen_cache_write,
+    _core_crypto_sha256_hex,
     _core_exception_message,
     _core_eq,
     _core_gte,
@@ -58,12 +63,16 @@ from .gen import (
     _validate_optimized_artifact,
 )
 from .signature import (
+    _js_text,
     _core_string_extract_leading_group,
     _core_string_find_outside_quotes,
     _core_string_split_once,
     _core_string_split_top_level,
+    _js_json_dumps,
+    _js_number_text,
 )
 from .agent import (
+    AxAgent,
     OptimizerEngine,
     OptimizerEvaluator,
     _build_agent_eval_prediction,
@@ -176,6 +185,9 @@ def _flow_mapper_from_spec(spec):
 
 
 class AxProgram(ABC):
+    def owned_worker_factory(self):
+        return None
+
     @abstractmethod
     def forward(self, client, values, options=None):
         ...
@@ -188,6 +200,25 @@ class AxProgram(ABC):
 
 
 class AxFlow(AxProgram):
+    def owned_worker_factory(self):
+        if self.execution_context is not None: return None
+        factories = {}
+        memo = {id(self.runtime_hooks):self.runtime_hooks}
+        for index, step in enumerate(self.state.get("steps", [])):
+            program = step.get("program")
+            if program is None: continue
+            factory = _owned_program_factory(program)
+            if factory is None: return None
+            factories[index] = factory
+            memo[id(program)] = program
+        try: snapshot = copy.deepcopy(self, dict(memo))
+        except (TypeError, ValueError): return None
+        def factory():
+            owned = copy.deepcopy(snapshot, dict(memo))
+            for index, create in factories.items(): owned.state["steps"][index]["program"] = create()
+            return owned
+        return factory
+
     def __init__(self, options: dict[str, Any] | str | None = None, bindings: dict[str, Any] | None = None, hooks: AxRuntimeHooks | None = None):
         if isinstance(options, str):
             normalized = _normalize_mermaid_bindings(bindings)
@@ -328,6 +359,8 @@ class AxFlow(AxProgram):
         return self.apply_optimized_components(artifact.get("componentMap") or {})
 
     def evaluate_optimization(self, client, dataset, candidate_map: dict[str, Any] | None = None, options: dict[str, Any] | None = None):
+        if (options or {}).get("demos"):
+            self.set_demos(options["demos"])
         return _flow_evaluate_optimization(self.state, client, dataset or [], candidate_map or {}, options or {})
 
     def optimize_with(self, engine: OptimizerEngine, dataset, options: dict[str, Any] | None = None):
@@ -370,15 +403,35 @@ class AxFlow(AxProgram):
         options: dict[str, Any] | None = None,
         hooks: AxRuntimeHooks | None = None,
     ):
+        # As in TS, the flow reads its cache before its span and metrics, so a
+        # stored output records neither.
+        run_options = _strip_runtime_hooks(options) or {}
+        lookup = _flow_cache_lookup_impl(self.state, values or {}, run_options)
+        if lookup.get("hit"):
+            return lookup.get("value")
         call_hooks = _merge_runtime_hooks(_coerce_runtime_hooks(hooks), _runtime_hooks_from_options(options))
-        with _runtime_hook_scope(
-            call_hooks,
-            self.runtime_hooks,
-            span_name="ax_gen_flow_forward",
-            attributes={"ax.program.id": self.state.get("program_id", "root.flow"), "ax.program.type": "AxFlow"},
-            metric_prefix="ax_gen_flow",
-        ):
-            return self._forward_unscoped(client, values, _strip_runtime_hooks(options))
+        # As TypeScript's AxFlow.forward does, a run control hears the flow's
+        # own lifecycle at its path; each node reports at <path>/<node>.
+        control = run_options.get("control")
+        run_path = run_options.get("execution_path", run_options.get("executionPath", "root"))
+        if control is not None:
+            control._emit({"type": "started", "path": run_path})
+        try:
+            with _runtime_hook_scope(
+                call_hooks,
+                self.runtime_hooks,
+                span_name="ax_gen_flow_forward",
+                attributes={"ax.program.id": self.state.get("program_id", "root.flow"), "ax.program.type": "AxFlow"},
+                metric_prefix="ax_gen_flow",
+            ):
+                output = self._forward_unscoped(client, values, {**run_options, "_ax_flow_cache_lookup": lookup})
+        except Exception as error:
+            if control is not None:
+                control._emit({"type": "failed", "path": run_path, "error": str(error)})
+            raise
+        if control is not None:
+            control._emit({"type": "completed", "path": run_path})
+        return output
 
     def _forward_unscoped(self, client: AIClient, values: dict[str, Any], options: dict[str, Any] | None = None):
         call_options = dict(options or {})
@@ -531,15 +584,26 @@ def _core_string_split_trim_nonempty(value, sep):
 
 
 def _core_string_str(value):
-    return str(value)
+    return _js_text(value)
 
 
 def _core_string_starts_with(value, prefix):
     return str(value).startswith(str(prefix))
 
 
+def _core_flow_caching_function(options):
+    # TS AxFlow's cachingFunction: the call's, else the process-wide one; the
+    # flow's constructor takes none.
+    options = options or {}
+    for key in ("cachingFunction", "caching_function"):
+        fn = options.get(key)
+        if fn is not None:
+            return fn
+    return _snapshot_global_caching_function()
+
+
 def _core_json_stable_stringify(value):
-    return json.dumps(value or {}, sort_keys=True, separators=(",", ":"))
+    return _js_json_dumps(value or {}, sort_keys=True)
 
 
 def _core_program_components(program):
@@ -554,4 +618,131 @@ def _core_program_apply_components(program, component_map):
     return {}
 
 
+def _core_program_signature(program):
+    # An AxGen's or AxAgent's signature text. Any other program (a nested
+    # flow, a custom program) has none, and its undeclared step is a barrier.
+    if isinstance(program, (AxGen, AxAgent)):
+        return str(program.signature)
+    return None
+
+
 # AXIR_CORE_FLOW_FUNCTIONS
+
+
+def _owned_program_factory(program):
+    method = getattr(program, "owned_worker_factory", None)
+    return method() if callable(method) else None
+
+
+def _core_flow_dispatch_group(flow_state, client, plans, state, options):
+    import contextvars
+    import queue
+    import threading
+    import time
+    from .session import AxRunControl
+    from .ai import AxCancellationToken
+    factory_method = getattr(client, "owned_worker_factory", None)
+    client_factory = factory_method() if callable(factory_method) else None
+    if client_factory is None:
+        return None
+    tasks = []
+    steps = flow_state.get("steps", [])
+    for plan in plans:
+        index = int(plan.get("stepIndex", 0))
+        step = steps[index]
+        if step.get("kind", "execute") != "execute":
+            return None
+        factory = _owned_program_factory(step.get("program"))
+        if factory is None:
+            return None
+        tasks.append((index, plan, step, factory(), client_factory()))
+    parent = (options or {}).get("control")
+    parent_token = (options or {}).get("cancellation", (options or {}).get("cancellationToken", (options or {}).get("cancellation_token")))
+    cancelled = threading.Event()
+    deliveries = queue.Queue()
+    delivery_lock = threading.Lock()
+    accepting_deliveries = True
+    def deliver(value):
+        with delivery_lock:
+            if accepting_deliveries: deliveries.put(value)
+    def close_deliveries():
+        nonlocal accepting_deliveries
+        with delivery_lock: accepting_deliveries = False
+    tokens = []
+    def stop():
+        cancelled.set()
+        for token in tokens: token.cancel("Flow group cancelled")
+    class Signal:
+        def is_set(self):
+            return cancelled.is_set() or bool(parent and parent.signal.is_set())
+    class WorkerControl(AxRunControl):
+        def __init__(self):
+            super().__init__()
+            self.signal = Signal()
+        def _pending(self, path, after):
+            return parent._pending(path, after) if parent else []
+        def _emit(self, event):
+            deliver(("event", dict(event)))
+    def run(position, task, owned_flow, owned_state, owned_options):
+        index, plan, step, program, owned_client = task
+        owned_step = {**copy.deepcopy({key:value for key,value in step.items() if key != "program"}), "program":program}
+        try:
+            report = flow_execute_owned_worker(owned_flow, owned_step, copy.deepcopy(plan), owned_client, owned_state, owned_options)
+        except BaseException as error:
+            report = {"error":str(error)}
+        deliver(("result", (position, report)))
+    for position, task in enumerate(tasks):
+        # Programs belonging to other nodes are opaque handles and never run in
+        # this worker. The selected program is supplied as an owned instance.
+        memo = {id(step.get("program")):step.get("program") for step in steps if step.get("program") is not None}
+        owned_flow = copy.deepcopy(flow_state, memo)
+        owned_options = copy.deepcopy(options or {}, {id(parent_token): parent_token} if parent_token is not None else {})
+        owned_options["control"] = WorkerControl()
+        cancellation = AxCancellationToken()
+        tokens.append(cancellation)
+        owned_options["cancellation"] = cancellation
+        context = contextvars.copy_context()
+        threading.Thread(target=context.run, args=(run,position,task,owned_flow,copy.deepcopy(state),owned_options), daemon=True).start()
+    reports = [None] * len(tasks)
+    deadline = None
+    pending = {}
+    def consume(kind, delivery):
+        nonlocal deadline
+        if kind == "event":
+            key = (delivery.get("path"), delivery.get("call_id"))
+            if delivery.get("type") == "tool.started": pending[key] = True
+            if delivery.get("type") in ("tool.completed", "tool.failed"): pending.pop(key, None)
+            if parent: parent._emit(delivery)
+            return
+        position, report = delivery
+        if reports[position] is not None: return
+        reports[position] = report
+        if report.get("error") is not None:
+            stop()
+            if deadline is None: deadline = time.monotonic() + 0.1
+        else:
+            steps[tasks[position][0]]["program"] = tasks[position][3]
+    try:
+        while any(report is None for report in reports):
+            if (parent and parent.signal.is_set()) or (parent_token and parent_token.cancelled):
+                stop()
+                if deadline is None: deadline = time.monotonic() + 0.1
+            try:
+                consume(*deliveries.get(timeout=0.02))
+            except queue.Empty:
+                pass
+            if deadline is not None and time.monotonic() >= deadline:
+                close_deliveries()
+                while True:
+                    try: consume(*deliveries.get_nowait())
+                    except queue.Empty: break
+                for position, task in enumerate(tasks):
+                    if reports[position] is None:
+                        node_path = str((options or {}).get("execution_path", (options or {}).get("executionPath", "root"))) + "/" + task[2].get("name", "")
+                        unresolved = [call_id for (path,call_id) in pending if path == node_path]
+                        reports[position] = {"error":f"Flow cancelled; unresolved node: {node_path}; unresolved calls: {unresolved}"}
+                break
+    finally:
+        close_deliveries()
+        stop()
+    return reports

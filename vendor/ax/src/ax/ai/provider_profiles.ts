@@ -1,9 +1,19 @@
+import { AxAIAnthropic } from './anthropic/api.js';
+import type { AxAIAnthropicChatRequest } from './anthropic/types.js';
 import {
   axFetchJsonSpeech,
+  axFetchMetaTranscription,
   axFetchMultipartTranscription,
 } from './audio/api.js';
 import type { AxAIFeatures } from './base.js';
 import { axBaseAIDefaultConfig } from './base.js';
+import {
+  axModelInfoMeta,
+  axModelInfoMetaMessages,
+  axModelInfoMetaSpark,
+} from './meta/info.js';
+import { axCreateMetaRealtimeApi } from './meta/realtime.js';
+import { AxAIMetaModel, type AxAIMetaResponsesConfig } from './meta/types.js';
 import {
   type AxAIOpenAIArgs,
   AxAIOpenAIBase,
@@ -46,16 +56,27 @@ import {
   axShouldUseGrokRealtime,
 } from './x-grok/api.js';
 
-export type AxAIProfileId = keyof typeof axAIProviderProfiles;
+export type AxAIProfileId =
+  | keyof typeof axAIProviderProfiles
+  // axir-nonportable:start chrome-ai
+  | 'chrome-ai';
+// axir-nonportable:end chrome-ai
 export type AxAIProfileTransport =
   | 'openai-chat'
   | 'openai-responses'
   | 'anthropic-messages'
   | 'gemini-generate-content'
-  | 'webllm';
+  | 'webllm'
+  // axir-nonportable:start chrome-ai
+  | 'chrome-ai'
+  // axir-nonportable:end chrome-ai
+  | 'typesafe-system-one'
+  | 'openai-decisions';
 
 export type AxAIProfileCapabilities = {
   functions: boolean;
+  functionEmulation?: boolean;
+  requiresStructuredOutput?: boolean;
   streaming: boolean;
   structuredOutputs: boolean;
   structuredOutputModes: readonly AxStructuredOutputRung[];
@@ -77,7 +98,8 @@ export type AxAIProfileCapabilities = {
 
 export type AxAIProfileRequestRules = {
   reasoning?: 'thinking-object' | 'effort' | 'openrouter';
-  toolChoice?: 'supported' | 'unforced';
+  toolChoice?: 'supported' | 'unforced' | 'no-named';
+  functionToolsRequireEffort?: 'none';
   defaultThinkingLevel?:
     | NonNullable<AxAIServiceOptions['thinkingTokenBudget']>
     | 'xhigh'
@@ -116,7 +138,8 @@ export type AxAIProfileModelRule = {
 };
 
 export type AxAIProfileAuthentication = {
-  type: 'bearer' | 'api-key-header' | 'api-key-query' | 'x-api-key' | 'none';
+  /** How the API key is sent. */
+  type: 'bearer' | 'api-key-header' | 'x-api-key' | 'none';
   header?: string;
   required: boolean;
 };
@@ -124,6 +147,13 @@ export type AxAIProfileAuthentication = {
 export type AxAIProfileOperation = {
   path: string;
   dialect: string;
+  url?: string;
+  /** Model an operation such as `speak` or `transcribe` uses when none is given. */
+  defaultModel?: string;
+  /** Request body encoding; transcription defaults to multipart upload. */
+  body?: 'json' | 'multipart';
+  /** Response encoding; speech defaults to raw binary audio. */
+  response?: 'json' | 'binary';
 };
 
 export type AxAIProfileEndpoint = {
@@ -172,6 +202,9 @@ export type AxAIProfileSummary = Readonly<{
   operations: Readonly<Record<string, Readonly<AxAIProfileOperation>>>;
   modelRules: readonly Readonly<AxAIProfileModelRule>[];
   capabilities: Readonly<AxAIProfileCapabilities>;
+  unsupportedThinkingLevels?: readonly NonNullable<
+    AxAIServiceOptions['thinkingTokenBudget']
+  >[];
   sources: readonly string[];
   reviewedAt: string;
 }>;
@@ -205,17 +238,77 @@ export const axAIProfiles = (): readonly AxAIProfileSummary[] =>
       operations: profile.operations,
       modelRules: profile.modelRules,
       capabilities: profile.capabilities,
+      ...(profile.request?.unsupportedThinkingLevels
+        ? {
+            unsupportedThinkingLevels: Object.keys(
+              profile.request.unsupportedThinkingLevels
+            ) as NonNullable<AxAIServiceOptions['thinkingTokenBudget']>[],
+          }
+        : {}),
       sources: profile.sources,
       reviewedAt: profile.reviewedAt,
     };
   });
 
+// axir-nonportable:start chrome-ai
+const chromeAIProfile: ProfileSpec = {
+  id: 'chrome-ai',
+  name: 'Chrome Built-in AI',
+  aliases: ['chrome', 'chrome-ai', 'prompt-api', 'gemini-nano'],
+  transport: 'chrome-ai',
+  baseURL: null,
+  requiresApiURL: false,
+  defaults: { model: 'gemini-nano' },
+  auth: { type: 'none', required: false },
+  operations: { chat: { path: '', dialect: 'chrome-ai' } },
+  modelRules: [],
+  capabilities: {
+    functions: false,
+    streaming: true,
+    structuredOutputs: true,
+    structuredOutputModes: ['native'],
+    thinking: false,
+    multiTurn: true,
+  },
+  sources: [],
+  reviewedAt: '2026-10-02',
+};
+// axir-nonportable:end chrome-ai
+
 export const axGetAIProfile = (name: string): AxAIProfileSummary => {
   const profile = resolveProfile(name);
+  // axir-nonportable:start chrome-ai
+  if (profile.id === 'chrome-ai') {
+    return {
+      id: 'chrome-ai',
+      name: profile.name,
+      aliases: profile.aliases,
+      transport: profile.transport,
+      requiresApiURL: false,
+      defaultModel: profile.defaults.model,
+      authentication: profile.auth,
+      operations: profile.operations,
+      modelRules: profile.modelRules,
+      capabilities: profile.capabilities,
+      sources: profile.sources,
+      reviewedAt: profile.reviewedAt,
+    };
+  }
+  // axir-nonportable:end chrome-ai
   return axAIProfiles().find((candidate) => candidate.id === profile.id)!;
 };
 
 export const axResolveAIProfileId = (name: string): AxAIProfileId => {
+  // axir-nonportable:start chrome-ai
+  if (
+    name.toLowerCase() === 'chrome-ai' ||
+    name.toLowerCase() === 'chrome' ||
+    name.toLowerCase() === 'prompt-api' ||
+    name.toLowerCase() === 'gemini-nano'
+  ) {
+    return 'chrome-ai';
+  }
+  // axir-nonportable:end chrome-ai
   const id = aliases[name.toLowerCase()];
   if (!id) {
     throw new Error(
@@ -225,8 +318,19 @@ export const axResolveAIProfileId = (name: string): AxAIProfileId => {
   return id;
 };
 
-const resolveProfile = (name: string): ProfileSpec =>
-  profiles[axResolveAIProfileId(name)];
+const resolveProfile = (name: string): ProfileSpec => {
+  // axir-nonportable:start chrome-ai
+  if (
+    name.toLowerCase() === 'chrome-ai' ||
+    name.toLowerCase() === 'chrome' ||
+    name.toLowerCase() === 'prompt-api' ||
+    name.toLowerCase() === 'gemini-nano'
+  ) {
+    return chromeAIProfile;
+  }
+  // axir-nonportable:end chrome-ai
+  return profiles[axResolveAIProfileId(name)];
+};
 
 const matchesRule = (model: string, rule: AxAIProfileModelRule): boolean =>
   (rule.match.exact?.includes(model) ?? false) ||
@@ -280,6 +384,8 @@ export const axResolveAIProfileFeatures = (
   const capabilities = { ...profile.capabilities, ...rule?.capabilities };
   return {
     functions: capabilities.functions,
+    functionEmulation: capabilities.functionEmulation,
+    requiresStructuredOutput: capabilities.requiresStructuredOutput,
     streaming: capabilities.streaming,
     structuredOutputs: capabilities.structuredOutputs,
     structuredOutputModes: capabilities.structuredOutputModes,
@@ -423,11 +529,27 @@ const applyRequestRules = (
     delete payload.reasoning_effort;
   }
 
+  if (
+    rules.functionToolsRequireEffort &&
+    Array.isArray(payload.tools) &&
+    payload.tools.length > 0 &&
+    payload.reasoning_effort !== rules.functionToolsRequireEffort
+  ) {
+    throw new Error(
+      "This deployment model supports function tools only with reasoning disabled; use thinkingTokenBudget: 'none' or the openai-responses provider"
+    );
+  }
+
   if (rules.toolChoice === 'unforced') {
     const choice = payload.tool_choice;
+    const choiceType =
+      choice && typeof choice === 'object'
+        ? (choice as { type?: unknown }).type
+        : undefined;
     const forcedFunction =
       choice && typeof choice === 'object'
-        ? (choice as { function?: { name?: unknown } }).function?.name
+        ? ((choice as { name?: unknown }).name ??
+          (choice as { function?: { name?: unknown } }).function?.name)
         : undefined;
     const axGeneratedChoice =
       options.functionCallSource === 'ax' && forcedFunction === '__axOutput';
@@ -436,6 +558,7 @@ const applyRequestRules = (
       (choice !== undefined &&
         choice !== 'auto' &&
         choice !== 'none' &&
+        choiceType !== 'auto' &&
         !axGeneratedChoice);
     if (callerForcedChoice) {
       throw new Error(
@@ -444,6 +567,40 @@ const applyRequestRules = (
     }
     if (choice === 'none') delete payload.tools;
     delete payload.tool_choice;
+  } else if (rules.toolChoice === 'no-named') {
+    const choice = payload.tool_choice;
+    if (
+      choice &&
+      typeof choice === 'object' &&
+      ['tool', 'function'].includes(
+        String((choice as { type?: unknown }).type ?? '')
+      )
+    ) {
+      const namedChoice = choice as {
+        type: string;
+        name?: string;
+        function?: { name?: string };
+      };
+      const name = namedChoice.name ?? namedChoice.function?.name;
+      const outputTools = Array.isArray(payload.tools)
+        ? payload.tools.filter(
+            (tool) => (tool.name ?? tool.function?.name) === '__axOutput'
+          )
+        : [];
+      if (
+        options.functionCallSource !== 'ax' ||
+        name !== '__axOutput' ||
+        outputTools.length !== 1
+      ) {
+        throw new Error(
+          'This deployment profile does not support explicitly named tool choices'
+        );
+      }
+      // Requiring the sole output tool is equivalent to forcing it by name.
+      payload.tools = outputTools;
+      payload.tool_choice =
+        namedChoice.type === 'tool' ? { type: 'any' } : 'required';
+    }
   }
   if (hasReasoning) {
     for (const field of rules.dropWhenThinking ?? []) delete payload[field];
@@ -479,6 +636,16 @@ const applyRequestRules = (
       (options as Record<string, unknown>).search_parameters;
     if (raw !== undefined) payload.search_parameters = snakeCaseObject(raw);
   }
+};
+
+const stripCacheControl = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(stripCacheControl);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter(([key]) => key !== 'cache_control')
+      .map(([key, child]) => [key, stripCacheControl(child)])
+  );
 };
 
 const applyExactModelInfoOverride = (
@@ -728,7 +895,19 @@ export type AxAIProfileArgs<TModelKey = string> = {
 
 export type AxAIDeploymentProfileId = Exclude<
   AxAIProfileId,
-  'openai' | 'openai-responses' | 'anthropic' | 'google-gemini' | 'webllm'
+  | 'openai'
+  | 'openai-responses'
+  | 'anthropic'
+  | 'google-gemini'
+  | 'webllm'
+  // axir-nonportable:start chrome-ai
+  | 'chrome-ai'
+  // axir-nonportable:end chrome-ai
+  | 'typesafe'
+  | 'openai-decisions'
+  | 'meta'
+  | 'meta-chat'
+  | 'meta-messages'
 >;
 
 export type AxAIDeploymentProfileArgs<TModelKey = string> = Omit<
@@ -781,7 +960,9 @@ export class AxAIOpenAIProfile<TModelKey = string> extends AxAIOpenAIBase<
       apiURL,
       config,
       options: args.options,
-      modelInfo: args.modelInfo ?? [],
+      modelInfo:
+        args.modelInfo ??
+        (profile.id === 'meta-chat' ? axModelInfoMetaSpark : []),
       models: normalizeProfileModelPresets(args.models),
       supportFor: (model) =>
         applyExactModelInfoOverride(
@@ -791,10 +972,14 @@ export class AxAIOpenAIProfile<TModelKey = string> extends AxAIOpenAIBase<
             args as Record<string, unknown>
           ),
           model,
-          args.modelInfo
+          args.modelInfo ??
+            (profile.id === 'meta-chat' ? axModelInfoMetaSpark : undefined)
         ),
       reasoningContentMode: reasoningAdapterFor(profile),
       realtime,
+      promptCaching: profile.id === 'meta-chat',
+      promptCachingAllModels: profile.id === 'meta-chat',
+      promptCacheBreakpoints: profile.id !== 'meta-chat',
       chatReqUpdater: (request, options) =>
         applyProfileChatRequest(
           profile,
@@ -806,6 +991,7 @@ export class AxAIOpenAIProfile<TModelKey = string> extends AxAIOpenAIBase<
     });
     this.setName(profile.name);
     this.setHeaders(async () => profileHeaders(profile, apiKey));
+    this.setExplicitModelConfigKeys(args.config);
     this.profileSpec = profile;
     this.profileApiURL = apiURL;
   }
@@ -897,7 +1083,8 @@ export class AxAIOpenAIProfile<TModelKey = string> extends AxAIOpenAIBase<
         model,
         input: req.text,
         voice: voice ?? 'alloy',
-        response_format: format === 'pcm' ? 'pcm16' : format,
+        // OpenAI's `pcm` is 16-bit PCM; it rejects `pcm16`.
+        response_format: format === 'pcm16' ? 'pcm' : format,
         ...(req.speed !== undefined ? { speed: req.speed } : {}),
       };
     }
@@ -928,6 +1115,9 @@ export class AxAIOpenAIResponsesProfile<
   TModelKey,
   AxAIOpenAIResponsesRequest<string>
 > {
+  private readonly profileSpec: ProfileSpec;
+  private readonly profileApiURL: string;
+
   constructor(args: Readonly<AxAIProfileArgs<TModelKey>>) {
     const profile = resolveProfile(args.name);
     if (profile.transport !== 'openai-responses') {
@@ -947,6 +1137,22 @@ export class AxAIOpenAIResponsesProfile<
       stream: true,
       ...args.config,
     } as AxAIOpenAIResponsesConfig<string, string>;
+    if (profile.id === 'meta') {
+      config.promptCaching = false;
+      const metaConfig = config as AxAIMetaResponsesConfig;
+      metaConfig.store ??= false;
+      metaConfig.includeEncryptedReasoning ??= true;
+      metaConfig.rejectReasoningNone ??= true;
+      metaConfig.highestReasoningEffort ??= 'xhigh';
+      config.defaultImageOutputFormat = 'webp';
+      metaConfig.reasoningEffortMap ??= {
+        minimal: 'minimal',
+        low: 'low',
+        medium: 'medium',
+        high: 'high',
+        highest: 'xhigh',
+      };
+    }
 
     super({
       apiKey: apiKey || 'local-no-key',
@@ -955,7 +1161,8 @@ export class AxAIOpenAIResponsesProfile<
       apiURL,
       config,
       options: args.options,
-      modelInfo: args.modelInfo ?? [],
+      modelInfo:
+        args.modelInfo ?? (profile.id === 'meta' ? axModelInfoMeta : []),
       models: args.models,
       supportFor: (model) =>
         applyExactModelInfoOverride(
@@ -965,11 +1172,111 @@ export class AxAIOpenAIResponsesProfile<
             args as Record<string, unknown>
           ),
           model,
-          args.modelInfo
+          args.modelInfo ??
+            (profile.id === 'meta' ? axModelInfoMeta : undefined)
         ),
-      responsesReqUpdater: (request) => {
+      realtime:
+        profile.id === 'meta'
+          ? {
+              shouldUse: (model) => model === 'muse-voice-transcribe-1.0',
+              createApi: (request) =>
+                axCreateMetaRealtimeApi(
+                  request,
+                  (config as AxAIOpenAIResponsesConfig<string, string>)
+                    .realtimeTranscription,
+                  args.credentialProvider
+                    ? async () => {
+                        const url = `${apiURL.replace(/^http/, 'ws').replace(/\/$/, '')}/asr/realtime`;
+                        const headers = await args.credentialProvider!({
+                          profile: profile.id,
+                          operation: 'realtime',
+                          method: 'WS',
+                          url,
+                        });
+                        const authorization =
+                          headers.Authorization ?? headers.authorization;
+                        if (!authorization) {
+                          throw new Error(
+                            'Meta realtime credential provider must return an Authorization header'
+                          );
+                        }
+                        return authorization.replace(/^Bearer\s+/i, '');
+                      }
+                    : undefined,
+                  `${apiURL.replace(/^http/, 'ws').replace(/\/$/, '')}/asr/realtime`
+                ),
+            }
+          : undefined,
+      responsesReqUpdater: (request, options) => {
         const payload = { ...request } as Record<string, unknown>;
         const model = String(request.model);
+        if (profile.id === 'meta' && model === 'muse-image-1.0') {
+          const callerFunctions = request.tools?.filter(
+            (tool) => tool.type === 'function'
+          );
+          if (callerFunctions?.length) {
+            throw new Error(
+              'muse-image-1.0 only permits the image_generation tool'
+            );
+          }
+          const imageConfig = (
+            config as AxAIOpenAIResponsesConfig<string, string>
+          ).imageGeneration;
+          payload.tools = [
+            {
+              type: 'image_generation',
+              ...(imageConfig?.size ? { size: imageConfig.size } : {}),
+              output_format: imageConfig?.outputFormat ?? 'webp',
+              ...(imageConfig?.enableImageSearch !== undefined
+                ? { enable_image_search: imageConfig.enableImageSearch }
+                : {}),
+              ...(imageConfig?.enableWebSearch !== undefined
+                ? { enable_web_search: imageConfig.enableWebSearch }
+                : {}),
+              ...(imageConfig?.enableShell !== undefined
+                ? { enable_shell: imageConfig.enableShell }
+                : {}),
+              ...(imageConfig?.reasoningStrength
+                ? { reasoning_strength: imageConfig.reasoningStrength }
+                : {}),
+            },
+          ];
+          delete payload.tool_choice;
+          delete payload.include;
+          delete payload.reasoning;
+          if (Array.isArray(request.input)) {
+            // Image summaries are display-only; the signed image handle is the
+            // provider's stateless editing context.
+            const input = request.input.filter(
+              (item) => typeof item === 'string' || item.type !== 'reasoning'
+            );
+            payload.input = input;
+            for (const item of input) {
+              if (!item || typeof item === 'string') continue;
+              if (
+                item.type !== 'message' &&
+                item.type !== 'image_generation_call'
+              ) {
+                throw new Error(
+                  'muse-image-1.0 accepts only text, reference images, and prior generated images'
+                );
+              }
+              if (item.type === 'message' && Array.isArray(item.content)) {
+                const unsupported = item.content.find(
+                  (part: { type: string }) =>
+                    part.type !== 'input_text' &&
+                    part.type !== 'input_image' &&
+                    part.type !== 'output_text'
+                );
+                if (unsupported) {
+                  throw new Error(
+                    `muse-image-1.0 does not support ${unsupported.type} input`
+                  );
+                }
+              }
+            }
+          }
+        }
         const features = applyExactModelInfoOverride(
           applyCapabilityGates(
             profile,
@@ -988,7 +1295,7 @@ export class AxAIOpenAIResponsesProfile<
         });
         delete payload.service_tier;
         if (mappedTier !== undefined) payload.service_tier = mappedTier;
-        applyRequestRules(payload, profile.request, args.options ?? {});
+        applyRequestRules(payload, profile.request, options);
         if (profile.request?.reasoningObjectFields && payload.reasoning) {
           const reasoning = payload.reasoning as Record<string, unknown>;
           payload.reasoning = Object.fromEntries(
@@ -1002,6 +1309,171 @@ export class AxAIOpenAIResponsesProfile<
     });
     this.setName(profile.name);
     this.setHeaders(async () => profileHeaders(profile, apiKey));
+    this.setExplicitModelConfigKeys(args.config);
+    this.profileSpec = profile;
+    this.profileApiURL = apiURL;
+  }
+
+  override async transcribe(
+    req: Readonly<AxTranscriptionRequest<string | TModelKey>>,
+    options?: Readonly<AxAIServiceOptions>
+  ): Promise<AxTranscriptionResponse> {
+    const operation = this.profileSpec.operations.transcribe;
+    if (!operation) {
+      throw new Error(
+        `Transcription is not supported by profile ${this.profileSpec.id}`
+      );
+    }
+    if (operation.dialect !== 'meta-transcription') {
+      throw new Error(`Unsupported transcription dialect ${operation.dialect}`);
+    }
+    const endpoint = new URL(
+      `${this.profileApiURL.replace(/\/$/, '')}${operation.path}`
+    );
+    if (req.sessionId) endpoint.searchParams.set('sessionId', req.sessionId);
+    const url = endpoint.toString();
+    const serviceOptions = this.getOptions();
+    const format = req.audio.format;
+    if (
+      format !== 'wav' &&
+      !req.audio.mimeType?.toLowerCase().includes('wav')
+    ) {
+      throw new Error('Meta Voice batch transcription requires WAV audio');
+    }
+    if (req.audio.channels !== undefined && req.audio.channels !== 1) {
+      throw new Error('Meta Voice batch transcription requires mono audio');
+    }
+    if (
+      req.audio.sampleRate !== undefined &&
+      req.audio.sampleRate !== 16_000 &&
+      req.audio.sampleRate !== 24_000
+    ) {
+      throw new Error(
+        'Meta Voice batch transcription requires 16000 Hz or 24000 Hz audio'
+      );
+    }
+    if (req.language || req.prompt) {
+      throw new Error(
+        'Meta Voice uses languageBias and keywords instead of language or prompt'
+      );
+    }
+    const model =
+      typeof req.model === 'string'
+        ? req.model
+        : AxAIMetaModel.MuseVoiceTranscribe10;
+    if (model !== AxAIMetaModel.MuseVoiceTranscribe10) {
+      throw new Error(
+        `Meta Voice transcribe requires ${AxAIMetaModel.MuseVoiceTranscribe10}`
+      );
+    }
+    return await axFetchMetaTranscription({
+      url,
+      headers: await this.buildHeaders(
+        {},
+        {
+          operation: 'transcribe',
+          method: 'POST',
+          url,
+        }
+      ),
+      audio: req.audio,
+      request: {
+        model,
+        audioEncoding: 'WAV',
+        ...(req.mode ? { mode: req.mode.toUpperCase() } : {}),
+        ...(req.languageBias?.length ? { languageBias: req.languageBias } : {}),
+        ...(req.keywords?.length ? { keywords: req.keywords } : {}),
+        ...(req.partialMode
+          ? { partialMode: req.partialMode.toUpperCase() }
+          : {}),
+        ...(req.emitAudioProgress !== undefined
+          ? { emitAudioProgress: req.emitAudioProgress }
+          : {}),
+      },
+      partialMode: req.partialMode,
+      sessionId: req.sessionId,
+      acceptEventStream:
+        req.partialMode !== undefined || req.emitAudioProgress === true,
+      fetch: options?.fetch ?? serviceOptions.fetch,
+      abortSignal: options?.abortSignal ?? serviceOptions.abortSignal,
+    });
+  }
+}
+
+export class AxAIAnthropicProfile<
+  TModelKey = string,
+> extends AxAIAnthropic<TModelKey> {
+  constructor(args: Readonly<AxAIProfileArgs<TModelKey>>) {
+    const profile = resolveProfile(args.name);
+    if (profile.transport !== 'anthropic-messages') {
+      throw new Error(`${profile.id} is not an Anthropic Messages profile`);
+    }
+    if (profile.id !== 'meta-messages') {
+      throw new Error(`Unsupported Anthropic Messages profile ${profile.id}`);
+    }
+    if (profile.auth.required && !args.apiKey && !args.credentialProvider) {
+      throw new Error(`${profile.name} API key not set`);
+    }
+    const apiURL = resolveProfileURL(profile, args as Record<string, unknown>);
+    const key = args.apiKey;
+    super({
+      apiKey: key,
+      credentialProvider: args.credentialProvider,
+      config: args.config as any,
+      options: args.options,
+      models: args.models as any,
+      _profile: {
+        id: profile.id,
+        name: profile.name,
+        apiURL,
+        headers: async () => profileHeaders(profile, key ?? ''),
+        defaultModel: profile.defaults.model,
+        modelInfo: args.modelInfo ?? axModelInfoMetaMessages,
+        supportFor: (model: string) =>
+          applyExactModelInfoOverride(
+            axResolveAIProfileFeatures(profile.id, model),
+            model,
+            args.modelInfo ?? axModelInfoMetaMessages
+          ),
+        supportsToolChoiceNone: true,
+        requestUpdater: (
+          request: AxAIAnthropicChatRequest,
+          options: Readonly<AxAIServiceOptions>
+        ) => {
+          const payload = { ...request } as Record<string, unknown>;
+          const budget = options.thinkingTokenBudget;
+          if (budget === 'none') {
+            throw new Error(
+              'Meta Muse Spark does not support reasoning level none'
+            );
+          }
+          if (budget || payload.thinking) {
+            payload.thinking = {
+              type: 'adaptive',
+              display:
+                options.showThoughts === false ? 'omitted' : 'summarized',
+            };
+          }
+          if (budget) {
+            const effort =
+              budget === 'minimal'
+                ? 'low'
+                : budget === 'highest'
+                  ? 'xhigh'
+                  : budget;
+            payload.output_config = {
+              ...((payload.output_config as Record<string, unknown>) ?? {}),
+              effort,
+            };
+          }
+          applyRequestRules(payload, profile.request, options);
+          delete payload.reasoning_effort;
+          delete payload.stop_sequences;
+          delete payload.top_k;
+          return stripCacheControl(payload) as AxAIAnthropicChatRequest;
+        },
+      },
+    } as any);
   }
 }
 

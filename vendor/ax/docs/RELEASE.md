@@ -22,6 +22,9 @@ names. User-facing libraries should read as Ax libraries in each ecosystem.
 
 ## Versioning
 
+Breaking changes deferred to the next major version are listed in
+[NEXT_MAJOR.md](NEXT_MAJOR.md).
+
 Generated package metadata uses the same version as the root `@ax-llm/ax`
 package. Release automation may override this with `AX_PACKAGE_VERSION`; local
 compiler runs fall back to the nearest `package.json` version and then to a
@@ -31,8 +34,10 @@ development fallback.
 
 `npm run release` is the normal release preparation path. It verifies that
 local `main` is clean and synchronized with `origin/main`, creates a
-`codex/release-<version>` branch, runs the workspace version bumps, regenerates
-the generated packages, creates the release commit, validates it, pushes the
+`codex/release-<version>` branch, runs the workspace version bumps (including
+internal example dependencies), refreshes the root lockfile, and checks that
+`npm ci` can resolve it. It then regenerates the generated packages, creates the
+release commit, validates it, pushes the
 branch, and opens a pull request. It intentionally does not tag, push directly
 to `main`, or create a GitHub Release.
 
@@ -189,12 +194,13 @@ manual dispatch available for retries and verification:
   trusted publishing with GitHub Actions OIDC and signed provenance.
 - `.github/workflows/package-publish.yml` separately publishes generated
   packages from the same release event.
-- Current generated-package publishing covers Python/PyPI and Rust/crates.io.
+- Current generated-package publishing covers Python/PyPI, Rust/crates.io,
+  and Java/Maven Central.
   PyPI builds and uploads the generated `axllm` wheel and source distribution;
   Rust publishes the generated `axllm` crate.
-- Java/Maven Central, C++ release artifacts/package-manager recipes, and Go
-  module release handling are future publishing work unless added in a separate
-  release change. Go consumers resolve the module from the git tag.
+- Java publishes the signed `dev.axllm:ax` artifacts to Maven Central.
+- C++ release artifacts/package-manager recipes and dedicated Go module release
+  handling are future publishing work. Go consumers resolve the module from git.
 
 CI publishing uses GitHub secrets and trusted-publishing/OIDC where configured,
 not `.env`. The repo `.env` is only for local example/provider runs and for any
@@ -207,3 +213,24 @@ constructors in opt-in sub-packages such as `runtime/goja` rather than in the
 root `axllm` package. For Rust, keep embedded runtime engines additive,
 feature-gated, and behind the existing `AxCodeRuntime` / `AxCodeSession`
 traits.
+
+Typesafe/Jev parity includes native System One and model discovery, configurable
+boolean conversion, signature value descriptions, and schema-aware request eligibility
+in Python, Java, C++, Go, and Rust. Verification also exercises MCP WebSocket pending
+cleanup on send failure, cancellation, close, batch requests, and request-ID reuse.
+
+### Recover only Java publication
+
+If Maven Central rejects a Java deployment before publishing it, verify that the
+version is absent from Central before retrying. The publication workflow pins
+Maven 3.9.16 to avoid runner-default changes in repository metadata
+that the Central plugin does not remove. Use the updated workflow on main while checking out the
+original release tag, and skip already-published Python and Rust packages:
+
+```bash
+gh workflow run package-publish.yml --ref main \
+  -f java_release_tag=25.0.1 -f dry_run=false
+```
+
+Use the affected release version for `java_release_tag`. Do not move the release tag
+or create another version to recover an unpublished Java artifact.

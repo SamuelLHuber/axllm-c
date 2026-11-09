@@ -275,7 +275,7 @@ describe('OpenAI prompt cache breakpoints', () => {
     expect(parts[1].type).toBe('image_url');
     expect(parts[1].image_url).toEqual({
       url: 'data:image/png;base64,aGVsbG8=',
-      details: 'auto',
+      detail: 'auto',
     });
     expect(parts[1].prompt_cache_breakpoint).toEqual({ mode: 'explicit' });
   });
@@ -298,7 +298,10 @@ describe('OpenAI prompt cache breakpoints', () => {
     Object.freeze(chatPrompt);
     for (const m of chatPrompt) {
       Object.freeze(m);
-      if (Array.isArray(m.content)) m.content.forEach((p) => Object.freeze(p));
+      if (Array.isArray(m.content))
+        m.content.forEach((p) => {
+          Object.freeze(p);
+        });
     }
 
     await ai.chat({ chatPrompt }, { sessionId: 's' });

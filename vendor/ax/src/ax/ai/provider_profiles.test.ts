@@ -38,7 +38,7 @@ const createMockFetch = (capture: Capture) =>
 describe('named AI deployment profiles', () => {
   it('publishes the fixed profile catalog with unique aliases and sources', () => {
     const profiles = axAIProfiles();
-    expect(profiles).toHaveLength(46);
+    expect(profiles).toHaveLength(51);
     expect(new Set(profiles.map((profile) => profile.id)).size).toBe(
       profiles.length
     );
@@ -162,6 +162,54 @@ describe('named AI deployment profiles', () => {
     }
     expect(response.modelUsage?.tokens?.serviceTier).toBe('priority');
   });
+
+  it.each([
+    ['openai-responses', 'gpt-5.4-mini'],
+    // The openai provider sends the GPT-6 family through its Responses sibling.
+    ['openai', 'gpt-6-sol'],
+    ['openai', 'gpt-6.1-sol'],
+  ] as const)(
+    'sends %s chat for %s to the configured apiURL',
+    async (name, model) => {
+      const fetch = vi.fn(
+        async (_url: RequestInfo | URL, _init?: RequestInit) =>
+          new Response(
+            JSON.stringify({
+              id: 'resp-url',
+              object: 'response',
+              created: 1,
+              model,
+              output: [
+                {
+                  id: 'msg-url',
+                  type: 'message',
+                  role: 'assistant',
+                  status: 'completed',
+                  content: [
+                    { type: 'output_text', text: 'ok', annotations: [] },
+                  ],
+                },
+              ],
+              usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          )
+      );
+      const service = ai({
+        name,
+        apiKey: 'key',
+        apiURL: 'https://responses.test/v1',
+        config: { model, stream: false },
+        options: { fetch },
+      });
+
+      await service.chat({ chatPrompt: [{ role: 'user', content: 'ping' }] });
+
+      expect(fetch.mock.calls.map(([url]) => String(url))).toEqual([
+        'https://responses.test/v1/responses',
+      ]);
+    }
+  );
 
   it('fails before transport for an unsupported explicit tier', async () => {
     const fetch = vi.fn();
@@ -464,14 +512,14 @@ describe('named AI deployment profiles', () => {
     });
 
     expect(
-      (capture.body?.messages as Record<string, unknown>[])[1]
+      (capture.body!.messages as Record<string, unknown>[])[1]
     ).toMatchObject({
       content: 'Use the lookup.',
       reasoning: 'Check the inventory first.',
       role: 'assistant',
     });
     expect(
-      (capture.body?.messages as Record<string, unknown>[])[1]
+      (capture.body!.messages as Record<string, unknown>[])[1]
     ).not.toHaveProperty('reasoning_content');
   });
 
@@ -543,8 +591,8 @@ describe('named AI deployment profiles', () => {
     });
     expect(
       (
-        (capture.body?.messages as Record<string, unknown>[])[1]
-          ?.reasoning_details as unknown[]
+        (capture.body!.messages as Record<string, unknown>[])[1]!
+          .reasoning_details as unknown[]
       )[0]
     ).toMatchObject({ id: 'reasoning-1', type: 'reasoning.summary' });
   });
@@ -883,6 +931,53 @@ describe('named AI deployment profiles', () => {
 
       expect(capture.body?.reasoning_effort).toBe(testCase.expectedEffort);
     }
+  });
+
+  it('maps Grok 3 Mini reasoning to its low and high effort levels', async () => {
+    const cases = [
+      { model: 'grok-3-mini', level: 'minimal', expectedEffort: 'low' },
+      {
+        model: 'grok-3-mini-fast',
+        level: 'medium',
+        expectedEffort: 'high',
+      },
+      { model: 'grok-3-mini', level: 'max', expectedEffort: 'high' },
+    ] as const;
+
+    for (const testCase of cases) {
+      const capture: Capture = {};
+      const service = ai({
+        name: 'grok',
+        apiKey: 'key',
+        config: { model: testCase.model, stream: false },
+        options: { fetch: createMockFetch(capture) },
+      });
+
+      await service.chat(
+        { chatPrompt: [{ role: 'user', content: 'think' }] },
+        { thinkingTokenBudget: testCase.level }
+      );
+
+      expect(capture.body?.reasoning_effort).toBe(testCase.expectedEffort);
+    }
+
+    const defaultCapture: Capture = {};
+    const service = ai({
+      name: 'grok',
+      apiKey: 'key',
+      config: { model: 'grok-3-mini', stream: false },
+      options: { fetch: createMockFetch(defaultCapture) },
+    });
+
+    await service.chat({ chatPrompt: [{ role: 'user', content: 'think' }] });
+
+    expect(defaultCapture.body?.reasoning_effort).toBe('low');
+    await expect(
+      service.chat(
+        { chatPrompt: [{ role: 'user', content: 'answer directly' }] },
+        { thinkingTokenBudget: 'none' }
+      )
+    ).rejects.toThrow('xAI Grok 3 Mini reasoning cannot be disabled');
   });
 
   it('preserves explicit none only where the deployment documents it', async () => {

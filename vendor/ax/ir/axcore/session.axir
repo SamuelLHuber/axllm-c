@@ -1,0 +1,1616 @@
+module @ax.session version "0.1" {
+  dialect @ax.gen version "0.1"
+
+  op ax.gen.semantic @chat_session_mode_enabled {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    type signature = "(options:json) -> bool"
+    body @entry(%options: json) {
+      %mode_snake = core.get %options["async_mode"] default "auto"
+      %mode = core.get %options["asyncMode"] default %mode_snake
+      %disabled = core.call intrinsic.eq(%mode, "off")
+      %function_snake = core.get %options["function_call_mode"] default "auto"
+      %function_mode = core.get %options["functionCallMode"] default %function_snake
+      %prompt = core.call intrinsic.eq(%function_mode, "prompt")
+      %legacy = core.call intrinsic.or(%disabled, %prompt)
+      %enabled = core.call intrinsic.not(%legacy)
+      core.return %enabled
+    }
+  }
+
+  op ax.gen.semantic @chat_session_validate_required_arguments {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr effect = "throws"
+    type signature = "(schema:json, arguments:json, path:string) -> void throws"
+    body @entry(%schema: json, %arguments: json, %path: string) {
+      // TS's checks (@chat_session_argument_errors), each failure as
+      // "<field>: <message>", after the caller's path.
+      %errors = core.call @chat_session_argument_errors(%schema, %schema, %arguments, "", 0)
+      %count = core.call intrinsic.len(%errors)
+      %invalid = core.call intrinsic.gt(%count, 0)
+      core.if %invalid {
+        %lines = core.list
+        core.for %failure in %errors {
+          %failure_field = core.get %failure["field"] default "arguments"
+          %failure_message = core.get %failure["message"] default ""
+          %line = core.call intrinsic.string.format("{}: {}", %failure_field, %failure_message)
+          core.append %lines, %line
+        }
+        %joined = core.string_join %lines sep "; "
+        %message = core.call intrinsic.string.format("{}: {}", %path, %joined)
+        %error = core.call intrinsic.error.validation(%message)
+        core.raise %error
+      }
+      core.return
+    }
+  }
+
+  op ax.gen.semantic @chat_session_argument_equal {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    type signature = "(left:json, right:json, depth:i64) -> bool"
+    body @entry(%left: json, %right: json, %depth: i64) {
+      %too_deep = core.call intrinsic.gt(%depth, 64)
+      core.if %too_deep {
+        core.return false
+      }
+      %next = core.call intrinsic.add(%depth, 1)
+      %left_list = core.type_is %left type "list"
+      %right_list = core.type_is %right type "list"
+      %same_list = core.call intrinsic.eq(%left_list, %right_list)
+      core.if %same_list {
+      } else {
+        core.return false
+      }
+      %left_object = core.type_is %left type "object"
+      %right_object = core.type_is %right type "object"
+      %same_object = core.call intrinsic.eq(%left_object, %right_object)
+      core.if %same_object {
+      } else {
+        core.return false
+      }
+      %left_string = core.type_is %left type "string"
+      %right_string = core.type_is %right type "string"
+      %same_string = core.call intrinsic.eq(%left_string, %right_string)
+      core.if %same_string {
+      } else {
+        core.return false
+      }
+      %left_number = core.type_is %left type "number"
+      %right_number = core.type_is %right type "number"
+      %same_number = core.call intrinsic.eq(%left_number, %right_number)
+      core.if %same_number {
+      } else {
+        core.return false
+      }
+      %left_boolean = core.type_is %left type "boolean"
+      %right_boolean = core.type_is %right type "boolean"
+      %same_boolean = core.call intrinsic.eq(%left_boolean, %right_boolean)
+      core.if %same_boolean {
+      } else {
+        core.return false
+      }
+      core.if %left_list {
+        %left_size = core.call intrinsic.len(%left)
+        %right_size = core.call intrinsic.len(%right)
+        %same_size = core.call intrinsic.eq(%left_size, %right_size)
+        core.if %same_size {
+        } else {
+          core.return false
+        }
+        %index = core.let 0
+        core.for %value in %left {
+          %other = core.get %right[%index]
+          %same = core.call @chat_session_argument_equal(%value, %other, %next)
+          core.if %same {
+          } else {
+            core.return false
+          }
+          %index = core.call intrinsic.add(%index, 1)
+        }
+        core.return true
+      }
+      core.if %left_object {
+        %left_keys = core.call intrinsic.map.keys(%left)
+        %right_keys = core.call intrinsic.map.keys(%right)
+        %same_keys = core.call @chat_session_argument_equal(%left_keys, %right_keys, %next)
+        core.if %same_keys {
+        } else {
+          core.return false
+        }
+        core.for %key in %left_keys {
+          %value = core.get %left[%key]
+          %other = core.get %right[%key]
+          %same = core.call @chat_session_argument_equal(%value, %other, %next)
+          core.if %same {
+          } else {
+            core.return false
+          }
+        }
+        core.return true
+      }
+      %same = core.call intrinsic.eq(%left, %right)
+      core.return %same
+    }
+  }
+
+  op ax.gen.semantic @chat_session_argument_errors {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    tag "source:src/ax/dsp/toolArguments.ts#axValidateToolArguments"
+    type signature = "(root:json, schema:json, arguments:json, path:string, depth:i64) -> json throws"
+    body @entry(%root: json, %schema: json, %arguments: json, %path: string, %depth: i64) {
+      // TS's axValidateToolArguments: each failure is {field, message}, the
+      // field being the argument's path ("a.b", "items[0]") or "arguments"
+      // for the value itself, in TS's order of checks.
+      %errors = core.list
+      %empty = core.map
+      %empty_list = core.list
+      %field = core.let %path
+      %at_root = core.call intrinsic.eq(%path, "")
+      core.if %at_root {
+        %field = core.let "arguments"
+      }
+      %too_deep = core.call intrinsic.gt(%depth, 64)
+      core.if %too_deep {
+        %deep = core.map
+        core.set %deep["field"] = %field
+        core.set %deep["message"] = "Arguments exceed schema nesting limit"
+        core.append %errors, %deep
+        core.return %errors
+      }
+      // Reference chains use a bounded loop, so cyclic refs cannot exhaust
+      // a host stack before the shared nesting limit rejects them.
+      %resolved_depth = core.let %depth
+      %reference = core.get %schema["$ref"] default ""
+      core.loop {
+        %no_reference = core.call intrinsic.not(%reference)
+        core.if %no_reference {
+          core.break
+        }
+        %reference_text = core.call intrinsic.string.str(%reference)
+        %local = core.call intrinsic.string.starts_with(%reference_text, "#/")
+        core.if %local {
+          %tail = core.call intrinsic.string.slice(%reference_text, 2)
+          %parts = core.call intrinsic.string.split(%tail, "/")
+          %target = core.let %root
+          core.for %part in %parts {
+            %slash = core.call intrinsic.string.replace(%part, "~1", "/")
+            %key = core.call intrinsic.string.replace(%slash, "~0", "~")
+            %array_target = core.type_is %target type "list"
+            core.if %array_target {
+              %found = core.get %empty["not_found"] default null
+              %index = core.let 0
+              core.for %entry in %target {
+                %index_key = core.call intrinsic.string.format("{}", %index)
+                %same_index = core.call intrinsic.eq(%index_key, %key)
+                core.if %same_index {
+                  %found = core.let %entry
+                }
+                %index = core.call intrinsic.add(%index, 1)
+              }
+              %target = core.let %found
+            } else {
+              %target_map = core.type_is %target type "object"
+              core.if %target_map {
+                %target = core.get %target[%key] default null
+              } else {
+                %target = core.call intrinsic.none()
+              }
+            }
+          }
+          %missing = core.call intrinsic.is_none(%target)
+          %target_boolean = core.type_is %target type "boolean"
+          core.if %target_boolean {
+            %is_false = core.call intrinsic.not(%target)
+            %missing = core.call intrinsic.or(%missing, %is_false)
+          }
+          %target_number = core.type_is %target type "number"
+          core.if %target_number {
+            %is_zero = core.call intrinsic.eq(%target, 0)
+            %missing = core.call intrinsic.or(%missing, %is_zero)
+          }
+          %target_string = core.type_is %target type "string"
+          core.if %target_string {
+            %is_empty = core.call intrinsic.eq(%target, "")
+            %missing = core.call intrinsic.or(%missing, %is_empty)
+          }
+          core.if %missing {
+            %unresolved = core.map
+            core.set %unresolved["field"] = %field
+            core.set %unresolved["message"] = "Unresolved schema reference"
+            core.append %errors, %unresolved
+            core.return %errors
+          }
+          %resolved_depth = core.call intrinsic.add(%resolved_depth, 1)
+          %reference_limit = core.call intrinsic.gt(%resolved_depth, 64)
+          core.if %reference_limit {
+            %deep = core.map
+            core.set %deep["field"] = %field
+            core.set %deep["message"] = "Arguments exceed schema nesting limit"
+            core.append %errors, %deep
+            core.return %errors
+          }
+          %schema = core.let %target
+          %reference = core.get %schema["$ref"] default ""
+        } else {
+          %external = core.map
+          core.set %external["field"] = %field
+          core.set %external["message"] = "External schema references are unsupported"
+          core.append %errors, %external
+          core.return %errors
+        }
+      }
+      %next_depth = core.call intrinsic.add(%resolved_depth, 1)
+      %all = core.get %schema["allOf"] default %empty_list
+      %all_is_list = core.type_is %all type "list"
+      core.if %all_is_list {
+        core.for %branch in %all {
+          %branch_errors = core.call @chat_session_argument_errors(%root, %branch, %arguments, %path, %next_depth)
+          core.for %error in %branch_errors {
+            core.append %errors, %error
+          }
+        }
+      }
+      %keywords = core.list
+      core.append %keywords, "anyOf"
+      core.append %keywords, "oneOf"
+      core.for %keyword in %keywords {
+        %branches = core.get %schema[%keyword] default null
+        %union_branches = core.type_is %branches type "list"
+        core.if %union_branches {
+          %matches = core.let 0
+          core.for %branch in %branches {
+            %branch_errors = core.call @chat_session_argument_errors(%root, %branch, %arguments, %path, %next_depth)
+            %error_count = core.call intrinsic.len(%branch_errors)
+            %match = core.call intrinsic.eq(%error_count, 0)
+            core.if %match {
+              %matches = core.call intrinsic.add(%matches, 1)
+            }
+          }
+          %no_match = core.call intrinsic.eq(%matches, 0)
+          %one = core.call intrinsic.eq(%keyword, "oneOf")
+          %not_one = core.call intrinsic.ne(%matches, 1)
+          %too_many = core.call intrinsic.and(%one, %not_one)
+          %invalid_union = core.call intrinsic.or(%no_match, %too_many)
+          core.if %invalid_union {
+            %union_message = core.call intrinsic.string.format("Arguments do not match {}", %keyword)
+            %union_error = core.map
+            core.set %union_error["field"] = %field
+            core.set %union_error["message"] = %union_message
+            core.append %errors, %union_error
+          }
+        }
+      }
+      // The value's own checks, in a frame of their own.
+      %value_errors = core.call @chat_session_argument_value_errors(%root, %schema, %arguments, %path, %next_depth)
+      core.for %value_error in %value_errors {
+        core.append %errors, %value_error
+      }
+      core.return %errors
+    }
+  }
+
+  op ax.gen.semantic @chat_session_argument_value_errors {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr private = true
+    tag "source:src/ax/dsp/toolArguments.ts#axValidateToolArguments"
+    type signature = "(root:json, schema:json, arguments:json, path:string, next_depth:i64) -> json throws"
+    body @entry(%root: json, %schema: json, %arguments: json, %path: string, %next_depth: i64) {
+      // TS's checks of the value itself (see @chat_session_argument_errors):
+      // its type, enum, const, string, number, list and object checks.
+      %errors = core.list
+      %empty = core.map
+      %empty_list = core.list
+      %field = core.let %path
+      %at_root = core.call intrinsic.eq(%path, "")
+      core.if %at_root {
+        %field = core.let "arguments"
+      }
+      // The value's JSON type, as TS names it: null, array, or typeof.
+      %actual = core.let "object"
+      %value_null = core.call intrinsic.is_none(%arguments)
+      %value_list = core.type_is %arguments type "list"
+      %value_string = core.type_is %arguments type "string"
+      %value_number = core.type_is %arguments type "number"
+      %value_boolean = core.type_is %arguments type "boolean"
+      core.if %value_null {
+        %actual = core.let "null"
+      }
+      core.if %value_list {
+        %actual = core.let "array"
+      }
+      core.if %value_string {
+        %actual = core.let "string"
+      }
+      core.if %value_number {
+        %actual = core.let "number"
+      }
+      core.if %value_boolean {
+        %actual = core.let "boolean"
+      }
+      %declared_type = core.get %schema["type"] default null
+      %types = core.list
+      %is_union = core.type_is %declared_type type "list"
+      core.if %is_union {
+        %types = core.let %declared_type
+      } else {
+        %type_given = core.call intrinsic.truthy(%declared_type)
+        core.if %type_given {
+          core.append %types, %declared_type
+        }
+      }
+      %type_count = core.call intrinsic.len(%types)
+      %typed = core.call intrinsic.gt(%type_count, 0)
+      core.if %typed {
+        %matches_type = core.let false
+        core.for %type in %types {
+          %same_type = core.call intrinsic.eq(%type, %actual)
+          %matches_type = core.call intrinsic.or(%matches_type, %same_type)
+          %wants_integer = core.call intrinsic.eq(%type, "integer")
+          %integer_check = core.call intrinsic.and(%wants_integer, %value_number)
+          core.if %integer_check {
+            %finite = core.call intrinsic.math.is_finite(%arguments)
+            core.if %finite {
+              %whole = core.call intrinsic.math.floor(%arguments)
+              %is_integer = core.call intrinsic.eq(%whole, %arguments)
+              %matches_type = core.call intrinsic.or(%matches_type, %is_integer)
+            }
+          }
+        }
+        core.if %matches_type {
+        } else {
+          %type_names = core.list
+          core.for %type_name in %types {
+            %type_text = core.call intrinsic.string.str(%type_name)
+            core.append %type_names, %type_text
+          }
+          %joined_types = core.call intrinsic.string.join(" or ", %type_names)
+          %type_message = core.call intrinsic.string.format("Expected {}, received {}", %joined_types, %actual)
+          %type_error = core.map
+          core.set %type_error["field"] = %field
+          core.set %type_error["message"] = %type_message
+          core.append %errors, %type_error
+          core.return %errors
+        }
+      }
+      %enum_values = core.get %schema["enum"] default null
+      %has_enum = core.type_is %enum_values type "list"
+      core.if %has_enum {
+        %allowed = core.let false
+        core.for %choice in %enum_values {
+          %same = core.call @chat_session_argument_equal(%choice, %arguments, 0)
+          %allowed = core.call intrinsic.or(%allowed, %same)
+        }
+        core.if %allowed {
+        } else {
+          %enum_error = core.map
+          core.set %enum_error["field"] = %field
+          core.set %enum_error["message"] = "Value is not in the allowed enum"
+          core.append %errors, %enum_error
+        }
+      }
+      %has_const = core.call intrinsic.map.contains(%schema, "const")
+      core.if %has_const {
+        %constant = core.get %schema["const"]
+        %same_const = core.call @chat_session_argument_equal(%constant, %arguments, 0)
+        core.if %same_const {
+        } else {
+          %const_error = core.map
+          core.set %const_error["field"] = %field
+          core.set %const_error["message"] = "Value does not match const"
+          core.append %errors, %const_error
+        }
+      }
+      core.if %value_string {
+        %length = core.call intrinsic.string.codepoint_length(%arguments)
+        %minimum = core.get %schema["minLength"] default 0
+        %maximum = core.get %schema["maxLength"] default %length
+        %too_short = core.call intrinsic.lt(%length, %minimum)
+        %too_long = core.call intrinsic.gt(%length, %maximum)
+        core.if %too_short {
+          %short_error = core.map
+          core.set %short_error["field"] = %field
+          core.set %short_error["message"] = "String is too short"
+          core.append %errors, %short_error
+        }
+        core.if %too_long {
+          %long_error = core.map
+          core.set %long_error["field"] = %field
+          core.set %long_error["message"] = "String is too long"
+          core.append %errors, %long_error
+        }
+        %pattern = core.get %schema["pattern"] default ""
+        core.if %pattern {
+          %pattern_matches = core.call @regex_test(%pattern, %arguments)
+          core.if %pattern_matches {
+          } else {
+            %pattern_error = core.map
+            core.set %pattern_error["field"] = %field
+            core.set %pattern_error["message"] = "String does not match pattern"
+            core.append %errors, %pattern_error
+          }
+        }
+      }
+      core.if %value_number {
+        %number_finite = core.call intrinsic.math.is_finite(%arguments)
+        core.if %number_finite {
+        } else {
+          %finite_error = core.map
+          core.set %finite_error["field"] = %field
+          core.set %finite_error["message"] = "Number must be finite"
+          core.append %errors, %finite_error
+        }
+        %number_minimum = core.get %schema["minimum"] default %arguments
+        %number_maximum = core.get %schema["maximum"] default %arguments
+        %low = core.call intrinsic.lt(%arguments, %number_minimum)
+        %high = core.call intrinsic.gt(%arguments, %number_maximum)
+        core.if %low {
+          %low_error = core.map
+          core.set %low_error["field"] = %field
+          core.set %low_error["message"] = "Number is below minimum"
+          core.append %errors, %low_error
+        }
+        core.if %high {
+          %high_error = core.map
+          core.set %high_error["field"] = %field
+          core.set %high_error["message"] = "Number is above maximum"
+          core.append %errors, %high_error
+        }
+      }
+      core.if %value_list {
+        %item_count = core.call intrinsic.len(%arguments)
+        %min_items = core.get %schema["minItems"] default 0
+        %max_items = core.get %schema["maxItems"] default %item_count
+        %few = core.call intrinsic.lt(%item_count, %min_items)
+        %many = core.call intrinsic.gt(%item_count, %max_items)
+        core.if %few {
+          %few_error = core.map
+          core.set %few_error["field"] = %field
+          core.set %few_error["message"] = "Too few items"
+          core.append %errors, %few_error
+        }
+        core.if %many {
+          %many_error = core.map
+          core.set %many_error["field"] = %field
+          core.set %many_error["message"] = "Too many items"
+          core.append %errors, %many_error
+        }
+        %items = core.get %schema["items"] default null
+        // A schema is an object, or true (JS truthiness: {} counts).
+        %items_map = core.type_is %items type "object"
+        %items_true = core.call intrinsic.eq(%items, true)
+        %has_items = core.call intrinsic.or(%items_map, %items_true)
+        core.if %has_items {
+          %item_index = core.let 0
+          core.for %item in %arguments {
+            %item_path = core.call intrinsic.string.format("{}[{}]", %path, %item_index)
+            %item_errors = core.call @chat_session_argument_errors(%root, %items, %item, %item_path, %next_depth)
+            core.for %error in %item_errors {
+              core.append %errors, %error
+            }
+            %item_index = core.call intrinsic.add(%item_index, 1)
+          }
+        }
+      }
+      %value_object = core.type_is %arguments type "object"
+      core.if %value_object {
+        %required = core.get %schema["required"] default %empty_list
+        %required_is_list = core.type_is %required type "list"
+        core.if %required_is_list {
+          core.for %name in %required {
+            %present = core.call intrinsic.map.contains(%arguments, %name)
+            core.if %present {
+            } else {
+              %required_field = core.let %name
+              core.if %at_root {
+              } else {
+                %required_field = core.call intrinsic.string.format("{}.{}", %path, %name)
+              }
+              %required_error = core.map
+              core.set %required_error["field"] = %required_field
+              core.set %required_error["message"] = "Required argument is missing"
+              core.append %errors, %required_error
+            }
+          }
+        }
+        %properties = core.get %schema["properties"] default %empty
+        %additional = core.get %schema["additionalProperties"] default null
+        %forbidden = core.call intrinsic.eq(%additional, false)
+        %additional_schema = core.type_is %additional type "object"
+        %names = core.call intrinsic.map.keys(%arguments)
+        core.for %name in %names {
+          %child = core.get %arguments[%name]
+          %properties_map = core.type_is %properties type "object"
+          %child_schema = core.call intrinsic.none()
+          core.if %properties_map {
+            %child_schema = core.get %properties[%name] default null
+          }
+          %child_map = core.type_is %child_schema type "object"
+          %child_true = core.call intrinsic.eq(%child_schema, true)
+          %known = core.call intrinsic.or(%child_map, %child_true)
+          core.if %known {
+            %child_path = core.let %name
+            core.if %at_root {
+            } else {
+              %child_path = core.call intrinsic.string.format("{}.{}", %path, %name)
+            }
+            %child_errors = core.call @chat_session_argument_errors(%root, %child_schema, %child, %child_path, %next_depth)
+            core.for %error in %child_errors {
+              core.append %errors, %error
+            }
+          } else {
+            core.if %forbidden {
+              %unexpected_message = core.call intrinsic.string.format("Unexpected property: {}", %name)
+              %unexpected = core.map
+              core.set %unexpected["field"] = %field
+              core.set %unexpected["message"] = %unexpected_message
+              core.append %errors, %unexpected
+            } else {
+              core.if %additional_schema {
+                // TS joins "<path>.<key>" here even at the root (".key").
+                %extra_path = core.call intrinsic.string.format("{}.{}", %path, %name)
+                %extra_errors = core.call @chat_session_argument_errors(%root, %additional, %child, %extra_path, %next_depth)
+                core.for %error in %extra_errors {
+                  core.append %errors, %error
+                }
+              }
+            }
+          }
+        }
+      }
+      core.return %errors
+    }
+  }
+
+  op ax.gen.semantic @chat_session_record_result {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr effect = "throws"
+    type signature = "(gen:json, state:json, call:json, result:json, ok:bool, options:json) -> bool throws"
+    body @entry(%gen: json, %state: json, %call: json, %result: json, %ok: bool, %options: json) {
+      %id = core.get %call["id"]
+      %text = core.let %result
+      core.if %ok {
+        core.try {
+          %formatted = core.call @function_result_text_impl(%result, %options)
+          %text = core.let %formatted
+        } catch %formatter_error {
+          core.call intrinsic.axgen.record_function_call(%gen, %call, %formatter_error, "error")
+          // The failing call has settled, as in axRunChatSession's pending map.
+          %unresolved = core.list
+          %empty_pending = core.map
+          %pending = core.get %state["pending"] default %empty_pending
+          %pending_ids = core.call intrinsic.map.keys(%pending)
+          core.for %pending_id in %pending_ids {
+            %other_call = core.call intrinsic.ne(%pending_id, %id)
+            %pending_call = core.get %pending[%pending_id]
+            %pending_status = core.get %pending_call["status"] default ""
+            %running = core.call intrinsic.eq(%pending_status, "running")
+            %still_running = core.call intrinsic.and(%other_call, %running)
+            core.if %still_running {
+              core.append %unresolved, %pending_id
+            }
+          }
+          %unresolved_text = core.call intrinsic.string.join(", ", %unresolved)
+          %no_unresolved = core.call intrinsic.eq(%unresolved_text, "")
+          core.if %no_unresolved {
+            %unresolved_text = core.let "none"
+          }
+          %formatter_message = core.call intrinsic.exception.message(%formatter_error)
+          %session_message = core.call intrinsic.string.format("Chat session failed: {}; unresolved calls: {}", %formatter_message, %unresolved_text)
+          %session_error = core.call intrinsic.exception.rewrap(%formatter_error, %session_message)
+          core.raise %session_error
+        }
+      }
+      %output = core.map
+      core.set %output["function_id"] = %id
+      core.set %output["result"] = %text
+      // As TS submits an error result with isError.
+      core.if %ok {
+      } else {
+        core.set %output["is_error"] = true
+      }
+      %changed = core.call @chat_session_complete_call(%state, %id, %output)
+      core.if %changed {
+        %status = core.let "error"
+        core.if %ok {
+          %status = core.let "ok"
+        }
+        core.call intrinsic.axgen.memory_add_function_result(%gen, %call, %text, %ok, %text)
+        core.call intrinsic.axgen.record_function_call(%gen, %call, %result, %status)
+        %empty_turns = core.list
+        %turns = core.get %state["turns"] default %empty_turns
+        %message = core.call @tool_result_message_impl(%call, %text)
+        %failed = core.call intrinsic.not(%ok)
+        core.if %failed {
+          // An error result is already the error payload's text.
+          core.set %message["result"] = %text
+          core.set %message["is_error"] = true
+        }
+        core.append %turns, %message
+        core.set %state["turns"] = %turns
+      }
+      core.return %changed
+    }
+  }
+
+  op ax.gen.semantic @chat_session_observe_output {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr effect = "throws"
+    type signature = "(gen:json, state:json, event:json) -> json throws"
+    body @entry(%gen: json, %state: json, %event: json) {
+      // The model.output event for a partial response event. Streaming
+      // assertions do not run here: a forward does not stream, and a stream
+      // checks them as the partial events stream (TS's onSessionDelta).
+      %empty_map = core.map
+      %empty_list = core.list
+      %texts = core.get %state["texts"] default %empty_map
+      %id = core.get %event["response_id"]
+      %text = core.get %texts[%id] default ""
+      %response = core.get %event["response"]
+      %results = core.get %response["results"] default %empty_list
+      core.for %result in %results {
+        %delta = core.get %result["content"] default ""
+        %text = core.call intrinsic.string.format("{}{}", %text, %delta)
+      }
+      core.set %texts[%id] = %text
+      core.set %state["texts"] = %texts
+      %version = core.get %state["version"] default 0
+      %output = core.map
+      core.set %output["response_id"] = %id
+      core.set %output["text"] = %text
+      core.set %output["version"] = %version
+      core.return %output
+    }
+  }
+
+
+  op ax.gen.semantic @chat_session_apply_boundary_updates {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    tag "src/ax/dsp/runControl.ts"
+    type signature = "(request:json, updates:list<json>, level:json) -> json"
+    body @entry(%request: json, %updates: list<json>, %level: json) {
+      %empty = core.map
+      %config = core.get %request["model_config"] default %empty
+      %config = core.call intrinsic.map.merge(%config, %empty)
+      %messages = core.get %request["chat_prompt"]
+      %current_level = core.let %level
+      %applied = core.list
+      core.for %update in %updates {
+        %kind = core.get %update["type"]
+        %steering = core.call intrinsic.eq(%kind, "steer")
+        core.if %steering {
+          %message = core.map
+          %text = core.get %update["text"]
+          core.set %message["role"] = "user"
+          core.set %message["content"] = %text
+          core.append %messages, %message
+        } else {
+          %next_level = core.get %update["level"]
+          %current_level = core.let %next_level
+        }
+        %id = core.get %update["id"]
+        core.append %applied, %id
+      }
+      %has_level = core.call intrinsic.is_not_none(%current_level)
+      core.if %has_level {
+        core.set %config["thinkingTokenBudget"] = %current_level
+      }
+      core.set %request["model_config"] = %config
+      core.set %request["chat_prompt"] = %messages
+      %result = core.map
+      core.set %result["request"] = %request
+      core.set %result["level"] = %current_level
+      core.set %result["applied"] = %applied
+      core.return %result
+    }
+  }
+
+  op ax.gen.semantic @chat_session_create_state {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    tag "src/ax/dsp/chatSession.ts"
+    type signature = "(model:string, path:string, max_steps:json) -> json"
+    body @entry(%model: string, %path: string, %max_steps: json) {
+      %state = core.map
+      %pending = core.map
+      %responses = core.map
+      %updates = core.map
+      core.set %state["model"] = %model
+      core.set %state["path"] = %path
+      core.set %state["max_steps"] = %max_steps
+      core.set %state["steps"] = 0
+      core.set %state["version"] = 0
+      core.set %state["pending"] = %pending
+      core.set %state["responses"] = %responses
+      core.set %state["updates"] = %updates
+      core.set %state["boundary"] = false
+      core.set %state["terminal"] = false
+      // The session's turns as prompt messages, as TS's memory records them:
+      // each response it continues from, and each tool result. A later
+      // request's prompt includes them.
+      %turns = core.list
+      core.set %state["turns"] = %turns
+      core.return %state
+    }
+  }
+
+  op ax.gen.semantic @chat_session_target_matches {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    tag "src/ax/dsp/runControl.ts"
+    type signature = "(target:string, path:string) -> bool"
+    body @entry(%target: string, %path: string) {
+      %exact = core.call intrinsic.eq(%target, %path)
+      %prefix = core.call intrinsic.string.format("{}/", %target)
+      %descendant = core.call intrinsic.string.starts_with(%path, %prefix)
+      %matches = core.call intrinsic.or(%exact, %descendant)
+      core.return %matches
+    }
+  }
+
+  op ax.gen.semantic @chat_session_unresolved {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    tag "src/ax/dsp/chatSession.ts"
+    type signature = "(state:json) -> list<json>"
+    body @entry(%state: json) {
+      %out = core.list
+      %pending = core.get %state["pending"]
+      %ids = core.call intrinsic.map.keys(%pending)
+      core.for %id in %ids {
+        %call = core.get %pending[%id]
+        %status = core.get %call["status"]
+        %sent = core.call intrinsic.eq(%status, "sent")
+        %unresolved = core.call intrinsic.not(%sent)
+        core.if %unresolved {
+          core.append %out, %id
+        }
+      }
+      core.return %out
+    }
+  }
+
+  op ax.gen.semantic @chat_session_register_call {
+    attr core_kind = "func"
+    attr effect = "throws"
+    attr emit_module = "gen"
+    tag "src/ax/dsp/chatSession.ts"
+    type signature = "(state:json, call:json, execution:string) -> bool throws"
+    body @entry(%state: json, %call: json, %execution: string) {
+      %terminal = core.get %state["terminal"] default false
+      core.if %terminal {
+        core.return false
+      }
+      %id = core.get %call["id"] default ""
+      %missing = core.call intrinsic.eq(%id, "")
+      core.if %missing {
+        core.raise "Completed tool calls require a call ID"
+      }
+      %pending = core.get %state["pending"]
+      %exists = core.call intrinsic.map.contains(%pending, %id)
+      core.if %exists {
+        core.return false
+      }
+      %record = core.map
+      core.set %record["call"] = %call
+      core.set %record["execution"] = %execution
+      core.set %record["status"] = "running"
+      core.set %pending[%id] = %record
+      core.set %state["pending"] = %pending
+      core.return true
+    }
+  }
+
+  op ax.gen.semantic @chat_session_result {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    type signature = "(response:json, id:string) -> json"
+    body @entry(%response: json, %id: string) {
+      %empty = core.map
+      %response = core.call intrinsic.map.merge(%response, %empty)
+      core.set %response["__session_response_id"] = %id
+      core.return %response
+    }
+  }
+
+  op ax.gen.semantic @chat_session_record_response {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    tag "src/ax/dsp/chatSession.ts"
+    type signature = "(gen:json, state:json, request:json, completion:json) -> void"
+    body @entry(%gen: json, %state: json, %request: json, %completion: json) {
+      // A response the session continues from goes into memory and the chat
+      // log, and into the session's turns: an assistant message with its
+      // text and tool calls. TS keeps no message for an empty response.
+      core.call intrinsic.axgen.memory_add_response(%gen, %request, %completion)
+      core.call intrinsic.axgen.record_chat_log(%gen, %request, %completion)
+      %empty_turns = core.list
+      %turns = core.get %state["turns"] default %empty_turns
+      %calls = core.call @response_function_calls_impl(%completion)
+      %call_count = core.call intrinsic.len(%calls)
+      %has_calls = core.call intrinsic.gt(%call_count, 0)
+      core.if %has_calls {
+        %turns = core.call @append_tool_call_messages_impl(%turns, %completion, %calls)
+      } else {
+        %content = core.get %completion["content"] default ""
+        %has_content = core.call intrinsic.truthy(%content)
+        core.if %has_content {
+          %message = core.map
+          core.set %message["role"] = "assistant"
+          core.set %message["content"] = %content
+          core.append %turns, %message
+        }
+      }
+      core.set %state["turns"] = %turns
+      core.return
+    }
+  }
+
+  op ax.gen.semantic @chat_session_step_limit_error {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    tag "src/ax/dsp/chatSession.ts"
+    type signature = "(state:json) -> error"
+    body @entry(%state: json) {
+      // axRunChatSession at its response budget: the session makes no more
+      // responses, and the run fails. TS submits the results that are ready
+      // first, so only calls still running count; it then waits for those,
+      // where a port reports them as unresolved.
+      %running = core.list
+      %empty_pending = core.map
+      %pending = core.get %state["pending"] default %empty_pending
+      %pending_ids = core.call intrinsic.map.keys(%pending)
+      core.for %pending_id in %pending_ids {
+        %record = core.get %pending[%pending_id]
+        %status = core.get %record["status"]
+        %is_running = core.call intrinsic.eq(%status, "running")
+        core.if %is_running {
+          core.append %running, %pending_id
+        }
+      }
+      %count = core.call intrinsic.len(%running)
+      %ids = core.call intrinsic.string.join(", ", %running)
+      %no_ids = core.call intrinsic.eq(%ids, "")
+      core.if %no_ids {
+        %ids = core.let "none"
+      }
+      %message = core.call intrinsic.string.format("Chat session failed: Maximum steps reached with unincorporated tool results ({}); unresolved calls: {}", %count, %ids)
+      %error = core.call intrinsic.error.runtime(%message)
+      core.return %error
+    }
+  }
+
+  op ax.gen.semantic @chat_session_final_result {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    tag "src/ax/dsp/chatSession.ts"
+    type signature = "(state:json, response:json) -> json"
+    body @entry(%state: json, %response: json) {
+      // The session's final response, carrying the turns before it for the
+      // request's prompt.
+      %id = core.get %state["response_id"] default ""
+      %result = core.call @chat_session_result(%response, %id)
+      %empty_turns = core.list
+      %turns = core.get %state["turns"] default %empty_turns
+      core.set %result["__session_turns"] = %turns
+      core.return %result
+    }
+  }
+
+  op ax.gen.semantic @chat_session_completion {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    type signature = "(response:json, id:string) -> json"
+    body @entry(%response: json, %id: string) {
+      %completion = core.call @chat_response_to_completion(%response)
+      core.set %completion["remote_id"] = %id
+      core.return %completion
+    }
+  }
+
+  op ax.gen.semantic @chat_session_has_continuation_work {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    type signature = "(state:json) -> bool"
+    body @entry(%state: json) {
+      %pending = core.call @chat_session_unresolved(%state)
+      %pending = core.call intrinsic.truthy(%pending)
+      %native_wait = core.call @chat_session_native_wait(%state)
+      %continuation = core.get %state["needs_continuation"] default false
+      %work = core.call intrinsic.or(%pending, %native_wait)
+      %work = core.call intrinsic.or(%work, %continuation)
+      core.return %work
+    }
+  }
+
+  op ax.gen.semantic @chat_session_normalize_call {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    tag "src/ax/dsp/chatSession.ts"
+    type signature = "(call:json) -> json"
+    body @entry(%call: json) {
+      %function = core.get %call["function"]
+      %missing = core.call intrinsic.is_none(%function)
+      core.if %missing {
+        %call = core.call @completion_call_to_chat_impl(%call)
+        %function = core.get %call["function"]
+      }
+      %name = core.get %function["name"]
+      %params = core.get %function["params"]
+      core.set %call["name"] = %name
+      core.set %call["params"] = %params
+      core.return %call
+    }
+  }
+
+  op ax.gen.semantic @chat_session_defer_final_call {
+    attr core_kind = "func"
+    attr effect = "throws"
+    attr emit_module = "gen"
+    tag "src/ax/dsp/chatSession.ts"
+    type signature = "(state:json, call:json) -> bool throws"
+    body @entry(%state: json, %call: json) {
+      %unresolved = core.call @chat_session_unresolved(%state)
+      %pending = core.call intrinsic.truthy(%unresolved)
+      %updates = core.get %state["needs_continuation"] default false
+      %defer = core.call intrinsic.or(%pending, %updates)
+      core.if %defer {
+        %registered = core.call @chat_session_register_call(%state, %call, "blocking")
+        core.if %registered {
+          %id = core.get %call["id"]
+          %result = core.map
+          core.set %result["function_id"] = %id
+          core.set %result["result"] = "Not executed: incorporate the background tool results and queued updates before calling this finalization function again."
+          core.call @chat_session_complete_call(%state, %id, %result)
+        }
+        core.return %registered
+      }
+      core.return false
+    }
+  }
+
+  op ax.gen.semantic @chat_session_complete_call {
+    attr core_kind = "func"
+    attr effect = "throws"
+    attr emit_module = "gen"
+    tag "src/ax/dsp/chatSession.ts"
+    type signature = "(state:json, id:string, result:json) -> bool throws"
+    body @entry(%state: json, %id: string, %result: json) {
+      %terminal = core.get %state["terminal"] default false
+      core.if %terminal {
+        core.return false
+      }
+      %pending = core.get %state["pending"]
+      %exists = core.call intrinsic.map.contains(%pending, %id)
+      %missing = core.call intrinsic.not(%exists)
+      core.if %missing {
+        core.raise "Tool result has no registered call"
+      }
+      %record = core.get %pending[%id]
+      %status = core.get %record["status"]
+      %running = core.call intrinsic.eq(%status, "running")
+      core.if %running {
+        core.set %record["result"] = %result
+        core.set %record["status"] = "ready"
+        core.set %pending[%id] = %record
+        core.set %state["pending"] = %pending
+        core.return true
+      }
+      core.return false
+    }
+  }
+
+  op ax.gen.semantic @chat_session_complete_response {
+    attr core_kind = "func"
+    attr effect = "throws"
+    attr emit_module = "gen"
+    tag "src/ax/dsp/chatSession.ts"
+    type signature = "(state:json, id:string) -> bool throws"
+    body @entry(%state: json, %id: string) {
+      %terminal = core.get %state["terminal"] default false
+      core.if %terminal {
+        core.return false
+      }
+      %responses = core.get %state["responses"]
+      %duplicate = core.call intrinsic.map.contains(%responses, %id)
+      core.if %duplicate {
+        core.return false
+      }
+      %steps = core.get %state["steps"] default 0
+      %limit = core.get %state["max_steps"]
+      %exhausted = core.call intrinsic.gte(%steps, %limit)
+      core.if %exhausted {
+        %limit_error = core.call @chat_session_step_limit_error(%state)
+        core.raise %limit_error
+      }
+      %next = core.call intrinsic.add(%steps, 1)
+      core.set %responses[%id] = true
+      core.set %state["responses"] = %responses
+      core.set %state["response_id"] = %id
+      core.set %state["steps"] = %next
+      core.set %state["boundary"] = true
+      %updates = core.get %state["updates"]
+      %update_ids = core.call intrinsic.map.keys(%updates)
+      %had_successor = core.let false
+      core.for %update_id in %update_ids {
+        %record = core.get %updates[%update_id]
+        %parent = core.get %record["native_parent"]
+        %has_parent = core.call intrinsic.is_not_none(%parent)
+        %successor = core.call intrinsic.ne(%parent, %id)
+        %finished = core.call intrinsic.and(%has_parent, %successor)
+        core.if %finished {
+          %had_successor = core.let true
+          core.set %record["native_state"] = "done"
+          core.set %updates[%update_id] = %record
+        }
+      }
+      core.set %state["updates"] = %updates
+      core.if %had_successor {
+        %queued = core.call @chat_session_has_queued_updates(%state)
+        core.set %state["needs_continuation"] = %queued
+      }
+      core.return true
+    }
+  }
+
+  op ax.gen.semantic @chat_session_has_queued_updates {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    type signature = "(state:json) -> bool"
+    body @entry(%state: json) {
+      %updates = core.get %state["updates"]
+      %ids = core.call intrinsic.map.keys(%updates)
+      core.for %id in %ids {
+        %record = core.get %updates[%id]
+        %status = core.get %record["status"]
+        %queued = core.call intrinsic.eq(%status, "queued")
+        core.if %queued {
+          core.return true
+        }
+      }
+      core.return false
+    }
+  }
+
+  op ax.gen.semantic @chat_session_native_update {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    type signature = "(state:json, id:string) -> bool"
+    body @entry(%state: json, %id: string) {
+      %terminal = core.get %state["terminal"] default false
+      core.if %terminal {
+        core.return false
+      }
+      %updates = core.get %state["updates"]
+      %record = core.get %updates[%id]
+      %native_state = core.get %record["native_state"]
+      %new_native = core.call intrinsic.is_none(%native_state)
+      core.if %new_native {
+        core.set %record["native_state"] = "awaiting_ack"
+        %responses = core.get %state["responses"]
+        %empty_baseline = core.map
+        %baseline = core.call intrinsic.map.merge(%empty_baseline, %responses)
+        core.set %record["native_responses"] = %baseline
+        core.set %updates[%id] = %record
+        core.set %state["updates"] = %updates
+      }
+      core.return %new_native
+    }
+  }
+
+  op ax.gen.semantic @chat_session_native_wait {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    type signature = "(state:json) -> bool"
+    body @entry(%state: json) {
+      %updates = core.get %state["updates"]
+      %ids = core.call intrinsic.map.keys(%updates)
+      core.for %id in %ids {
+        %record = core.get %updates[%id]
+        %native_state = core.get %record["native_state"]
+        %has_native = core.call intrinsic.is_not_none(%native_state)
+        core.if %has_native {
+          %status = core.get %record["status"]
+          %queued = core.call intrinsic.eq(%status, "queued")
+          %successor = core.call intrinsic.eq(%native_state, "awaiting_successor")
+          %waiting = core.call intrinsic.or(%queued, %successor)
+          core.if %waiting {
+            core.return true
+          }
+        }
+      }
+      core.return false
+    }
+  }
+
+  op ax.gen.semantic @chat_session_native_event {
+    attr core_kind = "func"
+    attr effect = "throws"
+    attr emit_module = "gen"
+    type signature = "(state:json, event:json) -> json throws"
+    body @entry(%state: json, %event: json) {
+      %result = core.map
+      core.set %result["changed"] = false
+      %terminal = core.get %state["terminal"] default false
+      core.if %terminal {
+        core.return %result
+      }
+      %status = core.get %event["status"]
+      %failed = core.call intrinsic.eq(%status, "failed")
+      core.if %failed {
+        %error = core.get %event["error"] default "Provider rejected steering"
+        core.raise %error
+      }
+      %updates = core.get %state["updates"]
+      %ids = core.call intrinsic.map.keys(%updates)
+      %steer_id = core.get %event["steer_id"]
+      %selected = core.call intrinsic.none()
+      core.for %id in %ids {
+        %record = core.get %updates[%id]
+        %record_steer = core.get %record["steer_id"]
+        %same = core.call intrinsic.eq(%record_steer, %steer_id)
+        %has_steer = core.call intrinsic.is_not_none(%steer_id)
+        %matches = core.call intrinsic.and(%same, %has_steer)
+        core.if %matches {
+          %selected = core.let %id
+        }
+      }
+      %missing = core.call intrinsic.is_none(%selected)
+      core.if %missing {
+        core.for %id in %ids {
+          %record = core.get %updates[%id]
+          %native_state = core.get %record["native_state"]
+          %record_steer = core.get %record["steer_id"]
+          %waiting = core.call intrinsic.eq(%native_state, "awaiting_ack")
+          %unassigned = core.call intrinsic.is_none(%record_steer)
+          %missing = core.call intrinsic.is_none(%selected)
+          %candidate = core.call intrinsic.and(%waiting, %unassigned)
+          %choose_record = core.call intrinsic.and(%missing, %candidate)
+          core.if %choose_record {
+            %selected = core.let %id
+          }
+        }
+      }
+      %found = core.call intrinsic.is_not_none(%selected)
+      core.if %found {
+        %record = core.get %updates[%selected]
+        core.set %record["steer_id"] = %steer_id
+        %parent = core.get %event["response_id"]
+        core.set %record["native_parent"] = %parent
+        %native_state = core.get %record["native_state"]
+        %empty_map = core.map
+        %baseline = core.get %record["native_responses"] default %empty_map
+        %responses = core.get %state["responses"]
+        %response_ids = core.call intrinsic.map.keys(%responses)
+        core.for %response_id in %response_ids {
+          %old_response = core.call intrinsic.map.contains(%baseline, %response_id)
+          %new_response = core.call intrinsic.not(%old_response)
+          %not_parent = core.call intrinsic.ne(%response_id, %parent)
+          %successor_seen = core.call intrinsic.and(%new_response, %not_parent)
+          core.if %successor_seen {
+            %native_state = core.let "done"
+            core.set %record["native_state"] = "done"
+          }
+        }
+        %pending_status = core.call intrinsic.eq(%status, "pending")
+        %done = core.call intrinsic.eq(%native_state, "done")
+        %not_done = core.call intrinsic.not(%done)
+        %pending = core.call intrinsic.and(%pending_status, %not_done)
+        core.if %pending {
+          %changed_state = core.call intrinsic.ne(%native_state, "pending_input")
+          core.set %record["native_state"] = "pending_input"
+          %empty = core.list
+          %required = core.get %event["required_call_ids"] default %empty
+          %old_required = core.get %record["required_call_ids"] default %empty
+          %changed_ids = core.call intrinsic.ne(%required, %old_required)
+          %changed = core.call intrinsic.or(%changed_state, %changed_ids)
+          core.set %record["required_call_ids"] = %required
+          core.set %state["needs_continuation"] = true
+          core.set %result["changed"] = %changed
+        } else {
+          %accepted = core.call intrinsic.eq(%status, "accepted")
+          core.if %accepted {
+            %record_status = core.get %record["status"]
+            %queued = core.call intrinsic.eq(%record_status, "queued")
+            core.if %queued {
+              %pending_input = core.call intrinsic.eq(%native_state, "pending_input")
+              %done = core.call intrinsic.eq(%native_state, "done")
+              %settled = core.call intrinsic.or(%pending_input, %done)
+              %await_successor = core.call intrinsic.not(%settled)
+              core.if %await_successor {
+                core.set %record["native_state"] = "awaiting_successor"
+              }
+              core.set %record["status"] = "applied"
+              %version = core.get %state["version"] default 0
+              %version = core.call intrinsic.add(%version, 1)
+              core.set %state["version"] = %version
+              core.set %result["changed"] = true
+              core.set %result["applied_id"] = %selected
+            }
+          }
+        }
+        core.set %updates[%selected] = %record
+        core.set %state["updates"] = %updates
+        %accepted = core.call intrinsic.eq(%status, "accepted")
+        %native_state = core.get %record["native_state"]
+        %pending_input = core.call intrinsic.eq(%native_state, "pending_input")
+        %not_pending = core.call intrinsic.not(%pending_input)
+        %can_clear = core.call intrinsic.and(%accepted, %not_pending)
+        core.if %can_clear {
+          %queued = core.call @chat_session_has_queued_updates(%state)
+          core.set %state["needs_continuation"] = %queued
+        }
+      }
+      core.return %result
+    }
+  }
+
+  op ax.gen.semantic @chat_session_boundary_action {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    tag "src/ax/dsp/chatSession.ts"
+    type signature = "(state:json) -> json"
+    body @entry(%state: json) {
+      %action = core.map
+      core.set %action["type"] = "wait"
+      %terminal = core.get %state["terminal"] default false
+      core.if %terminal {
+        core.set %action["type"] = "closed"
+        core.return %action
+      }
+      %native_wait = core.call @chat_session_native_wait(%state)
+      core.if %native_wait {
+        core.return %action
+      }
+      %boundary = core.get %state["boundary"] default false
+      %active = core.call intrinsic.not(%boundary)
+      core.if %active {
+        core.return %action
+      }
+      %pending = core.get %state["pending"]
+      %ids = core.call intrinsic.map.keys(%pending)
+      %results = core.list
+      %running = core.let false
+      %blocking = core.let false
+      core.for %id in %ids {
+        %record = core.get %pending[%id]
+        %status = core.get %record["status"]
+        %is_running = core.call intrinsic.eq(%status, "running")
+        %execution = core.get %record["execution"]
+        %is_blocking = core.call intrinsic.eq(%execution, "blocking")
+        %running_barrier = core.call intrinsic.and(%is_running, %is_blocking)
+        %blocking = core.call intrinsic.or(%blocking, %running_barrier)
+        %running = core.call intrinsic.or(%running, %is_running)
+        %ready = core.call intrinsic.eq(%status, "ready")
+        core.if %ready {
+          %result = core.get %record["result"]
+          core.append %results, %result
+        }
+      }
+      core.if %blocking {
+        core.return %action
+      }
+      %has_results = core.call intrinsic.truthy(%results)
+      core.if %has_results {
+        core.set %action["type"] = "submit"
+        core.set %action["results"] = %results
+        core.return %action
+      }
+      core.if %running {
+        core.return %action
+      }
+      %needs_continuation = core.get %state["needs_continuation"] default false
+      core.if %needs_continuation {
+        core.set %action["type"] = "continue"
+      } else {
+        core.set %action["type"] = "validate"
+      }
+      core.return %action
+    }
+  }
+
+  op ax.gen.semantic @chat_session_mark_submitted {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    tag "src/ax/dsp/chatSession.ts"
+    type signature = "(state:json, ids:list<json>) -> void"
+    body @entry(%state: json, %ids: list<json>) {
+      %pending = core.get %state["pending"]
+      core.for %id in %ids {
+        %record = core.get %pending[%id]
+        core.set %record["status"] = "sent"
+        core.set %pending[%id] = %record
+      }
+      core.set %state["pending"] = %pending
+      core.set %state["boundary"] = false
+      core.set %state["needs_continuation"] = false
+      core.return
+    }
+  }
+
+  op ax.gen.semantic @chat_session_queue_update {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    tag "src/ax/dsp/runControl.ts"
+    type signature = "(state:json, update:json) -> bool"
+    body @entry(%state: json, %update: json) {
+      %terminal = core.get %state["terminal"] default false
+      core.if %terminal {
+        core.return false
+      }
+      %target = core.get %update["target"] default "root"
+      %path = core.get %state["path"]
+      %matches = core.call @chat_session_target_matches(%target, %path)
+      %unmatched = core.call intrinsic.not(%matches)
+      core.if %unmatched {
+        core.return false
+      }
+      %id = core.get %update["id"]
+      %updates = core.get %state["updates"]
+      %exists = core.call intrinsic.map.contains(%updates, %id)
+      core.if %exists {
+        core.return false
+      }
+      %record = core.map
+      core.set %record["update"] = %update
+      core.set %record["status"] = "queued"
+      core.set %updates[%id] = %record
+      core.set %state["updates"] = %updates
+      core.set %state["needs_continuation"] = true
+      core.return true
+    }
+  }
+
+  op ax.gen.semantic @chat_session_record_unresolved {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    attr effect = "throws"
+    type signature = "(gen:json, state:json) -> void throws"
+    body @entry(%gen: json, %state: json) {
+      %pending = core.get %state["pending"]
+      %ids = core.call intrinsic.map.keys(%pending)
+      core.for %id in %ids {
+        %record = core.get %pending[%id]
+        %status = core.get %record["status"]
+        %running = core.call intrinsic.eq(%status, "running")
+        %recorded = core.get %record["diagnostic_recorded"] default false
+        %not_recorded = core.call intrinsic.not(%recorded)
+        %needed = core.call intrinsic.and(%running, %not_recorded)
+        core.if %needed {
+          %call = core.get %record["call"]
+          %message = core.let "Run closed before the started tool settled; its external effects may still complete"
+          core.call intrinsic.axgen.record_function_call(%gen, %call, %message, "unresolved")
+          core.set %record["diagnostic_recorded"] = true
+          core.set %pending[%id] = %record
+        }
+      }
+      core.set %state["pending"] = %pending
+      core.return
+    }
+  }
+
+  op ax.gen.semantic @chat_session_close_state {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    tag "src/ax/dsp/chatSession.ts"
+    type signature = "(state:json) -> list<json>"
+    body @entry(%state: json) {
+      core.set %state["terminal"] = true
+      %unresolved = core.call @chat_session_unresolved(%state)
+      core.return %unresolved
+    }
+  }
+  op ax.gen.semantic @chat_session_transition {
+    attr core_kind = "func"
+    attr effect = "throws"
+    attr emit_module = "gen"
+    tag "src/ax/dsp/chatSession.ts"
+    type signature = "(state:json, event:json) -> json throws"
+    body @entry(%state: json, %event: json) {
+      %type = core.get %event["type"]
+      %call = core.call intrinsic.eq(%type, "tool.validated")
+      %result = core.call intrinsic.eq(%type, "tool.result")
+      %response = core.call intrinsic.eq(%type, "response.completed")
+      %update = core.call intrinsic.eq(%type, "update.queued")
+      %submitted = core.call intrinsic.eq(%type, "results.submitted")
+      %closed = core.call intrinsic.eq(%type, "closed")
+      %validated = core.call intrinsic.eq(%type, "validated")
+      %applied = core.call intrinsic.eq(%type, "update.applied")
+      %changed = core.let false
+      %native_queued = core.call intrinsic.eq(%type, "native.queued")
+      core.if %native_queued {
+        %id = core.get %event["id"]
+        %changed = core.call @chat_session_native_update(%state, %id)
+        %action = core.call @chat_session_boundary_action(%state)
+        core.set %action["changed"] = %changed
+        core.return %action
+      }
+      %steering = core.call intrinsic.eq(%type, "steering")
+      core.if %steering {
+        %change = core.call @chat_session_native_event(%state, %event)
+        %action = core.call @chat_session_boundary_action(%state)
+        %action = core.call intrinsic.map.merge(%action, %change)
+        core.return %action
+      }
+      %final_call = core.call intrinsic.eq(%type, "tool.final")
+      core.if %final_call {
+        %tool_call = core.get %event["call"]
+        %changed = core.call @chat_session_defer_final_call(%state, %tool_call)
+        %action = core.call @chat_session_boundary_action(%state)
+        core.set %action["changed"] = %changed
+        core.return %action
+      }
+      core.if %call {
+        %tool_call = core.get %event["call"]
+        %execution = core.get %event["execution"] default "blocking"
+        %changed = core.call @chat_session_register_call(%state, %tool_call, %execution)
+      } else {
+        core.if %result {
+          %id = core.get %event["id"]
+          %value = core.get %event["result"]
+          %changed = core.call @chat_session_complete_call(%state, %id, %value)
+        } else {
+          core.if %response {
+            %id = core.get %event["id"]
+            %changed = core.call @chat_session_complete_response(%state, %id)
+          } else {
+            core.if %update {
+              %item = core.get %event["update"]
+              %changed = core.call @chat_session_queue_update(%state, %item)
+            } else {
+              core.if %submitted {
+                %ids = core.get %event["ids"]
+                core.call @chat_session_mark_submitted(%state, %ids)
+                %changed = core.let true
+              } else {
+                core.if %closed {
+                  core.call @chat_session_close_state(%state)
+                  %changed = core.let true
+                } else {
+                  core.if %validated {
+                    %action = core.call @chat_session_boundary_action(%state)
+                    %action_type = core.get %action["type"]
+                    %ready = core.call intrinsic.eq(%action_type, "validate")
+                    %not_ready = core.call intrinsic.not(%ready)
+                    core.if %not_ready {
+                      core.raise "Cannot finalize while model or tool work is unresolved"
+                    }
+                    core.set %state["terminal"] = true
+                    %changed = core.let true
+                  } else {
+                    core.if %applied {
+                      %id = core.get %event["id"]
+                      %updates = core.get %state["updates"]
+                      %exists = core.call intrinsic.map.contains(%updates, %id)
+                      core.if %exists {
+                        %record = core.get %updates[%id]
+                        %status = core.get %record["status"]
+                        %queued = core.call intrinsic.eq(%status, "queued")
+                        core.if %queued {
+                          core.set %record["status"] = "applied"
+                          core.set %updates[%id] = %record
+                          core.set %state["updates"] = %updates
+                          %item = core.get %record["update"]
+                          %kind = core.get %item["type"]
+                          %steer = core.call intrinsic.eq(%kind, "steer")
+                          core.if %steer {
+                            %version = core.get %state["version"] default 0
+                            %next_version = core.call intrinsic.add(%version, 1)
+                            core.set %state["version"] = %next_version
+                          }
+                          %changed = core.let true
+                        }
+                      }
+                    } else {
+                      core.raise "Unknown chat session transition"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      %action = core.call @chat_session_boundary_action(%state)
+      core.set %action["changed"] = %changed
+      core.return %action
+    }
+  }
+
+  op ax.gen.semantic @chat_session_tool_argument_errors {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    tag "source:src/ax/dsp/toolArguments.ts#axValidateToolArguments"
+    type signature = "(schema:json, arguments:json) -> json throws"
+    body @entry(%schema: json, %arguments: json) {
+      // TS's axValidateToolArguments failures ({field, message}), none when
+      // there is no schema.
+      %empty = core.list
+      %no_schema = core.call intrinsic.is_none(%schema)
+      core.if %no_schema {
+        core.return %empty
+      }
+      %errors = core.call @chat_session_argument_errors(%schema, %schema, %arguments, "", 0)
+      core.return %errors
+    }
+  }
+
+  op ax.gen.semantic @chat_session_tool_argument_error {
+    attr core_kind = "func"
+    attr emit_module = "gen"
+    tag "source:src/ax/dsp/functions.ts#FunctionError.getFixingInstructions"
+    type signature = "(name:string, schema:json, arguments:json) -> json throws"
+    body @entry(%name: string, %schema: json, %arguments: json) {
+      // A chat session's result for a call whose arguments fail the tool's
+      // schema, as TS's FunctionError.getFixingInstructions writes it; null
+      // when they pass. Each field shows the schema's description of a
+      // top-level property (with its allowed values), as TS does.
+      %errors = core.call @chat_session_tool_argument_errors(%schema, %arguments)
+      %count = core.call intrinsic.len(%errors)
+      %valid = core.call intrinsic.eq(%count, 0)
+      core.if %valid {
+        %nothing = core.call intrinsic.none()
+        core.return %nothing
+      }
+      %empty = core.map
+      %properties = core.get %schema["properties"] default %empty
+      %properties_map = core.type_is %properties type "object"
+      core.if %properties_map {
+      } else {
+        %properties = core.let %empty
+      }
+      %bullets = core.list
+      core.for %failure in %errors {
+        %field = core.get %failure["field"] default "arguments"
+        %message = core.get %failure["message"] default ""
+        %description = core.let ""
+        %property = core.get %properties[%field] default null
+        %property_map = core.type_is %property type "object"
+        core.if %property_map {
+          // TS: description, then " Allowed values are: <enum>" (an absent
+          // description reads "undefined" there).
+          %has_description = core.call intrinsic.map.contains(%property, "description")
+          %property_description = core.get %property["description"] default ""
+          %description = core.call intrinsic.string.str(%property_description)
+          %enum_values = core.get %property["enum"] default null
+          %enum_list = core.type_is %enum_values type "list"
+          core.if %enum_list {
+            %enum_count = core.call intrinsic.len(%enum_values)
+            %has_enum = core.call intrinsic.gt(%enum_count, 0)
+            core.if %has_enum {
+              core.if %has_description {
+              } else {
+                %description = core.let "undefined"
+              }
+              %enum_texts = core.list
+              core.for %enum_value in %enum_values {
+                %enum_null = core.call intrinsic.is_none(%enum_value)
+                %enum_text = core.let ""
+                core.if %enum_null {
+                } else {
+                  %enum_text = core.call intrinsic.string.str(%enum_value)
+                }
+                core.append %enum_texts, %enum_text
+              }
+              %enum_joined = core.call intrinsic.string.join(", ", %enum_texts)
+              %description = core.call intrinsic.string.format("{} Allowed values are: {}", %description, %enum_joined)
+            }
+          }
+        }
+        %bullet = core.call intrinsic.string.format("- `{}` - {} ({}).", %field, %message, %description)
+        core.append %bullets, %bullet
+      }
+      %joined = core.call intrinsic.string.join("\n", %bullets)
+      %text = core.call intrinsic.string.format("Errors In Function Arguments: Fix the following invalid arguments to '{}'\n{}", %name, %joined)
+      core.return %text
+    }
+  }
+}
