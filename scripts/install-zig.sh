@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-version="${ZIG_VERSION:-0.16.0}"
+version="${ZIG_VERSION:-0.17.1}"
 install_root="${ZIG_INSTALL_ROOT:-/tmp/axllm-c-zig}"
 os="$(uname -s)"
 arch="$(uname -m)"
@@ -9,19 +9,19 @@ arch="$(uname -m)"
 case "$os:$arch" in
   Linux:x86_64)
     name="zig-x86_64-linux-$version"
-    sha256="70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
+    sha256="3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a"
     ;;
   Linux:aarch64|Linux:arm64)
     name="zig-aarch64-linux-$version"
-    sha256="ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17"
+    sha256="a1546d5646eb184437918d6635ca6b762a0e889eac09cef720ee7a1ed3fe7795"
     ;;
   Darwin:x86_64)
     name="zig-x86_64-macos-$version"
-    sha256="0387557ed1877bc6a2e1802c8391953baddba76081876301c522f52977b52ba7"
+    sha256="9af07b20319fbd0c92ee46ad23e81d6a782b1aaea2cfb8dcbff35f1d2c7ddbb7"
     ;;
   Darwin:arm64|Darwin:aarch64)
     name="zig-aarch64-macos-$version"
-    sha256="b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489"
+    sha256="75f1bc7a1e9852f17ec9a0c1895f767c4ec56d46bc8a834920eece1d0359dd8d"
     ;;
   *)
     echo "unsupported Zig host: $os $arch" >&2
