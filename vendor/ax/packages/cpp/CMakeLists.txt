@@ -72,6 +72,7 @@ if(AX_BUILD_EXAMPLES)
   foreach(example
     signature_schema
     c_signature_schema
+    c_abi_surface
     model_catalog
     axgen_scripted_client_tool
     axgen_streaming_no_key

@@ -20,4 +20,8 @@ grep -q 'axllm/axllm_c.h' "$tmp/vendor/ax/tools/axir/internal/axir/codegen.go"
 grep -q 'var cppCHeader string' "$tmp/vendor/ax/tools/axir/internal/axir/templates_embed.go"
 grep -q 'axllm/axllm_c.cpp' "$tmp/vendor/ax/tools/axir/internal/axir/templates/package/cppCMakeLists.cmake"
 
+grep -q 'var cppCAbiSurfaceExample string' "$tmp/vendor/ax/tools/axir/internal/axir/templates_embed.go"
+grep -q 'examples/c_abi_surface.cpp' "$tmp/vendor/ax/tools/axir/internal/axir/codegen.go"
+grep -q 'c_abi_surface' "$tmp/vendor/ax/tools/axir/internal/axir/templates/package/cppCMakeLists.cmake"
+
 echo "overlay test ok"
