@@ -13,7 +13,7 @@ function patchEmbeds(file) {
   let s = readFileSync(file, 'utf8');
   s = insertAfterLine(s,
     'var cppConformance string',
-    '\n//go:embed templates/cpp/cppCHeader.h\nvar cppCHeader string\n\n//go:embed templates/cpp/cppCSignatureSchemaExample.cpp\nvar cppCSignatureSchemaExample string\n\n//go:embed templates/cpp/cppCSource.cpp\nvar cppCSource string\n'
+    '\n//go:embed templates/cpp/cppCHeader.h\nvar cppCHeader string\n\n//go:embed templates/cpp/cppCAbiSurfaceExample.cpp\nvar cppCAbiSurfaceExample string\n\n//go:embed templates/cpp/cppCSignatureSchemaExample.cpp\nvar cppCSignatureSchemaExample string\n\n//go:embed templates/cpp/cppCSource.cpp\nvar cppCSource string\n'
   );
   writeFileSync(file, s);
 }
@@ -26,7 +26,7 @@ function patchCodegen(file) {
   );
   s = insertAfterLine(s,
     '\t\t"examples/signature_schema.cpp":                         cppSignatureSchemaExample,',
-    '\t\t"examples/c_signature_schema.cpp":                       cppCSignatureSchemaExample,\n'
+    '\t\t"examples/c_signature_schema.cpp":                       cppCSignatureSchemaExample,\n\t\t"examples/c_abi_surface.cpp":                            cppCAbiSurfaceExample,\n'
   );
   writeFileSync(file, s);
 }
@@ -37,7 +37,7 @@ function patchCmake(file) {
     'add_library(axllm axllm/axllm.cpp axllm/mcp.cpp)',
     'add_library(axllm axllm/axllm.cpp axllm/axllm_c.cpp axllm/mcp.cpp)'
   );
-  s = insertAfterLine(s, '  foreach(example\n    signature_schema', '    c_signature_schema\n');
+  s = insertAfterLine(s, '  foreach(example\n    signature_schema', '    c_signature_schema\n    c_abi_surface\n');
   s = replaceOnce(s,
     '  FILES_MATCHING PATTERN "*.hpp"\n)',
     '  FILES_MATCHING PATTERN "*.hpp" PATTERN "*.h"\n)'
