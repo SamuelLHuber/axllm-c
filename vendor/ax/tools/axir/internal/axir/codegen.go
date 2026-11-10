@@ -377,6 +377,7 @@ func EmitCpp(model AxRuntimeModel, outDir string) error {
 		"conformance-coverage.json":                             mustConformanceCoverageManifest(model, "cpp"),
 		"examples/signature_schema.cpp":                         cppSignatureSchemaExample,
 		"examples/c_signature_schema.cpp":                       cppCSignatureSchemaExample,
+		"examples/c_abi_surface.cpp":                            cppCAbiSurfaceExample,
 		"examples/model_catalog.cpp":                            cppModelCatalogExample,
 		"examples/axgen_scripted_client_tool.cpp":               cppAxGenScriptedClientToolExample,
 		"examples/axgen_streaming_no_key.cpp":                   cppAxGenStreamingNoKeyExample,

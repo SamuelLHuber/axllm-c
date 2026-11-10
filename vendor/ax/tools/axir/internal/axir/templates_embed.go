@@ -22,6 +22,9 @@ var cppConformance string
 //go:embed templates/cpp/cppCHeader.h
 var cppCHeader string
 
+//go:embed templates/cpp/cppCAbiSurfaceExample.cpp
+var cppCAbiSurfaceExample string
+
 //go:embed templates/cpp/cppCSignatureSchemaExample.cpp
 var cppCSignatureSchemaExample string
 
