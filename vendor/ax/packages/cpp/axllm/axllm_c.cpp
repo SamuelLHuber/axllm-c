@@ -276,7 +276,7 @@ extern "C" {
 
 /* ---- memory, errors, version ---- */
 
-const char* axllm_c_version(void) { return "25.4.9"; }
+const char* axllm_c_version(void) { return "25.4.10"; }
 
 char* axllm_c_string_dup(const char* value) {
   if (value == nullptr) return nullptr;
