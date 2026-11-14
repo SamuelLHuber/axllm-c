@@ -32,3 +32,8 @@ out="$(cd "$repo_root" && AXLLM_C_BASE_URL="http://127.0.0.1:$port/v1" OPENAI_AP
   zig run examples/zig/inference.zig -I dist -DAXLLM_ENABLE_CURL=1 "${sources[@]}" -lc++ -lcurl 2>&1)"
 echo "$out"
 grep -q 'zig inference via axllm-c: .*Paris' <<< "$out"
+
+# The live email-extraction sample needs OPENAI_API_KEY; CI only proves it builds.
+(cd "$repo_root" && zig build-exe examples/zig/email_extraction.zig -I dist -DAXLLM_ENABLE_CURL=1 \
+  "${sources[@]}" -lc++ -lcurl -femit-bin="$(mktemp -d)/email_extraction")
+echo "zig email extraction sample builds"
