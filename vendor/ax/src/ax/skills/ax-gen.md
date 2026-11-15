@@ -164,6 +164,7 @@ for await (const chunk of stream) {
 - A new version starts on a validation or refusal retry, and when a later step replaces output an earlier step already emitted (for example after a field processor's feedback); the thought so far is re-emitted in the new version. Versions never decrease.
 - In TypeScript, partial JSON repair preserves string text such as `, t`, `, n`, trailing punctuation, and commas before brackets inside strings. Structural repair applies outside strings so these fragments do not change into literals or repeat in merged deltas.
 - A streamed `code` field drops its fences wherever the chunks split: a fence that may still be incomplete is held back, as a partial label is, so the merged deltas equal the non-streaming value.
+- Text accompanying streamed tool calls is retained in the complete assistant history and in the content parsed by later text chunks.
 
 ## Stopping And Cancellation
 
@@ -536,6 +537,19 @@ gen.getChatLog(): readonly AxChatLogEntry[]
 ```
 
 ### getUsage()
+
+For Anthropic document citations, a `file` input accepts
+`{ source: { type: 'text', data }, title?, context?, citations: { enabled: true } }`
+as well as the other document source forms documented in `ax-ai.md`.
+Use a text signature; native structured JSON and document citations cannot be
+combined. Each round trip's `getChatLog()[i].textBlocks` retains the original
+output passages and their citations after both `forward()` and
+`streamingForward()`. Python, Java, C++, Go, and Rust accept the same document
+values. Their per-request log entries expose `text_blocks` with `result_index`
+and a flat `usage.citations` list. Log access is `get_chat_log()` in
+Python/C++/Rust, `getChatLog()` in Java, and `ChatLog` in Go.
+The TypeScript flat citation list in `getUsage()` retains source
+locations but does not replace these passage associations.
 
 Returns token usage aggregated by `(ai, model)` across all steps. When a provider reports prompt-cache usage, `promptTokens` is the uncached input portion and `cacheReadTokens` / `cacheCreationTokens` carry the cache counters. Reset with `resetUsage()`.
 

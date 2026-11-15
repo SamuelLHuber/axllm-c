@@ -19,6 +19,8 @@ import type {
   AxChatRequest,
   AxChatResponse,
   AxChatResponseResult,
+  AxChatResponseTextBlock,
+  AxCitation,
   AxInternalChatRequest,
   AxModelConfig,
   AxModelInfo,
@@ -26,6 +28,11 @@ import type {
   AxTokenUsage,
 } from '../types.js';
 import { resolveVertexAIHost } from '../vertex.js';
+import {
+  createAnthropicDocument,
+  getAnthropicDocument,
+  validateAnthropicDocuments,
+} from './documents.js';
 import { axModelInfoAnthropic } from './info.js';
 import {
   type AxAIAnthropicChatError,
@@ -100,6 +107,70 @@ function mapAnthropicErrorEvent(error: {
     return new AxAIServiceStatusError(status, error.type, '', undefined, error);
   }
   return new AxAIRefusalError(error.message);
+}
+
+/**
+ * Anthropic reports two families of citations. URL citations (web search) carry a
+ * `url`. Document citations (a PDF or plain-text document sent with the request)
+ * carry a `type` plus offsets into that document instead of a URL. Only the first
+ * family used to survive the response mapper, so `char_location`, `page_location`,
+ * and `content_block_location` citations never reached callers — even though the
+ * cited span is the whole point of enabling citations on a document.
+ */
+function mapAnthropicCitation(value: unknown): AxCitation | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const c = value as Record<string, unknown>;
+  const citation: AxCitation = {};
+
+  if (typeof c.url === 'string' && c.url.length > 0) {
+    citation.url = c.url;
+  }
+  if (typeof c.title === 'string') {
+    citation.title = c.title;
+  }
+  if (typeof c.cited_text === 'string') {
+    citation.snippet = c.cited_text;
+  }
+
+  const type = c.type;
+  if (
+    type === 'char_location' ||
+    type === 'page_location' ||
+    type === 'content_block_location'
+  ) {
+    citation.type = type;
+    if (typeof c.document_index === 'number') {
+      citation.documentIndex = c.document_index;
+    }
+    if (typeof c.document_title === 'string') {
+      citation.documentTitle = c.document_title;
+    }
+    if (typeof c.file_id === 'string') citation.fileId = c.file_id;
+    if (type === 'char_location') {
+      if (typeof c.start_char_index === 'number') {
+        citation.startCharIndex = c.start_char_index;
+      }
+      if (typeof c.end_char_index === 'number') {
+        citation.endCharIndex = c.end_char_index;
+      }
+    } else if (type === 'page_location') {
+      if (typeof c.start_page_number === 'number') {
+        citation.startPageNumber = c.start_page_number;
+      }
+      if (typeof c.end_page_number === 'number') {
+        citation.endPageNumber = c.end_page_number;
+      }
+    } else {
+      if (typeof c.start_block_index === 'number') {
+        citation.startBlockIndex = c.start_block_index;
+      }
+      if (typeof c.end_block_index === 'number') {
+        citation.endBlockIndex = c.end_block_index;
+      }
+    }
+  }
+
+  return citation.url || citation.type ? citation : undefined;
 }
 
 const isClaudeOpus47OrLater = (model: string): boolean =>
@@ -535,6 +606,14 @@ class AxAIAnthropicImpl
       taskBudget: config.taskBudget,
     } as AxModelConfig;
   }
+
+  validateChatReq = (
+    req: Readonly<
+      AxInternalChatRequest<AxAIAnthropicModel | AxAIAnthropicVertexModel>
+    >
+  ): void => {
+    validateAnthropicDocuments(req, this.isVertex);
+  };
 
   createChatReq = async (
     req: Readonly<
@@ -1033,25 +1112,32 @@ class AxAIAnthropicImpl
 
     // Collect citations from text blocks (citations are embedded here)
     const citations: NonNullable<AxChatResponseResult['citations']> = [];
+    const textBlocks: AxChatResponseTextBlock[] = [];
 
-    for (const block of resp.content) {
+    for (const [blockIndex, block] of resp.content.entries()) {
       switch (block.type) {
-        case 'text':
+        case 'text': {
           aggregatedContent += block.text ?? '';
+          const blockCitations: AxCitation[] = [];
           // Map citations if present on the text block
           if (Array.isArray((block as any).citations)) {
             for (const c of (block as any).citations) {
-              if (c?.url) {
-                citations.push({
-                  url: String(c.url),
-                  title: typeof c.title === 'string' ? c.title : undefined,
-                  snippet:
-                    typeof c.cited_text === 'string' ? c.cited_text : undefined,
-                });
+              const citation = mapAnthropicCitation(
+                c as Record<string, unknown>
+              );
+              if (citation) {
+                citations.push(citation);
+                blockCitations.push(citation);
               }
             }
           }
+          textBlocks.push({
+            index: blockIndex,
+            text: block.text ?? '',
+            ...(blockCitations.length ? { citations: blockCitations } : {}),
+          });
           break;
+        }
         case 'thinking':
           // Store each thinking block separately with its signature
           {
@@ -1095,6 +1181,7 @@ class AxAIAnthropicImpl
     if (aggregatedContent) {
       result.content = aggregatedContent;
     }
+    if (textBlocks.length) result.textBlocks = textBlocks;
     if (thinkingBlocks.length > 0) {
       // Store array of all thinking blocks with their signatures
       result.thoughtBlocks = thinkingBlocks;
@@ -1153,11 +1240,34 @@ class AxAIAnthropicImpl
     const sstate = state as {
       indexIdMap: Record<number, string>;
       remoteId?: string;
+      textBlocks?: Record<number, AxChatResponseTextBlock>;
     };
 
     if (!sstate.indexIdMap) {
       sstate.indexIdMap = {};
     }
+    sstate.textBlocks ??= {};
+    const updateTextBlock = (
+      blockIndex: number,
+      text: string,
+      citations: AxCitation[],
+      start = false
+    ): AxChatResponseTextBlock => {
+      const previous = start ? undefined : sstate.textBlocks?.[blockIndex];
+      const allCitations = [...(previous?.citations ?? []), ...citations];
+      const block = {
+        index: blockIndex,
+        text: (previous?.text ?? '') + text,
+        ...(allCitations.length ? { citations: allCitations } : {}),
+      };
+      sstate.textBlocks![blockIndex] = block;
+      return {
+        ...block,
+        ...(block.citations
+          ? { citations: block.citations.map((citation) => ({ ...citation })) }
+          : {}),
+      };
+    };
 
     if (resp.type === 'error') {
       const { error } = resp as unknown as AxAIAnthropicErrorEvent;
@@ -1194,13 +1304,9 @@ class AxAIAnthropicImpl
         const annos: NonNullable<AxChatResponseResult['citations']> = [];
         if (Array.isArray((contentBlock as any).citations)) {
           for (const c of (contentBlock as any).citations) {
-            if (c?.url) {
-              annos.push({
-                url: String(c.url),
-                title: typeof c.title === 'string' ? c.title : undefined,
-                snippet:
-                  typeof c.cited_text === 'string' ? c.cited_text : undefined,
-              });
+            const citation = mapAnthropicCitation(c as Record<string, unknown>);
+            if (citation) {
+              annos.push(citation);
             }
           }
         }
@@ -1209,6 +1315,14 @@ class AxAIAnthropicImpl
             {
               index,
               content: contentBlock.text,
+              textBlocks: [
+                updateTextBlock(
+                  (resp as AxAIAnthropicContentBlockStartEvent).index,
+                  contentBlock.text,
+                  annos,
+                  true
+                ),
+              ],
               ...(annos.length ? { citations: annos } : {}),
             },
           ],
@@ -1282,14 +1396,12 @@ class AxAIAnthropicImpl
       // Emit standalone annotations when Anthropic streams citations separately
       if ((delta as any).type === 'citations_delta') {
         const c = (delta as any).citation;
-        if (c && typeof c.url === 'string' && c.url.length > 0) {
+        const citation = c
+          ? mapAnthropicCitation(c as Record<string, unknown>)
+          : undefined;
+        if (citation) {
           const annos: NonNullable<AxChatResponseResult['citations']> = [
-            {
-              url: String(c.url),
-              title: typeof c.title === 'string' ? c.title : undefined,
-              snippet:
-                typeof c.cited_text === 'string' ? c.cited_text : undefined,
-            },
+            citation,
           ];
           return {
             results: [
@@ -1297,6 +1409,13 @@ class AxAIAnthropicImpl
                 index,
                 content: '',
                 citations: annos,
+                textBlocks: [
+                  updateTextBlock(
+                    (resp as AxAIAnthropicContentBlockDeltaEvent).index,
+                    '',
+                    annos
+                  ),
+                ],
               },
             ],
             remoteId: sstate.remoteId,
@@ -1308,14 +1427,8 @@ class AxAIAnthropicImpl
         const annos: NonNullable<AxChatResponseResult['citations']> = [];
         if (Array.isArray((delta as any).citations)) {
           for (const c of (delta as any).citations) {
-            if (c?.url) {
-              annos.push({
-                url: String(c.url),
-                title: typeof c.title === 'string' ? c.title : undefined,
-                snippet:
-                  typeof c.cited_text === 'string' ? c.cited_text : undefined,
-              });
-            }
+            const citation = mapAnthropicCitation(c);
+            if (citation) annos.push(citation);
           }
         }
         return {
@@ -1323,6 +1436,13 @@ class AxAIAnthropicImpl
             {
               index,
               content: delta.text,
+              textBlocks: [
+                updateTextBlock(
+                  (resp as AxAIAnthropicContentBlockDeltaEvent).index,
+                  delta.text,
+                  annos
+                ),
+              ],
               ...(annos.length ? { citations: annos } : {}),
             },
           ],
@@ -1574,6 +1694,7 @@ export class AxAIAnthropic<TModelKey = string> extends AxBaseAI<
         structuredOutputModes,
         functionCot: true,
         media: {
+          documents: { supported: true, citations: true },
           images: {
             supported: true,
             formats: ['image/jpeg', 'image/png', 'image/gif', 'image/webp'],
@@ -1590,10 +1711,9 @@ export class AxAIAnthropic<TModelKey = string> extends AxBaseAI<
             maxDuration: 0,
           },
           files: {
-            supported: false,
-            formats: [],
-            maxSize: 0,
-            uploadMethod: 'none' as 'inline' | 'upload' | 'cloud' | 'none',
+            supported: true,
+            formats: ['application/pdf'],
+            uploadMethod: 'inline' as const,
           },
           urls: {
             supported: false,
@@ -1826,7 +1946,11 @@ function createMessages(
                   ? { cache_control: { type: 'ephemeral' as const } }
                   : {}),
               };
+            case 'document':
+              return createAnthropicDocument(v);
             case 'file': {
+              const document = getAnthropicDocument(v);
+              if (document) return createAnthropicDocument(document);
               if (!supportsExtendedMedia)
                 throw new Error('Invalid content type');
               const type = v.mimeType.startsWith('image/')

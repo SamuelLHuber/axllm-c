@@ -1,7 +1,7 @@
 ---
 name: ax-ai
 description: This skill helps an LLM generate correct AI provider setup and configuration code using @ax-llm/ax. Use when the user asks about ai(), providers, models, routing, adaptive balancing, presets, embeddings, batch audio with ai.transcribe() or ai.speak(), extended thinking, context caching, or mentions OpenAI/Anthropic/Google/Azure/DeepSeek/Meta/Mistral/Cohere/Reka/Grok/Typesafe/Jev with @ax-llm/ax.
-version: "25.4.10"
+version: "25.4.11"
 ---
 
 # AI Provider Codegen Rules (@ax-llm/ax)
@@ -653,6 +653,32 @@ console.log(res.results[0]?.thought);
 console.log(res.results[0]?.content);
 ```
 
+### Gemini 4 Hydrogen
+
+Select `AxAIGoogleGeminiModel.Gemini4Hydrogen` (`gemini-4-hydrogen`) with
+`name: 'google-gemini'`. Hydrogen supports native structured output, tools,
+streaming, and multimodal input. Logical `thinkingTokenBudget` values `low`,
+`medium`, `high`, and `highest` map to `low`, `medium`, `high`, and `xhigh`.
+`none` and `minimal` map to `low`; `none` also hides returned thoughts.
+Omitting the level preserves Google's `high` default. Numeric thinking budgets
+are rejected. Native `config.thinking.thinkingLevel: 'xhigh'` is also supported;
+Gemini 3 models clamp `xhigh` to `high`.
+
+Hydrogen accepts `maxTokens` alongside a thinking level. Ax supports a single
+response segment of up to 65,536 output tokens and rejects larger output caps;
+automatic continuation for longer decodes is not implemented. The 1,048,576-token
+context limit includes both input and output. Sampling parameters are omitted,
+penalties and multiple candidates are not sent, and explicit `contextCache`
+is unsupported. Google's implicit caching still applies automatically.
+
+Run `npm run tsx src/examples/typescript/generation/gemini-hydrogen.ts` with
+`GOOGLE_APIKEY`. Python, Java, C++, Go, and Rust also support Hydrogen through
+the shared Core implementation and include runnable generation examples. Use
+`model: "gemini-4-hydrogen"` and the native package
+`thinkingTokenBudget` / `thinking_token_budget` option.
+See Google's [Hydrogen guide](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/guides/gemini-4-hydrogen)
+and [pricing](https://aistudio.google.com/docs/pricing#gemini-4-hydrogen).
+
 ### Budget Levels
 
 | Level | Anthropic (tokens) | Gemini 2.5 (tokens) | Gemini 3 level |
@@ -686,6 +712,49 @@ the only place it is served. These models default an omitted effort to
 `medium`, so `none` is sent explicitly; GPT-6 Astra and GPT-6.1 Sol refuse
 `none` and Ax throws.
 Earlier OpenAI models retain their existing mapping.
+
+### Anthropic document citations
+
+Use a `document` chat part with `source`, optional `title` and `context`, and
+`citations: { enabled: true }`. The same value without `type` works in an AxGen
+`file` input or `f.file()` field. Source forms are:
+
+- `{ type: 'text', data: 'plain text' }`
+- `{ type: 'base64', mediaType: 'application/pdf', data: 'base64 PDF' }`
+- `{ type: 'url', url: 'https://example.com/source.pdf' }`
+- `{ type: 'file', fileId: 'uploaded file id' }` (first-party Files API)
+- `{ type: 'content', content: [{ type: 'text', text: 'one citable block' }] }`
+
+Existing PDF `file` parts also accept `title`, `context`, `citations`, and `cache`.
+Enable citations on every document in the request, including earlier messages,
+or on none. Native JSON-schema output (`output_config.format`, including
+`.useStructured()`) is rejected locally when citations are enabled. Use a text
+signature and cite the document in the output field description. Ax does not
+silently weaken an explicitly requested structured-output contract.
+
+`response.results[i].textBlocks` preserves each output block's text and citations.
+Streaming updates are complete snapshots for the given block `index`; replace
+that block rather than appending its snapshot text. Ordinary `result.content`
+retains its existing text-delta behavior. Citation source offsets point into the
+input document, while a text block identifies the output passage they support.
+Document citations have no `url`; inspect `type`, `documentIndex`, `documentTitle`,
+`snippet`, and the corresponding character, page, or content-block range.
+
+After `forward()` or `streamingForward()`, use `program.getChatLog()[i].textBlocks`
+for output passage associations, scoped to that round trip. Blocks also carry
+`resultIndex`. `getUsage()[i].citations` retains a flat source list; document indices
+are request-local and must not be treated as global document identifiers.
+Routers preserve native document inputs and exclude incompatible providers,
+even when media degradation is enabled.
+
+Run `src/examples/typescript/generation/anthropic-document-citations.ts` for
+non-streaming and streaming calls. Python, Java, C++, Go, and Rust support the
+same sources and validation. Generated chat results use `text_blocks` and their
+generation logs use `text_blocks` with `result_index`, plus `usage.citations`.
+Read these per-request logs using `get_chat_log()` (Python/C++/Rust),
+`getChatLog()` (Java), or `ChatLog` (Go). Citation location fields retain the
+camelCase names shown above. Public document citation examples are available
+under each language's `generation/` directory.
 
 ### Anthropic Model-Specific Behavior
 

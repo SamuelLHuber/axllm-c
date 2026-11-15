@@ -71,6 +71,24 @@ remains the compatibility alias for native JSON Schema support, not for every
 JSON response format. The selected rung is recorded with the chat log so runs
 remain comparable and debuggable.
 
+### Gemini 4 Hydrogen {#gemini-hydrogen}
+
+All six languages support `gemini-4-hydrogen` with the `google-gemini` profile.
+TypeScript also exposes `AxAIGoogleGeminiModel.Gemini4Hydrogen`. Set `thinkingTokenBudget` to `low`, `medium`, `high`,
+or `highest` (Google's `xhigh`). `none` and `minimal` use `low`; `none` also
+hides thoughts. Omitting the level preserves Google's default. Numeric budgets
+are rejected. `maxTokens` may be combined with a thinking level, up to 65,536
+output tokens per response; automatic continuation for longer decodes is not
+implemented. The model's 1,048,576-token context includes input and output.
+
+Hydrogen supports structured output and tools, ignores sampling controls, and
+uses implicit caching only. Explicit `contextCache` is unsupported.
+See the [runnable TypeScript example](https://github.com/ax-llm/ax/blob/main/src/examples/typescript/generation/gemini-hydrogen.ts).
+Python, Java, C++, Go, and Rust have equivalent runnable Hydrogen examples in
+their generation directories. Their request options accept `thinking_token_budget`
+and `model_config.max_tokens`; the native model config can also select
+`thinking_level: "xhigh"`.
+
 ### OpenAI Decisions {#openai-decisions}
 
 TypeScript supports `ai({ name: 'openai-decisions', apiKey })` with ordinary
@@ -414,6 +432,31 @@ metadata while updating output tokens.
 See [ai() API]({{langRoot}}/api/ai/).
 
 ## File routing
+
+### Anthropic document citations
+
+TypeScript, Python, Java, C++, Go, and Rust support native Anthropic document
+citations for plain text, base64
+PDFs, PDF URLs, uploaded file IDs, and custom text blocks. A `document` chat part
+carries a `source`, optional `title` and `context`, and
+`citations: { enabled: true }`. An AxGen `file` input accepts the same value
+without the `type` property. Enable citations on all request documents or none.
+Native structured JSON output is incompatible with citations and fails locally;
+use a text signature and ask it to cite the document.
+
+Read `response.results[i].textBlocks` for output passages paired with their
+citations. Streaming blocks are snapshots keyed by `index`. AxGen retains these
+blocks at `program.getChatLog()[i].textBlocks`, with `resultIndex` identifying the
+sample. Source offsets locate the cited input; the block text identifies the
+supported output passage. `getUsage()` also retains the flat citation list.
+Python, Java, C++, Go, and Rust use `text_blocks` and `result_index`. Their
+per-request generation log entries also retain `usage.citations`; document
+indices are local to that request. Read the log with `get_chat_log()` in Python,
+C++, and Rust, `getChatLog()` in Java, or the `ChatLog` field in Go.
+
+See the document citation example in [generation examples]({{langRoot}}/examples/generation/).
+
+### Provider selection
 
 A provider router preserves files for providers that can read them directly. File
 names, media types, cache metadata, and content order survive routing and later

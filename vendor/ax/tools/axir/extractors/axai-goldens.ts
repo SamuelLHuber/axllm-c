@@ -7039,6 +7039,15 @@ writeFixture('anthropic-simple-chat', {
         index: 0,
         id: 'msg_anthropic_1',
         content: 'Ax is portable.',
+        text_blocks: [
+          {
+            index: 0,
+            text: 'Ax is portable.',
+            citations: [
+              { url: 'https://axllm.dev', title: 'Ax', snippet: 'Ax docs' },
+            ],
+          },
+        ],
         function_calls: [],
         finish_reason: 'stop',
         citations: [
@@ -7223,6 +7232,7 @@ writeFixture('anthropic-thinking-response', {
         index: 0,
         id: 'msg_think',
         content: 'Done.',
+        text_blocks: [{ index: 2, text: 'Done.' }],
         function_calls: [],
         finish_reason: 'stop',
         thought: 'plansecret',
@@ -7287,6 +7297,7 @@ writeFixture('anthropic-sonnet-5-adaptive-thinking-request', {
         index: 0,
         id: 'msg_sonnet5_think',
         content: 'Done.',
+        text_blocks: [{ index: 0, text: 'Done.' }],
         function_calls: [],
         finish_reason: 'stop',
       },
@@ -7344,6 +7355,7 @@ writeFixture('anthropic-adaptive-thinking-hidden-request', {
         index: 0,
         id: 'msg_hidden_think',
         content: 'Done.',
+        text_blocks: [{ index: 0, text: 'Done.' }],
         function_calls: [],
         finish_reason: 'stop',
       },
@@ -7405,6 +7417,7 @@ writeFixture('anthropic-qualified-adaptive-model-request', {
         index: 0,
         id: 'msg_qualified_adaptive',
         content: 'Done.',
+        text_blocks: [{ index: 0, text: 'Done.' }],
         function_calls: [],
         finish_reason: 'stop',
       },
@@ -7465,7 +7478,9 @@ writeFixture('anthropic-streaming-tool-thinking', {
       },
     },
     {
-      results: [{ index: 0, content: 'hel' }],
+      results: [
+        { index: 0, content: 'hel', text_blocks: [{ index: 0, text: 'hel' }] },
+      ],
       remote_id: 'msg_stream_a',
     },
     {
@@ -13663,6 +13678,7 @@ const snakeSonnet55 = (value: any): any => {
   if (!value || typeof value !== 'object') return value;
   const names: Record<string, string> = {
     thoughtBlocks: 'thought_blocks',
+    textBlocks: 'text_blocks',
     functionCalls: 'function_calls',
     finishReason: 'finish_reason',
     remoteId: 'remote_id',
@@ -13980,6 +13996,7 @@ const snakeHaiku55 = (value: any): any => {
   if (!value || typeof value !== 'object') return value;
   const names: Record<string, string> = {
     thoughtBlocks: 'thought_blocks',
+    textBlocks: 'text_blocks',
     functionCalls: 'function_calls',
     finishReason: 'finish_reason',
     remoteId: 'remote_id',
@@ -17402,4 +17419,720 @@ for (const [id, assistant] of [
       }
     );
   }
+}
+// Hydrogen fixtures record the TypeScript request and cost oracle. Core owns
+// the behavior once, and each generated language executes the same fixtures.
+const normalizeHydrogenResponse = (response: any) => ({
+  results: response.results.map((entry: any) => ({
+    index: entry.index,
+    content: entry.content,
+    finish_reason: entry.finishReason,
+    function_calls: [],
+  })),
+  model_usage: response.modelUsage
+    ? {
+        ai: 'google-gemini',
+        model: response.modelUsage.model,
+        tokens: Object.fromEntries(
+          Object.entries(response.modelUsage.tokens).map(([key, value]) => [
+            key.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`),
+            value,
+          ])
+        ),
+      }
+    : null,
+});
+const hydrogenModel = AxAIGoogleGeminiModel.Gemini4Hydrogen;
+const hydrogenCases: {
+  name: string;
+  vertex?: boolean;
+  model?: AxAIGoogleGeminiModel;
+  preset?: boolean;
+  config?: Record<string, any>;
+  options?: Record<string, any>;
+  stream?: boolean;
+  error?: string;
+}[] = [
+  { name: 'default' },
+  {
+    name: 'model-key',
+    preset: true,
+    options: { thinkingTokenBudget: 'highest' },
+  },
+  {
+    name: 'gemini3-highest-regression',
+    model: AxAIGoogleGeminiModel.Gemini38Flash,
+    options: { thinkingTokenBudget: 'highest' },
+  },
+  {
+    name: 'gemini3-xhigh-clamped',
+    model: AxAIGoogleGeminiModel.Gemini38Flash,
+    config: { thinkingLevel: 'xhigh' },
+  },
+  ...[false, true].flatMap((vertex) =>
+    ['none', 'minimal', 'low', 'medium', 'high', 'highest'].map((level) => ({
+      name: `${vertex ? 'vertex-' : ''}thinking-${level}`,
+      vertex,
+      config: { maxTokens: 4096 },
+      options: { thinkingTokenBudget: level, showThoughts: true },
+    }))
+  ),
+  { name: 'native-xhigh', config: { thinkingLevel: 'xhigh' } },
+  { name: 'native-minimal', config: { thinkingLevel: 'minimal' } },
+  {
+    name: 'logical-overrides-native',
+    config: { thinkingLevel: 'xhigh' },
+    options: { thinkingTokenBudget: 'low' },
+  },
+  {
+    name: 'custom-highest-mapping',
+    config: { thinkingLevelMapping: { highest: 'medium' } },
+    options: { thinkingTokenBudget: 'highest' },
+  },
+  ...[false, true].map((vertex) => ({
+    name: `${vertex ? 'vertex-' : ''}sampling`,
+    vertex,
+    config: {
+      temperature: 0.2,
+      topP: 0.8,
+      topK: 20,
+      presencePenalty: 0.4,
+      frequencyPenalty: 0.2,
+      n: 3,
+    },
+  })),
+  {
+    name: 'stream-xhigh',
+    stream: true,
+    options: { thinkingTokenBudget: 'highest' },
+  },
+  {
+    name: 'max-output-boundary',
+    config: { maxTokens: 65_536 },
+    options: { thinkingTokenBudget: 'low' },
+  },
+  ...(['standard', 'flex', 'priority'] as const).map((serviceTier) => ({
+    name: `service-tier-${serviceTier}`,
+    options: { serviceTier },
+  })),
+  {
+    name: 'numeric-budget-error',
+    options: { thinkingTokenBudget: 1024 },
+    error: 'not support numeric thinkingTokenBudget',
+  },
+  {
+    name: 'max-output-error',
+    config: { maxTokens: 65_537 },
+    options: { thinkingTokenBudget: 'highest' },
+    error: 'long decodes require continuation support',
+  },
+  ...[{}, { name: 'cachedContents/unsupported' }].map(
+    (contextCache, index) => ({
+      name: `explicit-cache-error-${index}`,
+      options: { contextCache },
+      error: 'Context caching is not supported',
+    })
+  ),
+  {
+    name: 'vertex-explicit-cache-error',
+    vertex: true,
+    options: { contextCache: {} },
+    error: 'Context caching is not supported',
+  },
+  {
+    name: 'stream-explicit-cache-error',
+    stream: true,
+    options: { contextCache: {} },
+    error: 'Context caching is not supported',
+  },
+];
+for (const scenario of hydrogenCases) {
+  const selectedModel = scenario.model ?? hydrogenModel;
+  const defaultModel = scenario.preset
+    ? AxAIGoogleGeminiModel.Gemini38Flash
+    : selectedModel;
+  const models = scenario.preset
+    ? [{ key: 'hydrogen', model: selectedModel, description: 'Hydrogen' }]
+    : undefined;
+  const calls: { url: string; json: any }[] = [];
+  const { thinkingLevel, ...modelConfig } = scenario.config ?? {};
+  const response = {
+    candidates: [
+      {
+        content: { parts: [{ text: 'Hydrogen ready.' }] },
+        finishReason: 'STOP',
+      },
+    ],
+    usageMetadata: {
+      promptTokenCount: 100,
+      candidatesTokenCount: 10,
+      totalTokenCount: 110,
+      cachedContentTokenCount: 20,
+      ...(scenario.options?.serviceTier
+        ? { serviceTier: scenario.options.serviceTier }
+        : {}),
+    },
+  };
+  const body = `data: ${JSON.stringify(response)}\n\n`;
+  const vertexOptions = scenario.vertex
+    ? { projectId: 'demo-project', region: 'global' }
+    : {};
+  const client = ai({
+    name: 'google-gemini',
+    apiKey: scenario.vertex ? async () => 'test-key' : 'test-key',
+    ...vertexOptions,
+    models,
+    config: {
+      model: defaultModel,
+      ...modelConfig,
+      ...(thinkingLevel ? { thinking: { thinkingLevel } } : {}),
+    },
+    options: {
+      fetch: async (input, init) => {
+        calls.push({
+          url: String(input),
+          json: JSON.parse(String(init?.body)),
+        });
+        return new Response(scenario.stream ? body : JSON.stringify(response), {
+          status: 200,
+          headers: {
+            'Content-Type': scenario.stream
+              ? 'text/event-stream'
+              : 'application/json',
+          },
+        });
+      },
+    },
+  } as any);
+  let result: any;
+  let errorMessage = '';
+  try {
+    result = await client.chat(
+      {
+        ...(scenario.preset ? { model: 'hydrogen' } : {}),
+        chatPrompt: [{ role: 'user', content: 'Hello Hydrogen.' }],
+      },
+      { ...scenario.options, stream: scenario.stream ?? false }
+    );
+    if (result instanceof ReadableStream) {
+      const chunks: any[] = [];
+      for await (const chunk of result) chunks.push(chunk);
+      result = chunks;
+    }
+  } catch (error) {
+    errorMessage = error instanceof Error ? error.message : String(error);
+  }
+  if (scenario.error) {
+    if (!errorMessage.includes(scenario.error) || calls.length !== 0) {
+      throw new Error(
+        `Hydrogen ${scenario.name}: expected a local error, got ${errorMessage} and ${calls.length} requests`
+      );
+    }
+  } else if (errorMessage || calls.length !== 1) {
+    throw new Error(
+      `Hydrogen ${scenario.name}: ${errorMessage || 'missing request'}`
+    );
+  }
+  const wire = calls[0];
+  const fixture: Fixture = {
+    kind: scenario.stream ? 'ai_stream' : 'ai_chat',
+    provider: 'google-gemini',
+    model: defaultModel,
+    service_options: { ...vertexOptions, ...(models ? { models } : {}) },
+    request: {
+      ...(scenario.preset ? { model: 'hydrogen' } : {}),
+      chat_prompt: [{ role: 'user', content: 'Hello Hydrogen.' }],
+      model_config: { ...scenario.config, stream: scenario.stream ?? false },
+    },
+    options: scenario.options ?? {},
+    expected_transport_request_count: calls.length,
+    ...(scenario.error
+      ? { expected_error_contains: scenario.error }
+      : {
+          transport_responses: [
+            {
+              status: 200,
+              ...(scenario.stream ? { body } : { json: response }),
+            },
+          ],
+          expected_transport_request: {
+            url: wire!.url,
+            // Safety settings are provider defaults, outside the portable contract.
+            json: Object.fromEntries(
+              Object.entries(wire!.json).filter(
+                ([key]) => key !== 'safetySettings'
+              )
+            ) as Json,
+          },
+          expected_transport_json_absent: [
+            'generationConfig.temperature',
+            'generationConfig.topP',
+            'generationConfig.topK',
+            'generationConfig.frequencyPenalty',
+            'generationConfig.presencePenalty',
+            ...(selectedModel === hydrogenModel
+              ? ['generationConfig.candidateCount']
+              : []),
+            'generationConfig.thinkingConfig.thinkingBudget',
+            ...(wire!.json.generationConfig.thinkingConfig
+              ? []
+              : ['generationConfig.thinkingConfig']),
+            'cachedContent',
+          ],
+          expected_output: scenario.stream
+            ? result.map(normalizeHydrogenResponse)
+            : normalizeHydrogenResponse(result),
+          ...(!scenario.stream
+            ? {
+                expected_estimated_cost: client.getEstimatedCost(
+                  result.modelUsage
+                ),
+              }
+            : {}),
+        }),
+  };
+  writeFixture(`gemini-hydrogen-${scenario.name}`, fixture);
+}
+const hydrogenFeatures = ai({
+  name: 'google-gemini',
+  apiKey: 'test-key',
+  config: { model: hydrogenModel },
+}).getFeatures();
+writeFixture('gemini-hydrogen-features', {
+  kind: 'ai_provider_features',
+  provider: 'google-gemini',
+  model: hydrogenModel,
+  expected_output: {
+    functions: hydrogenFeatures.functions,
+    streaming: hydrogenFeatures.streaming,
+    thinking: hydrogenFeatures.thinking,
+    structured_outputs: hydrogenFeatures.structuredOutputs,
+    caching: hydrogenFeatures.caching as Json,
+  },
+});
+
+// Preserve Anthropic's source locations and the output blocks they support.
+// Expected results come from the TypeScript provider for both transport modes.
+for (const stream of [false, true]) {
+  const citations = [
+    {
+      type: 'char_location',
+      cited_text: 'A passage',
+      document_index: 0,
+      document_title: 'Notes',
+      start_char_index: 12,
+      end_char_index: 21,
+      file_id: 'file_notes',
+    },
+    {
+      type: 'page_location',
+      cited_text: 'A PDF passage',
+      document_index: 1,
+      document_title: 'Report',
+      start_page_number: 2,
+      end_page_number: 3,
+    },
+    {
+      type: 'content_block_location',
+      cited_text: 'A custom block',
+      document_index: 2,
+      start_block_index: 0,
+      end_block_index: 1,
+    },
+    {
+      type: 'web_search_result_location',
+      url: 'https://axllm.dev',
+      title: 'Ax',
+      cited_text: 'Web passage',
+    },
+  ];
+  const content = [
+    { type: 'text', text: 'Answer: ', citations: [] },
+    ...citations.map((citation, i) => ({
+      type: 'text',
+      text: `Claim ${i}. `,
+      citations: [citation],
+    })),
+    {
+      type: 'text',
+      text: 'Uncited.',
+      citations: [null, {}, { cited_text: 'unlocated' }],
+    },
+  ];
+  const raw = {
+    id: 'msg_citation_blocks',
+    type: 'message',
+    role: 'assistant',
+    model: haiku55,
+    content,
+    stop_reason: 'end_turn',
+    usage: { input_tokens: 2, output_tokens: 3 },
+  };
+  const events = [
+    {
+      type: 'message_start',
+      message: {
+        ...raw,
+        content: [],
+        stop_reason: null,
+        usage: { input_tokens: 2, output_tokens: 0 },
+      },
+    },
+    ...content.flatMap((block, index) => [
+      {
+        type: 'content_block_start',
+        index,
+        content_block: {
+          type: 'text',
+          text: '',
+          citations: index === 1 ? block.citations : [],
+        },
+      },
+      {
+        type: 'content_block_delta',
+        index,
+        delta: { type: 'text_delta', text: block.text },
+      },
+      ...(index === 1
+        ? []
+        : block.citations.map((citation) => ({
+            type: 'content_block_delta',
+            index,
+            delta: { type: 'citations_delta', citation },
+          }))),
+      { type: 'content_block_stop', index },
+    ]),
+    {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn' },
+      usage: { output_tokens: 3 },
+    },
+    { type: 'message_stop' },
+  ];
+  const body = events
+    .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+    .join('');
+  const client = new AxAIAnthropic({
+    apiKey: 'test-key',
+    config: { model: haiku55 },
+    options: {
+      fetch: async () =>
+        stream
+          ? new Response(body, {
+              headers: { 'content-type': 'text/event-stream' },
+            })
+          : Response.json(raw),
+    },
+  });
+  const response = await client.chat(
+    { chatPrompt: [{ role: 'user', content: 'Cite the evidence.' }] },
+    { stream }
+  );
+  const normalize = (value: any, event?: { type: string }) => {
+    const result = snakeSonnet55(value);
+    if (result.model_usage) result.model_usage.ai = 'anthropic';
+    // Portable stream usage is emitted on usage-bearing events, while TS also
+    // repeats the latest snapshot on intervening text and citation events.
+    if (
+      stream &&
+      event?.type !== 'message_start' &&
+      event?.type !== 'message_delta'
+    )
+      delete result.model_usage;
+    if (!stream) for (const item of result.results) item.function_calls ??= [];
+    return result;
+  };
+  const expected: any = stream ? [] : normalize(response);
+  if (stream) {
+    for await (const chunk of response as ReadableStream)
+      expected.push(normalize(chunk, events[expected.length]));
+  }
+  writeFixture(
+    `anthropic-document-citation-blocks-${stream ? 'stream' : 'chat'}`,
+    {
+      kind: stream ? 'ai_stream' : 'ai_chat',
+      provider: 'anthropic',
+      model: haiku55,
+      request: {
+        chat_prompt: [{ role: 'user', content: 'Cite the evidence.' }],
+        model_config: { stream },
+      },
+      transport_responses: [
+        stream ? { status: 200, body } : { status: 200, json: raw },
+      ],
+      expected_output: expected,
+    } as any
+  );
+}
+
+// Native document sources and request-wide citation constraints come from TS.
+const nativeDocuments = [
+  { type: 'document', source: { type: 'text', data: 'A passage.' } },
+  {
+    type: 'document',
+    source: { type: 'base64', mediaType: 'application/pdf', data: 'JVBERi0=' },
+  },
+  {
+    type: 'document',
+    source: { type: 'url', url: 'https://example.com/report.pdf' },
+  },
+  { type: 'document', source: { type: 'file', fileId: 'file_report' } },
+  {
+    type: 'document',
+    source: {
+      type: 'content',
+      content: [{ type: 'text', text: 'A custom passage.' }],
+    },
+  },
+  {
+    type: 'file',
+    mimeType: 'application/pdf',
+    data: 'JVBERi0=',
+    filename: 'legacy.pdf',
+  },
+  {
+    type: 'file',
+    mimeType: 'application/pdf',
+    fileUri: 'https://example.com/legacy.pdf',
+  },
+].map((doc) => ({
+  ...doc,
+  title: 'Evidence',
+  context: 'Use as evidence.',
+  citations: { enabled: true },
+  cache: true,
+}));
+const documentReply = {
+  id: 'msg_documents',
+  type: 'message',
+  role: 'assistant',
+  model: haiku55,
+  content: [{ type: 'text', text: 'Answer: supported' }],
+  stop_reason: 'end_turn',
+  usage: { input_tokens: 2, output_tokens: 3 },
+};
+for (const [index, doc] of nativeDocuments.entries()) {
+  let sent: any;
+  const client = new AxAIAnthropic({
+    apiKey: 'test-key',
+    config: { model: haiku55 },
+    options: {
+      fetch: async (_url, init) => {
+        sent = JSON.parse(String(init?.body));
+        return Response.json(documentReply);
+      },
+    },
+  });
+  const result = await client.chat(
+    { chatPrompt: [{ role: 'user', content: [doc] as any }] },
+    { stream: false }
+  );
+  const expected = snakeSonnet55(result);
+  expected.model_usage.ai = 'anthropic';
+  for (const item of expected.results) item.function_calls ??= [];
+  writeFixture(`anthropic-native-document-source-${index}`, {
+    kind: 'ai_chat',
+    provider: 'anthropic',
+    model: haiku55,
+    request: {
+      chat_prompt: [{ role: 'user', content: [doc] }],
+      model_config: { stream: false },
+    },
+    transport_responses: [{ status: 200, json: documentReply }],
+    expected_output: expected,
+    expected_transport_request: { json: { messages: sent.messages } },
+  } as any);
+}
+for (const [name, content, extra] of [
+  [
+    'mixed-citations',
+    [
+      nativeDocuments[0],
+      { type: 'document', source: { type: 'text', data: 'Uncited.' } },
+    ],
+    {},
+  ],
+  [
+    'json-schema',
+    [nativeDocuments[0]],
+    { responseFormat: { type: 'json_schema', schema: { type: 'object' } } },
+  ],
+  [
+    'empty-text',
+    [{ type: 'document', source: { type: 'text', data: ' ' } }],
+    {},
+  ],
+  [
+    'invalid-pdf',
+    [
+      {
+        type: 'document',
+        source: { type: 'base64', mediaType: 'text/plain', data: 'abc' },
+      },
+    ],
+    {},
+  ],
+  [
+    'invalid-url',
+    [{ type: 'document', source: { type: 'url', url: 'file:///tmp/doc' } }],
+    {},
+  ],
+  [
+    'empty-file-id',
+    [{ type: 'document', source: { type: 'file', fileId: '' } }],
+    {},
+  ],
+  [
+    'empty-content',
+    [{ type: 'document', source: { type: 'content', content: [] } }],
+    {},
+  ],
+  [
+    'invalid-title',
+    [{ type: 'document', source: { type: 'text', data: 'Text.' }, title: 3 }],
+    {},
+  ],
+  [
+    'invalid-citations',
+    [
+      {
+        type: 'document',
+        source: { type: 'text', data: 'Text.' },
+        citations: { enabled: 'yes' },
+      },
+    ],
+    {},
+  ],
+] as const) {
+  let requests = 0;
+  const client = new AxAIAnthropic({
+    apiKey: 'test-key',
+    config: { model: haiku55 },
+    options: {
+      fetch: async () => {
+        requests++;
+        return Response.json(documentReply);
+      },
+    },
+  });
+  let message = '';
+  try {
+    await client.chat(
+      { chatPrompt: [{ role: 'user', content }], ...extra } as any,
+      { stream: false }
+    );
+  } catch (error) {
+    message = (error as Error).message;
+  }
+  if (!message || requests)
+    throw new Error(
+      `Document validation did not reject ${name} before transport`
+    );
+  writeFixture(`anthropic-native-document-reject-${name}`, {
+    kind: 'ai_chat',
+    provider: 'anthropic',
+    model: haiku55,
+    request: {
+      chat_prompt: [{ role: 'user', content }],
+      ...extra,
+      model_config: { stream: false },
+    },
+    expected_error_contains: message,
+  } as any);
+}
+
+for (const test of [
+  {
+    name: 'history-mixed',
+    provider: 'anthropic',
+    options: {},
+    prompt: [
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'document',
+            source: { type: 'text', data: 'Earlier uncited source.' },
+          },
+        ],
+      },
+      { role: 'assistant', content: 'Read it.' },
+      { role: 'user', content: [nativeDocuments[0]] },
+    ],
+  },
+  {
+    name: 'vertex-file-id',
+    provider: 'anthropic',
+    options: { projectId: 'demo-project', region: 'us' },
+    prompt: [{ role: 'user', content: [nativeDocuments[3]] }],
+  },
+  {
+    name: 'non-pdf-file',
+    provider: 'anthropic',
+    options: {},
+    prompt: [
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'file',
+            mimeType: 'text/plain',
+            data: 'hello',
+            citations: { enabled: true },
+          },
+        ],
+      },
+    ],
+  },
+  {
+    name: 'unsupported-provider',
+    provider: 'openai',
+    options: {},
+    prompt: [{ role: 'user', content: [nativeDocuments[0]] }],
+  },
+  {
+    name: 'unsupported-cited-pdf',
+    provider: 'openai',
+    options: {},
+    prompt: [{ role: 'user', content: [nativeDocuments[5]] }],
+  },
+] as const) {
+  let calls = 0;
+  const fetch = async () => {
+    calls++;
+    return Response.json(documentReply);
+  };
+  const client =
+    test.provider === 'anthropic'
+      ? new AxAIAnthropic({
+          apiKey: async () => 'test-key',
+          ...test.options,
+          config: { model: haiku55 },
+          options: { fetch },
+        })
+      : new AxAIOpenAI({
+          apiKey: 'test-key',
+          config: { model: AxAIOpenAIModel.GPT54Mini },
+          options: { fetch },
+        });
+  let error = '';
+  try {
+    await client.chat({ chatPrompt: test.prompt } as any, { stream: false });
+  } catch (e) {
+    error = (e as Error).message;
+  }
+  if (!error || calls)
+    throw new Error(`Expected preflight rejection for ${test.name}`);
+  const expected =
+    test.provider === 'openai' && error.includes('native document')
+      ? 'native document'
+      : error;
+  writeFixture(`anthropic-native-document-reject-${test.name}`, {
+    kind: 'ai_chat',
+    provider: test.provider,
+    model: test.provider === 'anthropic' ? haiku55 : 'gpt-5.4-mini',
+    service_options: test.options,
+    request: { chat_prompt: test.prompt, model_config: { stream: false } },
+    expected_error_contains: expected,
+  } as any);
 }
