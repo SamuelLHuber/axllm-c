@@ -89,6 +89,15 @@ OPENAI_API_KEY=... zig run examples/zig/inference.zig -I dist -DAXLLM_ENABLE_CUR
 
 `AXLLM_C_BASE_URL` and `AXLLM_C_MODEL` override the endpoint and model; `scripts/verify-zig-example.sh` runs it against a local mock (`scripts/mock-openai.py`).
 
+### Email extraction sample (live)
+
+`examples/zig/email_extraction.zig` is an Ax port of the [DSPy email extraction tutorial](https://dspy.ai/tutorials/email_extraction/): four typed Ax programs (classify → extract entities → summarize → actions) composed from Zig, run against a real model:
+
+```bash
+OPENAI_API_KEY=... zig run examples/zig/email_extraction.zig -I dist -DAXLLM_ENABLE_CURL=1 \
+  dist/axllm/axllm_c.cpp dist/axllm/axllm.cpp dist/axllm/mcp.cpp -lc++ -lcurl
+```
+
 Expected hello output includes:
 
 ```text
