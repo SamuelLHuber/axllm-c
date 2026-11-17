@@ -1,7 +1,7 @@
 ---
 name: ax-agent
 description: This skill helps an LLM generate correct core AxAgent code using @ax-llm/ax. Use when the user asks about agent(), child agents, namespaced functions, discovery mode, clarification, bubbleErrors, host-side final/clarification protocol, or ordinary agent runtime behavior. For MCP clients, native runtime modules, subscriptions, tasks, or authentication use ax-mcp alongside this skill. For RLM/code-runtime work use ax-agent-rlm; for callbacks and telemetry use ax-agent-observability; for recall/memory/skill loading use ax-agent-memory-skills; for agent.optimize(...) use ax-agent-optimize.
-version: "25.4.11"
+version: "25.4.12"
 ---
 
 # AxAgent Codegen Rules (@ax-llm/ax)
@@ -386,6 +386,7 @@ Public flow rules:
 
 - `forward()` and `streamingForward()` throw `AxAgentClarificationError` when the actor calls `askClarification(...)`.
 - Successful `final(...)` completions always continue through the responder in public flows.
+- Runtime source analysis ignores regex literals in unambiguous expression positions, so quote-bearing patterns do not hide later completion calls or variable references. Division after literals, updates, and keyword-shaped properties remains visible. This lightweight analysis is not a full JavaScript parser.
 - `AxAgentClarificationError.question` is the user-facing question text.
 - `AxAgentClarificationError.clarification` is the normalized structured payload.
 - `AxAgentClarificationError.getState()` returns the saved continuation state captured at throw time.
