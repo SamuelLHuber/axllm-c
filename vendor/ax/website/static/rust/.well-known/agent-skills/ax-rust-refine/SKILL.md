@@ -1,7 +1,7 @@
 ---
 name: "ax-rust-refine"
 description: "Use when writing Rust code with `axllm` for reward-scored generation, iterative candidate improvement, evaluator feedback, and optimizer-backed refinement patterns."
-version: "25.4.12"
+version: "25.4.13"
 ---
 # Ax Refinement Patterns For Rust
 
@@ -35,7 +35,7 @@ let delta = result["metadata"]["bestScore"].as_f64().unwrap() - baseline;
 
 ## Relevant API Surface
 
-- AxGen: `ax`, `novel_f1_score`, `AxGen`, `run_control`, `AxRunControl`, `AxCachingFunction`, `set_caching_function`
+- AxGen: `ax`, `novel_f1_score`, `f1_score`, `AxGen`, `run_control`, `AxRunControl`, `AxCachingFunction`, `set_caching_function`
 - Optimizers: `optimize`, `playbook`, `AxPlaybook`, `AxBootstrapFewShot`, `AxGEPA`, `OptimizerEngine`, `OptimizerEvaluator`, `optimize_with_client`
 
 ## Guardrails

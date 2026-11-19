@@ -1,7 +1,7 @@
 ---
 name: "ax-go-typesafe"
 description: "Use when writing Go code with `github.com/ax-llm/ax/packages/go` for Typesafe Jev image inputs, boolean/class/rubric score/box signatures, decision evidence and provenance, native Noul/Choice/Score/Box, structured criteria and hybrid generation."
-version: "25.4.12"
+version: "25.4.13"
 ---
 # Typesafe / Jev For Go
 
@@ -81,7 +81,7 @@ Runnable signature and native examples are under src/examples/go/generation/. Se
 ## Relevant API Surface
 
 - Signatures: `axllm.S`, `axllm.FieldType`, `axllm.AxSignature`
-- AxGen: `axllm.NewAx`, `axllm.NovelF1Score`, `axllm.AxGen`, `axllm.RunControl`, `axllm.AxRunControl`, `axllm.AxCachingFunction`, `axllm.SetCachingFunction`
+- AxGen: `axllm.NewAx`, `axllm.NovelF1Score`, `axllm.F1Score`, `axllm.AxGen`, `axllm.RunControl`, `axllm.AxRunControl`, `axllm.AxCachingFunction`, `axllm.SetCachingFunction`
 - AxAI: `axllm.NewAI`, `axllm.GoogleGeminiDecisions`, `axllm.AxAIGoogleGeminiDecisionsClient`, `axllm.OpenAIDecisions`, `axllm.AxAIOpenAIDecisionsClient`, `axllm.Typesafe`, `axllm.AxAITypesafeClient`, `context.Context`, `axllm.AxAIServiceAbortedError`, `axllm.GetSupportedAIModels`, `axllm.AxCredentialRequest`, `axllm.AxCredentialProvider`, `AxOwnedClientFactory.OwnedWorkerFactory`, `axllm.AxChatSession`, `axllm.AxChatStream`, `axllm.OpenAICompatibleClient`, `axllm.OpenAIResponsesClient`, `axllm.GoogleGeminiClient`, `axllm.AnthropicClient`, `axllm.AxUsageContext`, `axllm.AxUsageEvent`, `axllm.AxUsageObserver`, `axllm.SetUsageObserver`, `axllm.AxRuntimeHooks`, `axllm.AxRateLimitInfo`, `axllm.AxRateLimiter`, `axllm.AxTracer`, `axllm.AxMeter`, `axllm.AxGlobals`, `axllm.SetRateLimiter`, `axllm.SetTracer`, `axllm.SetMeter`, `axllm.AxBalancer`, `axllm.AxBalancerAdaptiveStrategy`, `axllm.AxBalancerStatsStore`, `axllm.AxInMemoryBalancerStatsStore`, `axllm.CreateBalancerRouteStats`, `axllm.UpdateBalancerRouteStats`, `axllm.SampleBalancerRouteHealth`, `axllm.MultiServiceRouter`, `axllm.ProviderRouter.GetCompatibilityReport`, `axllm.ProviderRouter`
 
 ## Guardrails

@@ -1,7 +1,7 @@
 ---
 name: "ax-go-gen"
 description: "Use when writing Go code with `github.com/ax-llm/ax/packages/go` for AxGen programs, forward calls, indexed multi-sampling, result pickers, streaming, tools, assertions, traces, usage, and output parsing."
-version: "25.4.12"
+version: "25.4.13"
 ---
 # AxGen Structured Generation For Go
 
@@ -135,7 +135,7 @@ An unregistered tool name produces an error result for that call alone, with the
 
 ## Relevant API Surface
 
-- AxGen: `axllm.NewAx`, `axllm.NovelF1Score`, `axllm.AxGen`, `axllm.RunControl`, `axllm.AxRunControl`, `axllm.AxCachingFunction`, `axllm.SetCachingFunction`
+- AxGen: `axllm.NewAx`, `axllm.NovelF1Score`, `axllm.F1Score`, `axllm.AxGen`, `axllm.RunControl`, `axllm.AxRunControl`, `axllm.AxCachingFunction`, `axllm.SetCachingFunction`
 - Tools: `axllm.Fn`, `axllm.Tool`
 - MCP: `axllm.AxMCPClient`, `axllm.AxMCPStreamableHTTPTransport`, `axllm.AxMCPWebSocketTransport`, `axllm.AxMCPStdioTransport`
 

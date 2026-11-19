@@ -1,7 +1,7 @@
 ---
 name: "ax-java-gen"
 description: "Use when writing Java code with `dev.axllm:ax` for AxGen programs, forward calls, indexed multi-sampling, result pickers, streaming, tools, assertions, traces, usage, and output parsing."
-version: "25.4.12"
+version: "25.4.13"
 ---
 # AxGen Structured Generation For Java
 
@@ -135,7 +135,7 @@ An unregistered tool name produces an error result for that call alone, with the
 
 ## Relevant API Surface
 
-- AxGen: `Ax.ax`, `Ax.novelF1Score`, `AxGen`, `Ax.runControl`, `AxRunControl`, `AxCachingFunction`, `AxGlobals.setCachingFunction`
+- AxGen: `Ax.ax`, `Ax.novelF1Score`, `Ax.f1Score`, `AxGen`, `Ax.runControl`, `AxRunControl`, `AxCachingFunction`, `AxGlobals.setCachingFunction`
 - Tools: `Ax.fn`, `Tool`
 - MCP: `AxMCPClient`, `AxMCPStreamableHTTPTransport`, `AxMCPWebSocketTransport`, `AxMCPStdioTransport`
 

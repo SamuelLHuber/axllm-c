@@ -247,6 +247,7 @@ export class ActorAgentRLM<
   private _primitiveFlags(): Record<string, boolean | undefined> {
     const opts = this.actorDefinitionBuildOptions;
     return {
+      observationBoundaries: true,
       hasInspectRuntime: Boolean(opts?.hasInspectRuntime),
       hasAgentStatusCallback: Boolean(opts?.hasAgentStatusCallback),
       discoveryMode: Boolean(opts?.discoveryMode),
@@ -836,7 +837,8 @@ export class ActorAgentRLM<
     runOptions?: Pick<
       import('../ai/types.js').AxAIServiceOptions,
       'control' | 'executionPath'
-    >
+    >,
+    observations?: import('./agentInternal/turnObservations.js').TurnObservations
   ): Record<string, unknown> {
     return buildRuntimeGlobals(
       this,
@@ -852,7 +854,8 @@ export class ActorAgentRLM<
       onUsed,
       onFunctionCall,
       getCurrentMemories,
-      runOptions
+      runOptions,
+      observations
     );
   }
 

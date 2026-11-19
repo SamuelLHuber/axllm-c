@@ -1,7 +1,7 @@
 ---
 name: "ax-cpp-refine"
 description: "Use when writing C++ code with `axllm` for reward-scored generation, iterative candidate improvement, evaluator feedback, and optimizer-backed refinement patterns."
-version: "25.4.12"
+version: "25.4.13"
 ---
 # Ax Refinement Patterns For C++
 
@@ -33,7 +33,7 @@ auto result = engine.optimize(request, evaluator);
 
 ## Relevant API Surface
 
-- AxGen: `axllm::ax`, `axllm::axllm::novel_f1_score`, `axllm::AxGen`, `axllm::run_control`, `axllm::AxRunControl`, `axllm::AxCachingFunction`, `axllm::set_caching_function`
+- AxGen: `axllm::ax`, `axllm::axllm::novel_f1_score`, `axllm::axllm::f1_score`, `axllm::AxGen`, `axllm::run_control`, `axllm::AxRunControl`, `axllm::AxCachingFunction`, `axllm::set_caching_function`
 - Optimizers: `axllm::optimize`, `axllm::playbook`, `axllm::AxPlaybook`, `axllm::AxBootstrapFewShot`, `axllm::AxGEPA`, `axllm::OptimizerEngine`, `axllm::OptimizerEvaluator`
 
 ## Guardrails

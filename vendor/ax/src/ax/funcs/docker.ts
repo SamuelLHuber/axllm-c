@@ -7,19 +7,7 @@ export interface AxDockerContainer {
   ImageID: string;
   Command: string;
   Created: number;
-  State: {
-    Status: string;
-    Running: boolean;
-    Paused: boolean;
-    Restarting: boolean;
-    OOMKilled: boolean;
-    Dead: boolean;
-    Pid: number;
-    ExitCode: number;
-    Error: string;
-    StartedAt: Date;
-    FinishedAt: Date;
-  };
+  State: string;
   Status: string;
   Ports: Array<{
     IP: string;
@@ -53,6 +41,10 @@ export interface AxDockerContainer {
   }>;
 }
 
+interface DockerContainerInfo {
+  State: { Status: string };
+}
+
 export class AxDockerSession {
   private readonly apiUrl: string;
   private containerId: string | null = null;
@@ -73,8 +65,20 @@ export class AxDockerSession {
       throw new Error(`Failed to pull image: ${response.statusText}`);
     }
 
-    // Wait for the pull to complete
-    await response.text();
+    // Docker reports pull failures inside the progress stream after HTTP 200.
+    const output = await response.text();
+    for (const line of output.split('\n')) {
+      if (!line.trim()) continue;
+      const event = JSON.parse(line) as {
+        error?: string;
+        errorDetail?: { message?: string };
+      };
+      if (event.error || event.errorDetail) {
+        throw new Error(
+          `Failed to pull image: ${event.errorDetail?.message || event.error || 'Unknown error'}`
+        );
+      }
+    }
   }
 
   async createContainer({
@@ -216,7 +220,7 @@ export class AxDockerSession {
 
     for (const container of targetContainers) {
       // Stop the container if it's running
-      if (container.State.Status === 'running') {
+      if (container.State === 'running') {
         const stopResponse = await this.fetchDockerAPI(
           `/containers/${container.Id}/stop?t=${timeout}`,
           { method: 'POST' }
@@ -335,14 +339,14 @@ export class AxDockerSession {
 
   private async getContainerInfo(
     containerId: string
-  ): Promise<AxDockerContainer> {
+  ): Promise<DockerContainerInfo> {
     const response = await this.fetchDockerAPI(
       `/containers/${containerId}/json`
     );
     if (!response.ok) {
       throw new Error(`Failed to get container info: ${response.statusText}`);
     }
-    return response.json() as Promise<AxDockerContainer>;
+    return response.json() as Promise<DockerContainerInfo>;
   }
 
   private async waitForContainerToBeRunning(

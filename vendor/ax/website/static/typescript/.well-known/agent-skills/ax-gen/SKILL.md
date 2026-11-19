@@ -1,7 +1,7 @@
 ---
 name: ax-gen
 description: This skill helps an LLM generate correct AxGen code using @ax-llm/ax. Use when the user asks about ax(), AxGen, generators, forward(), streamingForward(), validation, assertions, streaming assertions, field processors, step hooks, self-tuning, or structured outputs. For MCP clients, transports, prompts, resources, tasks, subscriptions, or authentication use ax-mcp alongside this skill.
-version: "25.4.12"
+version: "25.4.13"
 ---
 
 # AxGen Codegen Rules (@ax-llm/ax)
@@ -663,3 +663,8 @@ Generated Python, C++, and Rust expose `novel_f1_score`; Go exposes
 `NovelF1Score`; Java exposes `Ax.novelF1Score`. They share the same Core metric,
 including Unicode normalization and finite empty-input scores. The optimization
 examples show scoring a rationale returned by a real provider.
+
+`AxEvalUtil.f1Score(prediction, groundTruth)` is the ordinary F1: the same
+normalization and multiset overlap, but nothing is excluded, so stopwords count.
+Generated Python, C++, and Rust expose `f1_score`; Go exposes `F1Score`; Java
+exposes `Ax.f1Score`.

@@ -1,7 +1,7 @@
 ---
 name: ax-ai
 description: This skill helps an LLM generate correct AI provider setup and configuration code using @ax-llm/ax. Use when the user asks about ai(), providers, models, routing, adaptive balancing, presets, embeddings, batch audio with ai.transcribe() or ai.speak(), extended thinking, context caching, or mentions OpenAI/Anthropic/Google/Azure/DeepSeek/Meta/Mistral/Cohere/Reka/Grok/Typesafe/Jev with @ax-llm/ax.
-version: "25.4.12"
+version: "25.4.13"
 ---
 
 # AI Provider Codegen Rules (@ax-llm/ax)
@@ -584,11 +584,14 @@ import { ai, AxAIDeepSeekModel } from '@ax-llm/ax';
 const deepseek = ai({
   name: 'deepseek',
   apiKey: process.env.DEEPSEEK_APIKEY!,
-  config: { model: AxAIDeepSeekModel.DeepSeekV4Flash },
+  config: { model: AxAIDeepSeekModel.DeepSeekFlash },
 });
 ```
 
-DeepSeek's current API models are `deepseek-v4-flash` and `deepseek-v4-pro`.
+DeepSeek's current API models are `deepseek-flash` (DeepSeek-V4.1-Flash, the
+default; text and image input) and `deepseek-v4-pro`. DeepSeek retired V4-Flash
+on 2026-09-10 and serves `deepseek-v4-flash` requests with V4.1-Flash, so that
+id still works but is deprecated in Ax.
 Legacy model enum/catalog values remain available for source compatibility, but
 profile rules are applied only to model IDs verified for the selected deployment.
 
@@ -599,8 +602,8 @@ disable it. DeepSeek's API exposes `low`, `medium`, `high`, and `max`:
 Ax maps `minimal` and `low` to `low`, preserves `medium`, maps `high` to `high`,
 and maps `highest` to `max`. DeepSeek V4
 thinking models support tools, but reject the `tool_choice` request parameter,
-so Ax omits auto and Ax-generated `__axOutput` tool choices for `deepseek-v4-pro`,
-`deepseek-v4-flash`, and `deepseek-reasoner` while still sending tool
+so Ax omits auto and Ax-generated `__axOutput` tool choices for `deepseek-flash`,
+`deepseek-v4-pro`, `deepseek-v4-flash`, and `deepseek-reasoner` while still sending tool
 definitions. An explicitly forced caller tool choice fails before the request.
 DeepSeek does not support native JSON
 schema structured outputs. Ax therefore uses validated `json_object` for a

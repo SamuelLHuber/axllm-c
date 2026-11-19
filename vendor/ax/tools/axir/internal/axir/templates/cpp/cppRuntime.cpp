@@ -25,6 +25,9 @@ namespace axllm {
 double novel_f1_score(const std::string& history, const std::string& prediction, const std::string& ground_truth, bool return_recall) {
   return Core::number(Core::eval_novel_f1(history, prediction, ground_truth, return_recall));
 }
+double f1_score(const std::string& prediction, const std::string& ground_truth) {
+  return Core::number(Core::eval_f1(prediction, ground_truth));
+}
 
 static std::function<bool()> agent_cancellation_check(Value options);
 namespace detail {
@@ -2456,6 +2459,10 @@ Value Core::agent_clarification_error(Value payload, Value state) {
       {"state", get_key(state, "runtime_state", Value::object())},
       {"payload", payload},
   });
+}
+Value Core::agent_runtime_observation_boundaries(Value runtime) {
+  auto it = code_runtime_registry().find(str(get_key(runtime, "__code_runtime_id")));
+  return Value(it != code_runtime_registry().end() && it->second != nullptr && it->second->supports_observation_boundaries());
 }
 Value Core::agent_runtime_is_executable(Value runtime) {
   auto it = code_runtime_registry().find(str(get_key(runtime, "__code_runtime_id")));
@@ -6333,8 +6340,14 @@ Tool& Tool::execution(const std::string& mode) {
   execution_mode = mode; return *this;
 }
 
+Tool& Tool::result_policy(const std::string& policy) {
+  if (policy != "inspect" && policy != "data") throw std::invalid_argument("Tool result_policy must be inspect or data");
+  result_policy_value = policy;
+  return *this;
+}
+
 Value Tool::value() const {
-  return Value(Object{
+  Object descriptor{
       {"__tool_id", id},
       {"execution", execution_mode},
       {"name", name},
@@ -6342,7 +6355,9 @@ Value Tool::value() const {
       {"parameters", parameters},
       {"args", args},
       {"returns", returns},
-  });
+  };
+  if (!result_policy_value.empty()) descriptor["result_policy"] = result_policy_value;
+  return Value(std::move(descriptor));
 }
 
 AxMemory::AxMemory() : items_(Value(Object{{"items", Value::array()}})) {}

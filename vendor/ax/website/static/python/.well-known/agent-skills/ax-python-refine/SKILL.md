@@ -1,7 +1,7 @@
 ---
 name: "ax-python-refine"
 description: "Use when writing Python code with `axllm` for reward-scored generation, iterative candidate improvement, evaluator feedback, and optimizer-backed refinement patterns."
-version: "25.4.12"
+version: "25.4.13"
 ---
 # Ax Refinement Patterns For Python
 
@@ -35,7 +35,7 @@ result = engine.optimize(request, evaluator)
 
 ## Relevant API Surface
 
-- AxGen: `ax`, `novel_f1_score`, `AxGen`, `run_control`, `AxRunControl`, `Callable[[str, dict | None], dict | None]`, `set_caching_function`
+- AxGen: `ax`, `novel_f1_score`, `f1_score`, `AxGen`, `run_control`, `AxRunControl`, `Callable[[str, dict | None], dict | None]`, `set_caching_function`
 - Optimizers: `optimize`, `playbook`, `AxPlaybook`, `AxBootstrapFewShot`, `AxGEPA`, `OptimizerEngine`, `OptimizerEvaluator`
 
 ## Guardrails

@@ -11,7 +11,7 @@ cargo add axllm
 Or add to your `Cargo.toml`:
 
 ```toml
-axllm = "25.4.12"
+axllm = "25.4.13"
 ```
 
 Enable realtime audio over WebSocket with the `realtime` feature (pulls `tungstenite`):
@@ -43,7 +43,7 @@ fn main() -> AxResult<()> {
 - AxAgent and RLM: let an agent plan and execute actor-code steps while Ax keeps envelopes, state, logs, traces, context, discovery, recall, and final typed responses aligned.
 - AxFlow: compose AxGen, AxAgent, and nested flows into a portable program graph.
 - Optimizers: save, load, apply, and evaluate optimizer artifacts, including the generated GEPA engine.
-- Evaluation: novel_f1_score scores multiset word overlap after excluding history and stopwords, with matching Unicode normalization and finite empty-input scores.
+- Evaluation: novel_f1_score scores multiset word overlap after excluding history and stopwords, with matching Unicode normalization and finite empty-input scores. f1_score is the ordinary F1 over every normalized token.
 
 ## Package Shape
 

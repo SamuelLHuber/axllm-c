@@ -3403,6 +3403,7 @@ func title(name string) string {
 type Tool struct {
     Parameters Value
     ExecutionMode string
+    ResultPolicy string
 	Name        string
 	// Namespace files a flat agent function under it (TS fn().namespace());
 	// empty means the agent's default "tools".
@@ -3420,6 +3421,12 @@ func Fn(name string) Tool {
 func (t Tool) Execution(mode string) Tool {
     if mode != "blocking" && mode != "background" { panic("Tool execution must be blocking or background") }
     t.ExecutionMode = mode
+    return t
+}
+// WithResultPolicy marks a tool result as inspect (default) or deterministic data.
+func (t Tool) WithResultPolicy(policy string) Tool {
+    if policy != "inspect" && policy != "data" { panic("Tool resultPolicy must be inspect or data") }
+    t.ResultPolicy = policy
     return t
 }
 // WithNamespace sets the namespace an agent lists and calls a flat function
@@ -3504,6 +3511,8 @@ func toolFields(fields map[string]Field) []Field {
 }
 func (t Tool) get(key string, fallback Value) Value {
 	switch key {
+    case "result_policy":
+        if t.ResultPolicy == "" { return fallback }; return t.ResultPolicy
 	case "execution":
         if t.ExecutionMode == "" { return "blocking" }; return t.ExecutionMode
 	case "name":
@@ -12533,6 +12542,10 @@ func _core_agent_clarification_error(values ...Value) Value {
 	}
 	return Object("__error", "clarification", "message", message, "payload", payload)
 }
+func _core_agent_runtime_observation_boundaries(runtime Value) Value {
+    support, ok := runtime.(interface { SupportsObservationBoundaries() bool })
+    return ok && support.SupportsObservationBoundaries()
+}
 func _core_agent_runtime_is_executable(runtime Value) Value { _, ok := runtime.(CodeRuntime); return ok }
 func _core_agent_runtime_create_session(values ...Value) (Value, error) {
 	if len(values) < 1 {
@@ -13492,6 +13505,11 @@ func runConformanceFixtureKind(fixture map[string]Value) {
         for _, item := range coreIter(coreGet(fixture, "cases", Array())) {
             actual := NovelF1Score(display(coreGet(item,"history","")), display(coreGet(item,"prediction","")), display(coreGet(item,"ground_truth","")), coreTruthy(coreGet(item,"return_recall",false)))
             assertEqual(actual, coreGet(item,"expected",nil), "novel F1: " + display(coreGet(item,"name","")))
+        }
+	case "eval_f1":
+        for _, item := range coreIter(coreGet(fixture, "cases", Array())) {
+            actual := F1Score(display(coreGet(item,"prediction","")), display(coreGet(item,"ground_truth","")))
+            assertEqual(actual, coreGet(item,"expected",nil), "F1: " + display(coreGet(item,"name","")))
         }
 	case "stream":
 		runConformanceStream(fixture)
@@ -20291,4 +20309,9 @@ func Version() string { return "{{AX_VERSION}}" }
 // Set returnRecall to return recall instead of the harmonic F1 score.
 func NovelF1Score(history, prediction, groundTruth string, returnRecall bool) float64 {
     return num(mustCore(eval_novel_f1(history, prediction, groundTruth, returnRecall)))
+}
+
+// F1Score scores multiset token overlap between a prediction and the ground truth.
+func F1Score(prediction, groundTruth string) float64 {
+    return num(mustCore(eval_f1(prediction, groundTruth)))
 }

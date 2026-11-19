@@ -1,7 +1,7 @@
 ---
 name: "ax-cpp-gen"
 description: "Use when writing C++ code with `axllm` for AxGen programs, forward calls, indexed multi-sampling, result pickers, streaming, tools, assertions, traces, usage, and output parsing."
-version: "25.4.12"
+version: "25.4.13"
 ---
 # AxGen Structured Generation For C++
 
@@ -135,7 +135,7 @@ An unregistered tool name produces an error result for that call alone, with the
 
 ## Relevant API Surface
 
-- AxGen: `axllm::ax`, `axllm::axllm::novel_f1_score`, `axllm::AxGen`, `axllm::run_control`, `axllm::AxRunControl`, `axllm::AxCachingFunction`, `axllm::set_caching_function`
+- AxGen: `axllm::ax`, `axllm::axllm::novel_f1_score`, `axllm::axllm::f1_score`, `axllm::AxGen`, `axllm::run_control`, `axllm::AxRunControl`, `axllm::AxCachingFunction`, `axllm::set_caching_function`
 - Tools: `axllm::Tool`, `axllm::Tool`
 - MCP: `axllm::AxMCPClient`, `axllm::AxMCPStreamableHTTPTransport`, `axllm::AxMCPWebSocketTransport`, `axllm::AxMCPStdioTransport`
 

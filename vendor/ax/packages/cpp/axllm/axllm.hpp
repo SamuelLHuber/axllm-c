@@ -34,6 +34,7 @@
 
 namespace axllm {
 double novel_f1_score(const std::string& history, const std::string& prediction, const std::string& ground_truth, bool return_recall = false);
+double f1_score(const std::string& prediction, const std::string& ground_truth);
 
 struct Value;
 using Array = std::vector<Value>;
@@ -548,6 +549,7 @@ struct Core {
   static Value agent_stage_usage(Value stage);
   static Value agent_stage_traces(Value stage);
   static Value agent_clarification_error(Value payload, Value state);
+  static Value agent_runtime_observation_boundaries(Value runtime);
   static Value agent_runtime_is_executable(Value runtime);
   static Value agent_runtime_create_session(Value runtime, Value globals, Value options);
   static Value agent_runtime_execute(Value session, Value code, Value options);
@@ -1065,6 +1067,7 @@ struct Core {
   static Value _normalize_optimization_dataset(Value dataset);
   static Value _date_parse_named_datetime_impl(Value text, Value units, Value start, Value end);
   static Value _stream_extract_block_impl(Value input);
+  static Value eval_f1(Value prediction, Value ground_truth);
   static Value _normalize_optimization_metric_scores(Value raw);
   static Value _scalarize_optimization_scores(Value scores, Value options);
   static Value _stream_strip_leading_fence_impl(Value text);
@@ -1300,6 +1303,7 @@ struct Core {
   static Value _stream_apply_structured_impl(Value state, Value fields, Value parsed, Value marker, Value held);
   static Value _gen_citation_log_metadata(Value entry, Value response);
   static Value _stream_feedback_text_impl(Value result);
+  static Value _parse_answer_outputs(Value gen, Value output_fields, Value response, Value validate_exact_json, Value thought_field, Value thought_prefix, Value text_contract, Value strict_mode, Value parse_state);
   static Value _stream_run_processors_impl(Value gen, Value kind, Value state, Value content, Value done);
   static Value _stream_check_assertions_impl(Value gen, Value xstate, Value content, Value done);
   static Value _stream_emit_deltas_impl(Value ctx, Value index, Value deltas);
@@ -1336,13 +1340,13 @@ struct Core {
   static Value _resolve_agent_auto_upgrade(Value options);
   static Value _agent_discoverable_doc_chars(Value callable_split);
   static Value _agent_has_discover_namespace(Value callable_split);
-  static Value _agent_policy_flags(Value options, Value callable_split, Value auto_upgrade);
   static Value _map_optimization_judge_quality_to_score(Value quality);
+  static Value _agent_policy_flags(Value options, Value callable_split, Value auto_upgrade);
   static Value _build_optimization_judge_payload(Value task, Value prediction, Value criteria);
   static Value _agent_policy_action(Value id, Value category, Value kind, Value stages, Value availability, Value effect, Value host_boundary, Value actor_visible);
   static Value _agent_policy_vocabulary_registry();
-  static Value _agent_context_policy_registry();
   static Value _build_agent_eval_prediction(Value output, Value action_log, Value usage, Value trace);
+  static Value _agent_context_policy_registry();
   static Value _agent_context_policy_migration_error(Value key);
   static Value _agent_context_budget_profile(Value budget);
   static Value _agent_context_preset_profile(Value preset);
@@ -1382,8 +1386,8 @@ struct Core {
   static Value _agent_compute_effective_chat_budget(Value base_budget, Value fixed_overhead_chars);
   static Value _agent_action_log_char_count(Value entries);
   static Value _agent_compute_dynamic_runtime_chars(Value entries, Value target_prompt_chars, Value max_runtime_chars);
-  static Value _agent_context_pressure(Value mutable_prompt_chars, Value effective_budget_chars, Value checkpoint_active);
   static Value _build_agent_run_prediction(Value state, Value marks, Value completion, Value usage, Value trace);
+  static Value _agent_context_pressure(Value mutable_prompt_chars, Value effective_budget_chars, Value checkpoint_active);
   static Value _agent_render_context_pressure(Value pressure);
   static Value _agent_depth_limited_value(Value value, Value depth, Value ancestors);
   static Value _agent_smart_stringify(Value value, Value max_chars);
@@ -1393,6 +1397,8 @@ struct Core {
   static Value _agent_entry_summary(Value entry, Value fallback_turn);
   static Value _agent_entry_callables_text(Value entry);
   static Value _agent_distill_structured_action_output(Value output);
+  static Value _agent_entry_is_paused(Value entry);
+  static Value _agent_render_paused_action_entry(Value entry, Value output);
   static Value _agent_render_full_action_entry(Value state, Value entry);
   static Value _agent_render_compact_action_entry(Value entry, Value turn, Value reason);
   static Value _agent_fallback_checkpoint_summary(Value entries, Value turns);
@@ -1462,6 +1468,8 @@ struct Core {
   static Value _agent_runtime_execution_options(Value state, Value options);
   static Value _agent_runtime_lifecycle_event(Value state, Value action, Value details);
   static Value _agent_runtime_create_session(Value state, Value runtime, Value globals, Value options);
+  static Value _agent_clip_observation_text(Value text, Value limit);
+  static Value _agent_apply_turn_observations(Value state, Value entry);
   static Value _agent_runtime_execute_step(Value state, Value runtime, Value session, Value code, Value options);
   static Value _agent_runtime_inspect_state(Value state, Value session, Value options);
   static Value _agent_runtime_export_session_state(Value state, Value session, Value options);
@@ -1542,6 +1550,11 @@ struct Core {
   static Value _agent_forward(Value state, Value distiller, Value executor, Value responder, Value client, Value values, Value options);
   static Value _agent_runtime_callable_names(Value state);
   static Value _agent_callable_visible(Value state, Value qualified);
+  static Value _agent_observation_enabled(Value state);
+  static Value _agent_guard_pending_observation(Value state, Value action);
+  static Value _agent_record_turn_observation(Value state, Value qualified, Value result);
+  static Value _agent_runtime_tool_requires_inspection(Value state, Value qualified);
+  static Value _agent_runtime_execute_batch(Value state, Value items, Value options);
   static Value _agent_runtime_invoke_callable(Value state, Value qualified, Value arguments);
   static Value _agent_run_actor_stages(Value state, Value distiller, Value executor, Value client, Value values, Value options);
   static Value _agent_complete_run(Value state, Value distiller, Value executor, Value responder, Value client, Value options, Value output);
@@ -1569,8 +1582,9 @@ struct Core {
   static Value _agent_schema_types(Value schema);
   static Value _agent_schema_short_type(Value schema);
   static Value _agent_schema_object_type(Value schema, Value respect_required);
+  static Value _agent_render_result_policy(Value callable);
   static Value _agent_render_callable_block(Value callable, Value language, Value is_javascript);
-  static Value _agent_render_actor_functions_list(Value callable_split, Value discovery_mode, Value language, Value is_javascript);
+  static Value _agent_render_actor_functions_list(Value callable_split, Value discovery_mode, Value language, Value is_javascript, Value feedback);
   static Value _agent_render_actor_modules_list(Value callable_split);
   static Value _agent_context_input_fields(Value state);
   static Value _agent_prompt_field_type(Value typ);
@@ -1616,6 +1630,8 @@ struct Core {
   static Value _agent_structured_clarification(Value payload);
   static Value _agent_truncate_inline(Value text, Value max_chars);
   static Value _agent_stage_step_turn(Value state);
+  static Value _agent_is_cut_off_reply_error(Value error);
+  static Value _agent_actor_stage_forward(Value state, Value stage_name, Value stage, Value client, Value values, Value options);
   static Value _flow_factory(Value options);
   static Value _program_descriptor(Value kind, Value id, Value metadata);
   static Value _program_trace_event(Value program_id, Value kind, Value payload);
@@ -2347,6 +2363,8 @@ class Tool {
   Tool& context_handler(std::function<Value(Value,const AxToolContext&)> handler);
   std::string execution_mode = "blocking";
   Tool& execution(const std::string& mode);
+  Tool& result_policy(const std::string& policy);
+  std::string result_policy_value;
   std::string id;
   std::string name;
   std::string description;
@@ -2605,6 +2623,7 @@ class AxCodeRuntime {
   virtual ~AxCodeRuntime() = default;
   virtual std::string language() const { return "JavaScript"; }
   virtual std::string usage_instructions() const { return ""; }
+  virtual bool supports_observation_boundaries() const { return false; }
   virtual AxCodeSession* create_session(Value globals, Value options = Value::object()) = 0;
   // Register a host callable under `name`. Default no-op so runtimes that do
   // not host callables are unaffected; the embedded JS engines override it so

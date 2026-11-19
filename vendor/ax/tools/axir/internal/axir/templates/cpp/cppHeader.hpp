@@ -34,6 +34,7 @@
 
 namespace axllm {
 double novel_f1_score(const std::string& history, const std::string& prediction, const std::string& ground_truth, bool return_recall = false);
+double f1_score(const std::string& prediction, const std::string& ground_truth);
 
 struct Value;
 using Array = std::vector<Value>;
@@ -548,6 +549,7 @@ struct Core {
   static Value agent_stage_usage(Value stage);
   static Value agent_stage_traces(Value stage);
   static Value agent_clarification_error(Value payload, Value state);
+  static Value agent_runtime_observation_boundaries(Value runtime);
   static Value agent_runtime_is_executable(Value runtime);
   static Value agent_runtime_create_session(Value runtime, Value globals, Value options);
   static Value agent_runtime_execute(Value session, Value code, Value options);
@@ -1220,6 +1222,8 @@ class Tool {
   Tool& context_handler(std::function<Value(Value,const AxToolContext&)> handler);
   std::string execution_mode = "blocking";
   Tool& execution(const std::string& mode);
+  Tool& result_policy(const std::string& policy);
+  std::string result_policy_value;
   std::string id;
   std::string name;
   std::string description;
@@ -1478,6 +1482,7 @@ class AxCodeRuntime {
   virtual ~AxCodeRuntime() = default;
   virtual std::string language() const { return "JavaScript"; }
   virtual std::string usage_instructions() const { return ""; }
+  virtual bool supports_observation_boundaries() const { return false; }
   virtual AxCodeSession* create_session(Value globals, Value options = Value::object()) = 0;
   // Register a host callable under `name`. Default no-op so runtimes that do
   // not host callables are unaffected; the embedded JS engines override it so

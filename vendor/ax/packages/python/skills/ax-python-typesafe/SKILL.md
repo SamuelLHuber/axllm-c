@@ -1,7 +1,7 @@
 ---
 name: "ax-python-typesafe"
 description: "Use when writing Python code with `axllm` for Typesafe Jev image inputs, boolean/class/rubric score/box signatures, decision evidence and provenance, native Noul/Choice/Score/Box, structured criteria and hybrid generation."
-version: "25.4.12"
+version: "25.4.13"
 ---
 # Typesafe / Jev For Python
 
@@ -81,7 +81,7 @@ Runnable signature and native examples are under src/examples/python/generation/
 ## Relevant API Surface
 
 - Signatures: `s`, `f`, `AxSignature`
-- AxGen: `ax`, `novel_f1_score`, `AxGen`, `run_control`, `AxRunControl`, `Callable[[str, dict | None], dict | None]`, `set_caching_function`
+- AxGen: `ax`, `novel_f1_score`, `f1_score`, `AxGen`, `run_control`, `AxRunControl`, `Callable[[str, dict | None], dict | None]`, `set_caching_function`
 - AxAI: `ai`, `google_gemini_decisions`, `AxAIGoogleGeminiDecisionsClient`, `openai_decisions`, `AxAIOpenAIDecisionsClient`, `typesafe`, `AxAITypesafeClient`, `AxCancellationToken`, `AxAIServiceAbortedError`, `get_supported_ai_models`, `dict[str, str]`, `Callable[[dict[str, str]], dict[str, str]]`, `AIClient.owned_worker_factory`, `AxChatSession`, `closable generator`, `OpenAICompatibleClient`, `OpenAIResponsesClient`, `GoogleGeminiClient`, `AnthropicClient`, `AxUsageContext`, `AxUsageEvent`, `AxUsageObserver`, `set_usage_observer`, `AxRuntimeHooks`, `AxRateLimitInfo`, `AxRateLimiter`, `AxTracer`, `AxMeter`, `AxGlobals`, `set_rate_limiter`, `set_tracer`, `set_meter`, `AxBalancer`, `AxBalancerAdaptiveStrategy`, `AxBalancerStatsStore`, `AxInMemoryBalancerStatsStore`, `create_balancer_route_stats`, `update_balancer_route_stats`, `sample_balancer_route_health`, `MultiServiceRouter`, `ProviderRouter.get_compatibility_report`, `ProviderRouter`
 
 ## Guardrails

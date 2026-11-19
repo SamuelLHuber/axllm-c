@@ -27,6 +27,7 @@ import {
   validateActorTurnCodePolicy,
 } from '../runtime.js';
 import type { ActorLoopContext } from './actorLoopContext.js';
+import { forwardWithCutOffRetry } from './cutOffReply.js';
 import {
   appendDiscoveryTurnSummary,
   stripDiscoveryTurnOutput,
@@ -328,16 +329,23 @@ export async function runActorTurn<_IN extends AxGenIn>(
   const usageBefore = s.actorProgram.getUsage()?.length ?? 0;
   const actorTurnCallback = rlm.actorTurnCallback;
 
-  const executorResult = await s.actorProgram.forward(
-    ai,
-    buildActorPromptValues(
-      actionLogText,
-      guidanceLogText,
-      mutableState.runtimeStateSummary,
-      summarizedActorLogText,
-      contextPressureText
-    ),
-    actorCallOptions
+  runtimeContext.beginActorTurn?.();
+  // One reply cut off at the output limit must not end the run: nothing has
+  // executed yet, so the same turn can simply ask again.
+  const executorResult = await forwardWithCutOffRetry<Record<string, unknown>>(
+    (turnActionLogText) =>
+      s.actorProgram.forward(
+        ai,
+        buildActorPromptValues(
+          turnActionLogText,
+          guidanceLogText,
+          mutableState.runtimeStateSummary,
+          summarizedActorLogText,
+          contextPressureText
+        ),
+        actorCallOptions
+      ),
+    actionLogText
   );
   if (!debugHideSystemPrompt) {
     mutableState.lastDebugLoggedActorInstruction = actorInstruction;
@@ -398,15 +406,6 @@ export async function runActorTurn<_IN extends AxGenIn>(
           ),
         }
       : validateActorTurnCodePolicy(code);
-
-    // Auto-split: discovery mixed with other code — run discovery first,
-    // then proceed to execute the full code block (discovery calls are
-    // idempotent so re-running is safe).
-    if (policyResult?.autoSplitDiscoveryCode) {
-      await runtimeContext.executeActorCode(
-        policyResult.autoSplitDiscoveryCode
-      );
-    }
 
     if (policyResult?.violation) {
       const policyViolation = policyResult.violation;
@@ -477,6 +476,8 @@ export async function runActorTurn<_IN extends AxGenIn>(
   let output: string;
   let isError: boolean;
   let isCodeError: boolean;
+  let hasObservationFeedback = false;
+  let executionPaused = false;
 
   try {
     const executionResult = await runtimeContext.executeActorCode(code);
@@ -484,6 +485,8 @@ export async function runActorTurn<_IN extends AxGenIn>(
     output = executionResult.output;
     isError = executionResult.isError;
     isCodeError = executionResult.isCodeError === true;
+    hasObservationFeedback = executionResult.hasObservationFeedback === true;
+    executionPaused = executionResult.executionPaused === true;
   } catch (err) {
     if (
       err instanceof AxAgentClarificationError ||
@@ -537,7 +540,8 @@ export async function runActorTurn<_IN extends AxGenIn>(
         : {}),
     });
     result = undefined;
-    output = buildGuidanceActionLogOutput(guidancePayload);
+    if (!hasObservationFeedback)
+      output = buildGuidanceActionLogOutput(guidancePayload);
     isError = false;
     isCodeError = false;
   }
@@ -563,7 +567,10 @@ export async function runActorTurn<_IN extends AxGenIn>(
     turn: entryTurn,
     code: actionLogCode,
     output,
-    tags: isError ? ['error'] : [],
+    tags: [
+      ...(isError ? ['error' as const] : []),
+      ...(executionPaused ? ['paused' as const] : []),
+    ],
     ...(() => {
       const calls = functionCallRecords?.slice(functionCallStartIndex) ?? [];
       return calls.length > 0 ? { _functionCalls: calls } : {};

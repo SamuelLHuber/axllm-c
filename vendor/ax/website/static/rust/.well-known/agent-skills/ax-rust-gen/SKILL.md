@@ -1,7 +1,7 @@
 ---
 name: "ax-rust-gen"
 description: "Use when writing Rust code with `axllm` for AxGen programs, forward calls, indexed multi-sampling, result pickers, streaming, tools, assertions, traces, usage, and output parsing."
-version: "25.4.12"
+version: "25.4.13"
 ---
 # AxGen Structured Generation For Rust
 
@@ -135,7 +135,7 @@ An unregistered tool name produces an error result for that call alone, with the
 
 ## Relevant API Surface
 
-- AxGen: `ax`, `novel_f1_score`, `AxGen`, `run_control`, `AxRunControl`, `AxCachingFunction`, `set_caching_function`
+- AxGen: `ax`, `novel_f1_score`, `f1_score`, `AxGen`, `run_control`, `AxRunControl`, `AxCachingFunction`, `set_caching_function`
 - Tools: `tool`, `Tool`
 - MCP: `AxMCPClient`, `AxMCPStreamableHTTPTransport`, `AxMCPWebSocketTransport`, `AxMCPStdioTransport`
 

@@ -10,14 +10,14 @@ Add the dependency from Maven Central:
 <dependency>
   <groupId>dev.axllm</groupId>
   <artifactId>ax</artifactId>
-  <version>25.4.12</version>
+  <version>25.4.13</version>
 </dependency>
 ```
 
 Or with Gradle:
 
 ```groovy
-implementation 'dev.axllm:ax:25.4.12'
+implementation 'dev.axllm:ax:25.4.13'
 ```
 
 Realtime audio over WebSocket uses the JDK's built-in `java.net.http` WebSocket — no extra dependency.
@@ -43,7 +43,7 @@ System.out.println(schema.get("properties"));
 - AxAgent and RLM: let an agent plan and execute actor-code steps while Ax keeps envelopes, state, logs, traces, context, discovery, recall, and final typed responses aligned.
 - AxFlow: compose AxGen, AxAgent, and nested flows into a portable program graph.
 - Optimizers: save, load, apply, and evaluate optimizer artifacts, including the generated GEPA engine.
-- Evaluation: Ax.novelF1Score scores multiset word overlap after excluding history and stopwords, with matching Unicode normalization and finite empty-input scores.
+- Evaluation: Ax.novelF1Score scores multiset word overlap after excluding history and stopwords, with matching Unicode normalization and finite empty-input scores. Ax.f1Score is the ordinary F1 over every normalized token.
 
 ## Package Shape
 

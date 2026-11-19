@@ -1,7 +1,7 @@
 ---
 name: "ax-java-refine"
 description: "Use when writing Java code with `dev.axllm:ax` for reward-scored generation, iterative candidate improvement, evaluator feedback, and optimizer-backed refinement patterns."
-version: "25.4.12"
+version: "25.4.13"
 ---
 # Ax Refinement Patterns For Java
 
@@ -33,7 +33,7 @@ var result = engine.optimize(request, evaluator);
 
 ## Relevant API Surface
 
-- AxGen: `Ax.ax`, `Ax.novelF1Score`, `AxGen`, `Ax.runControl`, `AxRunControl`, `AxCachingFunction`, `AxGlobals.setCachingFunction`
+- AxGen: `Ax.ax`, `Ax.novelF1Score`, `Ax.f1Score`, `AxGen`, `Ax.runControl`, `AxRunControl`, `AxCachingFunction`, `AxGlobals.setCachingFunction`
 - Optimizers: `Ax.optimize`, `Ax.playbook`, `AxPlaybook`, `AxBootstrapFewShot`, `AxGEPA`, `OptimizerEngine`, `OptimizerEvaluator`
 
 ## Guardrails

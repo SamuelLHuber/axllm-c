@@ -54,6 +54,18 @@ export type AxRuntimePrimitiveExample = {
  */
 export const axRuntimePrimitives: readonly AxRuntimePrimitive[] = [
   {
+    id: 'batch',
+    enabledBy: 'observationBoundaries',
+    stages: ['executor'],
+    description:
+      'Run independent tool calls together when all arguments are already known. Returns ordered outcomes; review inspection results on the next turn. Do not batch calls whose arguments depend on another result. Missing tool docs are loaded together before any calls execute.',
+    signatures: [
+      {
+        code: "await batch([{ name: 'namespace.function', args: { ... } }, ...]): { name: string, status: 'fulfilled' | 'rejected', value?: any, error?: string }[]",
+      },
+    ],
+  },
+  {
     id: 'llmQuery',
     stages: ['distiller', 'executor'],
     description:
